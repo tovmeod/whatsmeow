@@ -75,8 +75,14 @@ import aiohttp
 from PIL import Image, ImageOps
 
 from .protocol import ProtocolNode
-from .types import Message, Contact, Chat, GroupInfo, PrivacySetting, PrivacyValue, MessageType, MessageStatus, MessageKey, \
-	MessageInfo, JID
+# Updated imports for Protobuf classes
+from pymeow.pymeow.generated_protos.waE2E import WAWebProtobufsE2E_pb2
+from pymeow.pymeow.generated_protos.waCommon import WACommon_pb2 # For MessageKey
+from pymeow.pymeow.types import Message # This is now WAWebProtobufsE2E_pb2.Message
+from pymeow.pymeow.types import MessageKey # This is now WACommon_pb2.MessageKey
+from pymeow.pymeow.types import JID # For converting string JIDs to JID objects if needed by other logic
+# Original type imports from .types (some might be aliased now)
+from .types import Contact, Chat, GroupInfo, PrivacySetting, PrivacyValue, MessageType, MessageStatus
 from .types.presence import Presence, ChatPresence, ChatPresenceMedia, PresenceEvent, ChatPresenceEvent
 from .client_presence import ClientPresenceMixin
 from .exceptions import PymeowError, AuthenticationError, ConnectionError
@@ -2299,7 +2305,7 @@ class Client(ClientPresenceMixin):
             # Try to decode as a protocol node
             try:
                 from .protocol import ProtocolDecoder
-                decoder = ProtocolDecoder()
+                decoder = ProtocolDecoder() # Updated: No keys passed
                 node = decoder.decode(payload)
                 await self._handle_protocol_node(node)
                 return
@@ -2339,20 +2345,32 @@ class Client(ClientPresenceMixin):
                 
             # Check for history sync notification in message nodes
             if node.tag == 'message':
-                # Handle history sync notification
-                if node.attrs.get('type') == 'notification' and node.get_child('sync'):
+                # Attempt to parse as a Protobuf message first
+                message_obj = await self._parse_message_node(node)
+                if message_obj:
+                    await self._dispatch_event('message', message_obj)
+                # If _parse_message_node returns None (e.g. not a protobuf message or parse error),
+                # it might be an older style XML message or a special notification.
+                # The original _handle_message_node logic might need to be called here for those cases,
+                # or parts of it integrated if they handle non-protobuf message structures.
+                # For now, as per instructions, we only dispatch if message_obj is not None.
+                # The original logic for history sync notification inside 'message' type is now implicitly
+                # handled if it's part of the protobuf payload, or needs to be re-evaluated if it's a distinct XML structure.
+                # Based on the problem description, the focus is on protobuf messages.
+                # The original _handle_message_node call is removed and replaced by _parse_message_node + dispatch.
+                # History sync notification check:
+                elif node.attrs.get('type') == 'notification' and node.get_child('sync'):
                     sync_node = node.get_child('sync')
-                    if sync_node and sync_node.data:
+                    if sync_node and sync_node.data: # Assuming sync_node.data is JSON string
                         try:
-                            sync_data = json.loads(sync_node.data)
+                            sync_data = json.loads(sync_node.data) # If sync_node.data is bytes, decode first
                             if 'history_sync' in sync_data:
                                 await self._handle_history_sync(sync_data['history_sync'])
-                                return  # Skip normal message processing for sync notifications
+                                return
                         except (json.JSONDecodeError, KeyError) as e:
-                            logger.error(f"Failed to parse history sync data: {e}")
-
-                # Process as regular message node
-                await self._handle_message_node(node)
+                             logger.error(f"Failed to parse history sync data: {e}")
+                    # else:
+                    #     logger.warning(f"Received non-protobuf message node, and not a known XML notification type: {node.tag}")
 
             elif node.tag == 'presence':
                 await self._handle_presence_node(node)
@@ -2468,128 +2486,75 @@ class Client(ClientPresenceMixin):
             logger.error(error_msg, exc_info=True)
             raise PymeowError(error_msg) from e
 
-    async def _parse_message_node(self, node):
+    async def _parse_message_node(self, node: ProtocolNode) -> Optional[Message]:
         """
-        Parse a message protocol node into a dictionary.
+        Parse a message protocol node into a WAWebProtobufsE2E_pb2.Message object.
 
         Args:
             node: The protocol node to parse
 
         Returns:
-            A dictionary containing the parsed message data
+            A WAWebProtobufsE2E_pb2.Message object or None if parsing fails.
         """
-        try:
-            if not node or not hasattr(node, 'attrs'):
-                return None
-
-            message = {
-                'id': node.attrs.get('id'),
-                'from': node.attrs.get('from'),
-                'to': node.attrs.get('to'),
-                'type': node.attrs.get('type'),
-                'timestamp': int(node.attrs.get('t', time.time() * 1000)),
-                'notify': node.attrs.get('notify'),
-                'from_me': node.attrs.get('from_me', 'false').lower() == 'true',
-                'participant': node.attrs.get('participant'),
-                'node': node  # Include the raw node for reference
-            }
-
-            # Extract message content if available
-            if hasattr(node, 'content') and node.content:
-                if isinstance(node.content, list):
-                    for child in node.content:
-                        if not hasattr(child, 'tag'):
-                            continue
-
-                        if child.tag == 'body':
-                            message['body'] = child.content[0] if child.content else ''
-                        elif child.tag == 'reaction':
-                            try:
-                                # Handle reaction message
-                                message['type'] = 'reaction'
-                                reaction_id = child.attrs.get('id')
-                                reaction_emoji = child.content[0] if child.content else ''
-                                sender_jid = message.get('from')
-
-                                if not reaction_id:
-                                    logger.warning("Received reaction without message ID")
-                                    continue
-
-                                if not sender_jid:
-                                    logger.warning(f"Received reaction {reaction_id} without sender JID")
-                                    continue
-
-                                message['reaction'] = {
-                                    'id': reaction_id,
-                                    'emoji': reaction_emoji,
-                                    'sender_jid': sender_jid,
-                                    'timestamp': message['timestamp'],
-                                    'is_removal': not bool(reaction_emoji)
-                                }
-
-                                # Update the message store
-                                if hasattr(self, '_message_store') and self._message_store:
-                                    if reaction_emoji:
-                                        # Add or update reaction
-                                        await self._message_store.add_reaction(
-                                            reaction_id,
-                                            sender_jid,
-                                            reaction_emoji
-                                        )
-                                    else:
-                                        # Remove reaction
-                                        await self._message_store.remove_reaction(
-                                            reaction_id,
-                                            sender_jid
-                                        )
-
-                                # Dispatch a reaction event
-                                event_data = {
-                                    'message_id': reaction_id,
-                                    'sender_jid': sender_jid,
-                                    'emoji': reaction_emoji,
-                                    'is_removal': not bool(reaction_emoji),
-                                    'timestamp': message['timestamp']
-                                }
-                                await self._dispatch_event('reaction', event_data)
-
-                            except Exception as e:
-                                logger.error(f"Error processing reaction: {e}", exc_info=True)
-                                # Continue processing other message parts even if reaction handling fails
-
-                        elif child.tag == 'media' and child.attrs.get('type'):
-                            message['media_type'] = child.attrs['type']
-                            message['media_url'] = child.attrs.get('url')
-                            message['media_mimetype'] = child.attrs.get('mimetype')
-                            message['media_file_length'] = int(child.attrs.get('file_length', 0))
-                            message['media_sha256'] = child.attrs.get('file_sha256')
-                            message['media_enc_sha256'] = child.attrs.get('media_key')
-
-                # Handle quoted messages
-                quoted = node.find('quoted')
-                if quoted:
-                    message['quoted_message'] = await self._parse_message_node(quoted)
-
-            return message
-
-        except Exception as e:
-            logger.error(f"Error parsing message node: {e}", exc_info=True)
+        if not node or not hasattr(node, 'attrs'):
+            logger.warning("Attempted to parse an invalid or empty node.")
             return None
 
-    async def _handle_message_node(self, node):
-        """Handle a message protocol node."""
+        # Extract stanza info
+        node_attrs_id = node.attrs.get('id')
+        from_jid_str = node.attrs.get('from')
+        to_jid_str = node.attrs.get('to')
+        participant_jid_str = node.attrs.get('participant')
+        timestamp_str = node.attrs.get('t')
+        # node_type = node.attrs.get('type') # This is XML type, protobuf message has its own type fields
+
+        if not isinstance(node.content, bytes) or not node.content:
+            # This might be an older XML-formatted message or a notification without a protobuf body.
+            # For this refactoring, we are focusing on messages with Protobuf content.
+            # logger.debug(f"Message node {node_attrs_id} has no binary content to parse into Protobuf Message. XML type: {node_type}")
+            return None
+
         try:
-            # Extract message data from node
-            message = await self._parse_message_node(node)
-            if not message:
-                return
-
-            # Dispatch the message event
-            await self._dispatch_event('message', message)
-
+            parsed_proto_msg = WAWebProtobufsE2E_pb2.Message()
+            parsed_proto_msg.ParseFromString(node.content)
         except Exception as e:
-            logger.error(f"Error handling message node: {e}", exc_info=True)
-            await self._dispatch_event('error', {'error': str(e), 'type': 'message_node'})
+            logger.error(f"Failed to parse Protobuf content for message {node_attrs_id}: {e}", exc_info=True)
+            return None
+
+        # Populate/Override key and timestamp from stanza attributes
+        # The key is of type WACommon_pb2.MessageKey, which is already the type of parsed_proto_msg.key
+        if node_attrs_id:
+            parsed_proto_msg.key.id = node_attrs_id
+        
+        is_from_me = False
+        if self._auth_state and self._auth_state.device and hasattr(self._auth_state.device, 'id_str'):
+            is_from_me = (from_jid_str == self._auth_state.device.id_str)
+        elif self._auth_state and self._auth_state.me: # Fallback if device.id_str is not available
+             is_from_me = (from_jid_str == str(self._auth_state.me))
+
+
+        parsed_proto_msg.key.from_me = is_from_me
+
+        if is_from_me:
+            if to_jid_str:
+                parsed_proto_msg.key.remote_jid = to_jid_str
+        else:
+            if from_jid_str:
+                parsed_proto_msg.key.remote_jid = from_jid_str
+        
+        if participant_jid_str:
+            parsed_proto_msg.key.participant = participant_jid_str
+        
+        if timestamp_str:
+            try:
+                parsed_proto_msg.message_timestamp = int(timestamp_str)
+            except ValueError:
+                logger.warning(f"Invalid timestamp format for message {node_attrs_id}: {timestamp_str}")
+        
+        return parsed_proto_msg
+
+    # _handle_message_node is effectively replaced by the logic in _handle_protocol_node
+    # that now calls _parse_message_node and dispatches the protobuf object.
 
     async def _handle_presence_node(self, node):
         """Handle a presence protocol node.
@@ -4109,12 +4074,12 @@ class Client(ClientPresenceMixin):
         try:
             # Encode the node
             from .protocol import ProtocolEncoder
-            encoder = ProtocolEncoder()
+            encoder = ProtocolEncoder() # Updated: No keys passed
             data = encoder.encode(node)
 
-            # Encrypt if needed
+            # Encrypt if needed (This encryption call will be moved to WebSocketClient later)
             if self._send_cipher:
-                data = self._send_cipher.encrypt(data)
+                data = self._send_cipher.encrypt(data) # This line will be removed when WebSocketClient handles encryption
 
             # Send the data
             if self._websocket:

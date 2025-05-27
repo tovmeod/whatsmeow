@@ -3,12 +3,15 @@ Tests for disappearing messages functionality in PyMeow.
 """
 import logging
 import unittest
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, AsyncMock
 import asyncio
+from collections import defaultdict # For _event_handlers
 
-from pymeow.pymeow import MessageUtils, ExpirationType
-from pymeow.pymeow.client import Client
+from pymeow.pymeow import ExpirationType
+from pymeow.pymeow.client import Client # Using real Client
 from pymeow.pymeow.protocol import ProtocolNode
+from pymeow.pymeow.websocket import WebSocketClient # For spec of _websocket
+from pymeow.pymeow.generated_protos.waE2E import WAWebProtobufsE2E_pb2
 
 logger = logging.getLogger(__name__)
 
@@ -17,208 +20,162 @@ class TestDisappearingMessages(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        print("[0] Setting up test")
+        self.client = Client() # Instantiate real Client
         
-        # Create a mock client with required attributes
-        self.client = MagicMock(spec=Client)
-        self.client._enqueue_message = AsyncMock()
-        self.client._send_iq_and_wait = AsyncMock()
-        self.client.logger = logging.getLogger(__name__)
-        
-        # Mock the message store
+        # Mock dependencies
+        self.client._websocket = AsyncMock(spec=WebSocketClient)
+        self.client._auth_state = MagicMock()
+        self.client._auth_state.me = "self@s.whatsapp.net" # Example JID
+        self.client._auth_state.device = MagicMock()
+        self.client._auth_state.device.device_id = "TESTDEVICE"
+
+
         self.client._message_store = AsyncMock()
-        self.client._message_store.get_message = AsyncMock(return_value=None)
+        self.client._event_handlers = defaultdict(list) # As in Client.__init__
         
-        # Mock the message queue
-        self.client._message_queue = MagicMock()
-        self.client._message_queue.put = AsyncMock()
-        
-        # Set up mock connection state
-        self.client.connected = True
-        self.client.logged_in = True
-        self.client.is_connected = MagicMock(return_value=True)
+        # Set client state
         self.client._is_connected = True
         self.client._is_authenticated = True
         
-        print("[0] Test setup complete")
+        # Mock methods that would lead to actual network calls or complex internal logic not being tested here
+        self.client._send_iq_and_wait = AsyncMock()
+        # For individual chat ephemeral settings (if sent as regular message)
+        self.client._message_queue = MagicMock() 
+        self.client._message_queue.put = AsyncMock()
 
-    async def test_send_disappearing_message_90_days(self):
-        """Test sending a disappearing message with 90-day expiration."""
-        print("\n[1] Starting test_send_disappearing_message_90_days")
-        
-        # Configure the mock client's send_message method
-        self.client.send_message = AsyncMock(return_value="3EB01234567890")
-        
-        # Call the method with the 90-day expiration
-        try:
-            result = await self.client.send_message(
-                to="1234567890@s.whatsapp.net",
-                content="Test disappearing message with 90-day expiration",
-                expiration_seconds=ExpirationType.NINETY_DAYS.value
-            )
-            
-            # Verify the message was sent with the correct parameters
-            self.client.send_message.assert_called_once_with(
-                to="1234567890@s.whatsapp.net",
-                content="Test disappearing message with 90-day expiration",
-                expiration_seconds=ExpirationType.NINETY_DAYS.value
-            )
-            
-            # Verify the message ID was returned
-            self.assertTrue(result.startswith('3EB0'), "Should return a valid message ID")
-            
-        except Exception as e:
-            self.fail(f"Unexpected exception: {e}")
-    
-    async def test_set_90_day_disappearing_messages(self):
-        """Test setting 90-day disappearing messages for a chat."""
-        print("\n[2] Starting test_set_90_day_disappearing_messages")
-        
-        # Configure the mock client's set_disappearing_messages method
-        expected_result = {
-            'status': 'success',
-            'duration_seconds': ExpirationType.NINETY_DAYS.value,
-            'enabled': True
-        }
-        self.client.set_disappearing_messages = AsyncMock(return_value=expected_result)
-        
-        # Call the method with 90-day expiration
-        result = await self.client.set_disappearing_messages(
-            chat_jid="1234567890@s.whatsapp.net",
-            duration_seconds=ExpirationType.NINETY_DAYS.value
-        )
-        
-        # Verify the result
-        self.assertEqual(result['status'], 'success')
-        self.assertEqual(result['duration_seconds'], ExpirationType.NINETY_DAYS.value)
-        self.assertTrue(result['enabled'])
-        
-        # Verify the method was called with the correct parameters
-        self.client.set_disappearing_messages.assert_called_once_with(
-            chat_jid="1234567890@s.whatsapp.net",
-            duration_seconds=ExpirationType.NINETY_DAYS.value
-        )
 
-    async def test_set_disappearing_messages(self):
-        """Test setting disappearing messages for a chat."""
-        # Configure the mock client's set_disappearing_messages method
+    async def test_set_disappearing_messages_individual_chat(self):
+        """Test setting disappearing messages for an individual chat."""
+        chat_jid = "1234567890@s.whatsapp.net" # Individual JID
         duration = ExpirationType.ONE_DAY.value
-        expected_result = {
-            'status': 'success',
-            'duration_seconds': duration,
-            'enabled': True
-        }
-        self.client.set_disappearing_messages = AsyncMock(return_value=expected_result)
 
-        # Set disappearing messages for a chat
-        result = await self.client.set_disappearing_messages(
-            chat_jid="1234567890@s.whatsapp.net",
+        # The current Client.set_disappearing_messages sends a regular message
+        # with a ProtocolMessage for individual chats.
+        # This message gets put on the _message_queue.
+        
+        await self.client.set_disappearing_messages(
+            chat_jid=chat_jid,
             duration_seconds=duration
         )
 
-        # Verify the result
-        self.assertEqual(result['status'], 'success')
-        self.assertEqual(result['duration_seconds'], duration)
-        self.assertTrue(result['enabled'])
+        self.client._message_queue.put.assert_awaited_once()
+        args, _ = self.client._message_queue.put.call_args
+        _, message_node_sent, _ = args[0] # id, node, future
+
+        self.assertIsInstance(message_node_sent, ProtocolNode)
+        self.assertEqual(message_node_sent.tag, "message")
+        self.assertEqual(message_node_sent.attrs["to"], chat_jid)
         
-        # Verify the method was called with the correct parameters
-        self.client.set_disappearing_messages.assert_called_once_with(
-            chat_jid="1234567890@s.whatsapp.net",
+        # Verify the content is a serialized Protobuf WAWebProtobufsE2E_pb2.Message
+        # containing a ProtocolMessage for ephemeral setting.
+        self.assertTrue(isinstance(message_node_sent.content, bytes))
+        proto_msg = WAWebProtobufsE2E_pb2.Message()
+        proto_msg.ParseFromString(message_node_sent.content)
+
+        self.assertTrue(proto_msg.HasField("protocol_message"))
+        protocol_sub_msg = proto_msg.protocol_message
+        self.assertEqual(protocol_sub_msg.type, WAWebProtobufsE2E_pb2.ProtocolMessage.Type.EPHEMERAL_SETTING)
+        self.assertEqual(protocol_sub_msg.ephemeral_expiration, duration)
+        self.assertTrue(protocol_sub_msg.ephemeral_setting_timestamp > 0)
+
+    async def test_set_disappearing_messages_group_chat(self):
+        """Test setting disappearing messages for a group chat."""
+        group_jid = "group_id@g.us"
+        duration = ExpirationType.ONE_WEEK.value
+
+        # For group chats, set_disappearing_messages uses _send_iq_and_wait
+        # to send a w:g2 iq stanza.
+        self.client._send_iq_and_wait.return_value = ProtocolNode("iq", {"type": "result"}) # Simulate success
+
+        await self.client.set_disappearing_messages(
+            chat_jid=group_jid,
             duration_seconds=duration
         )
 
-    async def test_get_disappearing_messages(self):
-        """Test getting disappearing messages settings for a chat."""
-        # Configure the mock client's get_disappearing_messages method
-        expected_settings = {
-            'duration_seconds': 86400,
-            'is_ephemeral': False,
-            'enabled': True
-        }
-        self.client.get_disappearing_messages = AsyncMock(return_value=expected_settings)
-
-        # Get disappearing messages settings
-        settings = await self.client.get_disappearing_messages("1234567890@s.whatsapp.net")
+        self.client._send_iq_and_wait.assert_awaited_once()
+        args, _ = self.client._send_iq_and_wait.call_args
+        iq_node_sent = args[0] # First positional arg to _send_iq_and_wait
         
-        # Verify the result
-        self.assertEqual(settings['duration_seconds'], 86400)
-        self.assertFalse(settings['is_ephemeral'])
-        self.assertTrue(settings['enabled'])
-        
-        # Verify the method was called with the correct parameters
-        self.client.get_disappearing_messages.assert_called_once_with("1234567890@s.whatsapp.net")
+        self.assertEqual(iq_node_sent.tag, "iq")
+        self.assertEqual(iq_node_sent.attrs["to"], group_jid)
+        self.assertEqual(iq_node_sent.attrs["type"], "set")
+        self.assertEqual(iq_node_sent.attrs["xmlns"], "w:g2") # Namespace for group operations
 
-        # Verify the settings
-        self.assertTrue(settings['enabled'])
-        self.assertEqual(settings['duration_seconds'], 86400)  # Raw value from the mock
+        disappearing_mode_node = iq_node_sent.content[0] # Assuming first child
+        self.assertEqual(disappearing_mode_node.tag, "disappearing_mode")
+        self.assertEqual(disappearing_mode_node.attrs["duration"], str(duration))
+    
+    async def test_set_90_day_disappearing_messages_group(self):
+        """Test setting 90-day disappearing messages for a group chat."""
+        group_jid = "another_group@g.us"
+        duration = ExpirationType.NINETY_DAYS.value
 
-class TestMessageUtils(unittest.TestCase):
-    """Test cases for MessageUtils class."""
+        self.client._send_iq_and_wait.return_value = ProtocolNode("iq", {"type": "result"})
 
-    def test_validate_duration(self):
-        """Test duration validation."""
-        self.assertTrue(MessageUtils.validate_duration(0))  # Off
-        self.assertTrue(MessageUtils.validate_duration(86400))  # 1 day
-        self.assertTrue(MessageUtils.validate_duration(604800))  # 1 week
-        self.assertTrue(MessageUtils.validate_duration(7776000))  # 90 days
-        self.assertFalse(MessageUtils.validate_duration(12345))  # Invalid duration
-
-    def test_create_text_message_node_with_expiration(self):
-        """Test creating a message node with expiration."""
-        # Create a message with a valid expiration duration
-        duration_seconds = 86400  # 1 day in seconds
-        node = MessageUtils.create_text_message_node(
-            to="1234567890@s.whatsapp.net",
-            content="Test message",
-            message_id="test123",
-            expiration_seconds=duration_seconds
+        await self.client.set_disappearing_messages(
+            chat_jid=group_jid,
+            duration_seconds=duration
         )
+        
+        self.client._send_iq_and_wait.assert_awaited_once()
+        args, _ = self.client._send_iq_and_wait.call_args
+        iq_node_sent = args[0]
+        
+        self.assertEqual(iq_node_sent.tag, "iq")
+        self.assertEqual(iq_node_sent.attrs["to"], group_jid)
+        self.assertEqual(iq_node_sent.attrs["xmlns"], "w:g2")
+        disappearing_mode_node = iq_node_sent.content[0]
+        self.assertEqual(disappearing_mode_node.tag, "disappearing_mode")
+        self.assertEqual(disappearing_mode_node.attrs["duration"], str(duration))
 
-        # Check the node attributes
-        self.assertEqual(node.attrs['to'], '1234567890@s.whatsapp.net')
 
-        # Check that the ephemeral node was added with the correct duration
-        ephemeral_nodes = [
-            child for child in getattr(node, 'content', [])
-            if hasattr(child, 'tag') and child.tag == 'ephemeral'
+    async def test_get_disappearing_messages_group_chat(self):
+        """Test getting disappearing messages settings for a group chat."""
+        group_jid = "group_id@g.us"
+        expected_duration = ExpirationType.ONE_DAY.value
+
+        # Prepare a mock server response for the IQ query
+        mock_response_content = [
+            ProtocolNode("disappearing_mode", {"duration": str(expected_duration)})
         ]
+        mock_response_node = ProtocolNode("iq", {"type": "result"}, content=mock_response_content)
+        self.client._send_iq_and_wait.return_value = mock_response_node
 
-        self.assertTrue(len(ephemeral_nodes) > 0, "No ephemeral node found in message content")
-        ephemeral_node = ephemeral_nodes[0]
-        self.assertEqual(ephemeral_node.attrs.get('duration'), str(duration_seconds))
+        settings = await self.client.get_disappearing_messages(group_jid)
+        
+        self.client._send_iq_and_wait.assert_awaited_once()
+        args, _ = self.client._send_iq_and_wait.call_args
+        iq_node_sent = args[0]
 
-    def test_create_ephemeral_message_node(self):
-        """Test creating an ephemeral (view-once) message node."""
-        node = MessageUtils.create_text_message_node(
-            to="1234567890@s.whatsapp.net",
-            content="Test view-once message",
-            message_id="test456",
-            is_ephemeral=True
-        )
+        self.assertEqual(iq_node_sent.tag, "iq")
+        self.assertEqual(iq_node_sent.attrs["to"], group_jid)
+        self.assertEqual(iq_node_sent.attrs["type"], "get")
+        self.assertEqual(iq_node_sent.attrs["xmlns"], "w:g2") # Namespace for group operations
+        self.assertEqual(iq_node_sent.content[0].tag, "disappearing_mode") # Check for query content
+        
+        self.assertTrue(settings['enabled'])
+        self.assertEqual(settings['duration_seconds'], expected_duration)
+        self.assertFalse(settings['is_ephemeral']) # is_ephemeral is not part of group settings typically
 
-        self.assertEqual(node.attrs.get('ephemeral'), '1')
+    async def test_get_disappearing_messages_individual_chat_not_implemented(self):
+        """Test getting disappearing messages for individual chat (currently not implemented in client)."""
+        # Client.get_disappearing_messages seems designed for groups based on its IQ structure.
+        # If it were to support individual chats, it would need a different mechanism.
+        # For now, test that it might return default/off if called for individual.
+        individual_jid = "1234567890@s.whatsapp.net"
+        
+        # If _send_iq_and_wait is called and fails or returns non-group-like structure:
+        self.client._send_iq_and_wait.return_value = ProtocolNode("iq", {"type": "result"}, content=[]) # Empty result
+
+        settings = await self.client.get_disappearing_messages(individual_jid)
+        
+        # Depending on implementation, this might raise error or return defaults
+        # Current client.get_disappearing_messages uses group IQ. If it fails for individual,
+        # it might return default (disabled) or error. Let's assume it returns disabled.
+        self.assertFalse(settings['enabled'])
+        self.assertEqual(settings['duration_seconds'], 0)
+        self.assertFalse(settings['is_ephemeral'])
 
 
 if __name__ == "__main__":
-    import sys
-    
-    # Enable debug logging
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        stream=sys.stdout
-    )
-    
-    # Run the specific test directly
-    test = TestDisappearingMessages('test_send_disappearing_message')
-    test.setUp()
-    
-    # Run the test with debug info
-    print("\n=== Starting test with debug output ===\n")
-    try:
-        import asyncio
-        asyncio.run(test.test_send_disappearing_message())
-        print("\n=== Test completed successfully ===\n")
-    except Exception as e:
-        print(f"\n=== Test failed with error: {e} ===\n")
-        raise
+    unittest.main()

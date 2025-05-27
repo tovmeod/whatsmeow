@@ -361,6 +361,8 @@ class NoiseHandshakeState:
         self.initiator = False
         self.complete = False
         self.cipher = None
+        self.send_key_aesgcm: Optional[bytes] = None
+        self.recv_key_aesgcm: Optional[bytes] = None
 
     def initialize(self, initiator: bool, prologue: bytes, s: KeyPair, e: KeyPair = None,
                    rs: bytes = None, re: bytes = None, psk: bytes = None) -> None:
@@ -475,6 +477,25 @@ class NoiseHandshakeState:
             return self.cipher.decrypt(nonce, ciphertext, None)
         except Exception as e:
             raise NoiseHandshakeError(f"Decryption failed: {e}") from e
+
+    def split_transport_keys(self) -> None:
+        """
+        Derive AESGCM transport keys from the chaining key using HKDF.
+        This should be called once the handshake is complete.
+        """
+        if not self.ck:
+            raise NoiseHandshakeError("Chaining key not available to split transport keys.")
+
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(), # Ensure hashes is imported
+            length=64, # 32 bytes for send key, 32 bytes for receive key
+            salt=None, # Or b""
+            info=b"WhatsApp Transport Keys"
+        )
+        derived_keys = hkdf.derive(self.ck)
+        self.send_key_aesgcm = derived_keys[:32]
+        self.recv_key_aesgcm = derived_keys[32:]
+        logger.debug("Transport keys split and derived for AESGCM.")
 
     def write_message(self, payload: bytes = b"") -> bytes:
         """Write a handshake message.
@@ -668,7 +689,11 @@ class NoiseHandshake:
         """
         if not self.complete:
             raise NoiseHandshakeError("Handshake not complete")
-        return self.state.send_cipher
+        if not self.state.send_key_aesgcm:
+            self.state.split_transport_keys()
+        if not self.state.send_key_aesgcm: # Should be set now by split_transport_keys
+             raise NoiseHandshakeError("Failed to derive send_key_aesgcm.")
+        return AESGCM(self.state.send_key_aesgcm)
         
     def get_recv_cipher(self) -> Any:
         """Get the receive cipher after handshake is complete.
@@ -681,7 +706,11 @@ class NoiseHandshake:
         """
         if not self.complete:
             raise NoiseHandshakeError("Handshake not complete")
-        return self.state.recv_cipher
+        if not self.state.recv_key_aesgcm:
+            self.state.split_transport_keys()
+        if not self.state.recv_key_aesgcm: # Should be set now by split_transport_keys
+            raise NoiseHandshakeError("Failed to derive recv_key_aesgcm.")
+        return AESGCM(self.state.recv_key_aesgcm)
 
 # Re-export common types for easier access
 __all__ = [
