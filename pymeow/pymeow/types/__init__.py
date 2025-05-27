@@ -3,6 +3,8 @@ Types used throughout the PyMeow library.
 
 This module exports various types used for type hints and data validation.
 """
+from __future__ import annotations
+from typing import TYPE_CHECKING
 
 # Import and expose presence-related types
 from .presence import (
@@ -17,7 +19,7 @@ from .presence import (
 from .jid import JID
 
 # Message related types
-from .message import Message, MessageInfo, MessageKey, MessageStatus, MessageType
+from .message import Message, MessageType, MessageStatus, MessageInfo, MessageKey
 from .message_status import MessageStatusType, MessageStatusInfo, MessageStatusUpdate, MessageStatusError
 from .receipts import ReceiptType, ReceiptInfo, ReceiptBatch, ReadReceiptRequest
 

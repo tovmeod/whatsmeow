@@ -90,3 +90,7 @@ class ValidationError(PymeowError):
 class ProtocolError(PymeowError):
     """Raised when there is an error in the protocol implementation."""
     pass
+
+class PreKeyError(PymeowError):
+    """Raised when there is an error related to pre-keys."""
+    pass

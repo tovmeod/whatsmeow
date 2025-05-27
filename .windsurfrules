@@ -1,0 +1,5 @@
+Ask specific questions when clarification is needed
+use the project venv at .venv
+run the tests using the full path to the Python interpreter in the virtual environmen
+write tests in pytest
+do not ask for permission to run pytest
