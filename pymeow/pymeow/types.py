@@ -11,10 +11,15 @@ Go equivalent: types/ directory, particularly:
 This module defines the core data structures used throughout the pymeow
 library, including messages, contacts, groups, and other WhatsApp entities.
 """
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Union, Any
+from dataclasses import dataclass, field
 from enum import Enum, auto
+
+from .generated.waMsgTransport import WAMsgTransport_pb2
+
+# Alias for backward compatibility
+ProtoMessage = WAMsgTransport_pb2.MessageTransport
 
 class MessageType(Enum):
     """Types of WhatsApp messages."""
@@ -46,6 +51,8 @@ class PrivacySetting(Enum):
     CONTACT_BLACKLIST = "blacklist"
     MATCH_LAST_SEEN = "match_last_seen"
     NONE = "none"
+
+__all__ = ['MessageType', 'MessageStatus', 'PrivacySetting', 'Contact', 'Chat', 'Reaction', 'ProtoMessage']
 
 @dataclass
 class Contact:
@@ -100,40 +107,7 @@ class Reaction:
     timestamp: datetime
     is_removed: bool = False
 
-@dataclass
-class Message:
-    """Represents a WhatsApp message."""
-    id: str
-    timestamp: datetime
-    from_me: bool
-    chat_id: str
-    sender_id: str
-    message_type: MessageType
-    content: Any
-    status: MessageStatus = MessageStatus.PENDING
-    quoted_message: Optional['Message'] = None
-    mentions: List[str] = field(default_factory=list)
-    media_url: Optional[str] = None
-    media_caption: Optional[str] = None
-    media_mimetype: Optional[str] = None
-    media_sha256: Optional[bytes] = None
-    media_file_length: Optional[int] = None
-    media_file_name: Optional[str] = None
-    location: Optional[Dict[str, float]] = None
-    contact: Optional[Contact] = None
-    contacts: List[Contact] = field(default_factory=list)
-    is_forwarded: bool = False
-    is_ephemeral: bool = False
-    is_view_once: bool = False
-    is_from_template: bool = False
-    template_params: List[Dict[str, Any]] = field(default_factory=list)
-    poll_name: Optional[str] = None
-    poll_options: List[Dict[str, Any]] = field(default_factory=list)
-    poll_selectable_options_count: Optional[int] = None
-    poll_invalidated: bool = False
-    poll_votes: List[Dict[str, Any]] = field(default_factory=list)
-    reactions: List[Reaction] = field(default_factory=list)
-    reaction_to: Optional[str] = None  # For reaction messages, the ID of the message being reacted to
+# Message class has been moved to message.py to avoid circular imports
 
 @dataclass
 class GroupInfo:
