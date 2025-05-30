@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from pymeow import Client
+from pymeow.pymeow.qrchan import get_qr_channel
 from pymeow.store.sqlstore import Container, SQLStore
 from pymeow.types.events import Message
 from pymeow.types.events import QR
@@ -137,7 +138,7 @@ async def main():
             print("No existing session found, starting new login...")
 
             # Get QR channel for authentication
-            qr_channel = client.get_qr_channel()
+            qr_channel = get_qr_channel(client)
 
             # Connect to WhatsApp
             await client.connect()

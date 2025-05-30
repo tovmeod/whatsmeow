@@ -186,3 +186,16 @@ class NoPushNameError(PymeowError):
 class NoPrivacyTokenError(PymeowError):
     """Raised when trying to subscribe to presence without a privacy token."""
     pass
+
+# QR Channel Error Classes
+class ClientIsNilError(ClientError):
+    """Raised when trying to get a QR channel with a nil client."""
+    pass
+
+class QRAlreadyConnectedError(ClientError):
+    """Raised when trying to get a QR channel for an already connected client."""
+    pass
+
+class QRStoreContainsIDError(ClientError):
+    """Raised when trying to get a QR channel for a store that already contains an ID."""
+    pass
