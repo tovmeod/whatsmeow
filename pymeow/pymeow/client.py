@@ -12,9 +12,10 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypeVar, Generic
 from urllib.parse import urlparse
 
-from .generated.waE2E import waE2E_pb2
+from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from .generated.waWa6 import WAWebProtobufsWa6_pb2
-from .generated.waWeb import WAWebProtobufs_pb2
+from .generated.waWeb import WAWebProtobufsWeb_pb2
+from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
 from .generated.waCert import WACert_pb2
 from .mediaconn import MediaConnMixin
 
@@ -23,6 +24,7 @@ from .socket.noisesocket import NoiseSocket
 from .socket.noisehandshake import NoiseHandshake, new_noise_handshake
 from .binary.node import Node, Attrs
 from .store import Device
+from .types import message
 # Types module is now ported
 from .types.events import Disconnected, QR, Message, PrivacySettingsEvent
 from .types.jid import JID
@@ -327,7 +329,7 @@ class Client(MediaConnMixin):
             return JID.empty()
         return self.store.get_jid()
 
-    def get_message_for_retry(self, sender: JID, chat: JID, message_id: MessageID) -> Optional[WAE2E_pb2.Message]:
+    def get_message_for_retry(self, sender: JID, chat: JID, message_id: message.MessageID) -> Optional[waE2E_pb2.Message]:
         """Look up a message from the message store when it's not in the recent messages cache.
 
         Used as fallback when retry.py can't find a message in the recent cache.
@@ -370,7 +372,7 @@ class Client(MediaConnMixin):
         # For now, just return a placeholder
         return {"status": "sent", "to": str(to), "peer": peer}
 
-    def build_unavailable_message_request(self, chat: JID, sender: JID, message_id: MessageID) -> Any:
+    def build_unavailable_message_request(self, chat: JID, sender: JID, message_id: message.MessageID) -> Any:
         """Build a request for an unavailable message.
 
         Args:
@@ -921,7 +923,7 @@ class Client(MediaConnMixin):
             except Exception as err:
                 self.log.error(f"Event handler panicked while handling a {type(evt).__name__}: {err}")
 
-    async def parse_web_message(self, chat_jid: JID, web_msg: WAWebProtobufs_pb2.WebMessageInfo) -> Any:
+    async def parse_web_message(self, chat_jid: JID, web_msg: waWeb_pb2.WebMessageInfo) -> Any:
         """Parse a WebMessageInfo object into a Message to match what real-time messages have.
 
         Args:

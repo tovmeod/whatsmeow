@@ -127,10 +127,10 @@ class MsgMetaInfo:
         thread_message_sender_jid: The JID of the thread message sender.
     """
     target_id: Optional[MessageID] = None
-    target_sender: JID = JID(user="", server="")
+    target_sender: JID = field(default_factory=lambda: JID(user="", server=""))
     deprecated_lid_session: Optional[bool] = None
     thread_message_id: Optional[MessageID] = None
-    thread_message_sender_jid: JID = JID(user="", server="")
+    thread_message_sender_jid: JID = field(default_factory=lambda: JID(user="", server=""))
 
 
 @dataclass

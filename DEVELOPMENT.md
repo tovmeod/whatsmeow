@@ -33,6 +33,7 @@ The essential infrastructure for a WhatsApp client is now in place:
 | `send.go` | `send.py` | 🟡 | HIGH | Note: Partially implemented - depends on unported modules: Signal protocol encryption, session management, group participant resolution |
 | `sendfb.go` | `sendfb.py` | 🟡 | MEDIUM | Note: Partially implemented - depends on unported modules: send_group_v3, send_dm_v3 |
 | `user.go` | `user.py` | 🟡 | MEDIUM | Note: Partially implemented - depends on unported modules: send_iq_async, usync, participant_list_hash_v2 |
+| `store/sqlstore/*.go` | `store/sqlstore/*.py` | 🟡 | MEDIUM | Note: Partially implemented - depends on unported modules: dbutil |
 
 ## Next Steps
 

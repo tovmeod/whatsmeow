@@ -12,22 +12,23 @@ import logging
 import time
 import zlib
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union, cast
 
 from google.protobuf.message import Message as ProtobufMessage
 
 # Protocol Buffer imports
-from .generated.waE2E import waE2E_pb2
-from .generated.waHistorySync import waHistorySync_pb2
-from .generated.waWeb import waWeb_pb2
+from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
+from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2 as waHistorySync_pb2
+from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
 
 # appstate is now ported
 from . import appstate
 from .appstate.keys import ALL_PATCH_NAMES
 from .binary import node as binary_node
-from .store import SignalProtobufSerializer, AppStateSyncKey, PrivacyToken, MessageSecretInsert
+from .store import AppStateSyncKey, PrivacyToken, MessageSecretInsert
 # types module is now ported
 from .types import events, jid, message
+from .types.user import VerifiedName
 from enum import Enum, auto
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,7 +41,7 @@ import os
 import struct
 import asyncio
 from .util.hkdfutil import expand_hmac, sha256
-from .util.gcmutil import decrypt_gcm
+from .util.gcmutil import decrypt
 from google.protobuf import message as proto_message
 
 # TODO: Add imports for session, protocol, and groups modules
@@ -64,7 +65,8 @@ class MsgSecretType:
     ENC_SECRET_BOT_MSG = "Bot Message"
 
 # Global variables
-pb_serializer = SignalProtobufSerializer
+# In Go, SignalProtobufSerializer is used, but in Python serialization is handled internally by the record classes
+pb_serializer = None
 
 # Request from phone delay in seconds
 REQUEST_FROM_PHONE_DELAY = 5
@@ -495,7 +497,7 @@ class MessageHandlingMixin:
         except Exception as err:
             self.log.error(f"Failed to save push name of {user} in device store: {err}")
 
-    def parse_verified_name_content(self, node: binary_node.Node) -> Optional[message_types.VerifiedName]:
+    def parse_verified_name_content(self, node: binary_node.Node) -> Optional[VerifiedName]:
         """
         Parse a verified name node.
 
@@ -522,7 +524,7 @@ class MessageHandlingMixin:
             cert_details.ParseFromString(cert.details)
 
             # Create and return the verified name
-            return message_types.VerifiedName(
+            return VerifiedName(
                 certificate=cert,
                 details=cert_details
             )

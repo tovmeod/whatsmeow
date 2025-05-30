@@ -65,6 +65,10 @@ class RateLimitError(PymeowError):
     """Raised when rate limited by WhatsApp servers."""
     pass
 
+class ClientError(PymeowError):
+    """Raised when there is a client-side error."""
+    pass
+
 class ServerError(PymeowError):
     """Raised when there is an error from the WhatsApp servers."""
     def __init__(self, message: str, status_code: int = 500):

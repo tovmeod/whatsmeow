@@ -9,13 +9,13 @@ from enum import Enum, auto
 from typing import List, Optional, Protocol, Dict, Any, Union
 
 from ...binary.node import Node
-from ...generated.waArmadilloApplication import WAArm_pb2
+from ...generated.waArmadilloApplication import WAArmadilloApplication_pb2 as WAArm_pb2
 from ...generated.waConsumerApplication import WAConsumerApplication_pb2
-from ...generated.waE2E import WAE2E_pb2
-from ...generated.waHistorySync import WAHistorySync_pb2
+from ...generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
+from ...generated.waHistorySync import WAWebProtobufsHistorySync_pb2 as WAHistorySync_pb2
 from ...generated.waMsgApplication import WAMsgApplication_pb2
 from ...generated.waMsgTransport import WAMsgTransport_pb2
-from ...generated.waWeb import WAWeb_pb2
+from ...generated.waWeb import WAWebProtobufsWeb_pb2 as WAWeb_pb2
 from ..jid import JID
 from ..message import MessageInfo, MessageID, MessageSource
 from ..presence import ChatPresence, ChatPresenceMedia, ReceiptType

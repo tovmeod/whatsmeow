@@ -31,8 +31,7 @@ from .types.presence import (
 
 from .message import MessageHandlingMixin, MessageProcessingMixin
 from .client import Client as BaseClient
-from .rate_limiter import MessageRateLimiter, RateLimiter
-from .types import Message, Contact, Chat, GroupInfo, PrivacySetting, ExpirationType, ExpirationInfo
+from .types import Message, GroupInfo, PrivacySetting
 from .newsletter import NewsletterMixin
 
 # Create enhanced Client class with message handling capabilities
@@ -90,15 +89,8 @@ class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, Newslette
 __all__ = [
     'Client',
     'Message',
-    'Contact',
-    'Chat',
     'GroupInfo',
     'PrivacySetting',
-    'ExpirationType',
-    'ExpirationInfo',
-    'MessageUtils',
-    'DisappearingMessageManager',
-    'DisappearingMessageError',
     'MessageHandlingMixin',
     'MessageProcessingMixin',
     'NewsletterMixin',

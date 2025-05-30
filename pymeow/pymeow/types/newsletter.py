@@ -173,9 +173,9 @@ class NewsletterThreadMetadata:
     description: NewsletterText
     subscriber_count: int
     verification_state: NewsletterVerificationState
-    picture: Optional[ProfilePictureInfo] = None  # In Go: *ProfilePictureInfo
     preview: ProfilePictureInfo  # In Go: ProfilePictureInfo
     settings: NewsletterSettings
+    picture: Optional[ProfilePictureInfo] = None  # In Go: *ProfilePictureInfo
 
     @classmethod
     def from_json(cls, data: dict) -> 'NewsletterThreadMetadata':

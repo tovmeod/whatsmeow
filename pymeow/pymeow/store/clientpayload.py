@@ -17,41 +17,20 @@ WA_VERSION = [2, 3000, 1022781640]
 WA_VERSION_HASH = hashlib.md5(".".join(map(str, WA_VERSION)).encode()).digest()
 
 # Base client payload with default values
-BASE_CLIENT_PAYLOAD = WAWebProtobufsWa6_pb2.ClientPayload(
-    user_agent=WAWebProtobufsWa6_pb2.ClientPayload.UserAgent(
-        platform=WAWebProtobufsWa6_pb2.ClientPayload.UserAgent.Platform.WEB,
-        release_channel=WAWebProtobufsWa6_pb2.ClientPayload.UserAgent.ReleaseChannel.RELEASE,
-        app_version=WAWebProtobufsWa6_pb2.ClientPayload.UserAgent.AppVersion(
-            primary=WA_VERSION[0],
-            secondary=WA_VERSION[1],
-            tertiary=WA_VERSION[2]
-        ),
-        mcc="000",
-        mnc="000",
-        os_version="0.1.0",
-        manufacturer="",
-        device="Desktop",
-        os_build_number="0.1.0",
-        locale_language_iso6391="en",
-        locale_country_iso31661alpha2="en"
-    ),
-    web_info=WAWebProtobufsWa6_pb2.ClientPayload.WebInfo(
-        web_sub_platform=WAWebProtobufsWa6_pb2.ClientPayload.WebInfo.WebSubPlatform.WEB_BROWSER
-    ),
-    connect_type=WAWebProtobufsWa6_pb2.ClientPayload.ConnectType.WIFI_UNKNOWN,
-    connect_reason=WAWebProtobufsWa6_pb2.ClientPayload.ConnectReason.USER_ACTIVATED
-)
+# Simplified ClientPayload due to compatibility with protobuf 3.20.0
+# Many fields like user_agent, web_info, etc. are not available in this version
+BASE_CLIENT_PAYLOAD = WAWebProtobufsWa6_pb2.ClientPayload()
 
 # Device properties for registration
+# Simplified DeviceProps due to compatibility with protobuf 3.20.0
+# platform_type and require_full_sync fields are not available in this version
 DEVICE_PROPS = WACompanionReg_pb2.DeviceProps(
     os="whatsmeow",
     version=WACompanionReg_pb2.DeviceProps.AppVersion(
         primary=0,
         secondary=1,
         tertiary=0
-    ),
-    platform_type=WACompanionReg_pb2.DeviceProps.PlatformType.UNKNOWN,
-    require_full_sync=False
+    )
 )
 
 def set_os_info(name: str, version: Tuple[int, int, int]) -> None:
