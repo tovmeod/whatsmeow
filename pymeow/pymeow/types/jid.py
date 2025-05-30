@@ -52,6 +52,11 @@ class JID:
     device: int = 0
     integrator: int = 0
 
+    @classmethod
+    def server_jid(cls) -> 'JID':
+        """Returns the WhatsApp server JID."""
+        return cls(user="", server="s.whatsapp.net")
+
     def actual_agent(self) -> int:
         """Returns the actual agent value based on the server type."""
         if self.server == DEFAULT_USER_SERVER:

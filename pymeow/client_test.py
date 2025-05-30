@@ -10,13 +10,15 @@ import asyncio
 import logging
 import signal
 import sys
+import os
+from pathlib import Path
 from typing import Any
 
 from pymeow import Client
-from pymeow.store.sqlstore import SQLStore
-from pymeow.types.events.message import Message
-from pymeow.types.events.qr import QR
-from pymeow.types.events.connection import Connected, Disconnected
+from pymeow.store.sqlstore import Container, SQLStore
+from pymeow.types.events import Message
+from pymeow.types.events import QR
+from pymeow.types.events import Connected, Disconnected
 
 
 def setup_logging() -> logging.Logger:
@@ -89,19 +91,30 @@ async def main():
     db_log = logging.getLogger("Database")
 
     try:
-        # Create database store
-        # NOTE: You may need to adjust the database URL for your setup
-        store = SQLStore(
-            db_url="sqlite:///whatsapp_session.db",
-            logger=db_log
-        )
-        await store.initialize()
+        # Create data directory if it doesn't exist
+        data_dir = Path.home() / ".pymeow"
+        data_dir.mkdir(exist_ok=True)
+
+        # Create database path
+        db_path = data_dir / "whatsapp_session.db"
+        db_url = f"sqlite:///{db_path}"
+
+        print(f"Using database: {db_path}")
+
+        # Create database container
+        container = Container(db_url)
+        await container.initialize()
+
+        # Create database store with a test JID
+        # In a real application, you'd use the actual user's JID
+        test_jid = "test@example.com"
+        store = SQLStore(container, test_jid)
 
         # Get or create device store
-        device_store = await store.get_first_device()
+        device_store = await container.get_first_device()
         if device_store is None:
             print("Creating new device...")
-            device_store = await store.create_device()
+            device_store = await container.new_device(test_jid)
 
         # Create WhatsApp client
         client = Client(device_store, client_log)
@@ -120,7 +133,7 @@ async def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
         # Check if already logged in
-        if device_store.id is None:
+        if not hasattr(device_store, 'id') or device_store.id is None:
             print("No existing session found, starting new login...")
 
             # Get QR channel for authentication
@@ -184,8 +197,8 @@ async def main():
         try:
             if 'client' in locals():
                 await client.disconnect()
-            if 'store' in locals():
-                await store.close()
+            if 'container' in locals():
+                await container.close()
         except Exception as e:
             print(f"Error during shutdown: {e}")
 

@@ -1,7 +1,11 @@
 import logging
+import os
+import struct
 from typing import Optional, List
 from tortoise import Tortoise, transactions
 from tortoise.exceptions import DoesNotExist
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import serialization
 
 from .config import get_tortoise_config
 from .models.device import Device
@@ -55,8 +59,41 @@ class Container:
             return None
 
     async def new_device(self, jid: str) -> DeviceStore:
-        """Create a new device"""
-        device = await Device.create(id=jid)
+        """Create a new device with proper default values"""
+        # Generate identity key pair
+        identity_private_key = x25519.X25519PrivateKey.generate()
+        identity_public_key = identity_private_key.public_key()
+
+        # Generate signed pre-key
+        signed_pre_key_private = x25519.X25519PrivateKey.generate()
+        signed_pre_key_public = signed_pre_key_private.public_key()
+
+        # For now, use a dummy signature (in real implementation, this would be signed by identity key)
+        dummy_signature = os.urandom(64)
+
+        # Generate registration ID (random 32-bit integer)
+        registration_id = struct.unpack(">I", os.urandom(4))[0]
+
+        device = await Device.create(
+            id=jid,
+            registration_id=registration_id,
+            signed_pre_key=signed_pre_key_public.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            ),
+            signed_pre_key_id=1,  # Start with ID 1
+            signed_pre_key_signature=dummy_signature,
+            identity_key_private=identity_private_key.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption()
+            ),
+            identity_key_public=identity_public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            ),
+            platform="android"
+        )
         return self._device_to_store(device)
 
     async def put_device(self, store: DeviceStore) -> None:
@@ -89,7 +126,16 @@ class Container:
         store = DeviceStore()
         store.jid = device.id
         store.registration_id = device.registration_id
-        # Map other fields...
+        store.signed_pre_key = device.signed_pre_key
+        store.signed_pre_key_id = device.signed_pre_key_id
+        store.signed_pre_key_signature = device.signed_pre_key_signature
+        store.identity_key_private = device.identity_key_private
+        store.identity_key_public = device.identity_key_public
+        store.phone_id = device.phone_id
+        store.device_id = device.device_id
+        store.platform = device.platform
+        store.business_name = device.business_name
+        store.push_name = device.push_name
         return store
 
     def _store_to_device_dict(self, store: DeviceStore) -> dict:
@@ -97,5 +143,13 @@ class Container:
         return {
             "registration_id": store.registration_id,
             "signed_pre_key": store.signed_pre_key,
-            # Map other fields...
+            "signed_pre_key_id": store.signed_pre_key_id,
+            "signed_pre_key_signature": store.signed_pre_key_signature,
+            "identity_key_private": store.identity_key_private,
+            "identity_key_public": store.identity_key_public,
+            "phone_id": store.phone_id,
+            "device_id": store.device_id,
+            "platform": store.platform or "android",
+            "business_name": store.business_name,
+            "push_name": store.push_name,
         }

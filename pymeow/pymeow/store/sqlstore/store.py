@@ -17,7 +17,6 @@ class SQLStore:
     def __init__(self, container: Container, jid: str):
         self.container = container
         self.jid = jid
-        self.log = container.log
 
         # Async locks for thread safety
         self.pre_key_lock = asyncio.Lock()
