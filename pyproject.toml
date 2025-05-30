@@ -31,12 +31,12 @@ dependencies = [
     "aerich==0.9.0",
     "aiohttp==3.12.2",
     "cryptography==45.0.3",
-    "libsignal>=0.0.4",
     "pillow==11.2.1",
     "protobuf>=4.21.0,<5.0.0",
     "pycryptodome==3.23.0",
     "python-dotenv==1.1.0",
     "qrcode==8.2",
+    "signal-protocol>=0.2.2",
     "tortoise-orm[asyncpg]==0.25.0",
 ]
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import re
 from typing import Optional, Union, Dict, Any, Tuple
 
-from libsignal.axolotladdress import AxolotlAddress
+from signal_protocol import address
 
 
 # Known JID servers on WhatsApp
@@ -327,13 +327,13 @@ class JID:
         """Hash function for JID."""
         return hash((self.user, self.server, self.raw_agent, self.device, self.integrator))
 
-    def signal_address(self) -> AxolotlAddress:
+    def signal_address(self) -> address.ProtocolAddress:
         """Returns the Signal protocol address for the user.
 
-        Returns an AxolotlAddress object from the libsignal package, which is the Python
+        Returns an Address object from the signal_protocol package, which is the Python
         equivalent of protocol.SignalAddress in the Go implementation.
         """
-        return AxolotlAddress(self.signal_address_user(), self.device)
+        return address.Address(self.signal_address_user(), self.device)
 
 
 # Initialize predefined JIDs

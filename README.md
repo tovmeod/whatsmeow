@@ -33,3 +33,6 @@ Things that are not yet implemented:
 
 * Sending broadcast list messages (this is not supported on WhatsApp web either)
 * Calls
+
+export CFLAGS="-Wno-error=int-conversion -Wno-error=incompatible-pointer-types"
+uv sync

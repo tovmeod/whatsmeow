@@ -6,17 +6,10 @@ Port of whatsmeow/store/signal.go
 from typing import Optional, List, Any
 import logging
 
-# Standard libsignal imports
-from libsignal.ecc.djbec import DjbECPublicKey, DjbECPrivateKey
-from libsignal.identitykey import IdentityKey
-from libsignal.identitykeypair import IdentityKeyPair
-from libsignal.state.prekeyrecord import PreKeyRecord
-from libsignal.state.sessionrecord import SessionRecord
-from libsignal.state.signedprekeyrecord import SignedPreKeyRecord
-from libsignal.groups.state.senderkeyrecord import SenderKeyRecord
-from libsignal.groups.senderkeyname import SenderKeyName  # Import official SenderKeyName implementation
-from libsignal.util.keyhelper import KeyHelper
-from libsignal.axolotladdress import AxolotlAddress
+# Signal protocol imports
+from signal_protocol import curve, identity_key, state, storage, protocol, sender_keys, address
+from signal_protocol.state import PreKeyRecord, SessionRecord, SignedPreKeyRecord
+from signal_protocol.sender_keys import SenderKeyRecord, SenderKeyName
 
 # Equivalent to Go's SignalProtobufSerializer = serialize.NewProtoBufSerializer()
 # In Python, serialization is handled internally by the record classes
@@ -31,15 +24,17 @@ class SignalProtocolMixin:
     """
 
     # IdentityKeyStore implementation
-    async def get_identity_key_pair(self, ctx: Any = None) -> IdentityKeyPair:
+    async def get_identity_key_pair(self, ctx: Any = None) -> identity_key.IdentityKeyPair:
         """
         Get the identity key pair for this device.
 
         Go equivalent: func (device *Device) GetIdentityKeyPair() *identity.KeyPair
         """
-        return IdentityKeyPair(
-            IdentityKey(DjbECPublicKey(self.identity_key.pub)),
-            DjbECPrivateKey(self.identity_key.priv)
+        public_key = curve.PublicKey(self.identity_key.pub)
+        private_key = curve.PrivateKey(self.identity_key.priv)
+        return identity_key.IdentityKeyPair(
+            identity_key.IdentityKey(public_key),
+            private_key
         )
 
     async def get_local_registration_id(self, ctx: Any = None) -> int:
@@ -50,29 +45,29 @@ class SignalProtocolMixin:
         """
         return self.registration_id
 
-    async def save_identity(self, ctx: Any, address: AxolotlAddress, identity_key: IdentityKey) -> None:
+    async def save_identity(self, ctx: Any, addr: address.ProtocolAddress, identity_key_obj: identity_key.IdentityKey) -> None:
         """
         Save an identity key for a remote address.
 
         Go equivalent: func (device *Device) SaveIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) error
         """
-        addr_string = str(address)
+        addr_string = f"{addr.name}:{addr.device_id}"
         try:
-            await self.identities.put_identity(ctx, addr_string, identity_key.getPublicKey().serialize())
+            await self.identities.put_identity(ctx, addr_string, identity_key_obj.public_key.serialize())
         except Exception as e:
             if hasattr(self, 'log') and self.log:
                 self.log.error(f"Failed to save identity of {addr_string}: {e}")
             raise Exception(f"failed to save identity of {addr_string}: {e}")
 
-    async def is_trusted_identity(self, ctx: Any, address: AxolotlAddress, identity_key: IdentityKey) -> bool:
+    async def is_trusted_identity(self, ctx: Any, addr: address.ProtocolAddress, identity_key_obj: identity_key.IdentityKey) -> bool:
         """
         Check if an identity key is trusted for a remote address.
 
         Go equivalent: func (device *Device) IsTrustedIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) (bool, error)
         """
-        addr_string = str(address)
+        addr_string = f"{addr.name}:{addr.device_id}"
         try:
-            is_trusted = await self.identities.is_trusted_identity(ctx, addr_string, identity_key.getPublicKey().serialize())
+            is_trusted = await self.identities.is_trusted_identity(ctx, addr_string, identity_key_obj.public_key.serialize())
             return is_trusted
         except Exception as e:
             if hasattr(self, 'log') and self.log:
@@ -93,11 +88,11 @@ class SignalProtocolMixin:
 
             # Create a new pre-key record with the key pair
             # In Go: record.NewPreKey(preKey.KeyID, ecc.NewECKeyPair(...), nil)
-            return PreKeyRecord(
-                pre_key.key_id,
-                DjbECPublicKey(pre_key.pub),
-                DjbECPrivateKey(pre_key.priv)
-            )
+            public_key = curve.PublicKey(pre_key.pub)
+            private_key = curve.PrivateKey(pre_key.priv)
+            key_pair = curve.KeyPair(public_key, private_key)
+
+            return PreKeyRecord.new(pre_key.key_id, key_pair)
         except Exception as e:
             if hasattr(self, 'log') and self.log:
                 self.log.error(f"Failed to load pre-key {pre_key_id}: {e}")
@@ -133,24 +128,24 @@ class SignalProtocolMixin:
         raise NotImplementedError("contains_pre_key is not implemented")
 
     # SessionStore implementation
-    async def load_session(self, ctx: Any, address: AxolotlAddress) -> SessionRecord:
+    async def load_session(self, ctx: Any, addr: address.ProtocolAddress) -> SessionRecord:
         """
         Load a session for a remote address.
 
         Go equivalent: func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalAddress) (*record.Session, error)
         """
-        addr_string = str(address)
+        addr_string = f"{addr.name}:{addr.device_id}"
         try:
             raw_sess = await self.sessions.get_session(ctx, addr_string)
             if raw_sess is None:
                 # Create a new empty session record
                 # In Go: record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
-                return SessionRecord()
+                return SessionRecord.new()
 
             try:
                 # Deserialize the existing session record from bytes
                 # In Go: record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
-                return SessionRecord(serialized=raw_sess)
+                return SessionRecord.deserialize(raw_sess)
             except Exception as e:
                 if hasattr(self, 'log') and self.log:
                     self.log.error(f"Failed to deserialize session with {addr_string}: {e}")
@@ -168,13 +163,13 @@ class SignalProtocolMixin:
         """
         raise NotImplementedError("get_sub_device_sessions is not implemented")
 
-    async def store_session(self, ctx: Any, address: AxolotlAddress, record: SessionRecord) -> None:
+    async def store_session(self, ctx: Any, addr: address.ProtocolAddress, record: SessionRecord) -> None:
         """
         Store a session for a remote address.
 
         Go equivalent: func (device *Device) StoreSession(ctx context.Context, address *protocol.SignalAddress, record *record.Session) error
         """
-        addr_string = str(address)
+        addr_string = f"{addr.name}:{addr.device_id}"
         try:
             await self.sessions.put_session(ctx, addr_string, record.serialize())
         except Exception as e:
@@ -182,13 +177,13 @@ class SignalProtocolMixin:
                 self.log.error(f"Failed to store session with {addr_string}: {e}")
             raise Exception(f"failed to store session with {addr_string}: {e}")
 
-    async def contains_session(self, ctx: Any, remote_address: AxolotlAddress) -> bool:
+    async def contains_session(self, ctx: Any, remote_addr: address.ProtocolAddress) -> bool:
         """
         Check if a session exists for a remote address.
 
         Go equivalent: func (device *Device) ContainsSession(ctx context.Context, remoteAddress *protocol.SignalAddress) (bool, error)
         """
-        addr_string = str(remote_address)
+        addr_string = f"{remote_addr.name}:{remote_addr.device_id}"
         try:
             has_session = await self.sessions.has_session(ctx, addr_string)
             return has_session
@@ -197,7 +192,7 @@ class SignalProtocolMixin:
                 self.log.error(f"Failed to check if store has session for {addr_string}: {e}")
             raise Exception(f"failed to check if store has session for {addr_string}: {e}")
 
-    async def delete_session(self, ctx: Any, remote_address: AxolotlAddress) -> None:
+    async def delete_session(self, ctx: Any, remote_address: address.ProtocolAddress) -> None:
         """
         Delete a session for a remote address.
 
@@ -224,11 +219,14 @@ class SignalProtocolMixin:
         # similar to how it's done in the Go implementation
         if signed_pre_key_id == self.signed_pre_key.key_id:
             # In Go: record.NewSignedPreKey(signedPreKeyID, 0, ecc.NewECKeyPair(...), *device.SignedPreKey.Signature, nil)
-            return SignedPreKeyRecord(
+            public_key = curve.PublicKey(self.signed_pre_key.pub)
+            private_key = curve.PrivateKey(self.signed_pre_key.priv)
+            key_pair = curve.KeyPair(public_key, private_key)
+
+            return SignedPreKeyRecord.new(
                 signed_pre_key_id,
                 0,  # timestamp, not used in whatsmeow
-                DjbECPublicKey(self.signed_pre_key.pub),
-                DjbECPrivateKey(self.signed_pre_key.priv),
+                key_pair,
                 self.signed_pre_key.signature
             )
         return None
@@ -272,8 +270,9 @@ class SignalProtocolMixin:
 
         Go equivalent: func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName, keyRecord *groupRecord.SenderKey) error
         """
-        group_id = sender_key_name.getGroupId()
-        sender_string = str(sender_key_name.getSender())
+        group_id = sender_key_name.group_id
+        sender = sender_key_name.sender
+        sender_string = f"{sender.name}:{sender.device_id}"
         try:
             await self.sender_keys.put_sender_key(ctx, group_id, sender_string, key_record.serialize())
         except Exception as e:
@@ -287,19 +286,20 @@ class SignalProtocolMixin:
 
         Go equivalent: func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName) (*groupRecord.SenderKey, error)
         """
-        group_id = sender_key_name.getGroupId()
-        sender_string = str(sender_key_name.getSender())
+        group_id = sender_key_name.group_id
+        sender = sender_key_name.sender
+        sender_string = f"{sender.name}:{sender.device_id}"
         try:
             raw_key = await self.sender_keys.get_sender_key(ctx, group_id, sender_string)
             if raw_key is None:
                 # Create a new empty sender key record
                 # In Go: groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
-                return SenderKeyRecord()
+                return SenderKeyRecord.new()
 
             try:
                 # Deserialize the existing sender key record from bytes
                 # In Go: groupRecord.NewSenderKeyFromBytes(rawKey, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
-                return SenderKeyRecord(serialized=raw_key)
+                return SenderKeyRecord.deserialize(raw_key)
             except Exception as e:
                 if hasattr(self, 'log') and self.log:
                     self.log.error(f"Failed to deserialize sender key from {sender_string} for {group_id}: {e}")

@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple
 import os
 
-from libsignal.ecc.curve import Curve
-from libsignal.ecc.djbec import DjbECPublicKey, DjbECPrivateKey
+from signal_protocol import curve
 
 
 @dataclass
@@ -32,8 +31,8 @@ class KeyPair:
         Returns:
             A new KeyPair instance
         """
-        pub = Curve.generatePublicKey(priv)
-        return cls(pub=pub, priv=priv)
+        key_pair = curve.PrivateKey(priv).calculate_key_pair()
+        return cls(pub=key_pair.public_key.serialize(), priv=priv)
 
     @classmethod
     def generate(cls) -> 'KeyPair':
@@ -43,18 +42,14 @@ class KeyPair:
         Returns:
             A new KeyPair instance with random keys
         """
-        # Generate a random private key
-        priv = Curve.generatePrivateKey()
+        # Generate a new key pair using signal_protocol
+        key_pair = curve.KeyPair.generate()
 
-        # In Go, these bit operations are performed:
-        # priv[0] &= 248
-        # priv[31] &= 127
-        # priv[31] |= 64
-        #
-        # These operations ensure the private key is in the correct format for curve25519
-        # The Python libsignal implementation already handles this internally
+        # Extract the public and private keys
+        pub = key_pair.public_key.serialize()
+        priv = key_pair.private_key.serialize()
 
-        return cls.from_private_key(priv)
+        return cls(pub=pub, priv=priv)
 
     def create_signed_pre_key(self, key_id: int) -> 'PreKey':
         """
@@ -82,14 +77,14 @@ class KeyPair:
         """
         # Create the public key format for signing (0x05 + 32 bytes)
         pub_key_for_signature = bytearray(33)
-        pub_key_for_signature[0] = Curve.DJB_TYPE  # 0x05
+        pub_key_for_signature[0] = 0x05  # DJB_TYPE
         pub_key_for_signature[1:] = key_to_sign.pub
 
-        # Create a DjbECPrivateKey from the raw private key
-        private_key = DjbECPrivateKey(self.priv)
+        # Create a private key from the raw private key
+        private_key = curve.PrivateKey(self.priv)
 
         # Calculate the signature
-        signature = Curve.calculateSignature(private_key, bytes(pub_key_for_signature))
+        signature = private_key.calculate_signature(bytes(pub_key_for_signature))
         return signature
 
 

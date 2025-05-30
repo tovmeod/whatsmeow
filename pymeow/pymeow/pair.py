@@ -24,8 +24,7 @@ ADV_PREFIX_DEVICE_SIGNATURE_GENERATE = bytes([6, 1])
 ADV_HOSTED_PREFIX_DEVICE_IDENTITY_ACCOUNT_SIGNATURE = bytes([6, 5])
 ADV_HOSTED_PREFIX_DEVICE_IDENTITY_DEVICE_SIGNATURE_VERIFICATION = bytes([6, 6])
 
-from libsignal.ecc.djbec import DjbECPublicKey, DjbECPrivateKey
-from libsignal.ecc.curve import Curve
+from signal_protocol import curve
 
 def concat_bytes(*data: bytes) -> bytes:
     """
@@ -631,7 +630,7 @@ class PairDevice:
         if len(account_signature_key) != 32 or len(account_signature) != 64:
             return False
 
-        signature_key = DjbECPublicKey(account_signature_key)
+        signature_key = curve.PublicKey(account_signature_key)
         signature = account_signature
 
         prefix = ADV_PREFIX_ACCOUNT_SIGNATURE
@@ -640,7 +639,7 @@ class PairDevice:
 
         details = safe_get_proto_bytes(device_identity, "details")
         message = concat_bytes(prefix, details, ikp.pub)
-        return Curve.verifySignature(signature_key, message, signature)
+        return signature_key.verify_signature(message, signature)
 
     def generate_device_signature(self, device_identity: WAAdv_pb2.ADVSignedDeviceIdentity,
                                 ikp: KeyPair, is_hosted_account: bool) -> bytes:
@@ -669,7 +668,8 @@ class PairDevice:
             account_signature_key
         )
 
-        return Curve.calculateSignature(DjbECPrivateKey(ikp.priv), message)
+        private_key = curve.PrivateKey(ikp.priv)
+        return private_key.calculate_signature(message)
 
     async def send_pair_error(self, id_str: str, code: int, text: str) -> None:
         """
