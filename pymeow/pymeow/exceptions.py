@@ -94,3 +94,91 @@ class ProtocolError(PymeowError):
 class PreKeyError(PymeowError):
     """Raised when there is an error related to pre-keys."""
     pass
+
+class ElementMissingError(ProtocolError):
+    """Raised when an expected XML element is missing from a server response.
+
+    This corresponds to Go's ElementMissingError and is used when parsing
+    server responses that are missing required XML elements.
+    """
+
+    def __init__(self, tag: str, location: str):
+        self.tag = tag
+        self.location = location
+        super().__init__(f"Missing element '{tag}' in {location}")
+
+# IQ (Info Query) Error Classes
+class IQError(ProtocolError):
+    """Base class for Info Query related errors."""
+    pass
+
+class ErrIQNotAcceptable(IQError):
+    """Raised when an IQ request is not acceptable (406 status)."""
+    pass
+
+class ErrIQNotFound(IQError):
+    """Raised when an IQ request returns not found (404 status)."""
+    pass
+
+class ErrIQForbidden(IQError):
+    """Raised when an IQ request is forbidden (403 status)."""
+    pass
+
+class ErrIQGone(IQError):
+    """Raised when an IQ request returns gone (410 status)."""
+    pass
+
+class ErrIQNotAuthorized(IQError):
+    """Raised when an IQ request is not authorized (401 status)."""
+    pass
+
+# Media Error Classes
+class ErrInvalidImageFormat(MediaUploadError):
+    """Raised when an image format is invalid for upload."""
+    pass
+
+# Group-specific Error Classes
+class ErrGroupNotFound(GroupError):
+    """Raised when a group is not found."""
+    pass
+
+class ErrNotInGroup(GroupError):
+    """Raised when trying to perform an action on a group the user is not in."""
+    pass
+
+class ErrGroupInviteLinkUnauthorized(GroupError):
+    """Raised when unauthorized to access a group invite link."""
+    pass
+
+class ErrInviteLinkRevoked(GroupError):
+    """Raised when a group invite link has been revoked."""
+    pass
+
+class ErrInviteLinkInvalid(GroupError):
+    """Raised when a group invite link is invalid."""
+    pass
+
+# Message Secret Error Classes
+class OriginalMessageSecretNotFound(PymeowError):
+    """Raised when the original message secret key is not found."""
+    pass
+
+class NotEncryptedReactionMessage(PymeowError):
+    """Raised when trying to decrypt a non-encrypted reaction message."""
+    pass
+
+class NotEncryptedCommentMessage(PymeowError):
+    """Raised when trying to decrypt a non-encrypted comment message."""
+    pass
+
+class NotPollUpdateMessage(PymeowError):
+    """Raised when trying to decrypt poll vote from a non-poll update message."""
+    pass
+
+class NoPushNameError(PymeowError):
+    """Raised when trying to send presence without a push name."""
+    pass
+
+class NoPrivacyTokenError(PymeowError):
+    """Raised when trying to subscribe to presence without a privacy token."""
+    pass

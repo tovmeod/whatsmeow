@@ -1,142 +1,195 @@
 """
 Group-related types for PyMeow.
+
+Port of whatsmeow/types/group.go
 """
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 from .jid import JID
+from .message import AddressingMode
 
-class GroupLinkChangeType(str, Enum):
-    """Types of group link changes."""
-    PARENT = "parent"
-    SIBLING = "sibling"
-    SUB = "sub"
-    DEFAULT = ""
 
-class GroupUnlinkReason(str, Enum):
-    """Reasons for unlinking a group."""
-    DEFAULT = ""
-    DELETE = "delete"
+class GroupMemberAddMode(str, Enum):
+    """Modes for adding members to a group."""
+    ADMIN = "admin_add"
+    ALL_MEMBER = "all_member_add"
+
+
+@dataclass
+class GroupMembershipApprovalMode:
+    """Settings for group membership approval."""
+    is_join_approval_required: bool = False
+
+
+@dataclass
+class GroupParent:
+    """Information about a parent group."""
+    is_parent: bool = False
+    default_membership_approval_mode: str = ""  # request_required
+
+
+@dataclass
+class GroupLinkedParent:
+    """Information about a linked parent group."""
+    linked_parent_jid: Optional[JID] = None
+
+
+@dataclass
+class GroupIsDefaultSub:
+    """Information about whether a group is a default subgroup."""
+    is_default_sub_group: bool = False
+
+
+@dataclass
+class GroupName:
+    """Contains the name of a group along with metadata of who set it and when."""
+    name: str = ""
+    name_set_at: Optional[datetime] = None
+    name_set_by: Optional[JID] = None
+    name_set_by_pn: Optional[JID] = None
+
+
+@dataclass
+class GroupTopic:
+    """Contains the topic (description) of a group along with metadata of who set it and when."""
+    topic: str = ""
+    topic_id: str = ""
+    topic_set_at: Optional[datetime] = None
+    topic_set_by: Optional[JID] = None
+    topic_set_by_pn: Optional[JID] = None
+    topic_deleted: bool = False
+
+
+@dataclass
+class GroupLocked:
+    """Specifies whether the group info can only be edited by admins."""
+    is_locked: bool = False
+
+
+@dataclass
+class GroupAnnounce:
+    """Specifies whether only admins can send messages in the group."""
+    is_announce: bool = False
+    announce_version_id: str = ""
+
+
+@dataclass
+class GroupIncognito:
+    """Specifies whether the group is in incognito mode."""
+    is_incognito: bool = False
+
+
+@dataclass
+class GroupParticipantAddRequest:
+    """Information about a request to add a participant to a group."""
+    code: str = ""
+    expiration: Optional[datetime] = None
+
 
 @dataclass
 class GroupParticipant:
-    """Represents a participant in a group."""
-    jid: JID
+    """Contains info about a participant of a WhatsApp group chat."""
+    # The primary JID that should be used to send messages to this participant.
+    # Always equals either the LID or phone number.
+    jid: Optional[JID] = None
+    phone_number: Optional[JID] = None
+    lid: Optional[JID] = None
+
     is_admin: bool = False
     is_super_admin: bool = False
-    is_creator: bool = False
-    is_announce: bool = False
-    is_locked: bool = False
+
+    # This is only present for anonymous users in announcement groups, it's an obfuscated phone number
+    display_name: str = ""
+
+    # When creating groups, adding some participants may fail.
+    # In such cases, the error code will be here.
+    error: int = 0
+    add_request: Optional[GroupParticipantAddRequest] = None
+
+
+@dataclass
+class GroupEphemeral:
+    """Contains the group's disappearing messages settings."""
+    is_ephemeral: bool = False
+    disappearing_timer: int = 0
+
+
+@dataclass
+class GroupDelete:
+    """Information about a deleted group."""
+    deleted: bool = False
+    delete_reason: str = ""
+
+
+class GroupLinkChangeType(str, Enum):
+    """Types of group link changes."""
+    PARENT = "parent_group"
+    SUB = "sub_group"
+    SIBLING = "sibling_group"
+
+
+class GroupUnlinkReason(str, Enum):
+    """Reasons for unlinking a group."""
+    DEFAULT = "unlink_group"
+    DELETE = "delete_parent"
+
+
+@dataclass
+class GroupLinkTarget:
+    """Target information for group linking."""
+    jid: Optional[JID] = None
+    group_name: Optional[GroupName] = None
+    group_is_default_sub: Optional[GroupIsDefaultSub] = None
+
+
+@dataclass
+class GroupLinkChange:
+    """Information about a change in group linking."""
+    type: Optional[GroupLinkChangeType] = None
+    unlink_reason: Optional[GroupUnlinkReason] = None
+    group: Optional[GroupLinkTarget] = None
+
+
+@dataclass
+class GroupParticipantRequest:
+    """Information about a request to join a group."""
+    jid: Optional[JID] = None
+    requested_at: Optional[datetime] = None
+
+
+
 
 @dataclass
 class GroupInfo:
-    """Contains information about a group."""
-    jid: JID
-    owner_jid: JID
-    subject: str
-    subject_owner: Optional[JID] = None
-    subject_time: Optional[datetime] = None
-    creation: Optional[datetime] = None
-    participants: List[GroupParticipant] = None
-    description: Optional[str] = None
-    description_id: Optional[str] = None
-    description_time: Optional[datetime] = None
-    description_owner: Optional[JID] = None
-    locked: bool = False
-    announce: bool = True
-    restrict: bool = False
-    no_frequently_forwarded: bool = False
-    ephemeral_duration: Optional[int] = None
-    size: Optional[int] = None
-    support: bool = False
-    is_parent: bool = False
-    is_default_sub_group: bool = False
-    default_sub_group_jid: Optional[JID] = None
-    is_main_sub_group: bool = False
-    parent_group_jids: List[JID] = None
-    linked_parent_jid: Optional[JID] = None
-    linked_parent_name: Optional[str] = None
-    linked_children: List[Dict[str, Any]] = None
-    membership_approval_mode: bool = False
-    member_add_mode: str = "all"  # 'all', 'admin_add', 'unknown'
-    join_approval_mode: bool = False
-    join_approval_requests_pending: int = 0
-    is_community: bool = False
-    is_community_verified: bool = False
-    community_restricted: bool = False
-    community_default: bool = False
-    community_parent: bool = False
-    community_id: Optional[str] = None
-    community_announce: bool = False
-    community_restrict: bool = False
-    community_no_frequently_forwarded: bool = False
-    community_ephemeral: Optional[int] = None
-    community_default_membership_approval: bool = False
-    community_default_add_mode: str = "all"
-    community_default_join_approval_mode: bool = False
-    community_default_join_approval_requests_pending: int = 0
-    community_default_join_approval_requests_pending_count: int = 0
-    community_default_join_approval_requests_pending_up_to: Optional[datetime] = None
-    community_default_join_approval_requests_pending_since: Optional[datetime] = None
-    community_default_join_approval_requests_pending_sender: Optional[JID] = None
-    community_default_join_approval_requests_pending_name: Optional[str] = None
-    community_default_join_approval_requests_pending_count: int = 0
-    community_default_join_approval_requests_pending_up_to: Optional[datetime] = None
-    community_default_join_approval_requests_pending_since: Optional[datetime] = None
-    community_default_join_approval_requests_pending_sender: Optional[JID] = None
-    community_default_join_approval_requests_pending_name: Optional[str] = None
-    community_default_join_approval_requests_pending_count: int = 0
-    community_default_join_approval_requests_pending_up_to: Optional[datetime] = None
-    community_default_join_approval_requests_pending_since: Optional[datetime] = None
-    community_default_join_approval_requests_pending_sender: Optional[JID] = None
-    community_default_join_approval_requests_pending_name: Optional[str] = None
+    """Contains basic information about a group chat on WhatsApp."""
+    jid: Optional[JID] = None
+    owner_jid: Optional[JID] = None
+    owner_pn: Optional[JID] = None
+
+    group_name: Optional[GroupName] = None
+    group_topic: Optional[GroupTopic] = None
+    group_locked: Optional[GroupLocked] = None
+    group_announce: Optional[GroupAnnounce] = None
+    group_ephemeral: Optional[GroupEphemeral] = None
+    group_incognito: Optional[GroupIncognito] = None
+
+    group_parent: Optional[GroupParent] = None
+    group_linked_parent: Optional[GroupLinkedParent] = None
+    group_is_default_sub: Optional[GroupIsDefaultSub] = None
+    group_membership_approval_mode: Optional[GroupMembershipApprovalMode] = None
+
+    addressing_mode: Optional[AddressingMode] = None
+    group_created: Optional[datetime] = None
+    creator_country_code: str = ""
+
+    participant_version_id: str = ""
+    participants: Optional[List[GroupParticipant]] = None
+
+    member_add_mode: Optional[GroupMemberAddMode] = None
 
     def __post_init__(self):
         if self.participants is None:
             self.participants = []
-        if self.parent_group_jids is None:
-            self.parent_group_jids = []
-        if self.linked_children is None:
-            self.linked_children = []
-
-@dataclass
-class GroupLinkInfo:
-    """Information about a group's invite link."""
-    code: str
-    group_jid: JID
-    group_name: str
-    group_is_default_sub_group: bool
-    group_size: int
-    approval_required: bool
-    invite_code: str
-    invite_expiration: Optional[datetime] = None
-    invite_link: Optional[str] = None
-    invite_link_parent_group: Optional[bool] = None
-    invite_link_parent_group_pending_admin_approval: Optional[bool] = None
-    invite_link_parent_group_pending_admin_approval_count: Optional[int] = None
-    invite_link_parent_group_pending_admin_approval_up_to: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_since: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_sender: Optional[JID] = None
-    invite_link_parent_group_pending_admin_approval_name: Optional[str] = None
-    invite_link_parent_group_pending_admin_approval_count: Optional[int] = None
-    invite_link_parent_group_pending_admin_approval_up_to: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_since: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_sender: Optional[JID] = None
-    invite_link_parent_group_pending_admin_approval_name: Optional[str] = None
-    invite_link_parent_group_pending_admin_approval_count: Optional[int] = None
-    invite_link_parent_group_pending_admin_approval_up_to: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_since: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_sender: Optional[JID] = None
-    invite_link_parent_group_pending_admin_approval_name: Optional[str] = None
-    invite_link_parent_group_pending_admin_approval_count: Optional[int] = None
-    invite_link_parent_group_pending_admin_approval_up_to: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_since: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_sender: Optional[JID] = None
-    invite_link_parent_group_pending_admin_approval_name: Optional[str] = None
-    invite_link_parent_group_pending_admin_approval_count: Optional[int] = None
-    invite_link_parent_group_pending_admin_approval_up_to: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_since: Optional[datetime] = None
-    invite_link_parent_group_pending_admin_approval_sender: Optional[JID] = None
-    invite_link_parent_group_pending_admin_approval_name: Optional[str] = None

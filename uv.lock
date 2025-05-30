@@ -266,6 +266,17 @@ wheels = [
 ]
 
 [[package]]
+name = "libsignal"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "protobuf" },
+    { name = "python-axolotl-curve25519" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/53/27/e32fde7fea63362f3f93aca5c2640e5a66d9792c45dbd7dd19dc1cc7d275/libsignal-0.0.4.tar.gz", hash = "sha256:c27c206b82339e13f2c2fd7ab41f0073dfe750cd961ad1a81a4a94eabe94a728", size = 40256 }
+
+[[package]]
 name = "multidict"
 version = "6.4.4"
 source = { registry = "https://pypi.org/simple" }
@@ -470,6 +481,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "cryptography" },
+    { name = "libsignal" },
     { name = "pillow" },
     { name = "protobuf" },
     { name = "pycryptodome" },
@@ -491,6 +503,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = "==3.12.2" },
     { name = "cryptography", specifier = "==45.0.3" },
+    { name = "libsignal", specifier = ">=0.0.4" },
     { name = "pillow", specifier = "==11.2.1" },
     { name = "protobuf", specifier = ">=5.26.1,<6.0.dev0" },
     { name = "pycryptodome", specifier = "==3.23.0" },
@@ -547,6 +560,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/25/69/5f1e57f6c5a39f814
 wheels = [
     { url = "https://files.pythonhosted.org/packages/28/d0/def53b4a790cfb21483016430ed828f64830dd981ebe1089971cd10cab25/pytest_cov-6.1.1-py3-none-any.whl", hash = "sha256:bddf29ed2d0ab6f4df17b4c55b0a657287db8684af9c42ea546b21b1041b3dde", size = 23841 },
 ]
+
+[[package]]
+name = "python-axolotl-curve25519"
+version = "0.4.1.post2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/59/ca/c8111718bcc8da18e9b9868e784293232a58c57159a5ea18f00ee967258f/python-axolotl-curve25519-0.4.1.post2.tar.gz", hash = "sha256:0705a66297ebd2f508a60dc94e22881c754301eb81db93963322f6b3bdcb63a3", size = 79941 }
 
 [[package]]
 name = "python-dotenv"

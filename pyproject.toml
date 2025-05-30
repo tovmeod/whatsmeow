@@ -30,6 +30,7 @@ classifiers = [
 dependencies = [
     "aiohttp==3.12.2",
     "cryptography==45.0.3",
+    "libsignal>=0.0.4",
     "pillow==11.2.1",
     "protobuf>=5.26.1,<6.0.dev0",
     "pycryptodome==3.23.0",

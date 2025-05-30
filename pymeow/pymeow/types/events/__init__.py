@@ -7,34 +7,21 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
-from ...generated.waMsgTransport import WAMsgTransport_pb2
-from ..message import MessageSource
-
-@dataclass
-class QR:
-    """Event for when a QR code should be displayed for pairing."""
-    code: bytes
-
-@dataclass
-class Connected:
-    """Event for when the connection to WhatsApp is established."""
-    pass
-
-@dataclass
-class LoggedOut:
-    """Event for when the client is logged out."""
-    pass
-
-@dataclass
-class Message:
-    """Event for when a message is received."""
-    message: WAMsgTransport_pb2.Message
-    source: MessageSource
-
-@dataclass
-class Receipt:
-    """Event for message receipt updates."""
-    message_id: str
-    sender: str
-    timestamp: datetime
-    type: str  # read, delivery, etc
+from .events import (
+    QR, PairSuccess, PairError, QRScannedWithoutMultidevice, Connected,
+    KeepAliveTimeout, KeepAliveRestored, PermanentDisconnect, TempBanReason,
+    ConnectFailureReason, LoggedOut, StreamReplaced, ManualLoginReconnect,
+    TemporaryBan, ConnectFailure, ClientOutdated, CATRefreshError, StreamError,
+    Disconnected, HistorySync, DecryptFailMode, UnavailableType, UndecryptableMessage,
+    NewsletterMessageMeta, Message, FBMessage, Receipt, ChatPresenceEvent,
+    PresenceEvent, JoinedGroup, GroupInfo, Picture, UserAbout, IdentityChange,
+    PrivacySettingsEvent, OfflineSyncPreview, OfflineSyncCompleted, MediaRetryError,
+    MediaRetry, BlocklistAction, BlocklistChangeAction, BlocklistChange, Blocklist,
+    NewsletterJoin, NewsletterLeave, NewsletterMuteChange, NewsletterLiveUpdate
+)
+from .appstate import (
+    WAPatchName, Contact, PushName, BusinessName, Pin, Star, DeleteForMe, Mute,
+    Archive, MarkChatAsRead, ClearChat, DeleteChat, PushNameSetting,
+    UnarchiveChatsSetting, UserStatusMute, LabelEdit, LabelAssociationChat,
+    LabelAssociationMessage, AppState, AppStateSyncComplete
+)

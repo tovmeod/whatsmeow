@@ -16,6 +16,223 @@ from .exceptions import PreKeyError
 from .binary.node import Node
 from .types import JID
 
+def pre_key_to_node(key: 'PreKeyData') -> Node:
+    """Port of Go's preKeyToNode function.
+
+    Convert a pre-key to a binary Node with proper key ID encoding.
+
+    Args:
+        key: The pre-key to convert
+
+    Returns:
+        Node: The converted node
+    """
+    # Encode key ID as 3-byte big-endian integer (matching Go's keyID[1:])
+    key_id_bytes = struct.pack(">I", key.key_id)[1:]  # Skip first byte to get 3 bytes
+
+    # Create the node with id and value child nodes
+    node = Node(
+        tag="key",
+        content=[
+            Node(tag="id", content=key_id_bytes),
+            Node(tag="value", content=key.public_key),
+        ]
+    )
+
+    # If this is a signed pre-key (has signature), use skey tag and add signature
+    if hasattr(key, 'signature') and key.signature:
+        node.tag = "skey"
+        node.content.append(Node(tag="signature", content=key.signature))
+
+    return node
+
+def pre_keys_to_nodes(pre_keys: List['PreKeyData']) -> List[Node]:
+    """Port of Go's preKeysToNodes function.
+
+    Convert a list of pre-keys to a list of nodes.
+
+    Args:
+        pre_keys: List of pre-keys to convert
+
+    Returns:
+        List[Node]: List of converted nodes
+    """
+    return [pre_key_to_node(key) for key in pre_keys]
+
+def node_to_pre_key(node: Node) -> Optional['PreKeyData']:
+    """Port of Go's nodeToPreKey function.
+
+    Parse a pre-key from a node.
+
+    Args:
+        node: The node to parse
+
+    Returns:
+        Optional[PreKeyData]: The parsed pre-key, or None if parsing failed
+    """
+    key = PreKeyData(
+        key_id=0,
+        public_key=None,
+        private_key=None,
+        uploaded=False
+    )
+
+    # Check for id tag
+    id_node = None
+    for child in node.content:
+        if isinstance(child, Node) and child.tag == "id":
+            id_node = child
+            break
+
+    if not id_node:
+        return None
+
+    # Parse key ID from id node
+    try:
+        if isinstance(id_node.content, bytes):
+            # Key ID is a 3-byte big-endian integer, prepend a zero byte
+            id_bytes = bytes([0]) + id_node.content
+            if len(id_bytes) != 4:
+                return None
+            key.key_id = struct.unpack(">I", id_bytes)[0]
+        else:
+            return None
+    except (ValueError, TypeError, struct.error):
+        return None
+
+    # Check for value tag
+    value_node = None
+    for child in node.content:
+        if isinstance(child, Node) and child.tag == "value":
+            value_node = child
+            break
+
+    if not value_node or not isinstance(value_node.content, bytes):
+        return None
+
+    # Parse public key
+    public_key = value_node.content
+    if len(public_key) != 32:
+        return None
+
+    key.public_key = public_key
+
+    # If this is a signed pre-key, parse signature
+    if node.tag == "skey":
+        sig_node = None
+        for child in node.content:
+            if isinstance(child, Node) and child.tag == "signature":
+                sig_node = child
+                break
+
+        if not sig_node or not isinstance(sig_node.content, bytes):
+            return None
+
+        signature = sig_node.content
+        if len(signature) != 64:
+            return None
+
+        # For SignedPreKeyData, create that instead
+        return SignedPreKeyData(
+            key_id=key.key_id,
+            public_key=key.public_key,
+            private_key=None,
+            signature=signature,
+            timestamp=datetime.now()
+        )
+
+    return key
+
+def node_to_pre_key_bundle(device_id: int, node: Node) -> Optional[PreKeyBundle]:
+    """Port of Go's nodeToPreKeyBundle function.
+
+    Parse a pre-key bundle from a node.
+
+    Args:
+        device_id: The device ID
+        node: The node to parse
+
+    Returns:
+        Optional[PreKeyBundle]: The parsed pre-key bundle, or None if parsing failed
+
+    Raises:
+        PreKeyError: If there's an error in the node
+    """
+    # Check for error node
+    for child in node.content:
+        if isinstance(child, Node) and child.tag == "error":
+            raise PreKeyError(f"Error in pre-key response: {child.xml_string()}")
+
+    # Get registration node
+    registration_node = None
+    for child in node.content:
+        if isinstance(child, Node) and child.tag == "registration":
+            registration_node = child
+            break
+
+    if not registration_node or not isinstance(registration_node.content, bytes) or len(registration_node.content) != 4:
+        raise PreKeyError("Invalid registration ID in pre-key response")
+
+    registration_id = struct.unpack(">I", registration_node.content)[0]
+
+    # Find keys node (might be directly in content or in a "keys" child node)
+    keys_node = None
+    for child in node.content:
+        if isinstance(child, Node) and child.tag == "keys":
+            keys_node = child
+            break
+
+    if not keys_node:
+        keys_node = node
+
+    # Get identity key
+    identity_key_node = None
+    for child in keys_node.content:
+        if isinstance(child, Node) and child.tag == "identity":
+            identity_key_node = child
+            break
+
+    if not identity_key_node or not isinstance(identity_key_node.content, bytes) or len(identity_key_node.content) != 32:
+        raise PreKeyError("Invalid identity key in pre-key response")
+
+    identity_key = identity_key_node.content
+
+    # Get pre-key (optional)
+    pre_key_node = None
+    for child in keys_node.content:
+        if isinstance(child, Node) and child.tag == "key":
+            pre_key_node = child
+            break
+
+    pre_key = None
+    if pre_key_node:
+        pre_key = node_to_pre_key(pre_key_node)
+        if not pre_key:
+            raise PreKeyError("Invalid pre-key in pre-key response")
+
+    # Get signed pre-key (required)
+    signed_pre_key_node = None
+    for child in keys_node.content:
+        if isinstance(child, Node) and child.tag == "skey":
+            signed_pre_key_node = child
+            break
+
+    if not signed_pre_key_node:
+        raise PreKeyError("Missing signed pre-key in pre-key response")
+
+    signed_pre_key = node_to_pre_key(signed_pre_key_node)
+    if not signed_pre_key or not isinstance(signed_pre_key, SignedPreKeyData):
+        raise PreKeyError("Invalid signed pre-key in pre-key response")
+
+    # Create bundle
+    return PreKeyBundle(
+        registration_id=registration_id,
+        device_id=device_id,
+        pre_key=pre_key if isinstance(pre_key, PreKeyData) else None,
+        signed_pre_key=signed_pre_key,
+        identity_key=identity_key
+    )
+
 # Constants matching Go implementation
 WANTED_PREKEY_COUNT = 50  # Number of prekeys to upload in a batch
 MIN_PREKEY_COUNT = 5     # Threshold for when to upload new prekeys
@@ -61,6 +278,12 @@ class PreKeyData:
             },
             content=self.public_key
         )
+
+@dataclass
+class PreKeyResp:
+    """Response structure for fetchPreKeys - matches Go's preKeyResp struct."""
+    bundle: Optional[PreKeyBundle]
+    error: Optional[Exception]
 
 @dataclass
 class PreKeyBundle:
@@ -199,56 +422,8 @@ class PreKeyStore:
             if key.key_id <= last_key_id:
                 key.uploaded = True
 
-    async def _get_server_pre_key_count(self) -> int:
-        """Implements whatsmeow.*Client.getServerPreKeyCount.
 
-        Get the current count of pre-keys on the server.
-
-        Returns:
-            int: Number of pre-keys on the server.
-
-        Raises:
-            PreKeyError: If there's an error communicating with the server.
-        """
-        # This will be implemented by the Client class to match sendIQ in Go
-        raise NotImplementedError("Server communication not implemented")
-
-    async def _upload_pre_keys(self) -> None:
-        """Implements whatsmeow.*Client.uploadPreKeys.
-
-        Upload pre-keys to the server with proper locking and rate limiting.
-
-        Raises:
-            PreKeyError: If there's an error during the upload process.
-        """
-        async with self._upload_lock:
-            # Check upload cooldown
-            if not self.can_upload():
-                return
-
-            # Check if we already have enough keys on the server
-            try:
-                server_count = await self._get_server_pre_key_count()
-                if server_count >= WANTED_PREKEY_COUNT:
-                    return
-            except Exception as e:
-                raise PreKeyError(f"Failed to get server pre-key count: {e}") from e
-
-            # Get or generate pre-keys to upload
-            keys = await self.get_or_gen_pre_keys(WANTED_PREKEY_COUNT)
-            if not keys:
-                raise PreKeyError("No pre-keys available for upload")
-
-            # Convert to nodes for the server
-            key_nodes = [self._pre_key_to_node(key) for key in keys]
-
-            # This would be implemented by the Client class
-            # await self._send_pre_key_upload_request(key_nodes)
-
-            # Mark the keys as uploaded
-            await self.mark_keys_as_uploaded(keys[-1].key_id)
-
-    async def GenOnePreKey(self) -> PreKeyData:
+    async def generate_pre_key(self) -> PreKeyData:
         """Implements store.PreKeyStore.GenOnePreKey.
 
         Generate a single pre-key.
@@ -287,7 +462,7 @@ class PreKeyStore:
         self._pre_keys[key_id] = key
         return key
 
-    async def UploadedPreKeyCount(self) -> int:
+    async def get_uploaded_count(self) -> int:
         """Implements store.PreKeyStore.UploadedPreKeyCount.
 
         Get the count of uploaded pre-keys.
@@ -297,7 +472,7 @@ class PreKeyStore:
         """
         return sum(1 for key in self._pre_keys.values() if key.uploaded)
 
-    async def MarkPreKeysAsUploaded(self, up_to_id: int) -> None:
+    async def mark_keys_as_uploaded(self, up_to_id: int) -> None:
         """Implements store.PreKeyStore.MarkPreKeysAsUploaded.
 
         Mark pre-keys as uploaded up to the specified ID.
@@ -315,277 +490,10 @@ class PreKeyStore:
         # Update the last upload time
         self._last_upload = datetime.now()
 
-    def _pre_key_to_node(self, pre_key: PreKeyData) -> Node:
-        """Implements preKeyToNode from prekeys.go.
 
-        Convert a pre-key to a node for server communication.
 
-        Args:
-            pre_key: The pre-key to convert.
-        Returns:
-            Node: The converted node.
-        """
-        import logging
-        logging.basicConfig(level=logging.DEBUG)
-        logging.debug(f"_pre_key_to_node: key_id={pre_key.key_id}, public_key={pre_key.public_key.hex() if pre_key.public_key else None}")
-        
-        node = Node(
-            tag="key",
-            attributes={"id": str(pre_key.key_id)},
-            content=pre_key.public_key
-        )
-        logging.debug(f"_pre_key_to_node: created node: {node}")
-        return node
 
-    def _node_to_pre_key(self, node: Node) -> Optional[PreKeyData]:
-        """Implements nodeToPreKey from prekeys.go.
 
-        Parse a single pre-key from a node.
-
-        Args:
-            node: The node containing the pre-key data.
-
-        Returns:
-            PreKeyData if the node contains valid pre-key data, None otherwise.
-        """
-        import logging
-        logging.basicConfig(level=logging.DEBUG)
-        logging.debug(f"_node_to_pre_key: node={node}")
-        
-        if not isinstance(node, Node) or not hasattr(node, 'content'):
-            logging.debug("_node_to_pre_key: invalid node type or missing content")
-            return None
-
-        key_id = None
-        public_key = None
-
-        # Log the node structure for debugging
-        logging.debug(f"_node_to_pre_key: node.tag={node.tag}")
-        logging.debug(f"_node_to_pre_key: node.attributes={getattr(node, 'attributes', None)}")
-        logging.debug(f"_node_to_pre_key: node.content type={type(node.content)}")
-        if isinstance(node.content, bytes):
-            logging.debug(f"_node_to_pre_key: node.content length={len(node.content)}")
-        elif isinstance(node.content, list):
-            logging.debug(f"_node_to_pre_key: node.content length={len(node.content)}")
-            for i, item in enumerate(node.content):
-                logging.debug(f"_node_to_pre_key: node.content[{i}] type={type(item)}")
-                if isinstance(item, Node):
-                    logging.debug(f"_node_to_pre_key:   tag={item.tag}, attrs={getattr(item, 'attributes', None)}")
-
-        # Handle the node structure used in _pre_key_to_node (direct key node with id attribute and bytes content)
-        if node.tag == "key" and hasattr(node, 'attributes') and 'id' in node.attributes:
-            try:
-                key_id = int(node.attributes['id'])
-                if isinstance(node.content, bytes):
-                    public_key = node.content
-                    logging.debug(f"_node_to_pre_key: found key_id={key_id} in attributes, public_key length={len(public_key) if public_key else 0}")
-                # Also handle the case where content is a list with a single bytes element
-                elif isinstance(node.content, list) and len(node.content) == 1 and isinstance(node.content[0], bytes):
-                    public_key = node.content[0]
-                    logging.debug(f"_node_to_pre_key: found key_id={key_id} in attributes, public_key in list length={len(public_key) if public_key else 0}")
-            except (ValueError, TypeError) as e:
-                logging.debug(f"_node_to_pre_key: error parsing key_id: {e}")
-                return None
-        
-        # Handle the case where the node has child nodes (id and value nodes)
-        if public_key is None and isinstance(node.content, list):
-            logging.debug("_node_to_pre_key: checking child nodes")
-            for child in node.content:
-                if not isinstance(child, Node):
-                    continue
-                    
-                if child.tag == "id":
-                    try:
-                        if child.content is not None:
-                            key_id = int(child.content)
-                            logging.debug(f"_node_to_pre_key: found key_id={key_id} in id node")
-                    except (ValueError, TypeError) as e:
-                        logging.debug(f"_node_to_pre_key: error parsing key_id from id node: {e}")
-                        return None
-                elif child.tag == "value" and isinstance(child.content, bytes):
-                    public_key = child.content
-                    logging.debug(f"_node_to_pre_key: found public_key length={len(public_key) if public_key else 0} in value node")
-        
-        # If we have an attributes dict, check for id there too
-        if key_id is None and hasattr(node, 'attributes') and 'id' in node.attributes:
-            try:
-                key_id = int(node.attributes['id'])
-                logging.debug(f"_node_to_pre_key: found key_id={key_id} in attributes (fallback)")
-            except (ValueError, TypeError) as e:
-                logging.debug(f"_node_to_pre_key: error parsing key_id from attributes: {e}")
-                return None
-
-        if key_id is None:
-            logging.debug("_node_to_pre_key: key_id is None")
-        if public_key is None:
-            logging.debug("_node_to_pre_key: public_key is None")
-        elif len(public_key) not in (32, 33):
-            logging.debug(f"_node_to_pre_key: invalid public_key length: {len(public_key)} (expected 32 or 33)")
-
-        # X25519 public keys are 32 bytes, but sometimes they come with a 0x05 prefix (33 bytes)
-        if key_id is None or public_key is None or len(public_key) not in (32, 33):
-            return None
-            
-        # If the key has 33 bytes, validate the prefix but keep the full key
-        if len(public_key) == 33:
-            if public_key[0] != 0x05:
-                logging.debug(f"_node_to_pre_key: invalid public_key prefix: {public_key[0]:02x} (expected 0x05)")
-                return None
-            
-        result = PreKeyData(
-            key_id=key_id,
-            public_key=public_key,
-            private_key=None,  # Private key is not available when parsing from a node
-            uploaded=False  # Default to not uploaded since we don't know
-        )
-        logging.debug(f"_node_to_pre_key: returning {result}")
-        return result
-
-    def _pre_keys_to_nodes(self, pre_keys: List[PreKeyData]) -> List[Node]:
-        """Implements preKeysToNodes from prekeys.go.
-
-        Convert multiple pre-keys to nodes for server communication.
-
-        Args:
-            pre_keys: List of pre-keys to convert.
-
-        Returns:
-            List of converted nodes.
-        """
-        return [self._pre_key_to_node(key) for key in pre_keys]
-
-    def _parse_pre_key_bundle(self, node: Node) -> PreKeyBundle:
-        """Implements parsePreKeyBundle from prekeys.go.
-
-        Parse a pre-key bundle from a server response.
-
-        Args:
-            node: The node containing the pre-key bundle.
-
-        Returns:
-            PreKeyBundle: The parsed pre-key bundle.
-
-        Raises:
-            PreKeyError: If the bundle is invalid or missing required fields.
-        """
-        try:
-            if not isinstance(node, Node) or not hasattr(node, 'attributes') or not hasattr(node, 'content'):
-                raise PreKeyError("Invalid node type")
-
-            if 'registration' not in node.attributes:
-                raise PreKeyError("missing registration")
-            if 'device_id' not in node.attributes:
-                raise PreKeyError("missing device ID")
-                
-            registration_id = int(node.attributes['registration'])
-            device_id = int(node.attributes['device_id'])
-
-            # Extract identity key
-            identity_key = None
-            signed_pre_key_node = None
-            pre_key_node = None
-
-            if not isinstance(node.content, list):
-                raise PreKeyError("invalid node content")
-
-            for child in node.content:
-                if not isinstance(child, Node):
-                    continue
-                if child.tag == "identity" and isinstance(child.content, bytes):
-                    identity_key = child.content
-                elif child.tag == "skey":
-                    signed_pre_key_node = child
-                elif child.tag == "key":
-                    pre_key_node = child
-
-            if not identity_key:
-                raise PreKeyError("missing identity key in bundle")
-                
-            # Validate identity key format (should be 33 bytes starting with 0x05)
-            if len(identity_key) != 33 or identity_key[0] != 0x05:
-                raise PreKeyError("invalid identity key format")
-                
-            if not signed_pre_key_node:
-                raise PreKeyError("missing signed pre-key in bundle")
-
-            # Extract signed pre-key data
-            if 'id' not in signed_pre_key_node.attributes:
-                raise PreKeyError("missing signed pre-key ID")
-                
-            signed_key_id = int(signed_pre_key_node.attributes['id'])
-            signed_key_data = None
-            signed_key_sig = None
-
-            if isinstance(signed_pre_key_node.content, list):
-                for child in signed_pre_key_node.content:
-                    if not isinstance(child, Node):
-                        continue
-                    if child.tag == "key" and isinstance(child.content, bytes):
-                        signed_key_data = child.content
-                    elif child.tag == "signature" and isinstance(child.content, bytes):
-                        signed_key_sig = child.content
-
-            if not signed_key_data or not signed_key_sig:
-                raise PreKeyError("invalid signed pre-key data in bundle")
-
-            signed_pre_key = SignedPreKeyData(
-                key_id=signed_key_id,
-                public_key=signed_key_data,
-                private_key=None,  # Not provided in bundle
-                signature=signed_key_sig,
-                timestamp=datetime.now()  # Server doesn't send timestamp
-            )
-
-            # Extract pre-key (optional)
-            pre_key = None
-            if pre_key_node and isinstance(pre_key_node.content, bytes):
-                if 'id' not in pre_key_node.attributes:
-                    raise PreKeyError("missing pre-key ID")
-                pre_key_id = int(pre_key_node.attributes['id'])
-                pre_key = PreKeyData(
-                    key_id=pre_key_id,
-                    public_key=pre_key_node.content,
-                    private_key=None,  # Not provided in bundle
-                    uploaded=True
-                )
-
-            return PreKeyBundle(
-                registration_id=registration_id,
-                device_id=device_id,
-                pre_key=pre_key,
-                signed_pre_key=signed_pre_key,
-                identity_key=identity_key
-            )
-
-        except (KeyError, ValueError, AttributeError, TypeError) as e:
-            raise PreKeyError(f"invalid pre-key bundle: {e}") from e
-
-    async def fetch_pre_keys(self, users: List[JID]) -> Dict[JID, Tuple[Optional[PreKeyBundle], Optional[Exception]]]:
-        """Implements whatsmeow.*Client.fetchPreKeys.
-
-        Fetch pre-key bundles for multiple users.
-
-        Args:
-            users: List of user JIDs to fetch pre-keys for.
-
-        Returns:
-            Dictionary mapping user JIDs to tuples of (bundle, error).
-            If successful, error will be None and bundle will be populated.
-            If there was an error, bundle will be None and error will contain the exception.
-        """
-        results = {}
-
-        for user in users:
-            try:
-                # This would be implemented by the Client class
-                # node = await self._send_pre_key_fetch_request(user)
-                # bundle = self._parse_pre_key_bundle(node)
-                # results[user] = (bundle, None)
-                results[user] = (None, NotImplementedError("fetch_pre_keys not implemented"))
-            except Exception as e:
-                results[user] = (None, e)
-
-        return results
 
     def get_pre_key(self, key_id: int) -> Optional[PreKeyData]:
         """Implements store.PreKeyStore.GetPreKey.

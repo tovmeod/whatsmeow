@@ -106,6 +106,30 @@ from .newsletter import (
     NewsletterReaction,
 )
 
+# User types
+from .user import (
+    VerifiedName,
+    UserInfo,
+    BotListInfo,
+    BotProfileCommand,
+    BotProfileInfo,
+    ProfilePictureInfo,
+    ContactInfo,
+    LocalChatSettings,
+    IsOnWhatsAppResponse,
+    BusinessMessageLinkTarget,
+    ContactQRLinkTarget,
+    PrivacySetting,
+    PrivacySettingType,
+    PrivacySettings,
+    StatusPrivacyType,
+    StatusPrivacy,
+    Blocklist,
+    BusinessHoursConfig,
+    Category,
+    BusinessProfile,
+)
+
 # Business types
 from .business import (
     BusinessCategory,
@@ -226,7 +250,7 @@ __all__ = [
     'ReactionAggregation',
     'ReactionSync',
     'ReactionSettings',
-    
+
     # Expiration
     'ExpirationType',
     'ExpirationInfo',
@@ -248,4 +272,26 @@ __all__ = [
     'NewsletterSettings',
     'NewsletterMessageInfo',
     'NewsletterReaction',
+
+    # User types
+    'VerifiedName',
+    'UserInfo',
+    'BotListInfo',
+    'BotProfileCommand',
+    'BotProfileInfo',
+    'ProfilePictureInfo',
+    'ContactInfo',
+    'LocalChatSettings',
+    'IsOnWhatsAppResponse',
+    'BusinessMessageLinkTarget',
+    'ContactQRLinkTarget',
+    'PrivacySetting',
+    'PrivacySettingType',
+    'PrivacySettings',
+    'StatusPrivacyType',
+    'StatusPrivacy',
+    'Blocklist',
+    'BusinessHoursConfig',
+    'Category',
+    'BusinessProfile',
 ]

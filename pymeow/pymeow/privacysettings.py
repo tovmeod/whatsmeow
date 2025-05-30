@@ -4,45 +4,34 @@ WhatsApp privacy settings handling.
 Port of whatsmeow/privacysettings.go
 """
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Optional
+from dataclasses import dataclass
 
-from .generated.waCommon import WACommon_pb2
-
-class PrivacySettingType(Enum):
+class PrivacySettingType(str, Enum):
     """Types of WhatsApp privacy settings."""
-    LAST_SEEN = "last_seen"
-    ONLINE = "online"
-    PROFILE_PHOTO = "profile_photo"
+    GROUP_ADD = "groupadd"
+    LAST_SEEN = "last"
     STATUS = "status"
-    READ_RECEIPTS = "read_receipts"
-    GROUPS = "groups"
-    BLOCKED = "blocked"
+    PROFILE = "profile"
+    READ_RECEIPTS = "readreceipts"
+    ONLINE = "online"
+    CALL_ADD = "calladd"
 
-class PrivacyValue(Enum):
+class PrivacySetting(str, Enum):
     """Values for privacy settings."""
-    UNDEFINED = "undefined"
     ALL = "all"
     CONTACTS = "contacts"
-    CONTACT_BLACKLIST = "contact_blacklist"
+    CONTACT_BLACKLIST = "contact-blacklist"
     NONE = "none"
-    MATCHING_LAST_SEEN = "matching_last_seen"
+    MATCH_LAST_SEEN = "match-last-seen"
 
+@dataclass
 class PrivacySettings:
-    """Manages WhatsApp privacy settings."""
-
-    def __init__(self):
-        self._settings: Dict[PrivacySettingType, PrivacyValue] = {}
-        self._excluded_list: Dict[PrivacySettingType, List[str]] = {}
-
-    def set_privacy(self, setting: PrivacySettingType, value: PrivacyValue, excluded_jids: List[str] = None) -> None:
-        """Set a privacy setting."""
-        self._settings[setting] = value
-        if excluded_jids is not None:
-            self._excluded_list[setting] = excluded_jids
-
-    def get_privacy(self, setting: PrivacySettingType) -> tuple[Optional[PrivacyValue], List[str]]:
-        """Get a privacy setting and its excluded JIDs."""
-        return (
-            self._settings.get(setting),
-            self._excluded_list.get(setting, [])
-        )
+    """Represents the privacy settings for an account."""
+    group_add: PrivacySetting = PrivacySetting.ALL
+    last_seen: PrivacySetting = PrivacySetting.ALL
+    status: PrivacySetting = PrivacySetting.ALL
+    profile: PrivacySetting = PrivacySetting.ALL
+    read_receipts: PrivacySetting = PrivacySetting.ALL
+    online: PrivacySetting = PrivacySetting.ALL
+    call_add: PrivacySetting = PrivacySetting.ALL

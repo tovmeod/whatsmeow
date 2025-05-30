@@ -3,69 +3,308 @@ Signal protocol store implementation for WhatsApp.
 
 Port of whatsmeow/store/signal.go
 """
-from typing import Optional, Dict, List
-from dataclasses import dataclass
-import json
+from typing import Optional, List, Any
+import logging
 
-from ..generated.waE2E import WAWebProtobufsE2E_pb2
+# Standard libsignal imports
+from libsignal.ecc.djbec import DjbECPublicKey, DjbECPrivateKey
+from libsignal.identitykey import IdentityKey
+from libsignal.identitykeypair import IdentityKeyPair
+from libsignal.state.prekeyrecord import PreKeyRecord
+from libsignal.state.sessionrecord import SessionRecord
+from libsignal.state.signedprekeyrecord import SignedPreKeyRecord
+from libsignal.groups.state.senderkeyrecord import SenderKeyRecord
+from libsignal.groups.senderkeyname import SenderKeyName  # Import official SenderKeyName implementation
+from libsignal.util.keyhelper import KeyHelper
+from libsignal.axolotladdress import AxolotlAddress
 
-@dataclass
-class SignalSession:
-    """Signal protocol session data."""
-    registration_id: int
-    identity_key_pair: bytes
-    signed_pre_key: bytes
-    signed_pre_key_id: int
-    signed_pre_key_signature: bytes
+# Equivalent to Go's SignalProtobufSerializer = serialize.NewProtoBufSerializer()
+# In Python, serialization is handled internally by the record classes
+SignalProtobufSerializer = None
 
-class SignalStore:
-    """Stores Signal protocol related data."""
 
-    def __init__(self):
-        self._sessions: Dict[str, bytes] = {}
-        self._pre_keys: Dict[int, bytes] = {}
-        self._sender_keys: Dict[str, bytes] = {}
-        self._identity_keys: Dict[str, bytes] = {}
-        self._registration_id: Optional[int] = None
+class SignalProtocolMixin:
+    """
+    Mixin class that adds Signal Protocol store methods to the Device class.
 
-    def get_session(self, jid: str) -> Optional[bytes]:
-        """Get a Signal session for a JID."""
-        return self._sessions.get(jid)
+    This is equivalent to the methods added in store/signal.go in the Go implementation.
+    """
 
-    def save_session(self, jid: str, session_data: bytes) -> None:
-        """Save a Signal session for a JID."""
-        self._sessions[jid] = session_data
+    # IdentityKeyStore implementation
+    async def get_identity_key_pair(self, ctx: Any = None) -> IdentityKeyPair:
+        """
+        Get the identity key pair for this device.
 
-    def get_pre_key(self, key_id: int) -> Optional[bytes]:
-        """Get a pre-key by ID."""
-        return self._pre_keys.get(key_id)
+        Go equivalent: func (device *Device) GetIdentityKeyPair() *identity.KeyPair
+        """
+        return IdentityKeyPair(
+            IdentityKey(DjbECPublicKey(self.identity_key.pub)),
+            DjbECPrivateKey(self.identity_key.priv)
+        )
 
-    def save_pre_key(self, key_id: int, key_data: bytes) -> None:
-        """Save a pre-key."""
-        self._pre_keys[key_id] = key_data
+    async def get_local_registration_id(self, ctx: Any = None) -> int:
+        """
+        Get the registration ID for this device.
 
-    def get_sender_key(self, group_id: str, sender_id: str) -> Optional[bytes]:
-        """Get a sender key for a group participant."""
-        key = f"{group_id}:{sender_id}"
-        return self._sender_keys.get(key)
+        Go equivalent: func (device *Device) GetLocalRegistrationID() uint32
+        """
+        return self.registration_id
 
-    def save_sender_key(self, group_id: str, sender_id: str, key_data: bytes) -> None:
-        """Save a sender key for a group participant."""
-        key = f"{group_id}:{sender_id}"
-        self._sender_keys[key] = key_data
+    async def save_identity(self, ctx: Any, address: AxolotlAddress, identity_key: IdentityKey) -> None:
+        """
+        Save an identity key for a remote address.
 
-    def get_identity_key(self, jid: str) -> Optional[bytes]:
-        """Get an identity key for a JID."""
-        return self._identity_keys.get(jid)
+        Go equivalent: func (device *Device) SaveIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) error
+        """
+        addr_string = str(address)
+        try:
+            await self.identities.put_identity(ctx, addr_string, identity_key.getPublicKey().serialize())
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to save identity of {addr_string}: {e}")
+            raise Exception(f"failed to save identity of {addr_string}: {e}")
 
-    def save_identity_key(self, jid: str, key_data: bytes) -> None:
-        """Save an identity key for a JID."""
-        self._identity_keys[jid] = key_data
+    async def is_trusted_identity(self, ctx: Any, address: AxolotlAddress, identity_key: IdentityKey) -> bool:
+        """
+        Check if an identity key is trusted for a remote address.
 
-    def get_registration_id(self) -> Optional[int]:
-        """Get the registration ID."""
-        return self._registration_id
+        Go equivalent: func (device *Device) IsTrustedIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) (bool, error)
+        """
+        addr_string = str(address)
+        try:
+            is_trusted = await self.identities.is_trusted_identity(ctx, addr_string, identity_key.getPublicKey().serialize())
+            return is_trusted
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to check if {addr_string}'s identity is trusted: {e}")
+            raise Exception(f"failed to check if {addr_string}'s identity is trusted: {e}")
 
-    def set_registration_id(self, reg_id: int) -> None:
-        """Set the registration ID."""
-        self._registration_id = reg_id
+    # PreKeyStore implementation
+    async def load_pre_key(self, ctx: Any, pre_key_id: int) -> Optional[PreKeyRecord]:
+        """
+        Load a pre-key by ID.
+
+        Go equivalent: func (device *Device) LoadPreKey(ctx context.Context, id uint32) (*record.PreKey, error)
+        """
+        try:
+            pre_key = await self.pre_keys.get_pre_key(ctx, pre_key_id)
+            if pre_key is None:
+                return None
+
+            # Create a new pre-key record with the key pair
+            # In Go: record.NewPreKey(preKey.KeyID, ecc.NewECKeyPair(...), nil)
+            return PreKeyRecord(
+                pre_key.key_id,
+                DjbECPublicKey(pre_key.pub),
+                DjbECPrivateKey(pre_key.priv)
+            )
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to load pre-key {pre_key_id}: {e}")
+            raise Exception(f"failed to load prekey {pre_key_id}: {e}")
+
+    async def remove_pre_key(self, ctx: Any, pre_key_id: int) -> None:
+        """
+        Remove a pre-key.
+
+        Go equivalent: func (device *Device) RemovePreKey(ctx context.Context, id uint32) error
+        """
+        try:
+            await self.pre_keys.remove_pre_key(ctx, pre_key_id)
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to remove pre-key {pre_key_id}: {e}")
+            raise Exception(f"failed to remove prekey {pre_key_id}: {e}")
+
+    async def store_pre_key(self, ctx: Any, pre_key_id: int, pre_key_record: PreKeyRecord) -> None:
+        """
+        Store a pre-key.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("store_pre_key is not implemented")
+
+    async def contains_pre_key(self, ctx: Any, pre_key_id: int) -> bool:
+        """
+        Check if a pre-key exists.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("contains_pre_key is not implemented")
+
+    # SessionStore implementation
+    async def load_session(self, ctx: Any, address: AxolotlAddress) -> SessionRecord:
+        """
+        Load a session for a remote address.
+
+        Go equivalent: func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalAddress) (*record.Session, error)
+        """
+        addr_string = str(address)
+        try:
+            raw_sess = await self.sessions.get_session(ctx, addr_string)
+            if raw_sess is None:
+                # Create a new empty session record
+                # In Go: record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+                return SessionRecord()
+
+            try:
+                # Deserialize the existing session record from bytes
+                # In Go: record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+                return SessionRecord(serialized=raw_sess)
+            except Exception as e:
+                if hasattr(self, 'log') and self.log:
+                    self.log.error(f"Failed to deserialize session with {addr_string}: {e}")
+                raise Exception(f"failed to deserialize session with {addr_string}: {e}")
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to load session with {addr_string}: {e}")
+            raise Exception(f"failed to load session with {addr_string}: {e}")
+
+    async def get_sub_device_sessions(self, ctx: Any, name: str) -> list[int]:
+        """
+        Get all sub-device sessions for a name.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("get_sub_device_sessions is not implemented")
+
+    async def store_session(self, ctx: Any, address: AxolotlAddress, record: SessionRecord) -> None:
+        """
+        Store a session for a remote address.
+
+        Go equivalent: func (device *Device) StoreSession(ctx context.Context, address *protocol.SignalAddress, record *record.Session) error
+        """
+        addr_string = str(address)
+        try:
+            await self.sessions.put_session(ctx, addr_string, record.serialize())
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to store session with {addr_string}: {e}")
+            raise Exception(f"failed to store session with {addr_string}: {e}")
+
+    async def contains_session(self, ctx: Any, remote_address: AxolotlAddress) -> bool:
+        """
+        Check if a session exists for a remote address.
+
+        Go equivalent: func (device *Device) ContainsSession(ctx context.Context, remoteAddress *protocol.SignalAddress) (bool, error)
+        """
+        addr_string = str(remote_address)
+        try:
+            has_session = await self.sessions.has_session(ctx, addr_string)
+            return has_session
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to check if store has session for {addr_string}: {e}")
+            raise Exception(f"failed to check if store has session for {addr_string}: {e}")
+
+    async def delete_session(self, ctx: Any, remote_address: AxolotlAddress) -> None:
+        """
+        Delete a session for a remote address.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("delete_session is not implemented")
+
+    async def delete_all_sessions(self, ctx: Any) -> None:
+        """
+        Delete all sessions.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("delete_all_sessions is not implemented")
+
+    # SignedPreKeyStore implementation
+    async def load_signed_pre_key(self, ctx: Any, signed_pre_key_id: int) -> Optional[SignedPreKeyRecord]:
+        """
+        Load a signed pre-key by ID.
+
+        Go equivalent: func (device *Device) LoadSignedPreKey(ctx context.Context, signedPreKeyID uint32) (*record.SignedPreKey, error)
+        """
+        # This doesn't need to be async since it accesses the device's signed_pre_key directly,
+        # similar to how it's done in the Go implementation
+        if signed_pre_key_id == self.signed_pre_key.key_id:
+            # In Go: record.NewSignedPreKey(signedPreKeyID, 0, ecc.NewECKeyPair(...), *device.SignedPreKey.Signature, nil)
+            return SignedPreKeyRecord(
+                signed_pre_key_id,
+                0,  # timestamp, not used in whatsmeow
+                DjbECPublicKey(self.signed_pre_key.pub),
+                DjbECPrivateKey(self.signed_pre_key.priv),
+                self.signed_pre_key.signature
+            )
+        return None
+
+    async def load_signed_pre_keys(self, ctx: Any) -> list[SignedPreKeyRecord]:
+        """
+        Load all signed pre-keys.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("load_signed_pre_keys is not implemented")
+
+    async def store_signed_pre_key(self, ctx: Any, signed_pre_key_id: int, record: SignedPreKeyRecord) -> None:
+        """
+        Store a signed pre-key.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("store_signed_pre_key is not implemented")
+
+    async def contains_signed_pre_key(self, ctx: Any, signed_pre_key_id: int) -> bool:
+        """
+        Check if a signed pre-key exists.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("contains_signed_pre_key is not implemented")
+
+    async def remove_signed_pre_key(self, ctx: Any, signed_pre_key_id: int) -> None:
+        """
+        Remove a signed pre-key.
+
+        Go equivalent: panic("not implemented") - this is not implemented in Go either
+        """
+        raise NotImplementedError("remove_signed_pre_key is not implemented")
+
+    # SenderKeyStore implementation
+    async def store_sender_key(self, ctx: Any, sender_key_name: SenderKeyName, key_record: SenderKeyRecord) -> None:
+        """
+        Store a sender key.
+
+        Go equivalent: func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName, keyRecord *groupRecord.SenderKey) error
+        """
+        group_id = sender_key_name.getGroupId()
+        sender_string = str(sender_key_name.getSender())
+        try:
+            await self.sender_keys.put_sender_key(ctx, group_id, sender_string, key_record.serialize())
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to store sender key from {sender_string} for {group_id}: {e}")
+            raise Exception(f"failed to store sender key from {sender_string} for {group_id}: {e}")
+
+    async def load_sender_key(self, ctx: Any, sender_key_name: SenderKeyName) -> SenderKeyRecord:
+        """
+        Load a sender key.
+
+        Go equivalent: func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName) (*groupRecord.SenderKey, error)
+        """
+        group_id = sender_key_name.getGroupId()
+        sender_string = str(sender_key_name.getSender())
+        try:
+            raw_key = await self.sender_keys.get_sender_key(ctx, group_id, sender_string)
+            if raw_key is None:
+                # Create a new empty sender key record
+                # In Go: groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
+                return SenderKeyRecord()
+
+            try:
+                # Deserialize the existing sender key record from bytes
+                # In Go: groupRecord.NewSenderKeyFromBytes(rawKey, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
+                return SenderKeyRecord(serialized=raw_key)
+            except Exception as e:
+                if hasattr(self, 'log') and self.log:
+                    self.log.error(f"Failed to deserialize sender key from {sender_string} for {group_id}: {e}")
+                raise Exception(f"failed to deserialize sender key from {sender_string} for {group_id}: {e}")
+        except Exception as e:
+            if hasattr(self, 'log') and self.log:
+                self.log.error(f"Failed to load sender key from {sender_string} for {group_id}: {e}")
+            raise Exception(f"failed to load sender key from {sender_string} for {group_id}: {e}")

@@ -29,11 +29,63 @@ from .types.presence import (
     ChatPresenceEvent,
 )
 
-from .client import Client
+from .message import MessageHandlingMixin, MessageProcessingMixin
+from .client import Client as BaseClient
 from .rate_limiter import MessageRateLimiter, RateLimiter
-from .message_utils import MessageUtils
 from .types import Message, Contact, Chat, GroupInfo, PrivacySetting, ExpirationType, ExpirationInfo
-from .disappearing_messages import DisappearingMessageManager, DisappearingMessageError
+from .newsletter import NewsletterMixin
+
+# Create enhanced Client class with message handling capabilities
+class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, NewsletterMixin):
+    """
+    Client for WhatsApp Web API with message handling and newsletter capabilities.
+
+    This combines the base Client class with message handling and newsletter mixins,
+    similar to how the Device class is enhanced with SignalProtocolMixin.
+    """
+    pass
+
+    # Helper method stubs that should be implemented in the base client or one of the mixins
+    def send_iq(self, *args, **kwargs):
+        """Send an IQ request.
+
+        This method should be implemented in the base client.
+        """
+        raise NotImplementedError("send_iq method must be implemented in the base client")
+
+    def generate_request_id(self):
+        """Generate a unique request ID.
+
+        This method should be implemented in the base client.
+        """
+        raise NotImplementedError("generate_request_id method must be implemented in the base client")
+
+    def cancel_response(self, request_id, response):
+        """Cancel waiting for a response.
+
+        This method should be implemented in the base client.
+        """
+        raise NotImplementedError("cancel_response method must be implemented in the base client")
+
+    def generate_message_id(self):
+        """Generate a unique message ID.
+
+        This method should be implemented in the base client.
+        """
+        raise NotImplementedError("generate_message_id method must be implemented in the base client")
+
+    def send_node(self, node):
+        """Send a node to the server.
+
+        This method should be implemented in the base client.
+        """
+        raise NotImplementedError("send_node method must be implemented in the base client")
+    def wait_response(self, request_id):
+        """Wait for a response to a request.
+
+        This method should be implemented in the base client.
+        """
+        raise NotImplementedError("wait_response method must be implemented in the base client")
 
 __all__ = [
     'Client',
@@ -47,4 +99,7 @@ __all__ = [
     'MessageUtils',
     'DisappearingMessageManager',
     'DisappearingMessageError',
+    'MessageHandlingMixin',
+    'MessageProcessingMixin',
+    'NewsletterMixin',
 ]

@@ -1,200 +1,308 @@
 """
 Newsletter types for PyMeow.
+
+Port of types/newsletter.go
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum, auto
-from typing import Dict, List, Optional, Set, Union
+from enum import Enum
+from typing import Dict, List, Optional, Any
+import json
 
 from .jid import JID
+from .message import MessageServerID, MessageID
+from .user import ProfilePictureInfo
+from ..generated.waE2E import Message
+
+# TODO: Verify import when util/jsontime is ported
+# In Go: "go.mau.fi/util/jsontime"
 
 
-class NewsletterState(str, Enum):
-    """Possible states of a newsletter."""
-    ACTIVE = "active"
-    SUSPENDED = "suspended"
-    DELETED = "deleted"
+class NewsletterVerificationState(str, Enum):
+    """
+    Verification state of a newsletter.
+
+    Port of NewsletterVerificationState in Go.
+    """
+    VERIFIED = "verified"
+    UNVERIFIED = "unverified"
+
+    @classmethod
+    def from_text(cls, text: str) -> 'NewsletterVerificationState':
+        """Case-insensitive parsing like Go's UnmarshalText."""
+        return cls(text.lower())
 
 
-class NewsletterRole(str, Enum):
-    """Roles that a user can have in a newsletter."""
-    OWNER = "owner"
-    ADMIN = "admin"
-    SUBSCRIBER = "subscriber"
-    GUEST = "guest"
+class NewsletterPrivacy(str, Enum):
+    """
+    Privacy setting of a newsletter.
 
+    Port of NewsletterPrivacy in Go.
+    """
+    PRIVATE = "private"
+    PUBLIC = "public"
 
-class NewsletterMuteState(str, Enum):
-    """Mute states for a newsletter."""
-    MUTED = "muted"
-    UNMUTED = "unmuted"
+    @classmethod
+    def from_text(cls, text: str) -> 'NewsletterPrivacy':
+        """Case-insensitive parsing like Go's UnmarshalText."""
+        return cls(text.lower())
 
 
 class NewsletterReactionsMode(str, Enum):
-    """Reaction modes for newsletters."""
+    """
+    Reactions mode for a newsletter.
+
+    Port of NewsletterReactionsMode in Go.
+    """
     ALL = "all"
+    BASIC = "basic"
     NONE = "none"
-    FOLLOWERS = "followers"
+    BLOCKLIST = "blocklist"
 
 
-class NewsletterVerificationStatus(str, Enum):
-    """Verification status of a newsletter."""
-    VERIFIED = "verified"
-    UNVERIFIED = "unverified"
-    IN_REVIEW = "in_review"
-    REJECTED = "rejected"
+class NewsletterState(str, Enum):
+    """
+    State of a newsletter.
+
+    Port of NewsletterState in Go.
+    """
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    GEO_SUSPENDED = "geosuspended"
+
+    @classmethod
+    def from_text(cls, text: str) -> 'NewsletterState':
+        """Case-insensitive parsing like Go's UnmarshalText."""
+        return cls(text.lower())
+
+
+@dataclass
+class NewsletterMuted:
+    """
+    Mute state of a newsletter.
+
+    Port of NewsletterMuted in Go.
+    """
+    muted: bool
+
+
+@dataclass
+class WrappedNewsletterState:
+    """
+    Wrapped newsletter state.
+
+    Port of WrappedNewsletterState in Go.
+    """
+    type: NewsletterState
+
+
+class NewsletterMuteState(str, Enum):
+    """
+    Mute state of a newsletter.
+
+    Port of NewsletterMuteState in Go.
+    """
+    ON = "on"
+    OFF = "off"
+
+    @classmethod
+    def from_text(cls, text: str) -> 'NewsletterMuteState':
+        """Case-insensitive parsing like Go's UnmarshalText."""
+        return cls(text.lower())
+
+
+class NewsletterRole(str, Enum):
+    """
+    Role in a newsletter.
+
+    Port of NewsletterRole in Go.
+    """
+    SUBSCRIBER = "subscriber"
+    GUEST = "guest"
+    ADMIN = "admin"
+    OWNER = "owner"
+
+    @classmethod
+    def from_text(cls, text: str) -> 'NewsletterRole':
+        """Case-insensitive parsing like Go's UnmarshalText."""
+        return cls(text.lower())
+
+
+@dataclass
+class NewsletterText:
+    """
+    Text content in a newsletter.
+
+    Port of NewsletterText in Go.
+    """
+    text: str
+    id: str
+    update_time: datetime  # In Go: jsontime.UnixMicroString
+
+
+@dataclass
+class NewsletterReactionSettings:
+    """
+    Reaction settings for a newsletter.
+
+    Port of NewsletterReactionSettings in Go.
+    """
+    value: NewsletterReactionsMode
 
 
 @dataclass
 class NewsletterSettings:
-    """Settings for a newsletter."""
-    name: str
-    description: str = ""
-    is_muted: bool = False
-    is_following: bool = False
-    is_subscribed: bool = False
-    is_admin: bool = False
-    is_verified: bool = False
-    verification_status: NewsletterVerificationStatus = NewsletterVerificationStatus.UNVERIFIED
-    reactions_mode: NewsletterReactionsMode = NewsletterReactionsMode.ALL
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-    
-    def to_dict(self) -> Dict:
-        """Convert to a dictionary for serialization."""
-        return {
-            'name': self.name,
-            'description': self.description,
-            'is_muted': self.is_muted,
-            'is_following': self.is_following,
-            'is_subscribed': self.is_subscribed,
-            'is_admin': self.is_admin,
-            'is_verified': self.is_verified,
-            'verification_status': self.verification_status.value,
-            'reactions_mode': self.reactions_mode.value,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'NewsletterSettings':
-        """Create from a dictionary."""
-        from datetime import datetime
-        return cls(
-            name=data['name'],
-            description=data.get('description', ''),
-            is_muted=data.get('is_muted', False),
-            is_following=data.get('is_following', False),
-            is_subscribed=data.get('is_subscribed', False),
-            is_admin=data.get('is_admin', False),
-            is_verified=data.get('is_verified', False),
-            verification_status=NewsletterVerificationStatus(data.get('verification_status', 'unverified')),
-            reactions_mode=NewsletterReactionsMode(data.get('reactions_mode', 'all')),
-            created_at=datetime.fromisoformat(data['created_at']) if data.get('created_at') else None,
-            updated_at=datetime.fromisoformat(data['updated_at']) if data.get('updated_at') else None,
-        )
+    """
+    Settings for a newsletter.
+
+    Port of NewsletterSettings in Go.
+    """
+    reaction_codes: NewsletterReactionSettings
 
 
 @dataclass
-class NewsletterMessageInfo:
-    """Information about a newsletter message."""
-    message_id: str
-    newsletter_jid: JID
-    author_jid: JID
-    timestamp: datetime
-    content: str
-    
-    # Message status
-    is_edited: bool = False
-    is_deleted: bool = False
-    is_forwarded: bool = False
-    
-    # Engagement metrics
-    view_count: int = 0
-    like_count: int = 0
-    comment_count: int = 0
-    
-    # Media information
-    has_media: bool = False
-    media_url: Optional[str] = None
-    media_type: Optional[str] = None
-    media_caption: Optional[str] = None
-    
-    # Additional metadata
-    raw_data: Optional[Dict] = None
-    
-    def to_dict(self) -> Dict:
-        """Convert to a dictionary for serialization."""
-        return {
-            'message_id': self.message_id,
-            'newsletter_jid': str(self.newsletter_jid),
-            'author_jid': str(self.author_jid),
-            'timestamp': self.timestamp.isoformat(),
-            'content': self.content,
-            'is_edited': self.is_edited,
-            'is_deleted': self.is_deleted,
-            'is_forwarded': self.is_forwarded,
-            'view_count': self.view_count,
-            'like_count': self.like_count,
-            'comment_count': self.comment_count,
-            'has_media': self.has_media,
-            'media_url': self.media_url,
-            'media_type': self.media_type,
-            'media_caption': self.media_caption,
-            'raw_data': self.raw_data,
-        }
-    
+class NewsletterThreadMetadata:
+    """
+    Metadata for a newsletter thread.
+
+    Port of NewsletterThreadMetadata in Go.
+    """
+    creation_time: datetime  # In Go: jsontime.UnixString
+    invite_code: str
+    name: NewsletterText
+    description: NewsletterText
+    subscriber_count: int
+    verification_state: NewsletterVerificationState
+    picture: Optional[ProfilePictureInfo] = None  # In Go: *ProfilePictureInfo
+    preview: ProfilePictureInfo  # In Go: ProfilePictureInfo
+    settings: NewsletterSettings
+
     @classmethod
-    def from_dict(cls, data: Dict) -> 'NewsletterMessageInfo':
-        """Create from a dictionary."""
-        from datetime import datetime
-        return cls(
-            message_id=data['message_id'],
-            newsletter_jid=JID.from_string(data['newsletter_jid']),
-            author_jid=JID.from_string(data['author_jid']),
-            timestamp=datetime.fromisoformat(data['timestamp']),
-            content=data['content'],
-            is_edited=data.get('is_edited', False),
-            is_deleted=data.get('is_deleted', False),
-            is_forwarded=data.get('is_forwarded', False),
-            view_count=data.get('view_count', 0),
-            like_count=data.get('like_count', 0),
-            comment_count=data.get('comment_count', 0),
-            has_media=data.get('has_media', False),
-            media_url=data.get('media_url'),
-            media_type=data.get('media_type'),
-            media_caption=data.get('media_caption'),
-            raw_data=data.get('raw_data'),
-        )
+    def from_json(cls, data: dict) -> 'NewsletterThreadMetadata':
+        """Handle JSON parsing with proper field mapping."""
+        # Handle subscribers_count as string -> int conversion
+        if 'subscribers_count' in data:
+            data['subscriber_count'] = int(data.pop('subscribers_count'))
+        return cls(**data)
 
 
 @dataclass
-class NewsletterReaction:
-    """A reaction to a newsletter message."""
-    message_id: str
-    newsletter_jid: JID
-    reactor_jid: JID
-    reaction: str
+class NewsletterViewerMetadata:
+    """
+    Metadata for a newsletter viewer.
+
+    Port of NewsletterViewerMetadata in Go.
+    """
+    mute: NewsletterMuteState
+    role: NewsletterRole
+
+
+@dataclass
+class NewsletterMetadata:
+    """
+    Metadata for a newsletter.
+
+    Port of NewsletterMetadata in Go.
+    """
+    id: JID
+    state: WrappedNewsletterState
+    thread_meta: NewsletterThreadMetadata
+    viewer_meta: Optional[NewsletterViewerMetadata] = None
+
+
+class NewsletterKeyType(str, Enum):
+    """
+    Type of newsletter key.
+
+    Port of NewsletterKeyType in Go.
+    """
+    JID = "JID"
+    INVITE = "INVITE"
+
+
+@dataclass
+class NewsletterMessage:
+    """
+    A message in a newsletter.
+
+    Port of NewsletterMessage in Go.
+    """
+    message_server_id: MessageServerID
+    message_id: MessageID
+    type: str
     timestamp: datetime
-    
-    def to_dict(self) -> Dict:
-        """Convert to a dictionary for serialization."""
-        return {
-            'message_id': self.message_id,
-            'newsletter_jid': str(self.newsletter_jid),
-            'reactor_jid': str(self.reactor_jid),
-            'reaction': self.reaction,
-            'timestamp': self.timestamp.isoformat(),
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'NewsletterReaction':
-        """Create from a dictionary."""
-        from datetime import datetime
-        return cls(
-            message_id=data['message_id'],
-            newsletter_jid=JID.from_string(data['newsletter_jid']),
-            reactor_jid=JID.from_string(data['reactor_jid']),
-            reaction=data['reaction'],
-            timestamp=datetime.fromisoformat(data['timestamp']),
-        )
+    views_count: int
+    reaction_counts: Dict[str, int]
+    message: Optional[Message] = None  # From protobuf
+
+
+@dataclass
+class GraphQLErrorExtensions:
+    """
+    Extensions for a GraphQL error.
+
+    Port of GraphQLErrorExtensions in Go.
+    """
+    error_code: int
+    is_retryable: bool
+    severity: str
+
+
+@dataclass
+class GraphQLError:
+    """
+    A GraphQL error.
+
+    Port of GraphQLError in Go.
+    """
+    extensions: GraphQLErrorExtensions
+    message: str
+    path: List[str]
+
+    def __str__(self) -> str:
+        """
+        String representation of the error.
+
+        Port of Error() method in Go.
+        """
+        return f"{self.extensions.error_code} {self.message} ({self.extensions.severity})"
+
+
+class GraphQLErrors(List[GraphQLError]):
+    """
+    A list of GraphQL errors.
+
+    Port of GraphQLErrors in Go.
+    """
+
+    def unwrap(self) -> List[Exception]:
+        """
+        Unwrap the errors into a list of exceptions.
+
+        Port of Unwrap() method in Go.
+        """
+        return [err for err in self]
+
+    def __str__(self) -> str:
+        """
+        String representation of the errors.
+
+        Port of Error() method in Go.
+        """
+        if not self:
+            return ""
+        elif len(self) == 1:
+            return str(self[0])
+        else:
+            return f"{self[0]} (and {len(self)-1} other errors)"
+
+
+@dataclass
+class GraphQLResponse:
+    """
+    A response from a GraphQL API.
+
+    Port of GraphQLResponse in Go.
+    """
+    data: Any  # In Go: json.RawMessage
+    errors: GraphQLErrors

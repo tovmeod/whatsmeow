@@ -83,7 +83,7 @@ await client.send_message(
 
 ## Example
 
-See the [disappearing_messages_example.py](../examples/disappearing_messages_example.py) file for a complete example of using disappearing messages in PyMeow.
+See the [disappearing_messages_example.py](examples/disappearing_messages_example.py) file for a complete example of using disappearing messages in PyMeow.
 
 ## Notes
 
