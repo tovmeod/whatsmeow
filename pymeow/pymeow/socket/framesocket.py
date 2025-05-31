@@ -17,6 +17,7 @@ from .constants import (
     FrameTooLargeError, SocketClosedError, SocketAlreadyOpenError
 )
 
+logger = logging.getLogger(__name__)
 
 class FrameSocket:
     """
@@ -26,7 +27,7 @@ class FrameSocket:
     handling the framing protocol used by WhatsApp Web.
     """
 
-    def __init__(self, log: Optional[logging.Logger] = None):
+    def __init__(self):
         """
         Initialize a new FrameSocket.
 
@@ -37,7 +38,6 @@ class FrameSocket:
         self._session: Optional[ClientSession] = None
         self._task: Optional[asyncio.Task] = None
         self._closed: bool = False
-        self.log = log or logging.getLogger("pymeow.socket.framesocket")
 
         self.url: str = URL
         self.http_headers: Dict[str, str] = {"Origin": ORIGIN}
@@ -88,7 +88,7 @@ class FrameSocket:
             try:
                 await self._ws.close(code=code)
             except Exception as e:
-                self.log.warning(f"Error sending close message: {e}")
+                logger.warning(f"Error sending close message: {e}")
 
         if self._task is not None:
             self._task.cancel()
@@ -99,14 +99,14 @@ class FrameSocket:
             try:
                 await self._ws.close()
             except Exception as e:
-                self.log.error(f"Error closing websocket: {e}")
+                logger.error(f"Error closing websocket: {e}")
             self._ws = None
 
         if self._session is not None:
             try:
                 await self._session.close()
             except Exception as e:
-                self.log.error(f"Error closing session: {e}")
+                logger.error(f"Error closing session: {e}")
             self._session = None
 
         if self.on_disconnect:
@@ -124,7 +124,7 @@ class FrameSocket:
             raise SocketAlreadyOpenError()
 
         self._closed = False
-        self.log.debug(f"Dialing {self.url}")
+        logger.debug(f"Dialing {self.url}")
 
         try:
             # Create a new session
@@ -187,7 +187,7 @@ class FrameSocket:
             try:
                 await asyncio.wait_for(self._ws.send_bytes(whole_frame), timeout=self.write_timeout)
             except asyncio.TimeoutError:
-                self.log.warning(f"Write timed out after {self.write_timeout}s")
+                logger.warning(f"Write timed out after {self.write_timeout}s")
                 raise
         else:
             await self._ws.send_bytes(whole_frame)
@@ -236,7 +236,7 @@ class FrameSocket:
                         data = bytearray()
                 else:
                     # We have a partial header
-                    self.log.warning("Received partial header (report if this happens often)")
+                    logger.warning("Received partial header (report if this happens often)")
                     self.partial_header = data
                     data = bytearray()
             else:
@@ -255,39 +255,26 @@ class FrameSocket:
 
     async def _receive_loop(self) -> None:
         """Handle incoming WebSocket messages."""
-        self.log.debug(f"Frame websocket receive loop starting {id(self)}")
+        logger.debug(f"Frame websocket receive loop starting {id(self)}")
 
         try:
             async for msg in self._ws:
                 if msg.type == WSMsgType.BINARY:
                     self._process_data(msg.data)
                 elif msg.type == WSMsgType.CLOSE:
-                    self.log.debug(f"Server closed websocket with status {msg.data}")
+                    logger.debug(f"Server closed websocket with status {msg.data}")
                     break
                 else:
-                    self.log.warning(f"Got unexpected websocket message type {msg.type}")
+                    logger.warning(f"Got unexpected websocket message type {msg.type}")
         except asyncio.CancelledError:
             # Normal cancellation, don't log an error
             pass
         except Exception as e:
             # Only log if not closed intentionally
             if not self._closed:
-                self.log.error(f"Error reading from websocket: {e}")
+                logger.error(f"Error reading from websocket: {e}")
         finally:
-            self.log.debug(f"Frame websocket receive loop exiting {id(self)}")
+            logger.debug(f"Frame websocket receive loop exiting {id(self)}")
             # Use create_task to avoid blocking in the finally block
             if not self._closed:
                 asyncio.create_task(self.close(0))
-
-
-def new_frame_socket(log: Optional[logging.Logger] = None) -> FrameSocket:
-    """
-    Create a new FrameSocket with default settings.
-
-    Args:
-        log: Logger to use for logging
-
-    Returns:
-        A new FrameSocket instance
-    """
-    return FrameSocket(log)

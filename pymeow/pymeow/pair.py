@@ -6,6 +6,7 @@ Port of whatsmeow/pair.go
 import base64
 import hmac
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import Optional, Callable, Awaitable, Union, List, Dict, Any, Tuple
 import asyncio
@@ -25,6 +26,8 @@ ADV_HOSTED_PREFIX_DEVICE_IDENTITY_ACCOUNT_SIGNATURE = bytes([6, 5])
 ADV_HOSTED_PREFIX_DEVICE_IDENTITY_DEVICE_SIGNATURE_VERIFICATION = bytes([6, 6])
 
 from signal_protocol import curve
+
+logger = logging.getLogger(__name__)
 
 def concat_bytes(*data: bytes) -> bytes:
     """
@@ -169,7 +172,6 @@ class PairDevice:
         self._qr_callback: Optional[Callable[[bytes], Awaitable[None]]] = None
         self._ref_callback: Optional[Callable[[str], Awaitable[None]]] = None
         self.store = None
-        self.log = None
         self.pre_pair_callback = None
         self.phone_linking_cache = None
         self._expect_disconnect = False
@@ -186,7 +188,6 @@ class PairDevice:
         """
         # Set up references
         self.store = client.store
-        self.log = client.log
         self.pre_pair_callback = client.pre_pair_callback
 
         # Set up methods
@@ -368,17 +369,17 @@ class PairDevice:
                 },
             ))
         except Exception as e:
-            self.log.warning(f"Failed to send acknowledgement for pair-device request: {e}")
+            logger.warning(f"Failed to send acknowledgement for pair-device request: {e}")
 
         evt = events.QR(codes=[])
         for i, child in enumerate(pair_device.get_children()):
             if child.tag != "ref":
-                self.log.warning(f"pair-device node contains unexpected child tag {child.tag} at index {i}")
+                logger.warning(f"pair-device node contains unexpected child tag {child.tag} at index {i}")
                 continue
 
             content = child.content
             if not isinstance(content, bytes):
-                self.log.warning(f"pair-device node contains unexpected child content type {type(content)} at index {i}")
+                logger.warning(f"pair-device node contains unexpected child content type {type(content)} at index {i}")
                 continue
 
             evt.codes.append(self.make_qr_data(content.decode()))
@@ -417,7 +418,7 @@ class PairDevice:
         platform = pair_success.get_child_by_tag("platform").attrs.get("name", "")
 
         if not device_jid or not device_lid:
-            self.log.error("Invalid JID or LID in pair-success message")
+            logger.error("Invalid JID or LID in pair-success message")
             return
 
         # Handle pairing in a separate task
@@ -445,7 +446,7 @@ class PairDevice:
         try:
             await self.handle_pair(ctx, device_identity_bytes, req_id,
                                   business_name, platform, device_jid, device_lid)
-            self.log.info(f"Successfully paired {self.store.id}")
+            logger.info(f"Successfully paired {self.store.id}")
             self.dispatch_event(events.PairSuccess(
                 id=device_jid,
                 lid=device_lid,
@@ -453,7 +454,7 @@ class PairDevice:
                 platform=platform
             ))
         except Exception as e:
-            self.log.error(f"Failed to pair device: {e}")
+            logger.error(f"Failed to pair device: {e}")
             self.disconnect()
             self.dispatch_event(events.PairError(
                 id=device_jid,
@@ -509,7 +510,7 @@ class PairDevice:
 
         hmac_value = safe_get_proto_bytes(device_identity_container, "hmac")
         if h.digest() != hmac_value:
-            self.log.warning("Invalid HMAC from pair success message")
+            logger.warning("Invalid HMAC from pair success message")
             await self.send_pair_error(req_id, 401, "hmac-mismatch")
             raise PairInvalidDeviceIdentityHMACError()
 
@@ -697,7 +698,7 @@ class PairDevice:
                 )],
             ))
         except Exception as e:
-            self.log.error(f"Failed to send pair error node: {e}")
+            logger.error(f"Failed to send pair error node: {e}")
 
     async def pair(self, config: Optional[PairConfig] = None) -> None:
         """

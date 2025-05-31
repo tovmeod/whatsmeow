@@ -6,6 +6,7 @@ Port of whatsmeow/sendfb.go
 import asyncio
 import hmac
 import hashlib
+import logging
 import uuid
 import random
 import base64
@@ -46,6 +47,7 @@ RealMessageApplicationSub = Union[
     WAArmadilloApplication_pb2.Armadillo
 ]
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class MessageDebugTimings:
@@ -470,13 +472,13 @@ class Client:
                 resp_node = wait_task.result()
             # Check if we timed out
             elif timeout_task and timeout_task in done:
-                self.log.warning(f"Message {req.id} to {to} timed out after {req.timeout}s")
+                logger.warning(f"Message {req.id} to {to} timed out after {req.timeout}s")
                 raise MessageTimedOutError()
         except asyncio.CancelledError:
-            self.log.warning(f"Message {req.id} to {to} was cancelled")
+            logger.warning(f"Message {req.id} to {to} was cancelled")
             raise
         except Exception as e:
-            self.log.error(f"Error waiting for response to message {req.id}: {e}")
+            logger.error(f"Error waiting for response to message {req.id}: {e}")
             raise
         finally:
             # Clean up any pending tasks
@@ -508,7 +510,7 @@ class Client:
 
             expected_phash = resp_node.attrs.get("phash", "")
             if expected_phash and phash != expected_phash:
-                self.log.warning(
+                logger.warning(
                     f"Server returned different participant list hash when sending to {to}. "
                     "Some devices may not have received the message."
                 )
@@ -866,7 +868,7 @@ class Client:
                 retry_devices.append(jid)
             except Exception as e:
                 # TODO: Return these errors if it's a fatal one (like context cancellation or database)
-                self.log.warning(f"Failed to encrypt {id} for {jid}: {e}")
+                logger.warning(f"Failed to encrypt {id} for {jid}: {e}")
                 continue
 
         # Retry encryption for devices without sessions
@@ -876,7 +878,7 @@ class Client:
                 for jid in retry_devices:
                     if jid not in bundles or bundles[jid].err:
                         if jid in bundles:
-                            self.log.warning(f"Failed to fetch prekey for {jid}: {bundles[jid].err}")
+                            logger.warning(f"Failed to fetch prekey for {jid}: {bundles[jid].err}")
                         continue
 
                     dsm_for_device = None
@@ -890,10 +892,10 @@ class Client:
                         participant_nodes.append(encrypted)
                     except Exception as e:
                         # TODO: Return these errors if it's a fatal one (like context cancellation or database)
-                        self.log.warning(f"Failed to encrypt {id} for {jid} (retry): {e}")
+                        logger.warning(f"Failed to encrypt {id} for {jid} (retry): {e}")
                         continue
             except Exception as e:
-                self.log.warning(f"Failed to fetch prekeys for {retry_devices} to retry encryption: {e}")
+                logger.warning(f"Failed to fetch prekeys for {retry_devices} to retry encryption: {e}")
 
         return participant_nodes
 
@@ -980,51 +982,51 @@ class Client:
 
         try:
             # Create session builder
-            self.log.debug(f"Creating session builder for {to}")
+            logger.debug(f"Creating session builder for {to}")
             builder = SessionBuilder(self.store, to.signal_address(), self.pb_serializer)
 
             if bundle is not None:
-                self.log.debug(f"Processing prekey bundle for {to}")
+                logger.debug(f"Processing prekey bundle for {to}")
                 try:
                     await builder.process_bundle(ctx, bundle)
                 except Exception as e:
                     error_msg = str(e).lower()
                     if self.auto_trust_identity and "untrusted identity" in error_msg:
-                        self.log.warning(f"Got untrusted identity error for {to}, clearing stored identity and retrying")
+                        logger.warning(f"Got untrusted identity error for {to}, clearing stored identity and retrying")
                         try:
                             await self.clear_untrusted_identity(ctx, to)
                             await builder.process_bundle(ctx, bundle)
-                            self.log.info(f"Successfully processed bundle for {to} after clearing identity")
+                            logger.info(f"Successfully processed bundle for {to} after clearing identity")
                         except Exception as e2:
-                            self.log.error(f"Failed to process bundle for {to} after clearing identity: {e2}")
+                            logger.error(f"Failed to process bundle for {to} after clearing identity: {e2}")
                             raise UntrustedIdentityError(to) from e2
                     elif "no prekey" in error_msg:
-                        self.log.error(f"No prekey found in bundle for {to}")
+                        logger.error(f"No prekey found in bundle for {to}")
                         raise NoSessionError() from e
                     elif "invalid signature" in error_msg:
-                        self.log.error(f"Invalid signature in bundle for {to}")
+                        logger.error(f"Invalid signature in bundle for {to}")
                         raise EncryptionError(f"Invalid signature in bundle for {to}") from e
                     else:
-                        self.log.error(f"Failed to process bundle for {to}: {e}")
+                        logger.error(f"Failed to process bundle for {to}: {e}")
                         raise UntrustedIdentityError(to) from e
             elif not await self.store.contains_session(ctx, to.signal_address()):
-                self.log.warning(f"No session found for {to} and no bundle provided")
+                logger.warning(f"No session found for {to} and no bundle provided")
                 raise NoSessionError()
 
             # Create cipher
-            self.log.debug(f"Creating cipher for {to}")
+            logger.debug(f"Creating cipher for {to}")
             cipher = SessionCipher(builder, to.signal_address())
         except NoSessionError:
-            self.log.warning(f"No session available for {to}")
+            logger.warning(f"No session available for {to}")
             raise
         except UntrustedIdentityError as e:
-            self.log.error(f"Untrusted identity for {to}: {e}")
+            logger.error(f"Untrusted identity for {to}: {e}")
             raise
         except asyncio.CancelledError:
-            self.log.warning(f"Encryption for {to} was cancelled")
+            logger.warning(f"Encryption for {to} was cancelled")
             raise
         except Exception as e:
-            self.log.error(f"Unexpected error creating session for {to}: {e}")
+            logger.error(f"Unexpected error creating session for {to}: {e}")
             raise EncryptionError(f"Failed to create session for {to}: {str(e)}") from e
 
         # Create message transport
@@ -1046,28 +1048,28 @@ class Client:
 
         # Serialize and encrypt
         try:
-            self.log.debug(f"Serializing message transport for {to}")
+            logger.debug(f"Serializing message transport for {to}")
             plaintext = message_transport.SerializeToString()
 
-            self.log.debug(f"Encrypting message for {to}")
+            logger.debug(f"Encrypting message for {to}")
             ciphertext = await cipher.encrypt(ctx, plaintext)
-            self.log.debug(f"Successfully encrypted message for {to}")
+            logger.debug(f"Successfully encrypted message for {to}")
         except asyncio.CancelledError:
-            self.log.warning(f"Message encryption for {to} was cancelled")
+            logger.warning(f"Message encryption for {to} was cancelled")
             raise
         except Exception as e:
             error_msg = str(e).lower()
             if "session not found" in error_msg:
-                self.log.error(f"Session not found for {to} during encryption")
+                logger.error(f"Session not found for {to} during encryption")
                 raise NoSessionError() from e
             elif "untrusted identity" in error_msg:
-                self.log.error(f"Untrusted identity for {to} during encryption")
+                logger.error(f"Untrusted identity for {to} during encryption")
                 raise UntrustedIdentityError(to) from e
             elif "invalid key" in error_msg:
-                self.log.error(f"Invalid key for {to} during encryption: {e}")
+                logger.error(f"Invalid key for {to} during encryption: {e}")
                 raise EncryptionError(f"Invalid key for {to}: {str(e)}") from e
             else:
-                self.log.error(f"Failed to encrypt message for {to}: {e}")
+                logger.error(f"Failed to encrypt message for {to}: {e}")
                 raise EncryptionError(f"Failed to encrypt message for {to}: {str(e)}") from e
 
         # Create encryption attributes
@@ -1122,7 +1124,7 @@ class Client:
             SendNodeError: If there's an error sending the node
         """
         try:
-            self.log.debug(f"Creating payload for DM to {to}")
+            logger.debug(f"Creating payload for DM to {to}")
             # Create payload
             payload = WAMsgTransport_pb2.MessageTransport.Payload(
                 applicationPayload=WACommon_pb2.SubProtocol(
@@ -1132,7 +1134,7 @@ class Client:
                 futureProof=WACommon_pb2.FutureProofBehavior.PLACEHOLDER
             )
 
-            self.log.debug(f"Preparing message node for DM to {to}")
+            logger.debug(f"Preparing message node for DM to {to}")
             # Prepare message node
             try:
                 node, all_devices = await self.prepare_message_node_v3(
@@ -1140,35 +1142,35 @@ class Client:
                     [to, own_id.to_non_ad()], timings
                 )
             except DeviceListError as e:
-                self.log.error(f"Failed to get device list for DM to {to}: {e}")
+                logger.error(f"Failed to get device list for DM to {to}: {e}")
                 raise
             except EncryptionError as e:
-                self.log.error(f"Encryption error preparing message node for DM to {to}: {e}")
+                logger.error(f"Encryption error preparing message node for DM to {to}: {e}")
                 raise
             except asyncio.CancelledError:
-                self.log.warning(f"Message preparation for DM to {to} was cancelled")
+                logger.warning(f"Message preparation for DM to {to} was cancelled")
                 raise
             except Exception as e:
-                self.log.error(f"Unexpected error preparing message node for DM to {to}: {e}")
+                logger.error(f"Unexpected error preparing message node for DM to {to}: {e}")
                 raise SendNodeError(f"Failed to prepare message node for {to}: {str(e)}") from e
 
-            self.log.debug(f"Sending node for DM to {to}")
+            logger.debug(f"Sending node for DM to {to}")
             # Send node and get data
             start = datetime.now()
             try:
                 data = await self.send_node_and_get_data(node)
                 timings.send = (datetime.now() - start).total_seconds()
-                self.log.debug(f"Successfully sent DM to {to} in {timings.send:.3f}s")
+                logger.debug(f"Successfully sent DM to {to} in {timings.send:.3f}s")
             except asyncio.CancelledError:
-                self.log.warning(f"Sending DM to {to} was cancelled")
+                logger.warning(f"Sending DM to {to} was cancelled")
                 raise
             except Exception as e:
-                self.log.error(f"Failed to send node for DM to {to}: {e}")
+                logger.error(f"Failed to send node for DM to {to}: {e}")
                 raise SendNodeError(f"Failed to send message to {to}: {str(e)}") from e
 
             # Calculate participant hash
             phash = participant_list_hash_v2(all_devices)
-            self.log.debug(f"Calculated participant hash for DM to {to}: {phash}")
+            logger.debug(f"Calculated participant hash for DM to {to}: {phash}")
 
             # Return data and participant hash
             return data, phash
@@ -1182,5 +1184,5 @@ class Client:
             # Already logged and raised in inner try blocks
             raise
         except Exception as e:
-            self.log.error(f"Unexpected error sending DM to {to}: {e}")
+            logger.error(f"Unexpected error sending DM to {to}: {e}")
             raise SendNodeError(f"Failed to send DM to {to}: {str(e)}") from e

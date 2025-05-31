@@ -25,6 +25,8 @@ from .appstate.keys import WAPatchName, Processor, ExpandedAppStateKeys
 from .appstate.hash import HashState
 from .appstate.errors import ErrKeyNotFound
 
+logger = logging.getLogger(__name__)
+
 # Define ErrAppStateUpdate error class
 class ErrAppStateUpdate(Exception):
     """Raised when the server returns an error updating app state."""
@@ -78,7 +80,6 @@ class AppState:
         self.client = client
         self.store = store
         self.processor = processor
-        self.log = log or logging.getLogger("pymeow.appstate")
         self.app_state_sync_lock = asyncio.Lock()
         self.app_state_key_requests_lock = asyncio.Lock()
         self.app_state_key_requests: Dict[str, float] = {}
@@ -143,7 +144,7 @@ class AppState:
                 if name == WAPatchName.CRITICAL_UNBLOCK_LOW and was_full_sync and not self.emit_app_state_events_on_full_sync:
                     contacts = []
                     mutations, contacts = self.filter_contacts(mutations)
-                    self.log.debug(f"Mass inserting app state snapshot with {len(contacts)} contacts into the store")
+                    logger.debug(f"Mass inserting app state snapshot with {len(contacts)} contacts into the store")
                     err = await self.store.contacts.put_all_contact_names(ctx, contacts)
                     if err:
                         raise Exception(f"Failed to update contact store with data from snapshot: {err}")
@@ -152,10 +153,10 @@ class AppState:
                     await self.dispatch_app_state(ctx, mutation, full_sync, self.emit_app_state_events_on_full_sync)
 
             if full_sync:
-                self.log.debug(f"Full sync of app state {name} completed. Current version: {state.version}")
+                logger.debug(f"Full sync of app state {name} completed. Current version: {state.version}")
                 self.client.dispatch_event(events.AppStateSyncComplete(name=name))
             else:
-                self.log.debug(f"Synced app state {name} from version {version} to {state.version}")
+                logger.debug(f"Synced app state {name} from version {version} to {state.version}")
 
     def filter_contacts(self, mutations: List[Any]) -> Tuple[List[Any], List[Any]]:
         """
@@ -334,7 +335,7 @@ class AppState:
             self.store.push_name = mutation.action.push_name_setting.name
             err = await self.store.save(ctx)
             if err:
-                self.log.error(f"Failed to save device store after updating push name: {err}")
+                logger.error(f"Failed to save device store after updating push name: {err}")
 
         elif mutation.index[0] == "setting_unarchiveChats":
             event_to_dispatch = events.UnarchiveChatsSetting(
@@ -384,7 +385,7 @@ class AppState:
             )
 
         if store_update_error:
-            self.log.error(f"Failed to update device store after app state mutation: {store_update_error}")
+            logger.error(f"Failed to update device store after app state mutation: {store_update_error}")
 
         if dispatch_evts and event_to_dispatch:
             self.client.dispatch_event(event_to_dispatch)
@@ -492,12 +493,12 @@ class AppState:
         if own_id.is_empty() or not debug_key_ids:
             return
 
-        self.log.info(f"Sending key request for app state keys {debug_key_ids}")
+        logger.info(f"Sending key request for app state keys {debug_key_ids}")
 
         try:
             await self.client.send_message(ctx, own_id, msg, {"peer": True})
         except Exception as e:
-            self.log.warning(f"Failed to send app state key request: {e}")
+            logger.warning(f"Failed to send app state key request: {e}")
 
     async def send_app_state(self, ctx: Any, patch: Any) -> None:
         """

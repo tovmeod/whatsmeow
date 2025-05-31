@@ -40,6 +40,7 @@ from .hash import (
 )
 from .keys import ExpandedAppStateKeys, Processor
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class PatchList:
@@ -272,17 +273,17 @@ class Decoder(Processor):
         try:
             await self.store.app_state.put_app_state_version(ctx, str(name), current_state.version, current_state.hash)
         except Exception as err:
-            self.log.error(f"Failed to update app state version in the database: {err}")
+            logger.error(f"Failed to update app state version in the database: {err}")
 
         try:
             await self.store.app_state.delete_app_state_mutation_macs(ctx, str(name), out.removed_macs)
         except Exception as err:
-            self.log.error(f"Failed to remove deleted mutation MACs from the database: {err}")
+            logger.error(f"Failed to remove deleted mutation MACs from the database: {err}")
 
         try:
             await self.store.app_state.put_app_state_mutation_macs(ctx, str(name), current_state.version, out.added_macs)
         except Exception as err:
-            self.log.error(f"Failed to insert added mutation MACs to the database: {err}")
+            logger.error(f"Failed to insert added mutation MACs to the database: {err}")
 
     async def validate_snapshot_mac(self, ctx: Any, name: WAPatchName, current_state: HashState,
                                   key_id: bytes, expected_snapshot_mac: bytes) -> Tuple[ExpandedAppStateKeys, Optional[Exception]]:
@@ -341,7 +342,7 @@ class Decoder(Processor):
 
         warnings, err = current_state.update_hash(encrypted_mutations, get_prev_set_value_mac)
         if warnings:
-            self.log.warning(f"Warnings while updating hash for {name}: {warnings}")
+            logger.warning(f"Warnings while updating hash for {name}: {warnings}")
         if err:
             return None, None, ValueError(f"Failed to update state hash: {err}")
 
@@ -409,7 +410,7 @@ class Decoder(Processor):
 
             warnings, err = current_state.update_hash(patch.mutations, get_prev_set_value_mac)
             if warnings:
-                self.log.warning(f"Warnings while updating hash for {patch_list.name}: {warnings}")
+                logger.warning(f"Warnings while updating hash for {patch_list.name}: {warnings}")
             if err:
                 return None, None, ValueError(f"Failed to update state hash: {err}")
 

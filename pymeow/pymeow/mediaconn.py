@@ -15,6 +15,7 @@ from .request import InfoQuery, InfoQueryType
 from .types.jid import JID
 from .exceptions import ClientError
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class MediaConnHost:
@@ -49,7 +50,6 @@ class MediaConnMixin:
     def __init__(self):
         self.media_conn_cache: Optional[MediaConn] = None
         self.media_conn_lock = asyncio.Lock()
-        self.log = logging.getLogger("pymeow.mediaconn")
 
     async def refresh_media_conn(self, force: bool = False) -> MediaConn:
         """
@@ -117,7 +117,7 @@ class MediaConnMixin:
             hosts = []
             for child in resp_mc.children:
                 if child.tag != "host":
-                    self.log.warning(f"Unexpected child in media_conn element: {child}")
+                    logger.warning(f"Unexpected child in media_conn element: {child}")
                     continue
 
                 hostname = child.attrs.get("hostname", "")

@@ -78,6 +78,7 @@ class SetProxyOptions:
     no_websocket: bool = False
     no_media: bool = False
 
+logger = logging.getLogger(__name__)
 
 class Client(MediaConnMixin):
     """Client for WhatsApp Web API.
@@ -86,7 +87,7 @@ class Client(MediaConnMixin):
     It handles authentication, message sending/receiving, and other WhatsApp features.
     """
 
-    def __init__(self, device_store: Device, logger: Optional[logging.Logger] = None):
+    def __init__(self, device_store: Device):
         """Initialize a new WhatsApp web client.
 
         Args:
@@ -94,15 +95,10 @@ class Client(MediaConnMixin):
             logger: Optional logger to use for logging. If None, a no-op logger will be used.
         """
         super().__init__()
-        if logger is None:
-            logger = logging.getLogger("pymeow")
-            logger.addHandler(logging.NullHandler())
-
         # Generate a unique ID prefix
         unique_id_prefix = bytes([random.randint(0, 255), random.randint(0, 255)])
 
         self.store = device_store
-        self.log = logger
         self.recv_log = logging.getLogger(f"{logger.name}.Recv")
         self.send_log = logging.getLogger(f"{logger.name}.Send")
 
@@ -345,7 +341,7 @@ class Client(MediaConnMixin):
         # This method should look up a message from the message store
         # For now, we'll just return None as we don't have a message store implementation
         # In a real implementation, this would query a database or other storage
-        self.log.debug(f"Looking up message {message_id} from {sender} in {chat} for retry")
+        logger.debug(f"Looking up message {message_id} from {sender} in {chat} for retry")
         return None
 
     async def send_message(self, to: JID, message: Any, peer: bool = False, **kwargs) -> Any:
@@ -364,7 +360,7 @@ class Client(MediaConnMixin):
         if not peer and kwargs.get("peer"):
             peer = True
 
-        self.log.debug(f"Sending message to {to}" + (" (peer)" if peer else ""))
+        logger.debug(f"Sending message to {to}" + (" (peer)" if peer else ""))
 
         # Implement the actual message sending logic here
         # This would typically involve encryption and sending via the socket
@@ -383,7 +379,7 @@ class Client(MediaConnMixin):
         Returns:
             A message request object
         """
-        self.log.debug(f"Building request for unavailable message {message_id} from {sender} in {chat}")
+        logger.debug(f"Building request for unavailable message {message_id} from {sender} in {chat}")
 
         # Build a proper message request for unavailable messages
         # This would typically involve creating a protobuf message
@@ -462,7 +458,7 @@ class Client(MediaConnMixin):
             # TODO: Check if this is a network error
             is_network_error = True
             if is_network_error and self.initial_auto_reconnect and self.enable_auto_reconnect:
-                self.log.error("Initial connection failed but reconnecting in background")
+                logger.error("Initial connection failed but reconnecting in background")
                 asyncio.create_task(self.dispatch_event(Disconnected()))
                 asyncio.create_task(self._auto_reconnect())
                 return
@@ -490,7 +486,7 @@ class Client(MediaConnMixin):
             # TODO: Implement WebSocket dialer configuration
 
             # Create frame socket
-            fs = FrameSocket(self.log.getChild("Socket"))
+            fs = FrameSocket()
             if self.messenger_config is not None:
                 fs.url = self.messenger_config.websocket_url
                 fs.http_headers["Origin"] = self.messenger_config.base_url
@@ -540,15 +536,15 @@ class Client(MediaConnMixin):
                 await self._clear_response_waiters("xmlstreamend")
 
                 if not self._is_expected_disconnect() and remote:
-                    self.log.debug("Emitting Disconnected event")
+                    logger.debug("Emitting Disconnected event")
                     asyncio.create_task(self.dispatch_event(Disconnected()))
                     asyncio.create_task(self._auto_reconnect())
                 elif remote:
-                    self.log.debug("OnDisconnect() called, but it was expected, so not emitting event")
+                    logger.debug("OnDisconnect() called, but it was expected, so not emitting event")
                 else:
-                    self.log.debug("OnDisconnect() called after manual disconnection")
+                    logger.debug("OnDisconnect() called after manual disconnection")
             else:
-                self.log.debug("Ignoring OnDisconnect on different socket")
+                logger.debug("Ignoring OnDisconnect on different socket")
 
     def _expect_disconnect(self) -> None:
         """Mark that a disconnection is expected."""
@@ -573,7 +569,7 @@ class Client(MediaConnMixin):
 
         while True:
             auto_reconnect_delay = self.auto_reconnect_errors * 2
-            self.log.debug(f"Automatically reconnecting after {auto_reconnect_delay} seconds")
+            logger.debug(f"Automatically reconnecting after {auto_reconnect_delay} seconds")
             self.auto_reconnect_errors += 1
             await asyncio.sleep(auto_reconnect_delay)
 
@@ -582,12 +578,12 @@ class Client(MediaConnMixin):
                 return
             except ValueError as err:
                 if str(err) == "Already connected":
-                    self.log.debug("Connect() said we're already connected after autoreconnect sleep")
+                    logger.debug("Connect() said we're already connected after autoreconnect sleep")
                     return
                 else:
-                    self.log.error(f"Error reconnecting after autoreconnect sleep: {err}")
+                    logger.error(f"Error reconnecting after autoreconnect sleep: {err}")
                     if self.auto_reconnect_hook is not None and not self.auto_reconnect_hook(err):
-                        self.log.debug("AutoReconnectHook returned false, not reconnecting")
+                        logger.debug("AutoReconnectHook returned false, not reconnecting")
                         return
 
     def is_connected(self) -> bool:
@@ -716,22 +712,22 @@ class Client(MediaConnMixin):
         try:
             decompressed = Node.unpack(data)
         except Exception as err:
-            self.log.warning(f"Failed to decompress frame: {err}")
-            self.log.debug(f"Errored frame hex: {data.hex()}")
+            logger.warning(f"Failed to decompress frame: {err}")
+            logger.debug(f"Errored frame hex: {data.hex()}")
             return
 
         try:
             node = Node.unmarshal(decompressed)
         except Exception as err:
-            self.log.warning(f"Failed to decode node in frame: {err}")
-            self.log.debug(f"Errored frame hex: {decompressed.hex()}")
+            logger.warning(f"Failed to decode node in frame: {err}")
+            logger.debug(f"Errored frame hex: {decompressed.hex()}")
             return
 
         self.recv_log.debug(f"{node.xml_string()}")
 
         if node.tag == "xmlstreamend":
             if not self._is_expected_disconnect():
-                self.log.warning("Received stream end frame")
+                logger.warning("Received stream end frame")
             # TODO: Should we do something else?
         elif await self._receive_response(node):
             # Handled by response waiter
@@ -740,10 +736,10 @@ class Client(MediaConnMixin):
             try:
                 await self.handler_queue.put(node)
             except asyncio.QueueFull:
-                self.log.warning("Handler queue is full, message ordering is no longer guaranteed")
+                logger.warning("Handler queue is full, message ordering is no longer guaranteed")
                 asyncio.create_task(self._put_in_handler_queue(node))
         elif node.tag != "ack":
-            self.log.debug(f"Didn't handle WhatsApp node {node.tag}")
+            logger.debug(f"Didn't handle WhatsApp node {node.tag}")
 
     async def _put_in_handler_queue(self, node: Node) -> None:
         """Put a node in the handler queue, waiting if necessary.
@@ -755,7 +751,7 @@ class Client(MediaConnMixin):
 
     async def _handler_queue_loop(self) -> None:
         """Process nodes from the handler queue."""
-        self.log.debug("Starting handler queue loop")
+        logger.debug("Starting handler queue loop")
 
         while True:
             try:
@@ -769,9 +765,9 @@ class Client(MediaConnMixin):
                     async with asyncio.timeout(300):  # 5 minutes
                         await task
                 except asyncio.TimeoutError:
-                    self.log.warning(f"Node handling is taking long for {node.xml_string()} - continuing in background")
+                    logger.warning(f"Node handling is taking long for {node.xml_string()} - continuing in background")
             except asyncio.CancelledError:
-                self.log.debug("Closing handler queue loop")
+                logger.debug("Closing handler queue loop")
                 return
 
     async def _process_node(self, node: Node) -> None:
@@ -787,11 +783,11 @@ class Client(MediaConnMixin):
             if handler:
                 await handler(node)
         except Exception as e:
-            self.log.error(f"Error handling node {node.tag}: {e}")
+            logger.error(f"Error handling node {node.tag}: {e}")
 
         duration = time.time() - start
         if duration > 5:
-            self.log.warning(f"Node handling took {duration:.2f}s for {node.xml_string()}")
+            logger.warning(f"Node handling took {duration:.2f}s for {node.xml_string()}")
 
     async def _send_node_and_get_data(self, node: Node) -> bytes:
         """Send a node to the server and get the raw data.
@@ -921,7 +917,7 @@ class Client(MediaConnMixin):
             try:
                 handler.fn(evt)
             except Exception as err:
-                self.log.error(f"Event handler panicked while handling a {type(evt).__name__}: {err}")
+                logger.error(f"Event handler panicked while handling a {type(evt).__name__}: {err}")
 
     async def parse_web_message(self, chat_jid: JID, web_msg: waWeb_pb2.WebMessageInfo) -> Any:
         """Parse a WebMessageInfo object into a Message to match what real-time messages have.
@@ -961,7 +957,7 @@ class Client(MediaConnMixin):
         try:
             await self.store.lids.put_lid_mapping(lid, pn)
         except Exception as err:
-            self.log.error(f"Failed to store LID-PN mapping for {lid} -> {pn}: {err}")
+            logger.error(f"Failed to store LID-PN mapping for {lid} -> {pn}: {err}")
 
     # Node handler methods
     async def _handle_encrypted_message(self, node: Node) -> None:
@@ -1377,7 +1373,7 @@ class Client(MediaConnMixin):
         try:
             await waiter.put(node)
         except asyncio.QueueFull:
-            self.log.warning(f"Response queue for {id_attr} is full, dropping response")
+            logger.warning(f"Response queue for {id_attr} is full, dropping response")
 
         return True
 
@@ -1532,10 +1528,10 @@ class Client(MediaConnMixin):
                     try:
                         server_count = await self.get_server_pre_key_count(ctx)
                         if server_count >= WANTED_PREKEY_COUNT:
-                            self.log.debug("Canceling prekey upload request due to likely race condition")
+                            logger.debug("Canceling prekey upload request due to likely race condition")
                             return
                     except Exception as e:
-                        self.log.error(f"Failed to get server pre-key count: {e}")
+                        logger.error(f"Failed to get server pre-key count: {e}")
                         # Continue with upload anyway
 
             # Encode registration ID as 4-byte big-endian integer
@@ -1545,13 +1541,13 @@ class Client(MediaConnMixin):
             try:
                 pre_keys = await self.store.pre_keys.get_or_gen_pre_keys(WANTED_PREKEY_COUNT)
                 if not pre_keys:
-                    self.log.error("No pre-keys available for upload")
+                    logger.error("No pre-keys available for upload")
                     return
             except Exception as e:
-                self.log.error(f"Failed to get pre-keys to upload: {e}")
+                logger.error(f"Failed to get pre-keys to upload: {e}")
                 return
 
-            self.log.info(f"Uploading {len(pre_keys)} new pre-keys to server")
+            logger.info(f"Uploading {len(pre_keys)} new pre-keys to server")
 
             # Send IQ with registration ID, type, identity key, pre-key list, and signed pre-key
             try:
@@ -1570,10 +1566,10 @@ class Client(MediaConnMixin):
                 ))
 
                 if err:
-                    self.log.error(f"Failed to upload pre-keys: {err}")
+                    logger.error(f"Failed to upload pre-keys: {err}")
                     return
 
-                self.log.debug("Got response to uploading pre-keys")
+                logger.debug("Got response to uploading pre-keys")
 
                 # Mark keys as uploaded
                 await self.store.pre_keys.mark_keys_as_uploaded(pre_keys[-1].key_id)
@@ -1582,7 +1578,7 @@ class Client(MediaConnMixin):
                 self.last_pre_key_upload = time.time()
 
             except Exception as e:
-                self.log.error(f"Failed to upload pre-keys: {e}")
+                logger.error(f"Failed to upload pre-keys: {e}")
                 return
 
     async def fetch_pre_keys(self, ctx: Any, users: List['JID']) -> Dict['JID', 'PreKeyResp']:
@@ -1655,7 +1651,7 @@ class Client(MediaConnMixin):
                 from .types import JID
                 user_jid = JID.from_string(child.attributes.get("jid", ""))
             except Exception as e:
-                self.log.warning(f"Failed to parse JID in pre-key response: {e}")
+                logger.warning(f"Failed to parse JID in pre-key response: {e}")
                 continue
 
             # Parse the pre-key bundle or error
@@ -1724,7 +1720,7 @@ class Client(MediaConnMixin):
 
         settings, err = await self.try_fetch_privacy_settings(False)
         if err:
-            self.log.error(f"Failed to fetch privacy settings: {err}")
+            logger.error(f"Failed to fetch privacy settings: {err}")
             return PrivacySettings()
 
         return settings
@@ -1865,11 +1861,11 @@ class Client(MediaConnMixin):
         Args:
             privacy_node: The node containing the privacy settings notification.
         """
-        self.log.debug("Parsing privacy settings change notification")
+        logger.debug("Parsing privacy settings change notification")
 
         settings, err = await self.try_fetch_privacy_settings(False)
         if err:
-            self.log.error(f"Failed to fetch privacy settings when handling change: {err}")
+            logger.error(f"Failed to fetch privacy settings when handling change: {err}")
             return
 
         evt = self._parse_privacy_settings(privacy_node, settings)
@@ -1947,7 +1943,7 @@ class Client(MediaConnMixin):
 
             return True
         except Exception as e:
-            self.log.error(f"Error verifying server certificate: {e}")
+            logger.error(f"Error verifying server certificate: {e}")
             return False
 
     async def get_server_push_notification_config(self) -> Optional[Node]:
@@ -1965,7 +1961,7 @@ class Client(MediaConnMixin):
         ))
 
         if err:
-            self.log.error(f"Failed to get server push notification config: {err}")
+            logger.error(f"Failed to get server push notification config: {err}")
             return None
 
         return resp

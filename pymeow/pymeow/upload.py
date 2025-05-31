@@ -51,7 +51,6 @@ class Client:
     def __init__(self):
         self.http_session = None
         self.messenger_config = None
-        self.logger = None
 
     async def ensure_http_session(self):
         """Ensure an HTTP session exists."""

@@ -137,6 +137,7 @@ MEDIA_TYPE_TO_MMS_TYPE = {
 # Constants
 MEDIA_HMAC_LENGTH = 10
 
+logger = logging.getLogger(__name__)
 
 class MediaDownloader:
     """Handles downloading media from WhatsApp servers."""
@@ -150,7 +151,6 @@ class MediaDownloader:
         self.client = client
         self.media_conn = MediaConn()
         self.http_session = None
-        self.logger = None  # Will be set by the client
 
     async def ensure_http_session(self):
         """Ensure an HTTP session exists."""
@@ -313,8 +313,7 @@ class MediaDownloader:
                 MEDIA_TYPE_TO_MMS_TYPE[media_type]
             )
         else:
-            if is_web_whatsapp_net_url and self.logger:
-                self.logger.warning(f"Got a media message with a web.whatsapp.net URL ({url}) and no direct path")
+            logger.warning(f"Got a media message with a web.whatsapp.net URL ({url}) and no direct path")
             raise ErrNoURLPresent
 
     async def download_fb(
@@ -405,8 +404,7 @@ class MediaDownloader:
                 if i >= len(hosts) - 1:
                     raise DownloadError(f"Failed to download media from last host: {e}")
 
-                if self.logger:
-                    self.logger.warning(f"Failed to download media: {e}, trying with next host...")
+                logger.warning(f"Failed to download media: {e}, trying with next host...")
 
         # This should never be reached due to the exception handling above
         raise DownloadError("Failed to download media")
@@ -548,8 +546,7 @@ class MediaDownloader:
                     except ValueError:
                         pass
 
-                if self.logger:
-                    self.logger.warning(
+                logger.warning(
                         f"Failed to download media due to network error: {e}, "
                         f"retrying in {retry_duration}s..."
                     )

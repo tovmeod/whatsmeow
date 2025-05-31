@@ -47,7 +47,6 @@ from google.protobuf import message as proto_message
 # TODO: Add imports for session, protocol, and groups modules
 # These are referenced in the code but not imported
 
-# Logger
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -187,7 +186,7 @@ class MessageHandlingMixin:
 
         # Don't send more than 5 retry receipts for the same message
         if retry_count >= 5:
-            self.log.warning(f"Not sending any more retry receipts for {message_id}")
+            logger.warning(f"Not sending any more retry receipts for {message_id}")
             return
 
         # If this is the first retry, start the delayed request from phone
@@ -250,13 +249,13 @@ class MessageHandlingMixin:
                     )
                 )
             except Exception as err:
-                self.log.error(f"Failed to get prekey for retry receipt: {err}")
+                logger.error(f"Failed to get prekey for retry receipt: {err}")
 
         # Send the node
         try:
             await self.send_node(payload)
         except Exception as err:
-            self.log.error(f"Failed to send retry receipt for {message_id}: {err}")
+            logger.error(f"Failed to send retry receipt for {message_id}: {err}")
 
     def pre_key_to_node(self, key):
         """
@@ -314,7 +313,7 @@ class MessageHandlingMixin:
             # Wait for the delay or cancellation
             try:
                 await asyncio.wait_for(cancel_event.wait(), REQUEST_FROM_PHONE_DELAY)
-                self.log.debug(f"Cancelled delayed request for message {info.id} from phone")
+                logger.debug(f"Cancelled delayed request for message {info.id} from phone")
                 return
             except asyncio.TimeoutError:
                 # Timeout means we should proceed with the request
@@ -327,9 +326,9 @@ class MessageHandlingMixin:
                     self.build_unavailable_message_request(info.chat, info.sender, info.id),
                     {"peer": True}
                 )
-                self.log.debug(f"Requested message {info.id} from phone")
+                logger.debug(f"Requested message {info.id} from phone")
             except Exception as err:
-                self.log.warning(f"Failed to send request for unavailable message {info.id} to phone: {err}")
+                logger.warning(f"Failed to send request for unavailable message {info.id} to phone: {err}")
         finally:
             # Clean up
             self.pending_phone_rerequests_lock.acquire()
@@ -433,7 +432,7 @@ class MessageHandlingMixin:
                 attrs=attrs
             ))
         except Exception as err:
-            self.log.warning(f"Failed to send acknowledgement for {node.tag} {node.attrs.get('id')}: {err}")
+            logger.warning(f"Failed to send acknowledgement for {node.tag} {node.attrs.get('id')}: {err}")
 
     async def update_business_name(self, ctx: Any, user: jid.JID,
                                   message_info: message_types.MessageInfo, name: str):
@@ -455,7 +454,7 @@ class MessageHandlingMixin:
         try:
             changed, previous_name = await self.store.contacts.put_business_name(user, name)
             if changed:
-                self.log.debug(f"Business name of {user} changed from {previous_name} to {name}, dispatching event")
+                logger.debug(f"Business name of {user} changed from {previous_name} to {name}, dispatching event")
                 self.dispatch_event(events.BusinessName(
                     jid=user,
                     message=message_info,
@@ -463,7 +462,7 @@ class MessageHandlingMixin:
                     new_business_name=name
                 ))
         except Exception as err:
-            self.log.error(f"Failed to save business name of {user} in device store: {err}")
+            logger.error(f"Failed to save business name of {user} in device store: {err}")
 
     async def update_push_name(self, ctx: Any, user: jid.JID,
                               message_info: message_types.MessageInfo, name: str):
@@ -487,7 +486,7 @@ class MessageHandlingMixin:
         try:
             changed, previous_name = await self.store.contacts.put_push_name(user, name)
             if changed:
-                self.log.debug(f"Push name of {user} changed from {previous_name} to {name}, dispatching event")
+                logger.debug(f"Push name of {user} changed from {previous_name} to {name}, dispatching event")
                 self.dispatch_event(events.PushName(
                     jid=user,
                     message=message_info,
@@ -495,7 +494,7 @@ class MessageHandlingMixin:
                     new_push_name=name
                 ))
         except Exception as err:
-            self.log.error(f"Failed to save push name of {user} in device store: {err}")
+            logger.error(f"Failed to save push name of {user} in device store: {err}")
 
     def parse_verified_name_content(self, node: binary_node.Node) -> Optional[VerifiedName]:
         """
@@ -529,7 +528,7 @@ class MessageHandlingMixin:
                 details=cert_details
             )
         except Exception as err:
-            self.log.error(f"Failed to parse verified name content: {err}")
+            logger.error(f"Failed to parse verified name content: {err}")
             return None
 
     async def handle_encrypted_message(self, node: binary_node.Node) -> None:
@@ -544,7 +543,7 @@ class MessageHandlingMixin:
         try:
             info = await self.parse_message_info(node)
         except Exception as err:
-            self.log.warning(f"Failed to parse message: {err}")
+            logger.warning(f"Failed to parse message: {err}")
             return
 
         if not info.sender_alt.is_empty():
@@ -805,21 +804,21 @@ class MessageHandlingMixin:
                 try:
                     info.verified_name = await self.parse_verified_name_content(child)
                 except Exception as err:
-                    self.log.warning(
+                    logger.warning(
                         f"Failed to parse verified_name node in {info.id}: {err}"
                     )
             elif child.tag == "bot":
                 try:
                     info.msg_bot_info = await self.parse_msg_bot_info(child)
                 except Exception as err:
-                    self.log.warning(
+                    logger.warning(
                         f"Failed to parse <bot> node in {info.id}: {err}"
                     )
             elif child.tag == "meta":
                 try:
                     info.msg_meta_info = await self.parse_msg_meta_info(child)
                 except Exception as err:
-                    self.log.warning(
+                    logger.warning(
                         f"Failed to parse <meta> node in {info.id}: {err}"
                     )
             elif child.tag == "franking":
@@ -852,7 +851,7 @@ class MessageHandlingMixin:
 
         plaintext_body = plaintext.content
         if not isinstance(plaintext_body, bytes):
-            self.log.warning(
+            logger.warning(
                 f"Plaintext message from {info.source_string()} doesn't have byte content"
             )
             return
@@ -861,7 +860,7 @@ class MessageHandlingMixin:
         try:
             msg.ParseFromString(plaintext_body)
         except Exception as err:
-            self.log.warning(
+            logger.warning(
                 f"Error unmarshaling plaintext message from {info.source_string()}: {err}"
             )
             return
@@ -895,7 +894,7 @@ class MessageHandlingMixin:
         try:
             await self.store.sessions.migrate_pn_to_lid(pn, lid)
         except Exception as err:
-            self.log.error(f"Failed to migrate signal store from {pn} to {lid}: {err}")
+            logger.error(f"Failed to migrate signal store from {pn} to {lid}: {err}")
 
     async def decrypt_messages(
         self, info: message_types.MessageInfo, node: binary_node.Node
@@ -910,7 +909,7 @@ class MessageHandlingMixin:
         unavailable_node = node.get_child_by_tag("unavailable")
         if unavailable_node and len(node.get_children_by_tag("enc")) == 0:
             u_type = events.UnavailableType(unavailable_node.attrs.get("type", ""))
-            self.log.warning(
+            logger.warning(
                 f"Unavailable message {info.id} from {info.source_string()} (type: {u_type})"
             )
             asyncio.create_task(self.delayed_request_message_from_phone(info))
@@ -924,7 +923,7 @@ class MessageHandlingMixin:
             return
 
         children = node.children
-        self.log.debug(f"Decrypting message from {info.source_string()}")
+        logger.debug(f"Decrypting message from {info.source_string()}")
         handled = False
         contains_direct_msg = False
         sender_encryption_jid = info.sender
@@ -942,9 +941,9 @@ class MessageHandlingMixin:
                         sender_encryption_jid = lid
                         info.sender_alt = lid
                     else:
-                        self.log.warning(f"No LID found for {info.sender}")
+                        logger.warning(f"No LID found for {info.sender}")
                 except Exception as err:
-                    self.log.error(f"Failed to get LID for {info.sender}: {err}")
+                    logger.error(f"Failed to get LID for {info.sender}: {err}")
 
         for child in children:
             if child.tag != "enc":
@@ -1016,18 +1015,18 @@ class MessageHandlingMixin:
                     except Exception as err:
                         raise Exception(f"failed to get message secret: {err}")
                 else:
-                    self.log.warning(
+                    logger.warning(
                         f"Unhandled encrypted message (type {enc_type}) from {info.source_string()}"
                     )
                     continue
             except Exception as err:
                 if isinstance(err, EVENT_ALREADY_PROCESSED.__class__) and str(err) == str(EVENT_ALREADY_PROCESSED):
-                    self.log.debug(
+                    logger.debug(
                         f"Ignoring message {info.id} from {info.source_string()}: {err}"
                     )
                     return
                 else:
-                    self.log.warning(
+                    logger.warning(
                         f"Error decrypting message from {info.source_string()}: {err}"
                     )
                     is_unavailable = (
@@ -1061,7 +1060,7 @@ class MessageHandlingMixin:
                 try:
                     msg.ParseFromString(decrypted)
                 except Exception as err:
-                    self.log.warning(
+                    logger.warning(
                         f"Error unmarshaling decrypted message from {info.source_string()}: {err}"
                     )
                     continue
@@ -1071,7 +1070,7 @@ class MessageHandlingMixin:
             elif version == 3:
                 handled = await self.handle_decrypted_armadillo(info, decrypted, retry_count)
             else:
-                self.log.warning(
+                logger.warning(
                     f"Unknown version {version} in decrypted message from {info.source_string()}"
                 )
 
@@ -1231,7 +1230,7 @@ class MessageHandlingMixin:
                         return await cipher.decrypt_message(prekey_msg)
                     except Exception as err:
                         if self.auto_trust_identity and "UntrustedIdentity" in str(err):
-                            self.log.warning(
+                            logger.warning(
                                 f"Got {err} error while trying to decrypt prekey message from {from_jid}, clearing stored identity and retrying"
                             )
                             try:
@@ -1412,12 +1411,12 @@ class MessageProcessingMixin:
             )
 
             await builder.process(sender_key_name, sdk_msg)
-            self.log.debug(
+            logger.debug(
                 f"Processed sender key distribution message from {sender_key_name.sender()} in {sender_key_name.group_id()}"
             )
 
         except Exception as err:
-            self.log.error(
+            logger.error(
                 f"Failed to process sender key distribution message from {from_jid} for {chat}: {err}"
             )
 
@@ -1433,16 +1432,16 @@ class MessageProcessingMixin:
                 except asyncio.CancelledError:
                     break
                 except Exception as err:
-                    self.log.error(f"Error handling history sync notification: {err}")
+                    logger.error(f"Error handling history sync notification: {err}")
 
         except Exception as err:
-            self.log.error(f"History sync handler failed: {err}")
+            logger.error(f"History sync handler failed: {err}")
         finally:
             self.history_sync_handler_started.set(False)
 
             # Check if new notifications appeared while we were shutting down
             if not self.history_sync_notifications.empty() and not self.history_sync_handler_started.get():
-                self.log.warning(
+                logger.warning(
                     "New history sync notifications appeared after loop stopped, restarting loop..."
                 )
                 asyncio.create_task(self.handle_history_sync_notification_loop())
@@ -1464,7 +1463,7 @@ class MessageProcessingMixin:
                     history_sync = waHistorySync_pb2.HistorySync()
                     history_sync.ParseFromString(raw_data)
 
-                    self.log.debug(
+                    logger.debug(
                         f"Received history sync (type {history_sync.sync_type}, chunk {history_sync.chunk_order})"
                     )
 
@@ -1484,7 +1483,7 @@ class MessageProcessingMixin:
                     )
 
         except Exception as err:
-            self.log.error(f"Failed to handle history sync notification: {err}")
+            logger.error(f"Failed to handle history sync notification: {err}")
 
     async def handle_app_state_sync_key_share(
         self, keys: waE2E_pb2.AppStateSyncKeyShare
@@ -1497,7 +1496,7 @@ class MessageProcessingMixin:
         """
         only_resync_if_not_synced = True
 
-        self.log.debug(f"Got {len(keys.keys)} new app state keys")
+        logger.debug(f"Got {len(keys.keys)} new app state keys")
 
         async with self.app_state_key_requests_lock:
             for key in keys.keys:
@@ -1519,12 +1518,12 @@ class MessageProcessingMixin:
                         )
                     )
 
-                    self.log.debug(
+                    logger.debug(
                         f"Received app state sync key {key.key_id.key_id.hex()} (ts: {key.key_data.timestamp})"
                     )
 
                 except Exception as err:
-                    self.log.error(
+                    logger.error(
                         f"Failed to store app state sync key {key.key_id.key_id.hex()}: {err}"
                     )
 
@@ -1536,7 +1535,7 @@ class MessageProcessingMixin:
                     only_resync_if_not_synced
                 )
             except Exception as err:
-                self.log.error(
+                logger.error(
                     f"Failed to do initial fetch of app state {name}: {err}"
                 )
 
@@ -1552,14 +1551,14 @@ class MessageProcessingMixin:
         req_id = msg.stanza_id
         parts = msg.peer_data_operation_result
 
-        self.log.debug(
+        logger.debug(
             f"Handling response to placeholder resend request {req_id} with {len(parts)} items"
         )
 
         for i, part in enumerate(parts):
             resp = part.placeholder_message_resend_response
             if not resp:
-                self.log.warning(
+                logger.warning(
                     f"Missing response in item #{i+1} of response to {req_id}"
                 )
                 continue
@@ -1573,7 +1572,7 @@ class MessageProcessingMixin:
                 self.dispatch_event(msg_evt)
 
             except Exception as err:
-                self.log.warning(
+                logger.warning(
                     f"Failed to parse web message in item #{i+1} of response to {req_id}: {err}"
                 )
 
@@ -1644,7 +1643,7 @@ class MessageProcessingMixin:
 
         if msg.sender_key_distribution_message:
             if not info.is_group:
-                self.log.warning(
+                logger.warning(
                     f"Got sender key distribution message in non-group chat from {info.sender}"
                 )
             else:
@@ -1683,9 +1682,9 @@ class MessageProcessingMixin:
                     info.id,
                     msg.message_context_info.message_secret
                 )
-                self.log.debug(f"Stored message secret key for {info.id}")
+                logger.debug(f"Stored message secret key for {info.id}")
             except Exception as err:
-                self.log.error(
+                logger.error(
                     f"Failed to store message secret key for {info.id}: {err}"
                 )
 
@@ -1752,30 +1751,30 @@ class MessageProcessingMixin:
                     )
 
         if secrets:
-            self.log.debug(
+            logger.debug(
                 f"Storing {len(secrets)} message secret keys in history sync"
             )
             try:
                 await self.store.msg_secrets.put_message_secrets(secrets)
-                self.log.info(
+                logger.info(
                     f"Stored {len(secrets)} message secret keys from history sync"
                 )
             except Exception as err:
-                self.log.error(
+                logger.error(
                     f"Failed to store message secret keys in history sync: {err}"
                 )
 
         if privacy_tokens:
-            self.log.debug(
+            logger.debug(
                 f"Storing {len(privacy_tokens)} privacy tokens in history sync"
             )
             try:
                 await self.store.privacy_tokens.put_privacy_tokens(*privacy_tokens)
-                self.log.info(
+                logger.info(
                     f"Stored {len(privacy_tokens)} privacy tokens from history sync"
                 )
             except Exception as err:
-                self.log.error(
+                logger.error(
                     f"Failed to store privacy tokens in history sync: {err}"
                 )
 
@@ -1832,6 +1831,6 @@ class MessageProcessingMixin:
                 )
             )
         except Exception as err:
-            self.log.warning(
+            logger.warning(
                 f"Failed to send acknowledgement for protocol message {id}: {err}"
             )

@@ -31,6 +31,7 @@ RECREATE_SESSION_TIMEOUT = timedelta(hours=1)
 # Delay before requesting a message from the phone
 REQUEST_FROM_PHONE_DELAY = timedelta(seconds=5)
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class RecentMessageKey:
@@ -126,7 +127,6 @@ class RetryHandler:
             client: The WhatsApp client instance
         """
         self.client = client
-        self.logger = logging.getLogger("pymeow.retry")
 
         # Cache of recent messages for handling retry receipts
         self.recent_messages_map: Dict[RecentMessageKey, RecentMessage] = {}
@@ -209,13 +209,13 @@ class RetryHandler:
             if wa_msg is None:
                 return RecentMessage(), Exception(f"couldn't find message {message_id}")
             else:
-                self.logger.debug(
+                logger.debug(
                     f"Found message in GetMessageForRetry to accept retry receipt for {receipt.chat}/{message_id} from {receipt.sender}"
                 )
 
             msg = RecentMessage(wa=wa_msg)
         else:
-            self.logger.debug(
+            logger.debug(
                 f"Found message in local cache to accept retry receipt for {receipt.chat}/{message_id} from {receipt.sender}"
             )
 
@@ -292,7 +292,7 @@ class RetryHandler:
             if err:
                 return err
         except Exception as e:
-            self.logger.error(f"Error getting message for retry: {e}")
+            logger.error(f"Error getting message for retry: {e}")
             return e
 
         # Handle FB consumer message if present
@@ -311,7 +311,7 @@ class RetryHandler:
         internal_counter = self.incoming_retry_request_counter[retry_key]
 
         if internal_counter >= 10:
-            self.logger.warning(f"Dropping retry request from {message_id} for {receipt.sender}: internal retry counter is {internal_counter}")
+            logger.warning(f"Dropping retry request from {message_id} for {receipt.sender}: internal retry counter is {internal_counter}")
             return None
 
         # Handle sender key distribution message for groups
@@ -335,7 +335,7 @@ class RetryHandler:
                         axolotl_sender_key_distribution_message=signal_skd_message.serialize()
                     )
             except Exception as e:
-                self.logger.warning(f"Failed to create sender key distribution message for retry of {message_id} in {receipt.chat} to {receipt.sender}: {e}")
+                logger.warning(f"Failed to create sender key distribution message for retry of {message_id} in {receipt.chat} to {receipt.sender}: {e}")
 
         # Handle device sent message for messages from me
         elif receipt.is_from_me:
@@ -356,10 +356,10 @@ class RetryHandler:
             try:
                 should_proceed = self.client.pre_retry_callback(receipt, message_id, retry_count, msg)
                 if not should_proceed:
-                    self.logger.info(f"Pre-retry callback cancelled retry for {message_id}")
+                    logger.info(f"Pre-retry callback cancelled retry for {message_id}")
                     return None
             except Exception as e:
-                self.logger.warning(f"Error in pre-retry callback: {e}")
+                logger.warning(f"Error in pre-retry callback: {e}")
                 # Continue with retry even if callback fails
 
         # Serialize the message
@@ -386,7 +386,7 @@ class RetryHandler:
             # Check if we should recreate the session
             reason, recreate = await self.should_recreate_session(retry_count, receipt.sender)
             if recreate:
-                self.logger.debug(f"Fetching prekeys for {receipt.sender} for handling retry receipt with no prekey bundle because {reason}")
+                logger.debug(f"Fetching prekeys for {receipt.sender} for handling retry receipt with no prekey bundle because {reason}")
                 try:
                     keys = await self.client.fetch_pre_keys([receipt.sender])
                     if receipt.sender in keys:
@@ -491,7 +491,7 @@ class RetryHandler:
                 attributes=attrs,
                 content=content
             ))
-            self.logger.debug(f"Sent retry #{retry_count} for {receipt.chat}/{message_id} to {receipt.sender}")
+            logger.debug(f"Sent retry #{retry_count} for {receipt.chat}/{message_id} to {receipt.sender}")
             return None
         except Exception as e:
             return Exception(f"Failed to send retry message: {e}")
@@ -536,7 +536,7 @@ class RetryHandler:
             # Wait for the delay or cancellation
             try:
                 await asyncio.wait_for(cancel_event.wait(), timeout=REQUEST_FROM_PHONE_DELAY.total_seconds())
-                self.logger.debug(f"Cancelled delayed request for message {info.id} from phone")
+                logger.debug(f"Cancelled delayed request for message {info.id} from phone")
                 return
             except asyncio.TimeoutError:
                 pass
@@ -548,9 +548,9 @@ class RetryHandler:
                     self.client.build_unavailable_message_request(info.chat, info.sender, info.id),
                     peer=True
                 )
-                self.logger.debug(f"Requested message {info.id} from phone")
+                logger.debug(f"Requested message {info.id} from phone")
             except Exception as e:
-                self.logger.warning(f"Failed to send request for unavailable message {info.id} to phone: {e}")
+                logger.warning(f"Failed to send request for unavailable message {info.id} to phone: {e}")
         finally:
             # Clean up
             if info.id in self.pending_phone_rerequests:
@@ -596,7 +596,7 @@ class RetryHandler:
 
         # Don't send too many retry receipts
         if retry_count >= 5:
-            self.logger.warning(f"Not sending any more retry receipts for {id_str}")
+            logger.warning(f"Not sending any more retry receipts for {id_str}")
             return
 
         # Start delayed request from phone on first retry
@@ -642,7 +642,7 @@ class RetryHandler:
                 # Generate a new prekey
                 key = await self.client.store.pre_keys.gen_one_pre_key()
                 if not key:
-                    self.logger.error("Failed to get prekey for retry receipt")
+                    logger.error("Failed to get prekey for retry receipt")
                     return
 
                 # Get device identity
@@ -662,12 +662,12 @@ class RetryHandler:
 
                 payload.content.append(keys_node)
             except Exception as e:
-                self.logger.error(f"Failed to prepare identity information for retry receipt: {e}")
+                logger.error(f"Failed to prepare identity information for retry receipt: {e}")
                 return
 
         # Send the receipt
         try:
             await self.client.send_node(payload)
-            self.logger.debug(f"Sent retry receipt #{retry_count} for {id_str} to {attrs['to']}")
+            logger.debug(f"Sent retry receipt #{retry_count} for {id_str} to {attrs['to']}")
         except Exception as e:
-            self.logger.error(f"Failed to send retry receipt for {id_str}: {e}")
+            logger.error(f"Failed to send retry receipt for {id_str}: {e}")

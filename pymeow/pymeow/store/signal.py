@@ -15,6 +15,7 @@ from signal_protocol.sender_keys import SenderKeyRecord, SenderKeyName
 # In Python, serialization is handled internally by the record classes
 SignalProtobufSerializer = None
 
+logger = logging.getLogger(__name__)
 
 class SignalProtocolMixin:
     """
@@ -55,8 +56,7 @@ class SignalProtocolMixin:
         try:
             await self.identities.put_identity(ctx, addr_string, identity_key_obj.public_key.serialize())
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to save identity of {addr_string}: {e}")
+            logger.error(f"Failed to save identity of {addr_string}: {e}")
             raise Exception(f"failed to save identity of {addr_string}: {e}")
 
     async def is_trusted_identity(self, ctx: Any, addr: address.ProtocolAddress, identity_key_obj: identity_key.IdentityKey) -> bool:
@@ -70,8 +70,7 @@ class SignalProtocolMixin:
             is_trusted = await self.identities.is_trusted_identity(ctx, addr_string, identity_key_obj.public_key.serialize())
             return is_trusted
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to check if {addr_string}'s identity is trusted: {e}")
+            logger.error(f"Failed to check if {addr_string}'s identity is trusted: {e}")
             raise Exception(f"failed to check if {addr_string}'s identity is trusted: {e}")
 
     # PreKeyStore implementation
@@ -94,8 +93,7 @@ class SignalProtocolMixin:
 
             return PreKeyRecord.new(pre_key.key_id, key_pair)
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to load pre-key {pre_key_id}: {e}")
+            logger.error(f"Failed to load pre-key {pre_key_id}: {e}")
             raise Exception(f"failed to load prekey {pre_key_id}: {e}")
 
     async def remove_pre_key(self, ctx: Any, pre_key_id: int) -> None:
@@ -107,8 +105,7 @@ class SignalProtocolMixin:
         try:
             await self.pre_keys.remove_pre_key(ctx, pre_key_id)
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to remove pre-key {pre_key_id}: {e}")
+            logger.error(f"Failed to remove pre-key {pre_key_id}: {e}")
             raise Exception(f"failed to remove prekey {pre_key_id}: {e}")
 
     async def store_pre_key(self, ctx: Any, pre_key_id: int, pre_key_record: PreKeyRecord) -> None:
@@ -147,12 +144,10 @@ class SignalProtocolMixin:
                 # In Go: record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
                 return SessionRecord.deserialize(raw_sess)
             except Exception as e:
-                if hasattr(self, 'log') and self.log:
-                    self.log.error(f"Failed to deserialize session with {addr_string}: {e}")
+                logger.error(f"Failed to deserialize session with {addr_string}: {e}")
                 raise Exception(f"failed to deserialize session with {addr_string}: {e}")
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to load session with {addr_string}: {e}")
+            logger.error(f"Failed to load session with {addr_string}: {e}")
             raise Exception(f"failed to load session with {addr_string}: {e}")
 
     async def get_sub_device_sessions(self, ctx: Any, name: str) -> list[int]:
@@ -173,8 +168,7 @@ class SignalProtocolMixin:
         try:
             await self.sessions.put_session(ctx, addr_string, record.serialize())
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to store session with {addr_string}: {e}")
+            logger.error(f"Failed to store session with {addr_string}: {e}")
             raise Exception(f"failed to store session with {addr_string}: {e}")
 
     async def contains_session(self, ctx: Any, remote_addr: address.ProtocolAddress) -> bool:
@@ -188,8 +182,7 @@ class SignalProtocolMixin:
             has_session = await self.sessions.has_session(ctx, addr_string)
             return has_session
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to check if store has session for {addr_string}: {e}")
+            logger.error(f"Failed to check if store has session for {addr_string}: {e}")
             raise Exception(f"failed to check if store has session for {addr_string}: {e}")
 
     async def delete_session(self, ctx: Any, remote_address: address.ProtocolAddress) -> None:
@@ -276,8 +269,7 @@ class SignalProtocolMixin:
         try:
             await self.sender_keys.put_sender_key(ctx, group_id, sender_string, key_record.serialize())
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to store sender key from {sender_string} for {group_id}: {e}")
+            logger.error(f"Failed to store sender key from {sender_string} for {group_id}: {e}")
             raise Exception(f"failed to store sender key from {sender_string} for {group_id}: {e}")
 
     async def load_sender_key(self, ctx: Any, sender_key_name: SenderKeyName) -> SenderKeyRecord:
@@ -301,10 +293,8 @@ class SignalProtocolMixin:
                 # In Go: groupRecord.NewSenderKeyFromBytes(rawKey, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
                 return SenderKeyRecord.deserialize(raw_key)
             except Exception as e:
-                if hasattr(self, 'log') and self.log:
-                    self.log.error(f"Failed to deserialize sender key from {sender_string} for {group_id}: {e}")
+                logger.error(f"Failed to deserialize sender key from {sender_string} for {group_id}: {e}")
                 raise Exception(f"failed to deserialize sender key from {sender_string} for {group_id}: {e}")
         except Exception as e:
-            if hasattr(self, 'log') and self.log:
-                self.log.error(f"Failed to load sender key from {sender_string} for {group_id}: {e}")
+            logger.error(f"Failed to load sender key from {sender_string} for {group_id}: {e}")
             raise Exception(f"failed to load sender key from {sender_string} for {group_id}: {e}")

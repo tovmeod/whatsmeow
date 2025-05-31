@@ -21,18 +21,70 @@ from pymeow.types.events import Message
 from pymeow.types.events import QR
 from pymeow.types.events import Connected, Disconnected
 
+class ColoredFormatter(logging.Formatter):
+    """
+    A custom formatter that adds colors to the terminal output based on the log level.
+    """
+    COLORS = {
+        'DEBUG': '\033[94m',  # Blue
+        'INFO': '\033[92m',   # Green
+        'WARNING': '\033[93m', # Yellow
+        'ERROR': '\033[91m',   # Red
+        'CRITICAL': '\033[91m\033[1m',  # Bold Red
+    }
+    RESET = '\033[0m'  # Reset color
 
+    def format(self, record):
+        log_message = super().format(record)
+        color = self.COLORS.get(record.levelname, self.RESET)
+        return f"{color}{log_message}{self.RESET}"
+
+APP_ROOT = Path(__file__).resolve().parent
+
+class ShortPathFormatter(ColoredFormatter):
+    """
+    A custom formatter that replaces {pathname} with {shortpathname} by trimming
+    everything before the project root.
+    """
+    def format(self, record):
+        # Add shortpathname attribute to the record
+        if hasattr(record, 'pathname'):
+            try:
+                # Convert pathname to a Path object
+                path = Path(record.pathname)
+                # Get the relative path from the project root
+                rel_path = path.relative_to(APP_ROOT)
+                # Store it as shortpathname
+                record.shortpathname = str(rel_path)
+            except (ValueError, AttributeError):
+                # If the path is not relative to APP_ROOT, use the original pathname
+                record.shortpathname = record.pathname
+
+        return super().format(record)
 def setup_logging() -> logging.Logger:
     """Set up logging for the client."""
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('whatsapp_client.log')
-        ]
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG)
+    console_formatter = ShortPathFormatter(
+        '{levelname} {asctime} {name} {module} {message} ({shortpathname}:{lineno})',
+        style='{'
     )
-    return logging.getLogger("PyMeow")
+    console_handler.setFormatter(console_formatter)
+
+    # Create file handler with plain formatter (no colors in file)
+    file_handler = logging.FileHandler('whatsapp_client.log')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '{levelname} {asctime} {name} {module} {message} ({pathname}:{lineno})',
+        style='{'
+    )
+    file_handler.setFormatter(file_formatter)
+
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
 
 
 async def event_handler(event: Any) -> None:
@@ -88,7 +140,8 @@ async def main():
     print("=" * 40)
 
     # Set up logging
-    client_log = setup_logging()
+    setup_logging()
+    logger = logging.getLogger(__name__)
     db_log = logging.getLogger("Database")
 
     try:
@@ -118,7 +171,7 @@ async def main():
             device_store = await container.new_device(test_jid)
 
         # Create WhatsApp client
-        client = Client(device_store, client_log)
+        client = Client(device_store)
 
         # Add event handler
         client.add_event_handler(event_handler)
@@ -190,7 +243,7 @@ async def main():
 
     except Exception as e:
         print(f"❌ Error: {e}")
-        client_log.exception("Unhandled exception in main")
+        logger.exception("Unhandled exception in main")
 
     finally:
         # Graceful shutdown

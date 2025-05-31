@@ -11,12 +11,13 @@ from .config import get_tortoise_config
 from .models.device import Device
 from ...store import Device as DeviceStore
 
+logger = logging.getLogger(__name__)
+
 class Container:
     """Database container managing WhatsApp store operations"""
 
     def __init__(self, db_url: str, logger: Optional[logging.Logger] = None):
         self.db_url = db_url
-        self.log = logger or logging.getLogger(__name__)
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -28,14 +29,14 @@ class Container:
         await Tortoise.init(config)
         await Tortoise.generate_schemas()
         self._initialized = True
-        self.log.info("Database initialized successfully")
+        logger.info("Database initialized successfully")
 
     async def close(self) -> None:
         """Close database connections"""
         if self._initialized:
             await Tortoise.close_connections()
             self._initialized = False
-            self.log.info("Database connections closed")
+            logger.info("Database connections closed")
 
     async def get_all_devices(self) -> List[DeviceStore]:
         """Get all registered devices"""

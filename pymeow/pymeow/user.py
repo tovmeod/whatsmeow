@@ -26,8 +26,9 @@ BUSINESS_MESSAGE_LINK_DIRECT_PREFIX = "https://api.whatsapp.com/message/"
 CONTACT_QR_LINK_DIRECT_PREFIX = "https://api.whatsapp.com/qr/"
 NEWSLETTER_LINK_PREFIX = "https://whatsapp.com/channel/"
 
+logger = logging.getLogger(__name__)
 
-class Client:
+class UserMixin:
     """
     This is a partial implementation of the Client class that only includes
     the user-related methods ported from user.go.
@@ -233,7 +234,7 @@ class Client:
             try:
                 info.verified_name = self._parse_verified_name(child.get_child_by_tag("business"))
             except Exception as e:
-                self.log.warning(f"Failed to parse {jid}'s verified name details: {e}")
+                logger.warning(f"Failed to parse {jid}'s verified name details: {e}")
 
             contact_node = child.get_child_by_tag("contact")
             info.is_in = contact_node.attr_getter().string("type") == "in"
@@ -285,7 +286,7 @@ class Client:
                 if verified_name:
                     await self._update_business_name(jid, None, verified_name.details.verified_name)
             except Exception as e:
-                self.log.warning(f"Failed to parse {jid}'s verified name details: {e}")
+                logger.warning(f"Failed to parse {jid}'s verified name details: {e}")
 
             status_bytes = child.get_child_by_tag("status").content
             if isinstance(status_bytes, bytes):
@@ -735,7 +736,7 @@ class Client:
         changed, previous_name = await self.store.contacts.put_push_name(user, name)
 
         if changed:
-            self.log.debug(f"Push name of {user} changed from {previous_name} to {name}, dispatching event")
+            logger.debug(f"Push name of {user} changed from {previous_name} to {name}, dispatching event")
             self.dispatch_event({
                 "type": "push_name",
                 "jid": user,
@@ -759,7 +760,7 @@ class Client:
         changed, previous_name = await self.store.contacts.put_business_name(user, name)
 
         if changed:
-            self.log.debug(f"Business name of {user} changed from {previous_name} to {name}, dispatching event")
+            logger.debug(f"Business name of {user} changed from {previous_name} to {name}, dispatching event")
             self.dispatch_event({
                 "type": "business_name",
                 "jid": user,
@@ -1043,7 +1044,7 @@ class Client:
             ag = child.attr_getter()
             blocked_jid = ag.jid("jid")
             if not ag.ok():
-                self.log.debug(f"Ignoring contact blocked data with unexpected attributes: {ag.error()}")
+                logger.debug(f"Ignoring contact blocked data with unexpected attributes: {ag.error()}")
                 continue
 
             output.jids.append(blocked_jid)

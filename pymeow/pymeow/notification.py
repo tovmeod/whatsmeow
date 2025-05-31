@@ -32,6 +32,7 @@ from .appstate import AppState
 # TODO: Verify import when store is ported
 from .store.store import Store
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class NewsletterEventWrapper:
@@ -89,7 +90,6 @@ class NotificationMixin:
             log: Logger to use for logging
         """
         self.store = store
-        self.log = log or logging.getLogger("whatsmeow.notification")
         self.user_devices_cache = {}
         self.user_devices_cache_lock = asyncio.Lock()
 
@@ -101,7 +101,7 @@ class NotificationMixin:
             evt: The event to dispatch
         """
         # This is a placeholder implementation
-        self.log.debug(f"Event dispatched: {evt}")
+        logger.debug(f"Event dispatched: {evt}")
 
     async def handle_encrypt_notification(self, ctx: asyncio.Context, node: Node) -> None:
         """
@@ -115,34 +115,34 @@ class NotificationMixin:
         if from_jid == jid.SERVER:
             count = node.get_child_by_tag("count")
             if not count:
-                self.log.warning(f"Didn't get count element in encryption notification {node.xml_string()}")
+                logger.warning(f"Didn't get count element in encryption notification {node.xml_string()}")
                 return
 
             attrs = count.attrs
             otks_left = attrs.get_int("value")
             if otks_left is None:
-                self.log.warning(f"Didn't get number of OTKs left in encryption notification {node.xml_string()}")
+                logger.warning(f"Didn't get number of OTKs left in encryption notification {node.xml_string()}")
                 return
 
-            self.log.info(f"Got prekey count from server: {node.xml_string()}")
+            logger.info(f"Got prekey count from server: {node.xml_string()}")
             if otks_left < MIN_PREKEY_COUNT:
                 await self.upload_prekeys(ctx)
         elif node.get_optional_child_by_tag("identity")[0]:
-            self.log.debug(f"Got identity change for {from_jid}: {node.xml_string()}, deleting all identities/sessions for that number")
+            logger.debug(f"Got identity change for {from_jid}: {node.xml_string()}, deleting all identities/sessions for that number")
             try:
                 await self.store.identities.delete_all_identities(ctx, from_jid.user)
             except Exception as e:
-                self.log.warning(f"Failed to delete all identities of {from_jid} from store after identity change: {e}")
+                logger.warning(f"Failed to delete all identities of {from_jid} from store after identity change: {e}")
 
             try:
                 await self.store.sessions.delete_all_sessions(ctx, from_jid.user)
             except Exception as e:
-                self.log.warning(f"Failed to delete all sessions of {from_jid} from store after identity change: {e}")
+                logger.warning(f"Failed to delete all sessions of {from_jid} from store after identity change: {e}")
 
             timestamp = node.attrs.get_unix_time("t")
             self.dispatch_event(IdentityChange(jid=from_jid, timestamp=timestamp))
         else:
-            self.log.debug(f"Got unknown encryption notification from server: {node.xml_string()}")
+            logger.debug(f"Got unknown encryption notification from server: {node.xml_string()}")
 
     async def handle_app_state_notification(self, ctx: asyncio.Context, node: Node) -> None:
         """
@@ -156,7 +156,7 @@ class NotificationMixin:
             attrs = collection.attrs
             name = attrs.get_string("name")
             version = attrs.get_uint64("version")
-            self.log.debug(f"Got server sync notification that app state {name} has updated to version {version}")
+            logger.debug(f"Got server sync notification that app state {name} has updated to version {version}")
 
             try:
                 # TODO: Implement fetch_app_state when appstate is ported
@@ -164,9 +164,9 @@ class NotificationMixin:
             except Exception as e:
                 # There are some app state changes right before a remote logout, so stop syncing if we're disconnected
                 if str(e) in ["IQDisconnected", "NotConnected"]:
-                    self.log.debug(f"Failed to sync app state after notification: {e}, not trying to sync other states")
+                    logger.debug(f"Failed to sync app state after notification: {e}, not trying to sync other states")
                     return
-                self.log.error(f"Failed to sync app state after notification: {e}")
+                logger.error(f"Failed to sync app state after notification: {e}")
 
     async def handle_picture_notification(self, ctx: asyncio.Context, node: Node) -> None:
         """
@@ -198,7 +198,7 @@ class NotificationMixin:
                 continue
 
             if attrs.error:
-                self.log.debug(f"Ignoring picture change notification with unexpected attributes: {attrs.error}")
+                logger.debug(f"Ignoring picture change notification with unexpected attributes: {attrs.error}")
                 continue
 
             self.dispatch_event(evt)
@@ -221,7 +221,7 @@ class NotificationMixin:
 
             cached = self.user_devices_cache.get(from_jid)
             if not cached:
-                self.log.debug(f"No device list cached for {from_jid}, ignoring device list notification")
+                logger.debug(f"No device list cached for {from_jid}, ignoring device list notification")
                 return
 
             cached_lid = None
@@ -235,7 +235,7 @@ class NotificationMixin:
 
             for child in node.get_children():
                 if child.tag not in ["add", "remove"]:
-                    self.log.debug(f"Unknown device list change tag {child.tag}")
+                    logger.debug(f"Unknown device list change tag {child.tag}")
                     continue
 
                 child_attrs = child.attrs
@@ -261,20 +261,20 @@ class NotificationMixin:
 
                 new_participant_hash = self.participant_list_hash_v2(cached["devices"])
                 if new_participant_hash == device_hash:
-                    self.log.debug(f"{from_jid}'s device list hash changed from {cached_participant_hash} to {device_hash} ({child.tag}). New hash matches")
+                    logger.debug(f"{from_jid}'s device list hash changed from {cached_participant_hash} to {device_hash} ({child.tag}). New hash matches")
                     self.user_devices_cache[from_jid] = cached
                 else:
-                    self.log.warning(f"{from_jid}'s device list hash changed from {cached_participant_hash} to {device_hash} ({child.tag}). New hash doesn't match ({new_participant_hash})")
+                    logger.warning(f"{from_jid}'s device list hash changed from {cached_participant_hash} to {device_hash} ({child.tag}). New hash doesn't match ({new_participant_hash})")
                     if from_jid in self.user_devices_cache:
                         del self.user_devices_cache[from_jid]
 
                 if from_lid and changed_device_lid and device_lid_hash and cached_lid:
                     new_lid_participant_hash = self.participant_list_hash_v2(cached_lid["devices"])
                     if new_lid_participant_hash == device_lid_hash:
-                        self.log.debug(f"{from_lid}'s device list hash changed from {cached_lid_hash} to {device_lid_hash} ({child.tag}). New hash matches")
+                        logger.debug(f"{from_lid}'s device list hash changed from {cached_lid_hash} to {device_lid_hash} ({child.tag}). New hash matches")
                         self.user_devices_cache[from_lid] = cached_lid
                     else:
-                        self.log.warning(f"{from_lid}'s device list hash changed from {cached_lid_hash} to {device_lid_hash} ({child.tag}). New hash doesn't match ({new_lid_participant_hash})")
+                        logger.warning(f"{from_lid}'s device list hash changed from {cached_lid_hash} to {device_lid_hash} ({child.tag}). New hash doesn't match ({new_lid_participant_hash})")
                         if from_lid in self.user_devices_cache:
                             del self.user_devices_cache[from_lid]
 
@@ -304,12 +304,12 @@ class NotificationMixin:
         async with self.user_devices_cache_lock:
             own_id = self.get_own_id().to_non_ad()
             if own_id.is_empty():
-                self.log.debug("Ignoring own device change notification, session was deleted")
+                logger.debug("Ignoring own device change notification, session was deleted")
                 return
 
             cached = self.user_devices_cache.get(own_id)
             if not cached:
-                self.log.debug("Ignoring own device change notification, device list not cached")
+                logger.debug("Ignoring own device change notification, device list not cached")
                 return
 
             old_hash = self.participant_list_hash_v2(cached.get("devices", []))
@@ -323,11 +323,11 @@ class NotificationMixin:
 
             new_hash = self.participant_list_hash_v2(new_device_list)
             if new_hash != expected_new_hash:
-                self.log.debug(f"Received own device list change notification {old_hash} -> {new_hash}, but expected hash was {expected_new_hash}")
+                logger.debug(f"Received own device list change notification {old_hash} -> {new_hash}, but expected hash was {expected_new_hash}")
                 if own_id in self.user_devices_cache:
                     del self.user_devices_cache[own_id]
             else:
-                self.log.debug(f"Received own device list change notification {old_hash} -> {new_hash}")
+                logger.debug(f"Received own device list change notification {old_hash} -> {new_hash}")
                 self.user_devices_cache[own_id] = {"devices": new_device_list, "dhash": expected_new_hash}
 
     async def handle_blocklist(self, ctx: asyncio.Context, node: Node) -> None:
@@ -354,7 +354,7 @@ class NotificationMixin:
             )
 
             if child_attrs.error:
-                self.log.warning(f"Unexpected data in blocklist event child {child.xml_string()}: {child_attrs.error}")
+                logger.warning(f"Unexpected data in blocklist event child {child.xml_string()}: {child_attrs.error}")
                 continue
 
             evt.changes.append(change)
@@ -385,7 +385,7 @@ class NotificationMixin:
             elif child.tag == "blocklist":
                 await self.handle_blocklist(ctx, child)
             else:
-                self.log.debug(f"Unhandled account sync item {child.tag}")
+                logger.debug(f"Unhandled account sync item {child.tag}")
 
     async def handle_privacy_token_notification(self, ctx: asyncio.Context, node: Node) -> None:
         """
@@ -397,43 +397,43 @@ class NotificationMixin:
         """
         own_id = self.get_own_id().to_non_ad()
         if own_id.is_empty():
-            self.log.debug("Ignoring privacy token notification, session was deleted")
+            logger.debug("Ignoring privacy token notification, session was deleted")
             return
 
         tokens = node.get_child_by_tag("tokens")
         if not tokens or tokens.tag != "tokens":
-            self.log.warning("privacy_token notification didn't contain <tokens> tag")
+            logger.warning("privacy_token notification didn't contain <tokens> tag")
             return
 
         parent_attrs = node.attrs
         sender = parent_attrs.get_jid("from")
         if parent_attrs.error:
-            self.log.warning(f"privacy_token notification didn't have a sender ({parent_attrs.error})")
+            logger.warning(f"privacy_token notification didn't have a sender ({parent_attrs.error})")
             return
 
         for child in tokens.get_children():
             attrs = child.attrs
             if child.tag != "token":
-                self.log.warning(f"privacy_token notification contained unexpected <{child.tag}> tag")
+                logger.warning(f"privacy_token notification contained unexpected <{child.tag}> tag")
                 continue
 
             target_user = attrs.get_jid("jid")
             if target_user != own_id:
-                self.log.warning(f"privacy_token notification contained token for different user {target_user}")
+                logger.warning(f"privacy_token notification contained token for different user {target_user}")
                 continue
 
             token_type = attrs.get_string("type")
             if token_type != "trusted_contact":
-                self.log.warning(f"privacy_token notification contained unexpected token type {token_type}")
+                logger.warning(f"privacy_token notification contained unexpected token type {token_type}")
                 continue
 
             if not isinstance(child.content, bytes):
-                self.log.warning("privacy_token notification contained non-binary token")
+                logger.warning("privacy_token notification contained non-binary token")
                 continue
 
             timestamp = attrs.get_unix_time("t")
             if attrs.error:
-                self.log.warning(f"privacy_token notification is missing some fields: {attrs.error}")
+                logger.warning(f"privacy_token notification is missing some fields: {attrs.error}")
 
             try:
                 await self.store.privacy_tokens.put_privacy_tokens(ctx, {
@@ -441,9 +441,9 @@ class NotificationMixin:
                     "token": child.content,
                     "timestamp": timestamp
                 })
-                self.log.debug(f"Stored privacy token from {sender} (ts: {timestamp})")
+                logger.debug(f"Stored privacy token from {sender} (ts: {timestamp})")
             except Exception as e:
-                self.log.error(f"Failed to save privacy token from {sender}: {e}")
+                logger.error(f"Failed to save privacy token from {sender}: {e}")
 
     def parse_newsletter_messages(self, node: Node) -> List[Dict[str, Any]]:
         """
@@ -481,7 +481,7 @@ class NotificationMixin:
                             message.ParseFromString(subchild.content)
                             msg["message"] = message
                         except Exception as e:
-                            self.log.warning(f"Failed to unmarshal newsletter message: {e}")
+                            logger.warning(f"Failed to unmarshal newsletter message: {e}")
                 elif subchild.tag == "views_count":
                     msg["views_count"] = subchild.attrs.get_int("count")
                 elif subchild.tag == "reactions":
@@ -544,7 +544,7 @@ class NotificationMixin:
                 if mute_change_data:
                     self.dispatch_event(NewsletterMuteChange(**mute_change_data))
             except json.JSONDecodeError as e:
-                self.log.error(f"Failed to unmarshal JSON in mex event: {e}")
+                logger.error(f"Failed to unmarshal JSON in mex event: {e}")
 
     async def handle_status_notification(self, ctx: asyncio.Context, node: Node) -> None:
         """
@@ -557,11 +557,11 @@ class NotificationMixin:
         attrs = node.attrs
         child, found = node.get_optional_child_by_tag("set")
         if not found:
-            self.log.debug("Status notification did not contain child with tag 'set'")
+            logger.debug("Status notification did not contain child with tag 'set'")
             return
 
         if not isinstance(child.content, bytes):
-            self.log.warning(f"Set status notification has unexpected content ({type(child.content)})")
+            logger.warning(f"Set status notification has unexpected content ({type(child.content)})")
             return
 
         self.dispatch_event(UserAbout(
@@ -602,7 +602,7 @@ class NotificationMixin:
                 evt = await self.parse_group_notification(node)
                 self.dispatch_event(evt)
             except Exception as e:
-                self.log.error(f"Failed to parse group notification: {e}")
+                logger.error(f"Failed to parse group notification: {e}")
         elif notif_type == "picture":
             await self.handle_picture_notification(ctx, node)
         elif notif_type == "mediaretry":
@@ -618,7 +618,7 @@ class NotificationMixin:
         elif notif_type == "status":
             await self.handle_status_notification(ctx, node)
         else:
-            self.log.warning(f"Unhandled notification with type {notif_type}")
+            logger.warning(f"Unhandled notification with type {notif_type}")
 
     # Helper methods that would be implemented elsewhere in the client
     def get_own_id(self):
@@ -629,12 +629,12 @@ class NotificationMixin:
     async def upload_prekeys(self, ctx):
         """Upload prekeys to the server."""
         # Placeholder implementation
-        self.log.info("Uploading prekeys")
+        logger.info("Uploading prekeys")
 
     async def store_lid_pn_mapping(self, ctx, lid, pn):
         """Store a mapping between a LID and a phone number."""
         # Placeholder implementation
-        self.log.debug(f"Storing LID-PN mapping: {lid} -> {pn}")
+        logger.debug(f"Storing LID-PN mapping: {lid} -> {pn}")
 
     def participant_list_hash_v2(self, participants: List[JID]) -> str:
         """
@@ -708,7 +708,7 @@ class NotificationMixin:
             node: The notification node
         """
         # TODO: Implement based on mediaretry.go
-        self.log.debug(f"Handling media retry notification: {node.xml_string()}")
+        logger.debug(f"Handling media retry notification: {node.xml_string()}")
 
     async def handle_privacy_settings_notification(self, ctx: asyncio.Context, node: Node) -> None:
         """
@@ -721,7 +721,7 @@ class NotificationMixin:
             node: The notification node
         """
         # TODO: Implement based on privacysettings.go
-        self.log.debug(f"Handling privacy settings notification: {node.xml_string()}")
+        logger.debug(f"Handling privacy settings notification: {node.xml_string()}")
 
     async def try_handle_code_pair_notification(self, ctx: asyncio.Context, node: Node) -> None:
         """
@@ -734,12 +734,12 @@ class NotificationMixin:
             node: The notification node
         """
         # TODO: Implement based on pair-code.go
-        self.log.debug(f"Handling code pair notification: {node.xml_string()}")
+        logger.debug(f"Handling code pair notification: {node.xml_string()}")
 
     async def fetch_app_state(self, ctx, name, force, full):
         """Fetch app state from the server."""
         # Placeholder implementation
-        self.log.debug(f"Fetching app state: {name}")
+        logger.debug(f"Fetching app state: {name}")
 
 
 class Client(NotificationMixin):

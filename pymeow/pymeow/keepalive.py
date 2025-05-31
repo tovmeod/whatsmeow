@@ -4,6 +4,7 @@ Keepalive mechanism for WhatsApp Web connection.
 Port of whatsmeow/keepalive.go
 """
 import asyncio
+import logging
 import random
 from datetime import datetime, timedelta
 from typing import Tuple
@@ -19,6 +20,7 @@ KEEP_ALIVE_INTERVAL_MIN = timedelta(seconds=20)
 KEEP_ALIVE_INTERVAL_MAX = timedelta(seconds=30)
 KEEP_ALIVE_MAX_FAIL_TIME = timedelta(minutes=3)
 
+logger = logging.getLogger(__name__)
 
 class Client:
     """
@@ -30,7 +32,6 @@ class Client:
 
     def __init__(self):
         self.enable_auto_reconnect: bool = True
-        self.log = None  # Placeholder for logger
 
     async def keep_alive_loop(self, ctx: asyncio.Task = None) -> None:
         """
@@ -73,8 +74,7 @@ class Client:
                     if (self.enable_auto_reconnect and
                         datetime.now() - last_success > KEEP_ALIVE_MAX_FAIL_TIME):
 
-                        if self.log:
-                            self.log.debug("Forcing reconnect due to keepalive failure")
+                        logger.debug("Forcing reconnect due to keepalive failure")
 
                         self.disconnect()
                         asyncio.create_task(self.auto_reconnect())
@@ -117,8 +117,7 @@ class Client:
                 return True, True
 
             except asyncio.TimeoutError:
-                if self.log:
-                    self.log.warn("Keepalive timed out")
+                logger.warning("Keepalive timed out")
                 return False, True  # Timeout but continue
 
         except asyncio.CancelledError:
@@ -126,8 +125,7 @@ class Client:
             return False, False
 
         except Exception as e:
-            if self.log:
-                self.log.warn(f"Failed to send keepalive: {e}")
+            logger.warning(f"Failed to send keepalive: {e}")
             return False, True  # Error but continue
 
     async def _dispatch_keepalive_timeout(self, error_count: int, last_success: datetime) -> None:
@@ -139,8 +137,7 @@ class Client:
             )
             self.dispatch_event(event)
         except Exception as e:
-            if self.log:
-                self.log.warn(f"Failed to dispatch keepalive timeout event: {e}")
+            logger.warning(f"Failed to dispatch keepalive timeout event: {e}")
 
     async def _dispatch_keepalive_restored(self) -> None:
         """Dispatch keepalive restored event in background."""
@@ -148,8 +145,7 @@ class Client:
             event = KeepAliveRestored()
             self.dispatch_event(event)
         except Exception as e:
-            if self.log:
-                self.log.warn(f"Failed to dispatch keepalive restored event: {e}")
+            logger.warning(f"Failed to dispatch keepalive restored event: {e}")
 
     # These methods would be implemented elsewhere in the Client class
     async def send_iq_async(self, query: InfoQuery) -> asyncio.Future:

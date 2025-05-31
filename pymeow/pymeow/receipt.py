@@ -15,6 +15,8 @@ from .types.events import Receipt
 from .types.presence import ReceiptType
 from .exceptions import ElementMissingError
 
+logger = logging.getLogger(__name__)
+
 class ReceiptMixin:
     """Mixin for handling message receipts in WhatsApp."""
 
@@ -33,7 +35,7 @@ class ReceiptMixin:
                     asyncio.create_task(self._handle_retry_receipt_task(receipt, node))
                 self.dispatch_event(receipt)
         except Exception as e:
-            self.log.warning(f"Failed to parse receipt: {e}")
+            logger.warning(f"Failed to parse receipt: {e}")
         finally:
             defer_ack()
 
@@ -48,7 +50,7 @@ class ReceiptMixin:
         try:
             await self.handle_retry_receipt(receipt, node)
         except Exception as e:
-            self.log.error(f"Failed to handle retry receipt for {receipt.message_source.chat}/{receipt.message_ids[0]} from {receipt.message_source.sender}: {e}")
+            logger.error(f"Failed to handle retry receipt for {receipt.message_source.chat}/{receipt.message_ids[0]} from {receipt.message_source.sender}: {e}")
 
     def handle_grouped_receipt(self, partial_receipt: Receipt, participants: Node) -> None:
         """
@@ -63,7 +65,7 @@ class ReceiptMixin:
 
         for child in participants.get_children():
             if child.tag != "user":
-                self.log.warning(f"Unexpected node in grouped receipt participants: {child.xml_string()}")
+                logger.warning(f"Unexpected node in grouped receipt participants: {child.xml_string()}")
                 continue
 
             ag = child.attr_getter()
@@ -76,7 +78,7 @@ class ReceiptMixin:
             )
 
             if not ag.ok():
-                self.log.warning(f"Failed to parse user node {child.xml_string()} in grouped receipt: {ag.error()}")
+                logger.warning(f"Failed to parse user node {child.xml_string()} in grouped receipt: {ag.error()}")
                 continue
 
             asyncio.create_task(self.dispatch_event(receipt))
@@ -189,7 +191,7 @@ class ReceiptMixin:
                 attrs=attrs
             ))
         except Exception as e:
-            self.log.warning(f"Failed to send acknowledgement for {node.tag} {node.attrs['id']}: {e}")
+            logger.warning(f"Failed to send acknowledgement for {node.tag} {node.attrs['id']}: {e}")
 
     async def mark_read(self, ids: List[MessageID], timestamp: datetime, chat: JID, sender: JID,
                   receipt_type_extra: Optional[ReceiptType] = None) -> None:
@@ -314,4 +316,4 @@ class ReceiptMixin:
                 attrs=attrs
             ))
         except Exception as e:
-            self.log.warning(f"Failed to send receipt for {info.id}: {e}")
+            logger.warning(f"Failed to send receipt for {info.id}: {e}")

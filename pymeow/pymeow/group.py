@@ -24,6 +24,8 @@ from .exceptions import ElementMissingError, ErrIQNotAcceptable, ErrIQNotFound, 
 # Constants
 INVITE_LINK_PREFIX = "https://chat.whatsapp.com/"
 
+logger = logging.getLogger(__name__)
+
 @dataclass
 class ReqCreateGroup:
     """Request data for creating a group."""
@@ -711,12 +713,12 @@ class Client:
 
         for child in children:
             if child.tag != "group":
-                self.log.debug(f"Unexpected child in group list response: {child.xml_string()}")
+                logger.debug(f"Unexpected child in group list response: {child.xml_string()}")
                 continue
 
             parsed, parse_err = await self.parse_group_node(child)
             if parse_err:
-                self.log.warning(f"Error parsing group {parsed.jid}: {parse_err}")
+                logger.warning(f"Error parsing group {parsed.jid}: {parse_err}")
 
             infos.append(parsed)
 
@@ -855,7 +857,7 @@ class Client:
                 try:
                     await self.store.lids.put_many_lid_mappings(ctx, lid_pairs)
                 except Exception as e:
-                    self.log.warning(f"Failed to store LID mappings for members of {jid}: {e}")
+                    logger.warning(f"Failed to store LID mappings for members of {jid}: {e}")
 
         return group_info, None
 
@@ -992,10 +994,10 @@ class Client:
             elif child.tag == "membership_approval_mode":
                 group.is_join_approval_required = True
             else:
-                self.log.debug(f"Unknown element in group node {group.jid}: {child.xml_string()}")
+                logger.debug(f"Unknown element in group node {group.jid}: {child.xml_string()}")
 
             if not child_ag.ok():
-                self.log.warning(f"Possibly failed to parse {child.tag} element in group node: {child_ag.errors}")
+                logger.warning(f"Possibly failed to parse {child.tag} element in group node: {child_ag.errors}")
 
         return group, ag.error()
 

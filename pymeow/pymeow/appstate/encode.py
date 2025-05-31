@@ -4,6 +4,7 @@ App state encoding for WhatsApp.
 Port of whatsmeow/appstate/encode.go
 """
 import json
+import logging
 import time
 import hashlib
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from ..util.cbcutil import encrypt_cbc
 from .hash import HashState, WAPatchName, concat_and_hmac, generate_content_mac, generate_patch_mac
 from .keys import Processor, WAPatchName, INDEX_MUTE, INDEX_PIN, INDEX_ARCHIVE, INDEX_STAR, INDEX_LABEL_ASSOCIATION_CHAT, INDEX_LABEL_ASSOCIATION_MESSAGE, INDEX_LABEL_EDIT, INDEX_SETTING_PUSH_NAME
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class MutationInfo:
@@ -476,7 +478,7 @@ class Encoder(Processor):
 
         warnings, err = state.update_hash(mutations, get_prev_set_value_mac)
         if warnings:
-            self.log.warning(f"Warnings while updating hash for {patch_info.type} (sending new app state): {warnings}")
+            logger.warning(f"Warnings while updating hash for {patch_info.type} (sending new app state): {warnings}")
         if err:
             raise ValueError(f"Failed to update state hash: {err}")
 

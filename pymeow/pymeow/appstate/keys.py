@@ -57,6 +57,8 @@ INDEX_LABEL_EDIT = "label_edit"
 INDEX_LABEL_ASSOCIATION_CHAT = "label_jid"
 INDEX_LABEL_ASSOCIATION_MESSAGE = "label_message"
 
+logger = logging.getLogger(__name__)
+
 @dataclass
 class ExpandedAppStateKeys:
     """Expanded app state keys derived from the original key data."""
@@ -81,7 +83,6 @@ class Processor:
         self.key_cache: Dict[str, ExpandedAppStateKeys] = {}
         self.key_cache_lock = asyncio.Lock()
         self.store = store
-        self.log = log or logging.getLogger("pymeow.appstate.keys")
 
     @staticmethod
     def expand_app_state_keys(key_data: bytes) -> ExpandedAppStateKeys:
@@ -159,7 +160,7 @@ class Processor:
                 if missing:
                     missing_keys.append(key_id)
             except Exception as err:
-                self.log.warning(f"Error fetching key {key_id.hex()} while checking if it's missing: {err}")
+                logger.warning(f"Error fetching key {key_id.hex()} while checking if it's missing: {err}")
 
         if patch_list.snapshot is not None:
             await check_missing(patch_list.snapshot.key_id.id if patch_list.snapshot.key_id else None)

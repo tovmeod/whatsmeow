@@ -14,6 +14,8 @@ from .. import store
 # TODO: Verify import when dbutil is ported
 from ...util import dbutil
 
+logger = logging.getLogger(__name__)
+
 class CachedLIDMap:
     """
     Cached implementation of the LIDStore interface.
@@ -230,7 +232,7 @@ async def put_many_lid_mappings(self, ctx: Any, mappings: List[store.LIDMapping]
         valid_mappings = []
         for mapping in mappings:
             if mapping.lid.server != "lid.whatsapp.net" or mapping.pn.server != "s.whatsapp.net":
-                logging.getLogger("whatsmeow.sqlstore").debug(
+                logger.debug(
                     f"Ignoring invalid entry in PutManyLIDMappings: {mapping.lid}/{mapping.pn}"
                 )
                 continue

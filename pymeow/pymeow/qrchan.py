@@ -51,7 +51,7 @@ from .types.events.events import (
     Connected, ConnectFailure, LoggedOut, TemporaryBan, Disconnected, ClientOutdated
 )
 from .exceptions import ClientIsNilError, QRAlreadyConnectedError, QRStoreContainsIDError
-from .. import Client
+from . import Client
 
 
 @dataclass
@@ -97,6 +97,7 @@ QR_CHANNEL_ERR_UNEXPECTED_EVENT = QRChannelItem(event=QR_CHANNEL_EVENT_UNEXPECTE
 QR_CHANNEL_CLIENT_OUTDATED = QRChannelItem(event=QR_CHANNEL_EVENT_OUTDATED)
 QR_CHANNEL_SCANNED_WITHOUT_MULTIDEVICE = QRChannelItem(event=QR_CHANNEL_EVENT_NO_MULTIDEVICE)
 
+logger = logging.getLogger(__name__)
 
 class QRChannel:
     """
@@ -106,7 +107,7 @@ class QRChannel:
     It uses asyncio for asynchronous operation.
     """
 
-    def __init__(self, client: Client, output_channel: asyncio.Queue, logger: logging.Logger):
+    def __init__(self, client: Client, output_channel: asyncio.Queue):
         """
         Initialize a QR channel.
 
@@ -117,7 +118,6 @@ class QRChannel:
         """
         self.client = client
         self.lock = asyncio.Lock()
-        self.logger = logger
         self.handler_id = None
         self.closed = False
         self.output = output_channel
@@ -166,7 +166,7 @@ class QRChannel:
             # Otherwise, try again
             return await self.__anext__()
         except Exception as e:
-            self.logger.error("Error getting next item from queue: %s", e)
+            logger.error("Error getting next item from queue: %s", e)
             if self.closed:
                 raise StopAsyncIteration
             raise
@@ -178,7 +178,7 @@ class QRChannel:
         Ensures proper cleanup of resources.
         """
         if not self.closed:
-            self.logger.debug("Closing QR channel due to context exit")
+            logger.debug("Closing QR channel due to context exit")
             await self.close()
 
     async def close(self) -> None:
@@ -187,7 +187,7 @@ class QRChannel:
         """
         async with self.lock:
             if not self.closed:
-                self.logger.debug("Closing QR channel")
+                logger.debug("Closing QR channel")
                 self.stop_qrs.set()
                 if self.handler_id is not None:
                     self.client.remove_event_handler(self.handler_id)
@@ -207,24 +207,24 @@ class QRChannel:
                 if not codes:
                     async with self.lock:
                         if not self.closed:
-                            self.logger.debug("Ran out of QR codes, closing channel with status %s and disconnecting client", QR_CHANNEL_TIMEOUT)
+                            logger.debug("Ran out of QR codes, closing channel with status %s and disconnecting client", QR_CHANNEL_TIMEOUT)
                             try:
                                 await asyncio.wait_for(
                                     self.output.put(QR_CHANNEL_TIMEOUT),
                                     timeout=1.0
                                 )
                             except asyncio.TimeoutError:
-                                self.logger.warning("Timed out putting timeout event in queue")
+                                logger.warning("Timed out putting timeout event in queue")
                             except Exception as e:
-                                self.logger.error("Error putting timeout event in queue: %s", e)
+                                logger.error("Error putting timeout event in queue: %s", e)
 
                             await self.close()
                             self.client.disconnect()
                         else:
-                            self.logger.debug("Ran out of QR codes, but channel is already closed")
+                            logger.debug("Ran out of QR codes, but channel is already closed")
                     return
                 elif self.closed:
-                    self.logger.debug("QR code channel is closed, exiting QR emitter")
+                    logger.debug("QR code channel is closed, exiting QR emitter")
                     return
 
                 timeout = 20.0  # Default timeout in seconds
@@ -232,7 +232,7 @@ class QRChannel:
                     timeout = 60.0
 
                 next_code, codes = codes[0], codes[1:]
-                self.logger.debug("Emitting QR code %s", next_code)
+                logger.debug("Emitting QR code %s", next_code)
 
                 try:
                     # Use wait_for with a timeout to avoid blocking indefinitely
@@ -245,14 +245,14 @@ class QRChannel:
                         timeout=1.0
                     )
                 except asyncio.TimeoutError:
-                    self.logger.warning("Timed out putting QR code in queue")
+                    logger.warning("Timed out putting QR code in queue")
                     async with self.lock:
                         if not self.closed:
                             await self.close()
                             self.client.disconnect()
                     return
                 except Exception as e:
-                    self.logger.error("Error putting QR code in queue: %s", e)
+                    logger.error("Error putting QR code in queue: %s", e)
                     async with self.lock:
                         if not self.closed:
                             await self.close()
@@ -263,17 +263,17 @@ class QRChannel:
                 try:
                     # Wait for the stop signal with a timeout
                     await asyncio.wait_for(self.stop_qrs.wait(), timeout=timeout)
-                    self.logger.debug("Got signal to stop QR emitter")
+                    logger.debug("Got signal to stop QR emitter")
                     return
                 except asyncio.TimeoutError:
                     # Timeout expired, continue to next code
                     pass
 
                 if self.closed:
-                    self.logger.debug("Channel is closed, stopping QR emitter")
+                    logger.debug("Channel is closed, stopping QR emitter")
                     return
         except Exception as e:
-            self.logger.error("Unexpected error in emit_qrs: %s", e, exc_info=True)
+            logger.error("Unexpected error in emit_qrs: %s", e, exc_info=True)
             async with self.lock:
                 if not self.closed:
                     await self.close()
@@ -289,25 +289,25 @@ class QRChannel:
         try:
             async with self.lock:
                 if self.closed:
-                    self.logger.debug("Dropping event of type %s, channel is closed", type(raw_evt).__name__)
+                    logger.debug("Dropping event of type %s, channel is closed", type(raw_evt).__name__)
                     return
 
                 output_type = None
 
                 if isinstance(raw_evt, QR):
-                    self.logger.debug("Received QR code event, starting to emit codes to channel")
+                    logger.debug("Received QR code event, starting to emit codes to channel")
                     # Create a task to emit QR codes asynchronously
                     self._emit_task = asyncio.create_task(self.emit_qrs(raw_evt.codes.copy()))
                     return
                 elif isinstance(raw_evt, QRScannedWithoutMultidevice):
-                    self.logger.debug("QR code scanned without multidevice enabled")
+                    logger.debug("QR code scanned without multidevice enabled")
                     try:
                         await asyncio.wait_for(
                             self.output.put(QR_CHANNEL_SCANNED_WITHOUT_MULTIDEVICE),
                             timeout=1.0
                         )
                     except (asyncio.TimeoutError, Exception) as e:
-                        self.logger.warning("Failed to put QR_CHANNEL_SCANNED_WITHOUT_MULTIDEVICE in queue: %s", e)
+                        logger.warning("Failed to put QR_CHANNEL_SCANNED_WITHOUT_MULTIDEVICE in queue: %s", e)
                     return
                 elif isinstance(raw_evt, ClientOutdated):
                     output_type = QR_CHANNEL_CLIENT_OUTDATED
@@ -329,20 +329,20 @@ class QRChannel:
                 self.stop_qrs.set()
 
                 if not self.closed:
-                    self.logger.debug("Closing channel with status %s", output_type)
+                    logger.debug("Closing channel with status %s", output_type)
                     try:
                         await asyncio.wait_for(
                             self.output.put(output_type),
                             timeout=1.0
                         )
                     except (asyncio.TimeoutError, Exception) as e:
-                        self.logger.warning("Failed to put final status in queue: %s", e)
+                        logger.warning("Failed to put final status in queue: %s", e)
 
                     await self.close()
                 else:
-                    self.logger.debug("Got status %s, but channel is already closed", output_type)
+                    logger.debug("Got status %s, but channel is already closed", output_type)
         except Exception as e:
-            self.logger.error("Unexpected error in handle_event: %s", e, exc_info=True)
+            logger.error("Unexpected error in handle_event: %s", e, exc_info=True)
 
     def handle_event_sync(self, raw_evt: Any) -> None:
         """
@@ -355,7 +355,7 @@ class QRChannel:
         asyncio.create_task(self.handle_event(raw_evt))
 
 
-async def get_qr_channel(client: WhatsAppClient, max_size: int = 8) -> QRChannel:
+async def get_qr_channel(client: Client, max_size: int = 8) -> QRChannel:
     """
     Returns a QR channel that automatically outputs a new QR code when the previous one expires.
 
@@ -406,7 +406,6 @@ async def get_qr_channel(client: WhatsAppClient, max_size: int = 8) -> QRChannel
     qrc = QRChannel(
         client=client,
         output_channel=output,
-        logger=logging.getLogger("QRChannel")
     )
     qrc.handler_id = client.add_event_handler(qrc.handle_event_sync)
 

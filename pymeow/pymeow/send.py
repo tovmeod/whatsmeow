@@ -13,11 +13,11 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union, Tuple
 import struct
 
-from ..generated.waE2E import waE2E_pb2
-from ..generated.waMsgApplication import waMsgApplication_pb2
-from ..generated.waMsgTransport import waMsgTransport_pb2
-from ..generated.waCommon import waCommon_pb2
-from ..generated.waConsumerApplication import waConsumerApplication_pb2
+from .generated.waE2E import waE2E_pb2
+from .generated.waMsgApplication import waMsgApplication_pb2
+from .generated.waMsgTransport import waMsgTransport_pb2
+from .generated.waCommon import waCommon_pb2
+from .generated.waConsumerApplication import waConsumerApplication_pb2
 
 from .types.jid import JID
 from .types.message import MessageID, MessageInfo
@@ -48,6 +48,7 @@ MESSAGE_TYPE_REGULAR = "regular"
 MESSAGE_TYPE_PEER = "peer"
 MESSAGE_TYPE_GROUP = "group"
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class MessageDebugTimings:
@@ -230,7 +231,6 @@ class SendMixin:
     """Mixin providing message sending functionality."""
 
     def __init__(self):
-        self.log: logging.Logger = logging.getLogger(__name__)
         # TODO: Verify when store is ported
         self.store: Store = None
         # TODO: Verify when retry is ported
@@ -285,7 +285,7 @@ class SendMixin:
                 return await self._send_dm_message(to, message, extra, debug_timings)
 
         except Exception as e:
-            self.log.error(f"Failed to send message to {to}: {e}")
+            logger.error(f"Failed to send message to {to}: {e}")
             raise WhatsAppError(f"Failed to send message: {e}") from e
 
     async def _send_peer_message(
