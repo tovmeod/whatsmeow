@@ -16,6 +16,58 @@ from .exceptions import PreKeyError
 from .binary.node import Node
 from .types import JID
 
+@dataclass
+class PreKeyData:
+    """Pre-key data structure matching libsignal's prekey."""
+    key_id: int
+    public_key: bytes
+    private_key: bytes
+    uploaded: bool = False
+
+    def to_node(self) -> Node:
+        """Convert to binary node for server communication."""
+        return Node(
+            tag="key",
+            attributes={
+                "id": str(self.key_id)
+            },
+            content=self.public_key
+        )
+
+@dataclass
+class SignedPreKeyData:
+    """Signed pre-key data structure."""
+    key_id: int
+    public_key: bytes
+    private_key: bytes
+    signature: bytes
+    timestamp: datetime
+
+    def to_node(self) -> Node:
+        """Convert to binary node for server communication."""
+        return Node(
+            tag="skey",
+            attributes={
+                "id": str(self.key_id),
+                "timestamp": str(int(self.timestamp.timestamp()))
+            },
+            content=[
+                Node(tag="key", attributes={}, content=self.public_key),
+                Node(tag="signature", attributes={}, content=self.signature)
+            ]
+        )
+
+
+@dataclass
+class PreKeyBundle:
+    """Pre-key bundle for Signal protocol."""
+    registration_id: int
+    device_id: int
+    pre_key: Optional[PreKeyData]
+    signed_pre_key: SignedPreKeyData
+    identity_key: bytes
+
+
 def pre_key_to_node(key: 'PreKeyData') -> Node:
     """Port of Go's preKeyToNode function.
 
@@ -239,60 +291,10 @@ MIN_PREKEY_COUNT = 5     # Threshold for when to upload new prekeys
 DJB_TYPE = 5  # curve25519 key type (matching Go's ecc.DjbType)
 
 @dataclass
-class SignedPreKeyData:
-    """Signed pre-key data structure."""
-    key_id: int
-    public_key: bytes
-    private_key: bytes
-    signature: bytes
-    timestamp: datetime
-
-    def to_node(self) -> Node:
-        """Convert to binary node for server communication."""
-        return Node(
-            tag="skey",
-            attributes={
-                "id": str(self.key_id),
-                "timestamp": str(int(self.timestamp.timestamp()))
-            },
-            content=[
-                Node(tag="key", attributes={}, content=self.public_key),
-                Node(tag="signature", attributes={}, content=self.signature)
-            ]
-        )
-
-@dataclass
-class PreKeyData:
-    """Pre-key data structure matching libsignal's prekey."""
-    key_id: int
-    public_key: bytes
-    private_key: bytes
-    uploaded: bool = False
-
-    def to_node(self) -> Node:
-        """Convert to binary node for server communication."""
-        return Node(
-            tag="key",
-            attributes={
-                "id": str(self.key_id)
-            },
-            content=self.public_key
-        )
-
-@dataclass
 class PreKeyResp:
     """Response structure for fetchPreKeys - matches Go's preKeyResp struct."""
     bundle: Optional[PreKeyBundle]
     error: Optional[Exception]
-
-@dataclass
-class PreKeyBundle:
-    """Pre-key bundle for Signal protocol."""
-    registration_id: int
-    device_id: int
-    pre_key: Optional[PreKeyData]
-    signed_pre_key: SignedPreKeyData
-    identity_key: bytes
 
 class PreKeyStore:
     """Manages WhatsApp pre-keys."""

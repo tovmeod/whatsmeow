@@ -171,6 +171,7 @@ class FrameSocket:
 
         # Copy the header if it's there
         if self.header is not None:
+            logger.info(f"Prepending self.header to frame: {self.header.hex()} (raw bytes: {list(self.header)})")
             whole_frame[0:header_length] = self.header
             # We only want to send the header once
             self.header = None
@@ -182,6 +183,10 @@ class FrameSocket:
 
         # Copy actual frame data
         whole_frame[header_length + FRAME_LENGTH_SIZE:] = data
+
+        logger.info(f"Sending frame: header_length={header_length}, data_length={data_length}")
+        logger.info(f"Complete frame (hex): {whole_frame.hex()}")
+        logger.info(f"Complete frame length: {len(whole_frame)}")
 
         if self.write_timeout and self.write_timeout > 0:
             try:
@@ -221,7 +226,7 @@ class FrameSocket:
                     # Extract frame length from first 3 bytes
                     length = (data[0] << 16) + (data[1] << 8) + data[2]
                     self.incoming_length = length
-                    self.received_length = len(data) - FRAME_LENGTH_SIZE
+                    self.received_length = len(data)
                     data = data[FRAME_LENGTH_SIZE:]
 
                     if len(data) >= length:
@@ -234,11 +239,6 @@ class FrameSocket:
                         self.incoming = bytearray(length)
                         self.incoming[:len(data)] = data
                         data = bytearray()
-                else:
-                    # We have a partial header
-                    logger.warning("Received partial header (report if this happens often)")
-                    self.partial_header = data
-                    data = bytearray()
             else:
                 # We're continuing a partial frame
                 if self.received_length + len(data) >= self.incoming_length:
@@ -256,25 +256,46 @@ class FrameSocket:
     async def _receive_loop(self) -> None:
         """Handle incoming WebSocket messages."""
         logger.debug(f"Frame websocket receive loop starting {id(self)}")
+        ws_closed_before_loop = self._ws.closed if self._ws else "N/A"
+        logger.debug(f"Initial self._ws.closed state: {ws_closed_before_loop}, self._closed flag: {self._closed}")
 
         try:
             async for msg in self._ws:
+                logger.debug(f"Received message of type: {msg.type}")
                 if msg.type == WSMsgType.BINARY:
+                    logger.info(f"Received BINARY message data (hex): {msg.data.hex() if msg.data else 'None'}")
                     self._process_data(msg.data)
                 elif msg.type == WSMsgType.CLOSE:
-                    logger.debug(f"Server closed websocket with status {msg.data}")
+                    logger.info(f"Server closed websocket with status: {msg.data}, WebSocket close code: {self._ws.close_code}")
+                    break
+                elif msg.type == WSMsgType.ERROR:
+                    logger.error(f"WebSocket error message received: {msg.data}. Exception from _ws.exception(): {self._ws.exception()}", exc_info=True)
                     break
                 else:
-                    logger.warning(f"Got unexpected websocket message type {msg.type}")
+                    logger.warning(f"Got unexpected websocket message type: {msg.type}, data: {msg.data}")
         except asyncio.CancelledError:
-            # Normal cancellation, don't log an error
-            pass
+            logger.debug("Frame websocket receive loop cancelled (asyncio.CancelledError).")
         except Exception as e:
-            # Only log if not closed intentionally
             if not self._closed:
-                logger.error(f"Error reading from websocket: {e}")
+                logger.error(f"Error reading from websocket: {e}", exc_info=True)
+            else:
+                logger.info(f"Error reading from websocket after it was already marked closed: {e}", exc_info=True)
         finally:
-            logger.debug(f"Frame websocket receive loop exiting {id(self)}")
-            # Use create_task to avoid blocking in the finally block
+            ws_closed_after_loop = self._ws.closed if self._ws else "N/A"
+            ws_close_code_after_loop = self._ws.close_code if self._ws else "N/A"
+            ws_exception_obj_after_loop = self._ws.exception() if self._ws else None
+            ws_exception_after_loop_str = str(ws_exception_obj_after_loop) if ws_exception_obj_after_loop else "N/A"
+
+            logger.debug(
+                f"Frame websocket receive loop ending. "
+                f"self._ws.closed: {ws_closed_after_loop}, "
+                f"self._ws.close_code: {ws_close_code_after_loop}, "
+                f"self._ws.exception(): {ws_exception_after_loop_str}, "
+                f"self._closed flag: {self._closed}"
+            )
+
             if not self._closed:
+                logger.info(f"Calling self.close(0) from _receive_loop finally as self._closed was False. Loop ID: {id(self)}")
                 asyncio.create_task(self.close(0))
+            else:
+                logger.info(f"self.close(0) not called from _receive_loop finally as self._closed was True. Loop ID: {id(self)}")

@@ -598,7 +598,7 @@ requires-dist = [
     { name = "pycryptodome", specifier = "==3.23.0" },
     { name = "python-dotenv", specifier = "==1.1.0" },
     { name = "qrcode", specifier = "==8.2" },
-    { name = "signal-protocol", specifier = ">=0.2.2" },
+    { name = "signal-protocol", specifier = "==0.2.2" },
     { name = "tortoise-orm", extras = ["asyncpg"], specifier = "==0.25.0" },
 ]
 

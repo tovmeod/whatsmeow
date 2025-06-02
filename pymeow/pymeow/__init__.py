@@ -20,6 +20,8 @@ asyncio for efficient asynchronous I/O.
 
 __version__ = "0.1.0"
 
+from .handshake import HandshakeMixin
+from .keepalive import KeepAliveMixin
 # Re-export presence-related types and enums
 from .types.presence import (
     Presence,
@@ -33,9 +35,12 @@ from .message import MessageHandlingMixin, MessageProcessingMixin
 from .client import Client as BaseClient
 from .types import Message, GroupInfo, PrivacySetting
 from .newsletter import NewsletterMixin
+from .user import UserMixin
+
 
 # Create enhanced Client class with message handling capabilities
-class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, NewsletterMixin):
+class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, NewsletterMixin, UserMixin,
+             HandshakeMixin, KeepAliveMixin):
     """
     Client for WhatsApp Web API with message handling and newsletter capabilities.
 
@@ -45,13 +50,6 @@ class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, Newslette
     pass
 
     # Helper method stubs that should be implemented in the base client or one of the mixins
-    def send_iq(self, *args, **kwargs):
-        """Send an IQ request.
-
-        This method should be implemented in the base client.
-        """
-        raise NotImplementedError("send_iq method must be implemented in the base client")
-
     def generate_request_id(self):
         """Generate a unique request ID.
 

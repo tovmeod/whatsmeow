@@ -7,11 +7,13 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timedelta
-from typing import Tuple
+from typing import Tuple, Optional
 
-from .request import InfoQuery, InfoQueryType
-from .types.events import KeepAliveTimeout, KeepAliveRestored
+from .types.events.events import KeepAliveTimeout, KeepAliveRestored
 from .types.jid import JID
+
+# Logger for test values
+test_log = logging.getLogger("pymeow.test_values")
 
 
 # Constants for keepalive timing
@@ -22,27 +24,18 @@ KEEP_ALIVE_MAX_FAIL_TIME = timedelta(minutes=3)
 
 logger = logging.getLogger(__name__)
 
-class Client:
+class KeepAliveMixin:
     """
     WhatsApp Web client with keepalive functionality.
-
-    This is a partial Client class showing only keepalive-related methods.
-    In the actual implementation, this would be part of the main Client class.
     """
-
-    def __init__(self):
-        self.enable_auto_reconnect: bool = True
-
-    async def keep_alive_loop(self, ctx: asyncio.Task = None) -> None:
+    async def _keepalive_loop(self) -> None:
         """
         Main keepalive loop that periodically sends pings to the server.
 
-        This method runs continuously until the context is cancelled,
+        This method runs continuously until cancelled,
         sending keepalive pings at random intervals to detect connection issues.
-
-        Args:
-            ctx: Optional asyncio task for cancellation context
         """
+        logger.debug("Starting keepalive loop")
         last_success = datetime.now()
         error_count = 0
 
@@ -58,14 +51,15 @@ class Client:
                 await asyncio.sleep(interval_ms / 1000.0)
 
                 # Send keepalive ping
-                is_success, should_continue = await self.send_keep_alive()
+                is_success, should_continue = await self._send_keep_alive()
 
                 if not should_continue:
+                    logger.debug("Keepalive loop stopping")
                     return
                 elif not is_success:
                     error_count += 1
 
-                    # Dispatch timeout event in background
+                    # Dispatch timeout event
                     asyncio.create_task(
                         self._dispatch_keepalive_timeout(error_count, last_success)
                     )
@@ -75,9 +69,9 @@ class Client:
                         datetime.now() - last_success > KEEP_ALIVE_MAX_FAIL_TIME):
 
                         logger.debug("Forcing reconnect due to keepalive failure")
-
-                        self.disconnect()
-                        asyncio.create_task(self.auto_reconnect())
+                        await self.disconnect()
+                        asyncio.create_task(self._auto_reconnect())
+                        return
                 else:
                     # Ping succeeded
                     if error_count > 0:
@@ -86,10 +80,12 @@ class Client:
                     last_success = datetime.now()
 
         except asyncio.CancelledError:
-            # Context was cancelled, exit gracefully
+            logger.debug("Keepalive loop cancelled")
             return
+        except Exception as e:
+            logger.error(f"Unexpected error in keepalive loop: {e}", exc_info=True)
 
-    async def send_keep_alive(self) -> Tuple[bool, bool]:
+    async def _send_keep_alive(self) -> Tuple[bool, bool]:
         """
         Send a keepalive ping to the server.
 
@@ -99,25 +95,52 @@ class Client:
             - should_continue: True if keepalive loop should continue, False if it should stop
         """
         try:
-            # Send info query for keepalive
-            resp_future = await self.send_iq_async(InfoQuery(
-                namespace="w:p",
-                type=InfoQueryType.GET,
-                to=JID.server_jid(),
-                content=[]
-            ))
+            from .binary.node import Node
+            from .types.jid import JID
+            import uuid
+
+            # Log test values for mocking
+            test_log.info("KEEPALIVE_START: Capturing values for test mocking")
+
+            # Create a proper IQ query node for keepalive
+            iq_id = str(uuid.uuid4())
+            ping_node = Node(
+                tag="iq",
+                attributes={
+                    "id": iq_id,
+                    "type": "get",
+                    "to": str(JID.server_jid()),
+                    "xmlns": "w:p"
+                },
+                content=[]  # Empty content for ping
+            )
+
+            # Add the attributes that send_iq_async expects
+            ping_node.id = iq_id
+            ping_node.namespace = "w:p"  # Add namespace attribute
+            ping_node.type = "get"       # Add type attribute
+
+            # Log the ping node for testing
+            test_log.info(f"KEEPALIVE_PING_NODE: {ping_node.xml_string()}")
+
+            # Send info query for keepalive using the actual client API
+            resp_future = await self.send_iq_async(ping_node)
 
             # Wait for response with timeout
             try:
-                await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     resp_future,
                     timeout=KEEP_ALIVE_RESPONSE_DEADLINE.total_seconds()
                 )
                 # Response received successfully
+                # Log the response for testing
+                if response:
+                    test_log.info(f"KEEPALIVE_RESPONSE: {response.xml_string() if hasattr(response, 'xml_string') else str(response)}")
                 return True, True
 
             except asyncio.TimeoutError:
                 logger.warning("Keepalive timed out")
+                test_log.info("KEEPALIVE_TIMEOUT: Keepalive request timed out")
                 return False, True  # Timeout but continue
 
         except asyncio.CancelledError:
@@ -135,7 +158,7 @@ class Client:
                 error_count=error_count,
                 last_success=last_success
             )
-            self.dispatch_event(event)
+            await self.dispatch_event(event)  # Make this async
         except Exception as e:
             logger.warning(f"Failed to dispatch keepalive timeout event: {e}")
 
@@ -143,23 +166,6 @@ class Client:
         """Dispatch keepalive restored event in background."""
         try:
             event = KeepAliveRestored()
-            self.dispatch_event(event)
+            await self.dispatch_event(event)  # Make this async
         except Exception as e:
             logger.warning(f"Failed to dispatch keepalive restored event: {e}")
-
-    # These methods would be implemented elsewhere in the Client class
-    async def send_iq_async(self, query: InfoQuery) -> asyncio.Future:
-        """Send an IQ query asynchronously. Implementation in request.py"""
-        raise NotImplementedError("Implemented in request.py")
-
-    def disconnect(self) -> None:
-        """Disconnect the client. Implementation in client.py"""
-        raise NotImplementedError("Implemented in client.py")
-
-    async def auto_reconnect(self) -> None:
-        """Automatically reconnect the client. Implementation in client.py"""
-        raise NotImplementedError("Implemented in client.py")
-
-    def dispatch_event(self, event: object) -> None:
-        """Dispatch an event to event handlers. Implementation in client.py"""
-        raise NotImplementedError("Implemented in client.py")

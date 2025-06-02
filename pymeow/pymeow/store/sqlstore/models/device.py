@@ -16,6 +16,8 @@ class Device(Model):
     platform = fields.CharField(max_length=50, default="android")
     business_name = fields.CharField(max_length=255, null=True)
     push_name = fields.CharField(max_length=255, null=True)
+    noise_key_private = fields.BinaryField(null=True)
+    noise_key_public = fields.BinaryField(null=True)
 
     class Meta:
         table = "pymeow_device"

@@ -4,11 +4,14 @@ Noise protocol socket implementation for WhatsApp Web.
 Port of whatsmeow/socket/noisesocket.go
 """
 import asyncio
+import logging
 import struct
 from typing import Optional, Callable, Awaitable, Any
 
 # TODO: Verify import when cipher is ported
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+logger = logging.getLogger(__name__)
 
 class NoiseSocket:
     """
@@ -48,24 +51,37 @@ class NoiseSocket:
 
         This is the equivalent of the Go consumeFrames goroutine.
         """
-        if self.fs.ctx is None:
-            # Context being None implies the connection already closed somehow
-            return
-
         try:
             while not self.stop_consumer.is_set():
+                # Create tasks explicitly for the coroutines
+                frame_task = asyncio.create_task(self.fs.frames.get())
+                stop_task = asyncio.create_task(self.stop_consumer.wait())
+
                 # Wait for either a frame or cancellation
                 done, pending = await asyncio.wait(
-                    [self.fs.frames.get(), self.stop_consumer.wait()],
+                    [frame_task, stop_task],
                     return_when=asyncio.FIRST_COMPLETED
                 )
 
+                # Cancel any pending tasks to avoid warnings
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Process completed tasks
                 for task in done:
                     if task.exception() is None and not self.stop_consumer.is_set():
-                        # If we got a frame and we're not stopping, process it
-                        frame = task.result()
-                        if isinstance(frame, bytes):
-                            await self._receive_encrypted_frame(frame)
+                        # Check which task completed
+                        if task is frame_task:
+                            # If we got a frame and we're not stopping, process it
+                            frame = task.result()
+                            if isinstance(frame, bytes):
+                                await self._receive_encrypted_frame(frame)
+                        # If stop_task completed, the loop will exit naturally
+                        break
         except asyncio.CancelledError:
             # Task was cancelled, clean up
             pass
@@ -151,10 +167,15 @@ class NoiseSocket:
         try:
             iv = self._generate_iv(count)
             plaintext = self.read_key.decrypt(iv, ciphertext, None)
-            await self.on_frame(plaintext)
+
+            # Handle both sync and async callbacks
+            if asyncio.iscoroutinefunction(self.on_frame):
+                await self.on_frame(plaintext)
+            else:
+                self.on_frame(plaintext)
         except Exception as e:
             # Log error but don't crash
-            print(f"Failed to decrypt frame: {e}")
+            logger.error(f"Failed to decrypt frame: {e}")
 
     def is_connected(self) -> bool:
         """

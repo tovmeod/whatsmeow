@@ -5,6 +5,7 @@ Port of whatsmeow/user.go
 """
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import List, Dict, Optional, Any, Tuple, Union
 import contextlib
 import string

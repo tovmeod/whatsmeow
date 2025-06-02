@@ -27,7 +27,8 @@ class NoiseHandshake:
     a secure connection with the WhatsApp server.
     """
 
-    # Noise protocol handshake pattern
+    # Noise protocol handshake pattern with null bytes padding
+    # This matches the Go implementation's NoiseStartPattern constant
     NOISE_START_PATTERN = b"Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00"
 
     def __init__(self):
@@ -62,14 +63,23 @@ class NoiseHandshake:
         Raises:
             ValueError: If key preparation fails
         """
-        data = pattern.encode('utf-8')
+        # Convert pattern string to bytes if it's not already
+        data = pattern.encode('utf-8') if isinstance(pattern, str) else pattern
+
+        # If data is already 32 bytes, use it directly as the hash
+        # Otherwise, compute the SHA-256 hash of the data
         if len(data) == 32:
             self.hash = data
         else:
             self.hash = self._sha256_slice(data)
 
+        # Initialize salt with the hash
         self.salt = self.hash
+
+        # Prepare the AES-GCM cipher with the hash as the key
         self.key = prepare(self.hash)
+
+        # Authenticate the header
         self.authenticate(header)
 
     def authenticate(self, data: bytes) -> None:
@@ -104,7 +114,10 @@ class NoiseHandshake:
         Returns:
             A 12-byte IV with the counter in the last 4 bytes
         """
+        # Create a 12-byte IV with zeros
         iv = bytearray(12)
+        # Pack the counter into the last 4 bytes in big-endian format
+        # This matches the Go implementation in generateIV function
         struct.pack_into('>I', iv, 8, count)
         return bytes(iv)
 
@@ -124,11 +137,19 @@ class NoiseHandshake:
         if not self.key:
             raise ValueError("Encryption key not initialized")
 
+        # Get the counter value and generate IV
         count = self._post_increment_counter()
         iv = self._generate_iv(count)
-        ciphertext = self.key.encrypt(iv, plaintext, self.hash)
-        self.authenticate(ciphertext)
-        return ciphertext
+
+        # Encrypt the data using AESGCM with the hash as associated data
+        # This matches the Go implementation which uses gcmutil.Encrypt
+        try:
+            ciphertext = self.key.encrypt(iv, plaintext, self.hash)
+            # Authenticate the ciphertext
+            self.authenticate(ciphertext)
+            return ciphertext
+        except Exception as e:
+            raise ValueError(f"Encryption failed: {e}")
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         """
@@ -146,14 +167,19 @@ class NoiseHandshake:
         if not self.key:
             raise ValueError("Decryption key not initialized")
 
+        # Get the counter value and generate IV
         count = self._post_increment_counter()
         iv = self._generate_iv(count)
 
         try:
+            # Decrypt the data using AESGCM with the hash as associated data
+            # This matches the Go implementation which uses gcmutil.Decrypt
             plaintext = self.key.decrypt(iv, ciphertext, self.hash)
+            # Authenticate the ciphertext after successful decryption
             self.authenticate(ciphertext)
             return plaintext
         except Exception as e:
+            # Provide more detailed error message
             raise ValueError(f"Decryption failed: {e}")
 
     async def finish(self, fs: FrameSocket,
@@ -193,16 +219,19 @@ class NoiseHandshake:
             ValueError: If key mixing fails
         """
         try:
-            # Convert bytes to X25519 keys
+            # Ensure keys are the correct length
             if len(priv) != 32 or len(pub) != 32:
                 raise ValueError("Invalid key length")
 
-            # Use cryptography's X25519 implementation
+            # Create X25519 key objects from the raw bytes
             private_key = X25519PrivateKey.from_private_bytes(priv)
             public_key = X25519PublicKey.from_public_bytes(pub)
 
-            # Compute shared secret
+            # Perform the X25519 scalar multiplication
+            # This matches the Go implementation which uses curve25519.X25519
             secret = private_key.exchange(public_key)
+
+            # Mix the shared secret into the key
             self.mix_into_key(secret)
         except Exception as e:
             raise ValueError(f"Failed to mix shared secret: {e}")
@@ -243,32 +272,32 @@ class NoiseHandshake:
             if data is None:
                 data = b''
 
-            # Use cryptography's HKDF implementation
-            # Derive 64 bytes: 32 for write key + 32 for read key
-            hkdf = HKDF(
-                algorithm=hashes.SHA256(),
-                length=64,  # 32 bytes for write key + 32 bytes for read key
-                salt=salt,
-                info=None,
-            )
+            # Use a more direct approach to match the Go implementation
+            # In Go: h := hkdf.New(sha256.New, data, salt, nil)
+            # Then it reads 32 bytes twice from the same HKDF reader
 
-            # Derive the keys
-            output = hkdf.derive(data)
+            # Create a raw HKDF implementation
+            import io
+            import hmac
 
-            # Split the result into write and read keys
-            write = output[:32]
-            read = output[32:64]
+            # Step 1: Extract
+            if not salt:
+                salt = bytes([0] * 32)  # Use zero key if salt is empty
+            prk = hmac.new(salt, data, hashlib.sha256).digest()
+
+            # Step 2: Expand
+            # Create an expandable output function
+            info = b''
+            t = b''
+            okm = b''
+            for i in range(1, 3):  # We need 2 blocks (64 bytes total)
+                t = hmac.new(prk, t + info + bytes([i]), hashlib.sha256).digest()
+                okm += t
+
+            # Split the output into write and read keys
+            write = okm[:32]
+            read = okm[32:64]
 
             return write, read
         except Exception as e:
             raise ValueError(f"Failed to extract and expand keys: {e}")
-
-
-def new_noise_handshake() -> NoiseHandshake:
-    """
-    Create a new NoiseHandshake instance.
-
-    Returns:
-        A new NoiseHandshake instance
-    """
-    return NoiseHandshake()

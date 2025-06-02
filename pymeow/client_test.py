@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from pymeow import Client
-from pymeow.pymeow.qrchan import get_qr_channel
+from pymeow.qrchan import get_qr_channel
 from pymeow.store.sqlstore import Container, SQLStore
 from pymeow.types.events import Message
 from pymeow.types.events import QR
 from pymeow.types.events import Connected, Disconnected
+
+logger = logging.getLogger(__name__)
 
 class ColoredFormatter(logging.Formatter):
     """
@@ -121,7 +123,7 @@ async def event_handler(event: Any) -> None:
         print("❌ Disconnected from WhatsApp")
 
     else:
-        print(f"Received event: {type(event).__name__}")
+        logger.debug(f"client_test event handler ignoring Received event: {type(event).__name__}")
 
 
 async def main():
@@ -142,8 +144,9 @@ async def main():
     # Set up logging
     setup_logging()
     logger = logging.getLogger(__name__)
-    db_log = logging.getLogger("Database")
 
+    container = None
+    client = None
     try:
         # Create data directory if it doesn't exist
         data_dir = Path.home() / ".pymeow"
@@ -191,7 +194,7 @@ async def main():
             print("No existing session found, starting new login...")
 
             # Get QR channel for authentication
-            qr_channel = get_qr_channel(client)
+            qr_channel = await get_qr_channel(client)
 
             # Connect to WhatsApp
             await client.connect()
@@ -249,9 +252,9 @@ async def main():
         # Graceful shutdown
         print("Shutting down client...")
         try:
-            if 'client' in locals():
+            if client:
                 await client.disconnect()
-            if 'container' in locals():
+            if container:
                 await container.close()
         except Exception as e:
             print(f"Error during shutdown: {e}")

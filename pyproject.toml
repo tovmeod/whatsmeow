@@ -36,7 +36,7 @@ dependencies = [
     "pycryptodome==3.23.0",
     "python-dotenv==1.1.0",
     "qrcode==8.2",
-    "signal-protocol>=0.2.2",
+    "signal-protocol==0.2.2",
     "tortoise-orm[asyncpg]==0.25.0",
 ]
 

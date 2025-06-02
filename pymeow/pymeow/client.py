@@ -9,7 +9,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypeVar, Generic
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypeVar, Generic, Awaitable
 from urllib.parse import urlparse
 
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
@@ -21,7 +21,7 @@ from .mediaconn import MediaConnMixin
 
 from .socket.framesocket import FrameSocket
 from .socket.noisesocket import NoiseSocket
-from .socket.noisehandshake import NoiseHandshake, new_noise_handshake
+from .socket.noisehandshake import NoiseHandshake
 from .binary.node import Node, Attrs
 from .store import Device
 from .types import message
@@ -36,7 +36,7 @@ from .util.keys.keypair import KeyPair
 from .appstate import Processor
 
 # Type for event handlers
-EventHandler = Callable[[Any], None]
+EventHandler = Callable[[Any], Awaitable[None]]
 
 # Constants
 HANDLER_QUEUE_SIZE = 2048
@@ -214,6 +214,9 @@ class Client(MediaConnMixin):
 
         # Initialize node handlers
         self._init_node_handlers()
+
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._handler_task: Optional[asyncio.Task] = None
 
     def _init_node_handlers(self):
         """Initialize the node handlers dictionary."""
@@ -507,11 +510,12 @@ class Client(MediaConnMixin):
                 await self._do_handshake(fs, ephemeral_kp)
             except Exception as e:
                 await fs.close(0)
-                raise ValueError(f"Noise handshake failed: {e}")
+                raise ValueError(f"Noise handshake failed") from e
 
             # Start keepalive and handler loops
-            asyncio.create_task(self._keepalive_loop())
-            asyncio.create_task(self._handler_queue_loop())
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            self._handler_task = asyncio.create_task(self._handler_queue_loop())
+
 
     def is_logged_in(self) -> bool:
         """Check if the client is logged in.
@@ -520,31 +524,6 @@ class Client(MediaConnMixin):
             True if the client is logged in, False otherwise
         """
         return self is not None and self._is_logged_in
-
-    async def _on_disconnect(self, ns: NoiseSocket, remote: bool) -> None:
-        """Handle a disconnection event.
-
-        Args:
-            ns: The noise socket that was disconnected
-            remote: True if the disconnection was initiated by the remote end
-        """
-        await ns.stop(False)
-
-        async with self.socket_lock:
-            if self.socket is ns:
-                self.socket = None
-                await self._clear_response_waiters("xmlstreamend")
-
-                if not self._is_expected_disconnect() and remote:
-                    logger.debug("Emitting Disconnected event")
-                    asyncio.create_task(self.dispatch_event(Disconnected()))
-                    asyncio.create_task(self._auto_reconnect())
-                elif remote:
-                    logger.debug("OnDisconnect() called, but it was expected, so not emitting event")
-                else:
-                    logger.debug("OnDisconnect() called after manual disconnection")
-            else:
-                logger.debug("Ignoring OnDisconnect on different socket")
 
     def _expect_disconnect(self) -> None:
         """Mark that a disconnection is expected."""
@@ -616,6 +595,17 @@ class Client(MediaConnMixin):
 
     async def _unlocked_disconnect(self) -> None:
         """Disconnect from the WhatsApp web websocket without locking."""
+        # Cancel background tasks first
+        if self._keepalive_task and not self._keepalive_task.done():
+            logger.debug("Cancelling keepalive task")
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
+
+        if self._handler_task and not self._handler_task.done():
+            logger.debug("Cancelling handler task")
+            self._handler_task.cancel()
+            self._handler_task = None
+
         if self.socket is not None:
             await self.socket.stop(True)
             self.socket = None
@@ -659,10 +649,10 @@ class Client(MediaConnMixin):
         await self.store.delete()
 
     def add_event_handler(self, handler: EventHandler) -> int:
-        """Register a new function to receive all events emitted by this client.
+        """Register a new async function to receive all events emitted by this client.
 
         Args:
-            handler: The event handler function
+            handler: The async event handler function
 
         Returns:
             The event handler ID, which can be passed to remove_event_handler to remove it
@@ -702,44 +692,6 @@ class Client(MediaConnMixin):
         """Remove all event handlers that have been registered with add_event_handler."""
         # TODO: Implement proper locking
         self.event_handlers = []
-
-    async def _handle_frame(self, data: bytes) -> None:
-        """Handle a frame received from the server.
-
-        Args:
-            data: The frame data
-        """
-        try:
-            decompressed = Node.unpack(data)
-        except Exception as err:
-            logger.warning(f"Failed to decompress frame: {err}")
-            logger.debug(f"Errored frame hex: {data.hex()}")
-            return
-
-        try:
-            node = Node.unmarshal(decompressed)
-        except Exception as err:
-            logger.warning(f"Failed to decode node in frame: {err}")
-            logger.debug(f"Errored frame hex: {decompressed.hex()}")
-            return
-
-        self.recv_log.debug(f"{node.xml_string()}")
-
-        if node.tag == "xmlstreamend":
-            if not self._is_expected_disconnect():
-                logger.warning("Received stream end frame")
-            # TODO: Should we do something else?
-        elif await self._receive_response(node):
-            # Handled by response waiter
-            pass
-        elif node.tag in self.node_handlers:
-            try:
-                await self.handler_queue.put(node)
-            except asyncio.QueueFull:
-                logger.warning("Handler queue is full, message ordering is no longer guaranteed")
-                asyncio.create_task(self._put_in_handler_queue(node))
-        elif node.tag != "ack":
-            logger.debug(f"Didn't handle WhatsApp node {node.tag}")
 
     async def _put_in_handler_queue(self, node: Node) -> None:
         """Put a node in the handler queue, waiting if necessary.
@@ -805,8 +757,7 @@ class Client(MediaConnMixin):
             raise ValueError("Client is nil")
 
         # TODO: Implement proper locking
-        sock = self.socket
-        if sock is None:
+        if self.socket is None:
             raise ValueError("Not connected")
 
         try:
@@ -815,7 +766,7 @@ class Client(MediaConnMixin):
             raise ValueError(f"Failed to marshal node: {err}")
 
         self.send_log.debug(f"{node.xml_string()}")
-        await sock.send_frame(payload)
+        await self.socket.send_frame(payload)
         return payload
 
     async def _send_node(self, node: Node) -> None:
@@ -915,9 +866,9 @@ class Client(MediaConnMixin):
         # TODO: Implement proper locking
         for handler in self.event_handlers:
             try:
-                handler.fn(evt)
+                await handler.fn(evt)
             except Exception as err:
-                logger.error(f"Event handler panicked while handling a {type(evt).__name__}: {err}")
+                logger.exception(f"Event handler panicked while handling a {type(evt).__name__}: {err}")
 
     async def parse_web_message(self, chat_jid: JID, web_msg: waWeb_pb2.WebMessageInfo) -> Any:
         """Parse a WebMessageInfo object into a Message to match what real-time messages have.
@@ -1258,97 +1209,8 @@ class Client(MediaConnMixin):
         pass
 
     # Helper methods
-    async def _do_handshake(self, fs: FrameSocket, ephemeral_kp: KeyPair) -> None:
-        """Perform the handshake with the server.
 
-        Args:
-            fs: The frame socket
-            ephemeral_kp: The ephemeral key pair
 
-        Raises:
-            ValueError: If the handshake fails
-        """
-        nh = new_noise_handshake()
-        nh.start("Noise_XX_25519_AESGCM_SHA256", fs.header)
-        nh.authenticate(ephemeral_kp.pub)
-
-        # Create and send client hello message
-        data = WAWebProtobufsWa6_pb2.HandshakeMessage(
-            client_hello=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientHello(
-                ephemeral=ephemeral_kp.pub
-            )
-        ).SerializeToString()
-
-        await fs.send_frame(data)
-
-        # Wait for server response
-        try:
-            resp = await asyncio.wait_for(fs.frames.get(), 20)  # 20 seconds timeout
-        except asyncio.TimeoutError:
-            raise ValueError("Timed out waiting for handshake response")
-
-        # Parse server response
-        handshake_response = WAWebProtobufsWa6_pb2.HandshakeMessage()
-        handshake_response.ParseFromString(resp)
-
-        server_ephemeral = handshake_response.server_hello.ephemeral
-        server_static_ciphertext = handshake_response.server_hello.static
-        certificate_ciphertext = handshake_response.server_hello.payload
-
-        if (len(server_ephemeral) != 32 or
-            not server_static_ciphertext or
-            not certificate_ciphertext):
-            raise ValueError("Missing parts of handshake response")
-
-        # Process server ephemeral key
-        nh.authenticate(server_ephemeral)
-        nh.mix_shared_secret_into_key(ephemeral_kp.priv, server_ephemeral)
-
-        # Decrypt server static key
-        static_decrypted = nh.decrypt(server_static_ciphertext)
-        if len(static_decrypted) != 32:
-            raise ValueError(f"Unexpected length of server static plaintext {len(static_decrypted)} (expected 32)")
-
-        # Mix server static key into handshake
-        nh.mix_shared_secret_into_key(ephemeral_kp.priv, static_decrypted)
-
-        # Decrypt and verify certificate
-        cert_decrypted = nh.decrypt(certificate_ciphertext)
-        if not self._verify_server_cert(cert_decrypted, static_decrypted):
-            raise ValueError("Failed to verify server certificate")
-
-        # Send client finish message
-        encrypted_pubkey = nh.encrypt(self.store.noise_key.pub)
-        nh.mix_shared_secret_into_key(self.store.noise_key.priv, server_ephemeral)
-
-        # Get client payload
-        client_payload = None
-        if self.get_client_payload:
-            client_payload = self.get_client_payload()
-        else:
-            client_payload = self.store.get_client_payload()
-
-        # Serialize and encrypt client payload
-        client_finish_payload_bytes = client_payload.SerializeToString()
-        encrypted_client_finish_payload = nh.encrypt(client_finish_payload_bytes)
-
-        # Create and send client finish message
-        data = WAWebProtobufsWa6_pb2.HandshakeMessage(
-            client_finish=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientFinish(
-                static=encrypted_pubkey,
-                payload=encrypted_client_finish_payload
-            )
-        ).SerializeToString()
-
-        await fs.send_frame(data)
-
-        # Finish handshake and create noise socket
-        self.socket = await nh.finish(fs, self._handle_frame, self._on_disconnect)
-
-    async def _keepalive_loop(self) -> None:
-        """Send keepalive messages to the server."""
-        # TODO: Implement keepalive
-        pass
 
     async def _receive_response(self, node: Node) -> bool:
         """Process a response node.
@@ -1874,77 +1736,6 @@ class Client(MediaConnMixin):
             self._privacy_settings_cache = settings
 
         await self.dispatch_event(evt)
-
-    def _verify_server_cert(self, cert_decrypted: bytes, static_decrypted: bytes) -> bool:
-        """Verify the server certificate.
-
-        Args:
-            cert_decrypted: The decrypted certificate
-            static_decrypted: The decrypted static key
-
-        Returns:
-            True if the certificate is valid, False otherwise
-        """
-        try:
-            # Parse certificate chain
-            cert_chain = WACert_pb2.CertChain()
-            cert_chain.ParseFromString(cert_decrypted)
-
-            # Extract certificate details
-            intermediate_cert_details_raw = cert_chain.intermediate.details
-            intermediate_cert_signature = cert_chain.intermediate.signature
-            leaf_cert_details_raw = cert_chain.leaf.details
-            leaf_cert_signature = cert_chain.leaf.signature
-
-            # Validate certificate parts
-            if (not intermediate_cert_details_raw or
-                not intermediate_cert_signature or
-                not leaf_cert_details_raw or
-                not leaf_cert_signature):
-                return False
-
-            if len(intermediate_cert_signature) != 64:
-                return False
-
-            if len(leaf_cert_signature) != 64:
-                return False
-
-            # Verify intermediate certificate signature
-            # TODO: Implement proper Ed25519 signature verification
-            # For now, we'll assume the signature is valid
-
-            # Parse intermediate certificate details
-            intermediate_cert_details = WACert_pb2.CertChain.NoiseCertificate.Details()
-            intermediate_cert_details.ParseFromString(intermediate_cert_details_raw)
-
-            # Verify issuer serial
-            if intermediate_cert_details.issuer_serial != 0:  # WA_CERT_ISSUER_SERIAL
-                return False
-
-            # Verify intermediate key length
-            if len(intermediate_cert_details.key) != 32:
-                return False
-
-            # Verify leaf certificate signature
-            # TODO: Implement proper Ed25519 signature verification
-            # For now, we'll assume the signature is valid
-
-            # Parse leaf certificate details
-            leaf_cert_details = WACert_pb2.CertChain.NoiseCertificate.Details()
-            leaf_cert_details.ParseFromString(leaf_cert_details_raw)
-
-            # Verify leaf issuer serial
-            if leaf_cert_details.issuer_serial != intermediate_cert_details.serial:
-                return False
-
-            # Verify leaf key matches static key
-            if leaf_cert_details.key != static_decrypted:
-                return False
-
-            return True
-        except Exception as e:
-            logger.error(f"Error verifying server certificate: {e}")
-            return False
 
     async def get_server_push_notification_config(self) -> Optional[Node]:
         """Retrieves server push notification settings."""
