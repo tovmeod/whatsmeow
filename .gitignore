@@ -3,3 +3,8 @@ __pycache__/
 .mypy_cache/
 .idea/
 *.log
+
+### BROKK'S CONFIGURATION ###
+.brokk/**
+!.brokk/style.md
+!.brokk/project.properties

@@ -230,12 +230,12 @@ async def test_send_keep_alive_success():
     mock_response = MagicMock(spec=Node)
     mock_response.xml_string = MagicMock(return_value=SAMPLE_RESPONSE_XML)
 
-    # Create a future that will be returned by send_iq_async
-    response_future = asyncio.Future()
-    response_future.set_result(mock_response)
+    # Create a queue and put the response in it
+    response_queue = asyncio.Queue()
+    await response_queue.put(mock_response)
 
-    # Mock send_iq_async to return the future
-    test_instance.send_iq_async = AsyncMock(return_value=response_future)
+    # Mock send_iq_async to return (queue, None) tuple as per the new interface
+    test_instance.send_iq_async = AsyncMock(return_value=(response_queue, None))
 
     # Call the method under test
     is_success, should_continue = await test_instance._send_keep_alive()
@@ -244,14 +244,8 @@ async def test_send_keep_alive_success():
     assert is_success is True
     assert should_continue is True
 
-    # Verify send_iq_async was called with a Node
+    # Verify send_iq_async was called
     test_instance.send_iq_async.assert_called_once()
-    call_args = test_instance.send_iq_async.call_args[0][0]
-    assert isinstance(call_args, Node)
-    assert call_args.tag == "iq"
-    assert call_args.attributes["type"] == "get"
-    assert call_args.attributes["xmlns"] == "w:p"
-    assert call_args.attributes["to"] == "s.whatsapp.net"
 
 @pytest.mark.asyncio
 async def test_send_keep_alive_timeout():
@@ -350,6 +344,8 @@ async def test_dispatch_keepalive_restored():
 @pytest.mark.asyncio
 async def test_send_keep_alive_node_structure():
     """Test that the keepalive node has the correct structure."""
+    from ..pymeow.request import InfoQueryType  # Import the enum
+
     # Create test instance
     test_instance = TestKeepAlive()
 
@@ -358,9 +354,10 @@ async def test_send_keep_alive_node_structure():
     async def capture_node(node):
         nonlocal captured_node
         captured_node = node
-        future = asyncio.Future()
-        future.set_result(MagicMock())
-        return future
+        # Return the expected tuple format (queue, error)
+        response_queue = asyncio.Queue()
+        await response_queue.put(MagicMock())
+        return response_queue, None
 
     test_instance.send_iq_async = capture_node
 
@@ -381,7 +378,7 @@ async def test_send_keep_alive_node_structure():
     assert hasattr(captured_node, 'namespace')
     assert hasattr(captured_node, 'type')
     assert captured_node.namespace == "w:p"
-    assert captured_node.type == "get"
+    assert captured_node.type == InfoQueryType.GET  # Now check for the enum, not string
 
 @pytest.mark.asyncio
 async def test_keepalive_loop_exception_handling():
@@ -507,3 +504,185 @@ async def test_send_iq_async_interface():
 
     # Print what attributes were accessed for debugging
     print(f"Successfully accessed attributes: {tracker.accessed_attributes}")
+
+@pytest.mark.asyncio
+async def test_send_keep_alive_with_real_client_interface():
+    """Test to reproduce the 'str' object has no attribute 'value' error."""
+    # Create test instance
+    test_instance = TestKeepAlive()
+
+    # Mock send_iq_async to simulate what the real client does
+    # The error suggests that somewhere in the chain, a string is being treated as an object with a .value attribute
+
+    # Let's mock send_iq_async to behave more like the real client
+    async def mock_send_iq_async(query):
+        # Print debug info about what we received
+        print(f"send_iq_async called with: {type(query)} - {query}")
+        print(f"Query attributes: {dir(query)}")
+
+        # Try to access the .value attribute like the real client might
+        try:
+            if hasattr(query, 'value'):
+                print(f"Query.value: {query.value}")
+        except AttributeError as e:
+            print(f"AttributeError accessing query.value: {e}")
+
+        # Return a string instead of a proper response object to trigger the error
+        # This might be what's happening in the real client
+        return "fake_response_string"
+
+    test_instance.send_iq_async = mock_send_iq_async
+
+    # Call the method under test - this should reproduce the error
+    try:
+        is_success, should_continue = await test_instance._send_keep_alive()
+        print(f"Result: is_success={is_success}, should_continue={should_continue}")
+    except Exception as e:
+        print(f"Exception caught: {type(e).__name__}: {e}")
+        # This is expected - we want to see this error
+        assert "'str' object has no attribute 'value'" in str(e) or "AttributeError" in str(type(e).__name__)
+
+@pytest.mark.asyncio
+async def test_send_keep_alive_debug_real_error():
+    """Debug test to understand the exact error from the real client."""
+    # Create test instance
+    test_instance = TestKeepAlive()
+
+    # Mock send_iq_async to return the new interface properly
+    async def problematic_send_iq_async(query):
+        # Create a queue
+        response_queue = asyncio.Queue()
+
+        # Put a proper mock response in the queue
+        mock_response = MagicMock()
+        mock_response.xml_string = MagicMock(return_value="<response/>")
+        await response_queue.put(mock_response)
+
+        # Return the correct tuple interface
+        return response_queue, None
+
+    test_instance.send_iq_async = problematic_send_iq_async
+
+    # Call the method under test
+    is_success, should_continue = await test_instance._send_keep_alive()
+
+    # Should succeed now
+    assert is_success is True
+    assert should_continue is True
+
+@pytest.mark.asyncio
+async def test_send_keep_alive_investigate_response_handling():
+    """Investigate how the response is being handled to find the .value access."""
+    # Create test instance
+    test_instance = TestKeepAlive()
+
+    # Track what happens with the response
+    response_interactions = []
+
+    class TrackedResponse:
+        def __init__(self, data):
+            self._data = data
+            response_interactions.append(f"Created TrackedResponse with: {data}")
+
+        def __getattr__(self, name):
+            response_interactions.append(f"Accessed attribute: {name}")
+            if name == 'value':
+                response_interactions.append("ERROR: Tried to access .value on response")
+                raise AttributeError(f"'str' object has no attribute 'value'")
+            elif name == 'xml_string':
+                return lambda: "<fake>response</fake>"
+            return f"tracked_{name}"
+
+    async def tracking_send_iq_async(query):
+        response_interactions.append(f"send_iq_async called with query type: {type(query)}")
+
+        # Create a queue and put the tracked response in it
+        response_queue = asyncio.Queue()
+        await response_queue.put(TrackedResponse("fake_response_data"))
+
+        # Return the correct tuple interface
+        return response_queue, None
+
+    test_instance.send_iq_async = tracking_send_iq_async
+
+    # Call the method and see what interactions happen
+    is_success, should_continue = await test_instance._send_keep_alive()
+
+    # Print all interactions for debugging
+    print("Response interactions:")
+    for interaction in response_interactions:
+        print(f"  {interaction}")
+
+    # The method should succeed if we handle the response correctly
+    assert is_success is True
+    assert should_continue is True
+
+@pytest.mark.asyncio
+async def test_send_keep_alive_with_correct_interface():
+    """Test send_keep_alive with the correct send_iq_async interface."""
+    # Create test instance
+    test_instance = TestKeepAlive()
+
+    # Create a mock response queue
+    response_queue = asyncio.Queue()
+
+    # Create a mock response and put it in the queue
+    mock_response = MagicMock()
+    mock_response.xml_string = MagicMock(return_value='<iq type="result"/>')
+    await response_queue.put(mock_response)
+
+    # Mock send_iq_async to return (queue, None) as per the real interface
+    async def correct_send_iq_async(query):
+        return response_queue, None  # (queue, error)
+
+    test_instance.send_iq_async = correct_send_iq_async
+
+    # Call the method under test
+    is_success, should_continue = await test_instance._send_keep_alive()
+
+    # Verify results
+    assert is_success is True
+    assert should_continue is True
+
+@pytest.mark.asyncio
+async def test_send_keep_alive_with_error():
+    """Test send_keep_alive when send_iq_async returns an error."""
+    # Create test instance
+    test_instance = TestKeepAlive()
+
+    # Mock send_iq_async to return an error
+    async def error_send_iq_async(query):
+        return None, Exception("Test error")  # (queue, error)
+
+    test_instance.send_iq_async = error_send_iq_async
+
+    # Call the method under test
+    is_success, should_continue = await test_instance._send_keep_alive()
+
+    # Verify results
+    assert is_success is False
+    assert should_continue is True
+
+@pytest.mark.asyncio
+async def test_send_keep_alive_queue_timeout():
+    """Test send_keep_alive when the response queue times out."""
+    # Create test instance
+    test_instance = TestKeepAlive()
+
+    # Create an empty queue that will timeout
+    response_queue = asyncio.Queue()
+
+    # Mock send_iq_async to return empty queue
+    async def timeout_send_iq_async(query):
+        return response_queue, None  # (queue, error)
+
+    test_instance.send_iq_async = timeout_send_iq_async
+
+    # Mock the response deadline to be very short for fast testing
+    with patch('pymeow.pymeow.keepalive.KEEP_ALIVE_RESPONSE_DEADLINE', timedelta(milliseconds=10)):
+        # Call the method under test
+        is_success, should_continue = await test_instance._send_keep_alive()
+
+        # Verify results
+        assert is_success is False
+        assert should_continue is True

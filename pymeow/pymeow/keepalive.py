@@ -9,6 +9,7 @@ import random
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 
+from .request import InfoQueryType
 from .types.events.events import KeepAliveTimeout, KeepAliveRestored
 from .types.jid import JID
 
@@ -118,18 +119,23 @@ class KeepAliveMixin:
             # Add the attributes that send_iq_async expects
             ping_node.id = iq_id
             ping_node.namespace = "w:p"  # Add namespace attribute
-            ping_node.type = "get"       # Add type attribute
+            ping_node.type = InfoQueryType.GET  # Use the enum, not a string
 
             # Log the ping node for testing
             test_log.info(f"KEEPALIVE_PING_NODE: {ping_node.xml_string()}")
 
             # Send info query for keepalive using the actual client API
-            resp_future = await self.send_iq_async(ping_node)
+            # send_iq_async returns (queue, error) tuple, not a future
+            response_queue, error = await self.send_iq_async(ping_node)
 
-            # Wait for response with timeout
+            if error is not None:
+                logger.warning(f"Keepalive failed with error: {error}")
+                return False, True  # Error but continue
+
+            # Wait for response from the queue with timeout
             try:
                 response = await asyncio.wait_for(
-                    resp_future,
+                    response_queue.get(),  # Get response from the queue
                     timeout=KEEP_ALIVE_RESPONSE_DEADLINE.total_seconds()
                 )
                 # Response received successfully
@@ -148,7 +154,7 @@ class KeepAliveMixin:
             return False, False
 
         except Exception as e:
-            logger.warning(f"Failed to send keepalive: {e}")
+            logger.exception(f"Failed to send keepalive: {e}")
             return False, True  # Error but continue
 
     async def _dispatch_keepalive_timeout(self, error_count: int, last_success: datetime) -> None:
