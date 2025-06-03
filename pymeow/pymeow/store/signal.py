@@ -54,7 +54,7 @@ class SignalProtocolMixin:
         """
         addr_string = f"{addr.name}:{addr.device_id}"
         try:
-            await self.identities.put_identity(ctx, addr_string, identity_key_obj.public_key.serialize())
+            await self.identities.put_identity(addr_string, identity_key_obj.public_key.serialize())
         except Exception as e:
             logger.error(f"Failed to save identity of {addr_string}: {e}")
             raise Exception(f"failed to save identity of {addr_string}: {e}")
@@ -67,7 +67,7 @@ class SignalProtocolMixin:
         """
         addr_string = f"{addr.name}:{addr.device_id}"
         try:
-            is_trusted = await self.identities.is_trusted_identity(ctx, addr_string, identity_key_obj.public_key.serialize())
+            is_trusted = await self.identities.is_trusted_identity(addr_string, identity_key_obj.public_key.serialize())
             return is_trusted
         except Exception as e:
             logger.error(f"Failed to check if {addr_string}'s identity is trusted: {e}")
@@ -81,7 +81,7 @@ class SignalProtocolMixin:
         Go equivalent: func (device *Device) LoadPreKey(ctx context.Context, id uint32) (*record.PreKey, error)
         """
         try:
-            pre_key = await self.pre_keys.get_pre_key(ctx, pre_key_id)
+            pre_key = await self.pre_keys.get_pre_key(pre_key_id)
             if pre_key is None:
                 return None
 
@@ -103,7 +103,7 @@ class SignalProtocolMixin:
         Go equivalent: func (device *Device) RemovePreKey(ctx context.Context, id uint32) error
         """
         try:
-            await self.pre_keys.remove_pre_key(ctx, pre_key_id)
+            await self.pre_keys.remove_pre_key(pre_key_id)
         except Exception as e:
             logger.error(f"Failed to remove pre-key {pre_key_id}: {e}")
             raise Exception(f"failed to remove prekey {pre_key_id}: {e}")
@@ -133,7 +133,7 @@ class SignalProtocolMixin:
         """
         addr_string = f"{addr.name}:{addr.device_id}"
         try:
-            raw_sess = await self.sessions.get_session(ctx, addr_string)
+            raw_sess = await self.sessions.get_session(addr_string)
             if raw_sess is None:
                 # Create a new empty session record
                 # In Go: record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
@@ -166,7 +166,7 @@ class SignalProtocolMixin:
         """
         addr_string = f"{addr.name}:{addr.device_id}"
         try:
-            await self.sessions.put_session(ctx, addr_string, record.serialize())
+            await self.sessions.put_session(addr_string, record.serialize())
         except Exception as e:
             logger.error(f"Failed to store session with {addr_string}: {e}")
             raise Exception(f"failed to store session with {addr_string}: {e}")
@@ -179,7 +179,7 @@ class SignalProtocolMixin:
         """
         addr_string = f"{remote_addr.name}:{remote_addr.device_id}"
         try:
-            has_session = await self.sessions.has_session(ctx, addr_string)
+            has_session = await self.sessions.has_session(addr_string)
             return has_session
         except Exception as e:
             logger.error(f"Failed to check if store has session for {addr_string}: {e}")
@@ -267,7 +267,7 @@ class SignalProtocolMixin:
         sender = sender_key_name.sender
         sender_string = f"{sender.name}:{sender.device_id}"
         try:
-            await self.sender_keys.put_sender_key(ctx, group_id, sender_string, key_record.serialize())
+            await self.sender_keys.put_sender_key(group_id, sender_string, key_record.serialize())
         except Exception as e:
             logger.error(f"Failed to store sender key from {sender_string} for {group_id}: {e}")
             raise Exception(f"failed to store sender key from {sender_string} for {group_id}: {e}")
@@ -282,7 +282,7 @@ class SignalProtocolMixin:
         sender = sender_key_name.sender
         sender_string = f"{sender.name}:{sender.device_id}"
         try:
-            raw_key = await self.sender_keys.get_sender_key(ctx, group_id, sender_string)
+            raw_key = await self.sender_keys.get_sender_key(group_id, sender_string)
             if raw_key is None:
                 # Create a new empty sender key record
                 # In Go: groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)

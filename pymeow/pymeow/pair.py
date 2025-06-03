@@ -56,7 +56,7 @@ def concat_bytes(*data: bytes) -> bytes:
     """Concatenate multiple byte arrays."""
     return b''.join(data)
 
-async def handle_iq(client: Client, node: Node) -> None:
+async def handle_iq(client: "Client", node: Node) -> None:
     """Handle an IQ node for pairing."""
     children = node.get_children()
     if len(children) != 1 or node.attrs.get("from") != jid.SERVER_JID:
@@ -67,7 +67,7 @@ async def handle_iq(client: Client, node: Node) -> None:
     elif children[0].tag == "pair-success":
         await handle_pair_success(client, node)
 
-async def handle_pair_device(client: Client, node: Node) -> None:
+async def handle_pair_device(client: "Client", node: Node) -> None:
     """Handle a pair-device request from the server."""
     pair_device = node.get_child_by_tag("pair-device")
     try:
@@ -97,14 +97,14 @@ async def handle_pair_device(client: Client, node: Node) -> None:
 
     client.dispatch_event(evt)
 
-def make_qr_data(client: Client, ref: str) -> str:
+def make_qr_data(client: "Client", ref: str) -> str:
     """Create QR data from a reference and device information."""
     noise = base64.b64encode(client.store.noise_key.pub).decode()
     identity = base64.b64encode(client.store.identity_key.pub).decode()
     adv = base64.b64encode(client.store.adv_secret_key).decode()
     return f"{ref},{noise},{identity},{adv}"
 
-async def handle_pair_success(client: Client, node: Node) -> None:
+async def handle_pair_success(client: "Client", node: Node) -> None:
     """Handle a pair-success response from the server."""
     req_id = node.attrs.get("id")
     pair_success = node.get_child_by_tag("pair-success")
@@ -120,7 +120,7 @@ async def handle_pair_success(client: Client, node: Node) -> None:
     asyncio.create_task(_handle_pair_task(client, device_identity_bytes, req_id,
                                          business_name, platform, device_jid, device_lid))
 
-async def _handle_pair_task(client: Client, device_identity_bytes: bytes, req_id: str,
+async def _handle_pair_task(client: "Client", device_identity_bytes: bytes, req_id: str,
                            business_name: str, platform: str, device_jid: jid.JID, device_lid: jid.JID):
     """Task to handle pairing after receiving pair-success."""
     try:
@@ -136,7 +136,7 @@ async def _handle_pair_task(client: Client, device_identity_bytes: bytes, req_id
             id=device_jid, lid=device_lid, business_name=business_name, platform=platform, error=e
         ))
 
-async def handle_pair(client: Client, ctx, device_identity_bytes: bytes, req_id: str,
+async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_id: str,
                      business_name: str, platform: str, device_jid: jid.JID, device_lid: jid.JID) -> None:
     """Handle the main pairing process."""
     # Parse device identity container
@@ -227,7 +227,7 @@ async def handle_pair(client: Client, ctx, device_identity_bytes: bytes, req_id:
     await client.store_lid_pn_mapping(ctx, device_lid, device_jid)
 
     try:
-        await client.store.identities.put_identity(ctx, main_device_lid.signal_address(), main_device_identity)
+        await client.store.identities.put_identity(main_device_lid.signal_address(), main_device_identity)
     except Exception as e:
         await client.store.delete(ctx)
         await send_pair_error(client, req_id, 500, "internal-error")
@@ -294,7 +294,7 @@ def generate_device_signature(device_identity: WAAdv_pb2.ADVSignedDeviceIdentity
     private_key = curve.PrivateKey(ikp.priv)
     return private_key.calculate_signature(message)
 
-async def send_pair_error(client: Client, req_id: str, code: int, text: str) -> None:
+async def send_pair_error(client: "Client", req_id: str, code: int, text: str) -> None:
     """Send a pairing error response."""
     try:
         await client.send_node(Node(

@@ -276,12 +276,12 @@ class Decoder(Processor):
             logger.error(f"Failed to update app state version in the database: {err}")
 
         try:
-            await self.store.app_state.delete_app_state_mutation_macs(ctx, str(name), out.removed_macs)
+            await self.store.app_state.delete_app_state_mutation_macs(str(name), out.removed_macs)
         except Exception as err:
             logger.error(f"Failed to remove deleted mutation MACs from the database: {err}")
 
         try:
-            await self.store.app_state.put_app_state_mutation_macs(ctx, str(name), current_state.version, out.added_macs)
+            await self.store.app_state.put_app_state_mutation_macs(str(name), current_state.version, out.added_macs)
         except Exception as err:
             logger.error(f"Failed to insert added mutation MACs to the database: {err}")
 
@@ -404,7 +404,7 @@ class Decoder(Processor):
 
                 # Previous value not found in current patch, look in the database
                 try:
-                    return await self.store.app_state.get_app_state_mutation_mac(ctx, str(patch_list.name), index_mac), None
+                    return await self.store.app_state.get_app_state_mutation_mac(str(patch_list.name), index_mac), None
                 except Exception as err:
                     return None, err
 

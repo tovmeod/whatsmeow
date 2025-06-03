@@ -130,12 +130,12 @@ class NotificationMixin:
         elif node.get_optional_child_by_tag("identity")[0]:
             logger.debug(f"Got identity change for {from_jid}: {node.xml_string()}, deleting all identities/sessions for that number")
             try:
-                await self.store.identities.delete_all_identities(ctx, from_jid.user)
+                await self.store.identities.delete_all_identities(from_jid.user)
             except Exception as e:
                 logger.warning(f"Failed to delete all identities of {from_jid} from store after identity change: {e}")
 
             try:
-                await self.store.sessions.delete_all_sessions(ctx, from_jid.user)
+                await self.store.sessions.delete_all_sessions(from_jid.user)
             except Exception as e:
                 logger.warning(f"Failed to delete all sessions of {from_jid} from store after identity change: {e}")
 

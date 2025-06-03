@@ -103,11 +103,11 @@ class AppState:
         """
         async with self.app_state_sync_lock:
             if full_sync:
-                err = await self.store.app_state.delete_app_state_version(ctx, str(name))
+                err = await self.store.app_state.delete_app_state_version(str(name))
                 if err:
                     raise Exception(f"Failed to reset app state {name} version: {err}")
 
-            version, hash_val, err = await self.store.app_state.get_app_state_version(ctx, str(name))
+            version, hash_val, err = await self.store.app_state.get_app_state_version(str(name))
             if err:
                 raise Exception(f"Failed to get app state {name} version: {err}")
 
@@ -266,7 +266,7 @@ class AppState:
 
             if act and self.store.contacts:
                 store_update_error = await self.store.contacts.put_contact_name(
-                    ctx, jid_obj, act.first_name, act.full_name
+                    jid_obj, act.first_name, act.full_name
                 )
 
         elif mutation.index[0] == "clearChat":
@@ -511,7 +511,7 @@ class AppState:
         Raises:
             Exception: If there's an error sending the patch
         """
-        version, hash_val, err = await self.store.app_state.get_app_state_version(ctx, str(patch.type))
+        version, hash_val, err = await self.store.app_state.get_app_state_version(str(patch.type))
         if err:
             raise err
 

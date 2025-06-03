@@ -472,7 +472,7 @@ class Encoder(Processor):
 
         async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> tuple[Optional[bytes], Optional[Exception]]:
             try:
-                return await self.store.app_state.get_app_state_mutation_mac(ctx, str(patch_info.type), index_mac), None
+                return await self.store.app_state.get_app_state_mutation_mac(str(patch_info.type), index_mac), None
             except Exception as e:
                 return None, e
 
