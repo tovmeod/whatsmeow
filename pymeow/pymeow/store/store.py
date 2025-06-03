@@ -81,7 +81,7 @@ class PreKeyStore(ABC):
     """Interface for storing pre-keys."""
 
     @abstractmethod
-    async def get_or_gen_pre_keys(self, count: int) -> Tuple[List[PreKey], Optional[Exception]]:
+    async def get_or_gen_pre_keys(self, count: int) -> List[PreKey]:
         """Get or generate pre-keys."""
         pass
 
