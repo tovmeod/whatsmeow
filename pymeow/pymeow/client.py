@@ -83,7 +83,7 @@ class SetProxyOptions:
     no_media: bool = False
 
 logger = logging.getLogger(__name__)
-
+# todo: port sendNodeAndGetData in client.go to send_node_and_get_data
 class Client(MediaConnMixin):
     """Client for WhatsApp Web API.
 
