@@ -4,18 +4,21 @@ Media connection management for WhatsApp Web.
 This module handles querying and caching media server connection information.
 Port of whatsmeow/mediaconn.go
 """
-import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, TYPE_CHECKING
 
 from .binary.node import Node
-from .request import InfoQuery, InfoQueryType
+from .request import InfoQuery, InfoQueryType, send_iq
 from .types.jid import JID
-from .exceptions import ClientError
+from .exceptions import ErrClientIsNil
+
+if TYPE_CHECKING:
+    from .client import Client
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class MediaConnHost:
@@ -40,123 +43,97 @@ class MediaConn:
         return self.fetched_at + timedelta(seconds=self.ttl)
 
 
-class MediaConnMixin:
+async def refresh_media_conn(client: 'Client', force: bool = False) -> MediaConn:
     """
-    Mixin class providing media connection management functionality.
+    Refresh the media connection cache if needed.
 
-    This should be mixed into the Client class to provide mediaconn functionality.
+    Args:
+        client: The client instance
+        force: If True, force refresh even if cache is still valid
+
+    Returns:
+        MediaConn: Current media connection info
+
+    Raises:
+        ErrClientIsNil: If client is None
+        Various exceptions: If query fails
     """
+    if client is None:
+        raise ErrClientIsNil()
 
-    def __init__(self):
-        self.media_conn_cache: Optional[MediaConn] = None
-        self.media_conn_lock = asyncio.Lock()
+    async with client.media_conn_lock:
+        if (client.media_conn_cache is None or
+            force or
+            datetime.now() >= client.media_conn_cache.expiry()):
 
-    async def refresh_media_conn(self, force: bool = False) -> MediaConn:
-        """
-        Refresh the media connection cache if needed.
+            client.media_conn_cache = await query_media_conn(client)
 
-        Args:
-            force: If True, force refresh even if cache is still valid
-
-        Returns:
-            MediaConn: Current media connection info
-
-        Raises:
-            ClientError: If client is not initialized or query fails
-        """
-        if not hasattr(self, 'store') or self.store is None:
-            raise ClientError("Client is not initialized")
-
-        async with self.media_conn_lock:
-            if (self.media_conn_cache is None or
-                force or
-                datetime.now() >= self.media_conn_cache.expiry()):
-
-                self.media_conn_cache = await self.query_media_conn()
-
-        return self.media_conn_cache
-
-    async def query_media_conn(self) -> MediaConn:
-        """
-        Query WhatsApp servers for media connection information.
-
-        Returns:
-            MediaConn: Fresh media connection info from server
-
-        Raises:
-            ClientError: If the query fails or response is invalid
-        """
-        try:
-            # Send media_conn query
-            resp = await self.send_iq(InfoQuery(
-                namespace="w:m",
-                type=InfoQueryType.SET,
-                to=JID.server_jid(),
-                content=[Node(tag="media_conn")]
-            ))
-
-            if not resp.children or resp.children[0].tag != "media_conn":
-                raise ClientError("Failed to query media connections: unexpected response structure")
-
-            resp_mc = resp.children[0]
-
-            # Parse response attributes
-            try:
-                auth = resp_mc.attrs.get("auth", "")
-                ttl = int(resp_mc.attrs.get("ttl", "0"))
-                auth_ttl = int(resp_mc.attrs.get("auth_ttl", "0"))
-                max_buckets = int(resp_mc.attrs.get("max_buckets", "0"))
-
-                if not auth or ttl <= 0:
-                    raise ValueError("Missing required attributes")
-
-            except (ValueError, KeyError) as e:
-                raise ClientError(f"Failed to parse media connection attributes: {e}")
-
-            # Parse host list
-            hosts = []
-            for child in resp_mc.children:
-                if child.tag != "host":
-                    logger.warning(f"Unexpected child in media_conn element: {child}")
-                    continue
-
-                hostname = child.attrs.get("hostname", "")
-                if not hostname:
-                    raise ClientError("Missing hostname in media connection host")
-
-                hosts.append(MediaConnHost(hostname=hostname))
-
-            if not hosts:
-                raise ClientError("No media hosts received from server")
-
-            return MediaConn(
-                auth=auth,
-                auth_ttl=auth_ttl,
-                ttl=ttl,
-                max_buckets=max_buckets,
-                fetched_at=datetime.now(),
-                hosts=hosts
-            )
-
-        except Exception as e:
-            if isinstance(e, ClientError):
-                raise
-            raise ClientError(f"Failed to query media connections: {e}")
+    return client.media_conn_cache
 
 
-# For backwards compatibility with existing code
-class Client(MediaConnMixin):
+async def query_media_conn(client: 'Client') -> MediaConn:
     """
-    Partial Client class showing mediaconn integration.
+    Query WhatsApp servers for media connection information.
 
-    In the actual implementation, MediaConnMixin would be mixed into
-    the main Client class in client.py.
+    Args:
+        client: The client instance
+
+    Returns:
+        MediaConn: Fresh media connection info from server
+
+    Raises:
+        Various exceptions: If the query fails or response is invalid
     """
+    # Create info query for media connections
+    query = InfoQuery(
+        namespace="w:m",
+        type=InfoQueryType.SET,
+        to=JID.server_jid(),
+        content=[Node(tag="media_conn")]
+    )
 
-    def __init__(self):
-        super().__init__()
-        self.store = None  # Placeholder
+    resp = await send_iq(client, query)
 
-    async def send_iq(self, query: InfoQuery) -> Node:
-        """Send IQ query. Implementation would be in request.py"""
-        raise NotImplementedError("Implemented in request.py")
+    # Validate response structure - use get_children() method
+    children = resp.get_children()
+    if not children or children[0].tag != "media_conn":
+        raise ValueError("Failed to query media connections: unexpected child tag")
+
+    resp_mc = children[0]
+
+    # Parse response attributes using attr_getter like Go version
+    ag = resp_mc.attr_getter()
+    auth = ag.string("auth")
+    ttl = ag.int("ttl")
+    auth_ttl = ag.int("auth_ttl")
+    max_buckets = ag.int("max_buckets")
+
+    # Validate required attributes
+    if not auth or ttl <= 0:
+        raise ValueError("Failed to parse media connections: missing required attributes")
+
+    # Parse host list
+    hosts = []
+    for child in resp_mc.get_children():
+        if child.tag != "host":
+            logger.warning(f"Unexpected child in media_conn element: {child.xml_string()}")
+            continue
+
+        cag = child.attr_getter()
+        hostname = cag.string("hostname")
+        if not hostname:
+            raise ValueError("Missing hostname in media connection host")
+
+        hosts.append(MediaConnHost(hostname=hostname))
+
+    if not hosts:
+        raise ValueError("No media hosts received from server")
+
+    return MediaConn(
+        auth=auth,
+        auth_ttl=auth_ttl,
+        ttl=ttl,
+        max_buckets=max_buckets,
+        fetched_at=datetime.now(),
+        hosts=hosts
+    )

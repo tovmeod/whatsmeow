@@ -18,7 +18,6 @@ from .generated.waWa6 import WAWebProtobufsWa6_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
 from .generated.waCert import WACert_pb2
-from .mediaconn import MediaConnMixin
 from .pair import handle_iq
 
 from .socket.framesocket import FrameSocket
@@ -84,7 +83,7 @@ class SetProxyOptions:
 
 logger = logging.getLogger(__name__)
 # todo: port sendNodeAndGetData in client.go to send_node_and_get_data
-class Client(MediaConnMixin):
+class Client:
     """Client for WhatsApp Web API.
 
     This client provides functionality to connect to and interact with the WhatsApp web API.
