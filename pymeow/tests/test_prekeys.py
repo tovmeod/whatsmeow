@@ -405,7 +405,11 @@ async def test_client_integration_methods():
     mock_client = MagicMock()
     mock_client.send_iq = AsyncMock()
     mock_client.server_jid = "server@whatsapp.net"
-    mock_client.upload_prekeys_lock = AsyncMock().__aenter__()
+
+    # Create a proper async context manager for the lock
+    mock_lock = AsyncMock()
+    mock_client.upload_prekeys_lock = mock_lock
+
     mock_client.last_pre_key_upload = None
     mock_client.store = MagicMock()
     mock_client.store.registration_id = 12345

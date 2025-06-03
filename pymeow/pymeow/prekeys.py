@@ -4,12 +4,9 @@ WhatsApp prekeys handling.
 Port of whatsmeow/prekeys.go
 """
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Union, Any, TYPE_CHECKING
+from typing import List, Optional, Dict, Any, TYPE_CHECKING
 import struct
-import asyncio
 from datetime import datetime, timedelta
-from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives import serialization
 
 from .exceptions import PreKeyError
 from .binary.node import Node
@@ -105,7 +102,7 @@ def node_to_pre_key(node: Node) -> Optional[PreKey]:
         raise PreKeyError(f"prekey ID has unexpected number of bytes ({len(id_bytes)}, expected 3)")
 
     # Parse key ID from 3-byte big-endian (prepend zero byte)
-    key_id = struct.unpack(">I", bytes([0]) + id_bytes)[0]
+    key_id = struct.unpack(">I", bytes([0]) + id_bytes)[0]  # type: ignore[arg-type]
 
     # Get value tag
     value_node = node.get_child_by_tag("value")
@@ -162,7 +159,7 @@ def node_to_pre_key_bundle(device_id: int, node: Node) -> PreKeyBundle:
     if not registration_node or not isinstance(registration_node.content, bytes) or len(registration_node.content) != 4:
         raise PreKeyError("invalid registration ID in prekey response")
 
-    registration_id = struct.unpack(">I", registration_node.content)[0]
+    registration_id = struct.unpack(">I", registration_node.content)[0]  # type: ignore[arg-type]
 
     # Find keys node (might be directly in content or in a "keys" child node)
     keys_node, found = node.get_optional_child_by_tag("keys")
