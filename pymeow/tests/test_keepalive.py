@@ -343,42 +343,44 @@ async def test_dispatch_keepalive_restored():
 
 @pytest.mark.asyncio
 async def test_send_keep_alive_node_structure():
-    """Test that the keepalive node has the correct structure."""
-    from ..pymeow.request import InfoQueryType  # Import the enum
+    """Test that the keepalive query has the correct structure."""
+    from ..pymeow.request import InfoQueryType, InfoQuery  # Import the classes we need
 
     # Create test instance
     test_instance = TestKeepAlive()
 
-    # Mock send_iq_async to capture the node
-    captured_node = None
-    async def capture_node(node):
-        nonlocal captured_node
-        captured_node = node
+    # Mock send_iq_async to capture the query
+    captured_query = None
+    async def capture_query(query):
+        nonlocal captured_query
+        captured_query = query
         # Return the expected tuple format (queue, error)
         response_queue = asyncio.Queue()
         await response_queue.put(MagicMock())
         return response_queue, None
 
-    test_instance.send_iq_async = capture_node
+    test_instance.send_iq_async = capture_query
 
     # Call the method under test
     await test_instance._send_keep_alive()
 
-    # Verify the node structure
-    assert captured_node is not None
-    assert captured_node.tag == "iq"
-    assert "id" in captured_node.attributes
-    assert captured_node.attributes["type"] == "get"
-    assert captured_node.attributes["to"] == "s.whatsapp.net"
-    assert captured_node.attributes["xmlns"] == "w:p"
-    assert captured_node.content == []  # Empty content for ping
+    # Verify the query structure
+    assert captured_query is not None
+    assert isinstance(captured_query, InfoQuery)
 
-    # Verify the attributes that send_iq_async expects
-    assert hasattr(captured_node, 'id')
-    assert hasattr(captured_node, 'namespace')
-    assert hasattr(captured_node, 'type')
-    assert captured_node.namespace == "w:p"
-    assert captured_node.type == InfoQueryType.GET  # Now check for the enum, not string
+    # Verify the InfoQuery attributes
+    assert hasattr(captured_query, 'id')
+    assert hasattr(captured_query, 'namespace')
+    assert hasattr(captured_query, 'type')
+    assert hasattr(captured_query, 'to')
+    assert hasattr(captured_query, 'content')
+
+    # Verify the values
+    assert captured_query.namespace == "w:p"
+    assert captured_query.type == InfoQueryType.GET
+    assert str(captured_query.to) == "s.whatsapp.net"
+    assert captured_query.content == []  # Empty content for ping
+    assert captured_query.id is not None  # Should have a UUID
 
 @pytest.mark.asyncio
 async def test_keepalive_loop_exception_handling():
