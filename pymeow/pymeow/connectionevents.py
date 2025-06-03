@@ -5,13 +5,13 @@ Port of whatsmeow/connectionevents.go
 """
 import asyncio
 import logging
-from datetime import datetime
-from typing import Optional, Dict, Any, Callable, List, TYPE_CHECKING
+from datetime import datetime, timedelta
+from typing import Optional, TYPE_CHECKING
 
 from .binary.node import Node
-from .types import types
-from .types.events import events
-from .types.jid import JID
+from .prekeys import get_server_prekey_count, upload_prekeys
+from .types import jid, events
+from .store import store
 
 if TYPE_CHECKING:
     from .client import Client
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 # Constants
 MIN_PREKEY_COUNT = 5  # Threshold for when to upload new prekeys
 
+logger = logging.getLogger(__name__)
 
 async def handle_stream_error(cli: "Client", node: Node) -> None:
     """
@@ -28,52 +29,78 @@ async def handle_stream_error(cli: "Client", node: Node) -> None:
         cli: The WhatsApp client
         node: The stream error node from the server
     """
-    ctx = asyncio.get_event_loop()
-    cli.is_logged_in.store(False)
-    cli.clear_response_waiters(node)
+    ctx = {}
+    cli._is_logged_in = False
+    await cli._clear_response_waiters(node)
 
     code = node.attrs.get("code", "")
-    conflict = node.get_optional_child_by_tag("conflict")
-    conflict_type = conflict.attr_getter().optional_string("type") if conflict else None
+    conflict, _ = node.get_optional_child_by_tag("conflict")
+    conflict_type = conflict.attributes.get("type") if conflict else None
 
     if code == "515":
         if cli.disable_login_auto_reconnect:
-            cli.log.info("Got 515 code, but login autoreconnect is disabled, not reconnecting")
+            logger.info("Got 515 code, but login autoreconnect is disabled, not reconnecting")
             asyncio.create_task(cli.dispatch_event(events.ManualLoginReconnect()))
             return
 
-        cli.log.info("Got 515 code, reconnecting...")
+        logger.info("Got 515 code, reconnecting...")
         asyncio.create_task(_reconnect_after_515(cli))
     elif code == "401" and conflict_type == "device_removed":
-        cli.expect_disconnect()
-        cli.log.info("Got device removed stream error, sending LoggedOut event and deleting session")
-        asyncio.create_task(cli.dispatch_event(events.LoggedOut(on_connect=False, reason=events.ConnectFailureReason.LOGGED_OUT)))
+        cli._expect_disconnect()
+        logger.info("Got device removed stream error, sending LoggedOut event and deleting session")
+        asyncio.create_task(cli.dispatch_event(events.LoggedOut(on_connect=False,
+                                                                reason=events.ConnectFailureReason.LOGGED_OUT)))
         try:
             await cli.store.delete(ctx)
         except Exception as e:
-            cli.log.warning(f"Failed to delete store after device_removed error: {e}")
+            logger.warning(f"Failed to delete store after device_removed error: {e}")
     elif conflict_type == "replaced":
-        cli.expect_disconnect()
-        cli.log.info("Got replaced stream error, sending StreamReplaced event")
+        cli._expect_disconnect()
+        logger.info("Got replaced stream error, sending StreamReplaced event")
         asyncio.create_task(cli.dispatch_event(events.StreamReplaced()))
     elif code == "503":
         # This seems to happen when the server wants to restart or something.
         # The disconnection will be emitted as an events.Disconnected and then the auto-reconnect will do its thing.
-        cli.log.warning("Got 503 stream error, assuming automatic reconnect will handle it")
+        logger.warning("Got 503 stream error, assuming automatic reconnect will handle it")
     elif cli.refresh_cat is not None and (code == events.ConnectFailureReason.CAT_INVALID.number_string() or
                                          code == events.ConnectFailureReason.CAT_EXPIRED.number_string()):
-        cli.log.info(f"Got {code} stream error, refreshing CAT before reconnecting...")
-        async with cli.socket_lock.reader_lock:
+        logger.info(f"Got {code} stream error, refreshing CAT before reconnecting...")
+        async with cli.socket_lock:
             try:
                 await cli.refresh_cat()
             except Exception as e:
-                cli.log.error(f"Failed to refresh CAT: {e}")
-                cli.expect_disconnect()
+                logger.error(f"Failed to refresh CAT: {e}")
+                cli._expect_disconnect()
                 asyncio.create_task(cli.dispatch_event(events.CATRefreshError(error=e)))
     else:
-        cli.expect_disconnect()
-        cli.log.warning(f"Unknown stream error: {node.xml_string()}")
+        logger.error(f"Unknown stream error: {node.xml_string()}")
         asyncio.create_task(cli.dispatch_event(events.StreamError(code=code, raw=node)))
+
+
+async def handle_ib(cli: "Client", node: Node) -> None:
+    """
+    Handle an IB node from the WhatsApp server.
+
+    Args:
+        cli: The WhatsApp client
+        node: The IB node from the server
+    """
+    children = node.get_children()
+    for child in children:
+        if child.tag == "downgrade_webclient":
+            asyncio.create_task(cli.dispatch_event(events.QRScannedWithoutMultidevice()))
+        elif child.tag == "offline_preview":
+            await cli.dispatch_event(events.OfflineSyncPreview(
+                total=int(child.attrs.get("count", 0)),
+                app_data_changes=int(child.attrs.get("appdata", 0)),
+                messages=int(child.attrs.get("message", 0)),
+                notifications=int(child.attrs.get("notification", 0)),
+                receipts=int(child.attrs.get("receipt", 0))
+            ))
+        elif child.tag == "offline":
+            await cli.dispatch_event(events.OfflineSyncCompleted(
+                count=int(child.attrs.get("count", 0))
+            ))
 
 
 async def handle_connect_failure(cli: "Client", node: Node) -> None:
@@ -84,59 +111,59 @@ async def handle_connect_failure(cli: "Client", node: Node) -> None:
         cli: The WhatsApp client
         node: The connection failure node from the server
     """
-    ctx = asyncio.get_event_loop()
-    ag = node.attr_getter()
-    reason = events.ConnectFailureReason(ag.int("reason"))
-    message = ag.optional_string("message")
+    ctx = {}
+    reason = events.ConnectFailureReason(int(node.attrs.get("reason", 0)))
+    message = node.attrs.get("message", "")
     will_auto_reconnect = True
 
-    # Handle different failure reasons
+    # Handle different failure reasons - use switch-like logic from Go
     if reason == events.ConnectFailureReason.SERVICE_UNAVAILABLE or reason == events.ConnectFailureReason.INTERNAL_SERVER_ERROR:
         # Auto-reconnect for 503s
         pass
     elif reason == events.ConnectFailureReason.CAT_INVALID or reason == events.ConnectFailureReason.CAT_EXPIRED:
         # Auto-reconnect when rotating CAT, lock socket to ensure refresh goes through before reconnect
-        async with cli.socket_lock.reader_lock:
+        async with cli.socket_lock:
             pass
     else:
         # By default, expect a disconnect (i.e. prevent auto-reconnect)
-        cli.expect_disconnect()
+        cli._expect_disconnect()
         will_auto_reconnect = False
 
-    if reason == 403:
-        cli.log.debug(
-            f"Message for 403 connect failure: {ag.optional_string('logout_message_header')} / "
-            f"{ag.optional_string('logout_message_subtext')}"
+    # Check for 403 by comparing the enum value directly
+    if reason.value == 403:
+        logger.debug(
+            f"Message for 403 connect failure: {node.attrs.get('logout_message_header', '')} / "
+            f"{node.attrs.get('logout_message_subtext', '')}"
         )
 
     if reason.is_logged_out():
-        cli.log.info(f"Got {reason} connect failure, sending LoggedOut event and deleting session")
+        logger.info(f"Got {reason} connect failure, sending LoggedOut event and deleting session")
         asyncio.create_task(cli.dispatch_event(events.LoggedOut(on_connect=True, reason=reason)))
         try:
             await cli.store.delete(ctx)
         except Exception as e:
-            cli.log.warning(f"Failed to delete store after {int(reason)} failure: {e}")
+            logger.warning(f"Failed to delete store after {reason.value} failure: {e}")
     elif reason == events.ConnectFailureReason.TEMP_BANNED:
-        cli.log.warning(f"Temporary ban connect failure: {node.xml_string()}")
+        logger.warning(f"Temporary ban connect failure: {node.xml_string()}")
         asyncio.create_task(cli.dispatch_event(events.TemporaryBan(
-            code=events.TempBanReason(ag.int("code")),
-            expire=datetime.fromtimestamp(ag.int("expire"))
+            code=events.TempBanReason(int(node.attrs.get("code", 0))),
+            expire=timedelta(seconds=int(node.attrs.get("expire", 0)))
         )))
     elif reason == events.ConnectFailureReason.CLIENT_OUTDATED:
-        cli.log.error(f"Client outdated (405) connect failure (client version: {cli.store.get_wa_version()})")
+        logger.error(f"Client outdated (405) connect failure (client version: {store.get_wa_version()})")
         asyncio.create_task(cli.dispatch_event(events.ClientOutdated()))
     elif reason == events.ConnectFailureReason.CAT_INVALID or reason == events.ConnectFailureReason.CAT_EXPIRED:
-        cli.log.info(f"Got {int(reason)}/{message} connect failure, refreshing CAT before reconnecting...")
+        logger.info(f"Got {reason.value}/{message} connect failure, refreshing CAT before reconnecting...")
         try:
             await cli.refresh_cat()
         except Exception as e:
-            cli.log.error(f"Failed to refresh CAT: {e}")
-            cli.expect_disconnect()
+            logger.error(f"Failed to refresh CAT: {e}")
+            cli._expect_disconnect()
             asyncio.create_task(cli.dispatch_event(events.CATRefreshError(error=e)))
     elif will_auto_reconnect:
-        cli.log.warning(f"Got {int(reason)}/{message} connect failure, assuming automatic reconnect will handle it")
+        logger.warning(f"Got {reason.value}/{message} connect failure, assuming automatic reconnect will handle it")
     else:
-        cli.log.warning(f"Unknown connect failure: {node.xml_string()}")
+        logger.warning(f"Unknown connect failure: {node.xml_string()}")
         asyncio.create_task(cli.dispatch_event(events.ConnectFailure(reason=reason, message=message, raw=node)))
 
 
@@ -148,23 +175,25 @@ async def handle_connect_success(cli: "Client", node: Node) -> None:
         cli: The WhatsApp client
         node: The connection success node from the server
     """
-    ctx = asyncio.get_event_loop()
-    cli.log.info("Successfully authenticated")
+    ctx = {}
+    logger.info("Successfully authenticated")
     cli.last_successful_connect = datetime.now()
     cli.auto_reconnect_errors = 0
-    cli.is_logged_in.store(True)
+    cli._is_logged_in = True
 
-    node_lid = node.attr_getter().jid("lid")
+    node_lid_str = node.attrs.get("lid", "")
+    node_lid = jid.JID.from_string(node_lid_str) if node_lid_str else jid.JID()
+
     if cli.store.lid.is_empty() and not node_lid.is_empty():
         cli.store.lid = node_lid
         try:
             await cli.store.save(ctx)
         except Exception as e:
-            cli.log.warning(f"Failed to save device after updating LID: {e}")
+            logger.warning(f"Failed to save device after updating LID: {e}")
         else:
-            cli.log.info(f"Updated LID to {cli.store.lid}")
+            logger.info(f"Updated LID to {cli.store.lid}")
 
-        await cli.store_lid_pn_mapping(ctx, cli.store.get_lid(), cli.store.get_jid())
+        await cli.store_lid_pn_mapping(cli.store.get_lid(), cli.store.get_jid())
 
     # Start a task to handle post-connection setup
     asyncio.create_task(_post_connect_setup(cli))
@@ -177,34 +206,41 @@ async def _post_connect_setup(cli: "Client") -> None:
     Args:
         cli: The WhatsApp client
     """
-    ctx = asyncio.get_event_loop()
+    ctx = {}
 
     # Check and upload prekeys if needed
+    db_count = None
+    server_count = None
+
     try:
         db_count = await cli.store.pre_keys.uploaded_prekey_count(ctx)
     except Exception as e:
-        cli.log.error(f"Failed to get number of prekeys in database: {e}")
-    else:
+        logger.error(f"Failed to get number of prekeys in database: {e}")
+
+    if db_count is not None:
         try:
-            server_count = await cli.get_server_prekey_count(ctx)
+            server_count = await get_server_prekey_count(cli, ctx)
         except Exception as e:
-            cli.log.warning(f"Failed to get number of prekeys on server: {e}")
+            logger.warning(f"Failed to get number of prekeys on server: {e}")
         else:
-            cli.log.debug(f"Database has {db_count} prekeys, server says we have {server_count}")
+            logger.debug(f"Database has {db_count} prekeys, server says we have {server_count}")
             if server_count < MIN_PREKEY_COUNT or db_count < MIN_PREKEY_COUNT:
-                await cli.upload_prekeys(ctx)
-                sc, _ = await cli.get_server_prekey_count(ctx)
-                cli.log.debug(f"Prekey count after upload: {sc}")
+                await upload_prekeys(cli, ctx)
+                try:
+                    sc = await get_server_prekey_count(cli, ctx)
+                    logger.debug(f"Prekey count after upload: {sc}")
+                except Exception:
+                    pass
 
     # Set passive mode to false
     try:
-        await cli.set_passive(ctx, False)
+        await set_passive(cli, ctx, False)
     except Exception as e:
-        cli.log.warning(f"Failed to send post-connect passive IQ: {e}")
+        logger.warning(f"Failed to send post-connect passive IQ: {e}")
 
     # Dispatch connected event
     await cli.dispatch_event(events.Connected())
-    cli.close_socket_wait_chan()
+    await cli.close_socket_wait_chan()
 
 
 async def _reconnect_after_515(cli: "Client") -> None:
@@ -218,10 +254,10 @@ async def _reconnect_after_515(cli: "Client") -> None:
     try:
         await cli.connect()
     except Exception as e:
-        cli.log.error(f"Failed to reconnect after 515 code: {e}")
+        logger.error(f"Failed to reconnect after 515 code: {e}")
 
 
-async def set_passive(cli: "Client", ctx: asyncio.AbstractEventLoop, passive: bool) -> None:
+async def set_passive(cli: "Client", ctx, passive: bool) -> None:
     """
     Tell the WhatsApp server whether this device is passive or not.
 
@@ -241,13 +277,15 @@ async def set_passive(cli: "Client", ctx: asyncio.AbstractEventLoop, passive: bo
     """
     tag = "passive" if passive else "active"
 
-    _, err = await cli.send_iq({
-        "namespace": "passive",
-        "type": "set",
-        "to": types.SERVER_JID,
-        "context": ctx,
-        "content": [Node(tag=tag)]
-    })
+    from .send import info_query
+
+    _, err = await cli.send_iq(info_query(
+        namespace="passive",
+        type="set",
+        to=jid.SERVER_JID,
+        context=ctx,
+        content=[Node(tag=tag)]
+    ))
 
     if err:
         raise err

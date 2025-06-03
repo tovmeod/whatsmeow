@@ -1196,14 +1196,14 @@ class DangerousInternalClient:
         """
         return await self.c._get_server_pre_key_count(ctx)
 
-    async def upload_pre_keys(self, ctx) -> None:
+    async def upload_prekeys(self, ctx) -> None:
         """
         Upload pre-keys.
 
         Args:
             ctx: Context
         """
-        await self.c._upload_pre_keys(ctx)
+        await self.c._upload_prekeys(ctx)
 
     async def fetch_pre_keys(self, ctx, users: List) -> Dict:
         """

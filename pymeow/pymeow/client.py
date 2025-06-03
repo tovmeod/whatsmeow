@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypeVar, Generic, Awaitable
 from urllib.parse import urlparse
 
+from .connectionevents import handle_ib
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from .generated.waWa6 import WAWebProtobufsWa6_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2
@@ -138,7 +139,7 @@ class Client(MediaConnMixin):
         self.history_sync_notifications = asyncio.Queue(32)
         self.history_sync_handler_started = False
 
-        self.upload_pre_keys_lock = asyncio.Lock()
+        self.upload_prekeys_lock = asyncio.Lock()
         self.last_pre_key_upload = None
 
         # Import JID here to avoid circular imports
@@ -233,7 +234,7 @@ class Client(MediaConnMixin):
             "failure": self._handle_connect_failure,
             "stream:error": self._handle_stream_error,
             "iq": handle_iq,
-            "ib": self._handle_ib,
+            "ib": handle_ib,
         }
 
     async def set_proxy_address(self, addr: str, opts: Optional[SetProxyOptions] = None) -> None:
@@ -1191,15 +1192,6 @@ class Client(MediaConnMixin):
         # TODO: Implement stream error handling
         pass
 
-    async def _handle_ib(self, node: Node) -> None:
-        """Handle an IB node.
-
-        Args:
-            node: The IB node
-        """
-        # TODO: Implement IB handling
-        pass
-
     # Helper methods
 
 
@@ -1309,6 +1301,7 @@ class Client(MediaConnMixin):
         Args:
             reason: The reason for clearing
         """
+        # this is implemented in request.go
         # TODO: Implement response waiter clearing
         pass
 
@@ -1358,82 +1351,6 @@ class Client(MediaConnMixin):
             return count_value
         except (ValueError, TypeError) as e:
             raise ValueError(f"Failed to parse prekey count: {e}")
-
-    async def upload_pre_keys(self, ctx: Any) -> None:
-        """Upload pre-keys to server - port of Go's uploadPreKeys.
-
-        Args:
-            ctx: Context for the request (usually an asyncio event loop)
-
-        Raises:
-            ValueError: If there's an error communicating with the server
-        """
-        from .request import InfoQuery, InfoQueryType
-        from .prekeys import WANTED_PREKEY_COUNT, pre_key_to_node, pre_keys_to_nodes, DJB_TYPE
-        import struct
-        import time
-
-        # Acquire lock to prevent concurrent uploads
-        async with self.upload_pre_keys_lock:
-            # Check if we've uploaded recently (10 minute cooldown)
-            if self.last_pre_key_upload is not None:
-                if time.time() - self.last_pre_key_upload < 600:  # 10 minutes in seconds
-                    # Check server count before uploading
-                    try:
-                        server_count = await self.get_server_pre_key_count(ctx)
-                        if server_count >= WANTED_PREKEY_COUNT:
-                            logger.debug("Canceling prekey upload request due to likely race condition")
-                            return
-                    except Exception as e:
-                        logger.error(f"Failed to get server pre-key count: {e}")
-                        # Continue with upload anyway
-
-            # Encode registration ID as 4-byte big-endian integer
-            registration_id_bytes = struct.pack(">I", self.store.pre_keys.registration_id)
-
-            # Get or generate pre-keys
-            try:
-                pre_keys = await self.store.pre_keys.get_or_gen_pre_keys(WANTED_PREKEY_COUNT)
-                if not pre_keys:
-                    logger.error("No pre-keys available for upload")
-                    return
-            except Exception as e:
-                logger.error(f"Failed to get pre-keys to upload: {e}")
-                return
-
-            logger.info(f"Uploading {len(pre_keys)} new pre-keys to server")
-
-            # Send IQ with registration ID, type, identity key, pre-key list, and signed pre-key
-            try:
-                _, err = await self.send_iq(InfoQuery(
-                    namespace="encrypt",
-                    type=InfoQueryType.SET,
-                    to=self.server_jid,
-                    context=ctx,
-                    content=[
-                        Node(tag="registration", content=registration_id_bytes),
-                        Node(tag="type", content=bytes([DJB_TYPE])),
-                        Node(tag="identity", content=self.store.pre_keys.identity_key),
-                        Node(tag="list", content=pre_keys_to_nodes(pre_keys)),
-                        pre_key_to_node(self.store.pre_keys.signed_pre_key)
-                    ]
-                ))
-
-                if err:
-                    logger.error(f"Failed to upload pre-keys: {err}")
-                    return
-
-                logger.debug("Got response to uploading pre-keys")
-
-                # Mark keys as uploaded
-                await self.store.pre_keys.mark_keys_as_uploaded(pre_keys[-1].key_id)
-
-                # Update last upload time
-                self.last_pre_key_upload = time.time()
-
-            except Exception as e:
-                logger.error(f"Failed to upload pre-keys: {e}")
-                return
 
     async def fetch_pre_keys(self, ctx: Any, users: List['JID']) -> Dict['JID', 'PreKeyResp']:
         """Fetch pre-key bundles for users - port of Go's fetchPreKeys.
