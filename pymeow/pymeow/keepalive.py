@@ -9,7 +9,6 @@ import random
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 
-from .request import InfoQueryType
 from .types.events.events import KeepAliveTimeout, KeepAliveRestored
 from .types.jid import JID
 
@@ -96,37 +95,29 @@ class KeepAliveMixin:
             - should_continue: True if keepalive loop should continue, False if it should stop
         """
         try:
-            from .binary.node import Node
+            from .request import InfoQuery, InfoQueryType
             from .types.jid import JID
             import uuid
 
             # Log test values for mocking
             test_log.info("KEEPALIVE_START: Capturing values for test mocking")
 
-            # Create a proper IQ query node for keepalive
+            # Create a proper InfoQuery for keepalive
             iq_id = str(uuid.uuid4())
-            ping_node = Node(
-                tag="iq",
-                attributes={
-                    "id": iq_id,
-                    "type": "get",
-                    "to": str(JID.server_jid()),
-                    "xmlns": "w:p"
-                },
+            ping_query = InfoQuery(
+                id=iq_id,
+                namespace="w:p",
+                type=InfoQueryType.GET,
+                to=JID.server_jid(),
                 content=[]  # Empty content for ping
             )
 
-            # Add the attributes that send_iq_async expects
-            ping_node.id = iq_id
-            ping_node.namespace = "w:p"  # Add namespace attribute
-            ping_node.type = InfoQueryType.GET  # Use the enum, not a string
-
-            # Log the ping node for testing
-            test_log.info(f"KEEPALIVE_PING_NODE: {ping_node.xml_string()}")
+            # Log the ping query for testing
+            test_log.info(f"KEEPALIVE_PING_QUERY: ID={ping_query.id}, namespace={ping_query.namespace}, type={ping_query.type}, to={ping_query.to}")
 
             # Send info query for keepalive using the actual client API
             # send_iq_async returns (queue, error) tuple, not a future
-            response_queue, error = await self.send_iq_async(ping_node)
+            response_queue, error = await self.send_iq_async(ping_query)
 
             if error is not None:
                 logger.warning(f"Keepalive failed with error: {error}")
