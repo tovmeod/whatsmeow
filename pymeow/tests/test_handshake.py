@@ -7,7 +7,7 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
-from ..pymeow.handshake import HandshakeMixin, HandshakeError, CertificateVerificationError
+from ..pymeow.handshake import do_handshake, HandshakeError, CertificateVerificationError
 from ..pymeow.socket.framesocket import FrameSocket
 from ..pymeow.socket.noisehandshake import NoiseHandshake
 from ..pymeow.socket.noisesocket import NoiseSocket
@@ -29,45 +29,42 @@ SAMPLE_SERVER_RESPONSE = {
 SAMPLE_STATIC_DECRYPTED = bytes.fromhex('6f53b211b38d5026094a378e5b5efd2c1d8ab1d28fac06c4f9fc97e44a6dfc68')
 SAMPLE_CERT_DECRYPTED = bytes.fromhex('0a770a3308c70210031a206f53b211b38d5026094a378e5b5efd2c1d8ab1d28fac06c4f9fc97e44a6dfc6820d0bbf3bd0628d0f58bc30612408c3bfaec9868e6edd6d17d3470da33915c736695bd0e4ac0cfe63caf1a5d40214737256f6250087fe4195066ff0500356a5561960e0e9106b3ae751bb0e8d50512760a32080310001a201c51a9ac303994c6c8d0b92ea1878a533476599cc599fbea35997d9aa90cce62208091aebe0628ffdeb7dc061240270f294648539fed4870e25054dd4e95983aba29189c2ba6c8eeda7055555f753740f5ec192ab64c26c26d6ade6d20b9f774aee37120a6b20395f53c66058507')
 
-class TestHandshake(HandshakeMixin):
-    """Test class for handshake functionality."""
 
-    def __init__(self):
-        """Initialize the test class."""
-        super().__init__()
-        self.store = MagicMock()
-        self.store.noise_key = MagicMock()
-        self.store.noise_key.pub = b'\x01' * 32
-        self.store.noise_key.priv = b'\x02' * 32
-        self.store.get_client_payload = MagicMock(return_value=MagicMock())
-        self.get_client_payload = None
-        self._is_expected_disconnect = MagicMock(return_value=False)
-        self._clear_response_waiters = AsyncMock()
-        self.socket_lock = asyncio.Lock()
-        self.dispatch_event = AsyncMock()
-        self._auto_reconnect = AsyncMock()
-        self.send_iq_async = AsyncMock()
-        self.handler_queue = asyncio.Queue()
-        self.node_handlers = {}
-        self._receive_response = AsyncMock(return_value=False)
+def create_mock_client():
+    """Create a mock client for testing."""
+    mock_client = MagicMock()
+    mock_client.store = MagicMock()
+    mock_client.store.noise_key = MagicMock()
+    mock_client.store.noise_key.pub = b'\x01' * 32
+    mock_client.store.noise_key.priv = b'\x02' * 32
+    mock_client.socket = None
+    return mock_client
 
-@pytest.mark.skip(reason="Needs proper mocking of NoiseHandshake")
-@pytest.mark.asyncio
-async def test_do_handshake_success():
-    """Test successful handshake."""
-    # Create test instance
-    test_instance = TestHandshake()
 
-    # Create mock frame socket
+def create_mock_frame_socket():
+    """Create a mock frame socket for testing."""
     mock_fs = MagicMock()
     mock_fs.header = b'test_header'
     mock_fs.send_frame = AsyncMock()
     mock_fs.frames = asyncio.Queue()
+    return mock_fs
 
-    # Create mock ephemeral key pair
+
+def create_mock_ephemeral_keypair():
+    """Create a mock ephemeral key pair for testing."""
     mock_ephemeral_kp = MagicMock(spec=KeyPair)
     mock_ephemeral_kp.pub = SAMPLE_EPHEMERAL_KEYPAIR['pub']
     mock_ephemeral_kp.priv = SAMPLE_EPHEMERAL_KEYPAIR['priv']
+    return mock_ephemeral_kp
+
+
+@pytest.mark.asyncio
+async def test_do_handshake_success():
+    """Test successful handshake."""
+    # Create test instances
+    mock_client = create_mock_client()
+    mock_fs = create_mock_frame_socket()
+    mock_ephemeral_kp = create_mock_ephemeral_keypair()
 
     # Create mock server response
     server_response = HandshakeMessage()
@@ -80,8 +77,8 @@ async def test_do_handshake_success():
     # Add server response to frame socket queue
     await mock_fs.frames.put(server_response.SerializeToString())
 
-    # Mock NoiseHandshake methods
-    with patch('pymeow.socket.noisehandshake.NoiseHandshake', autospec=True) as mock_nh_class:
+    # Mock NoiseHandshake class and its methods
+    with patch('pymeow.pymeow.handshake.NoiseHandshake') as mock_nh_class:
         mock_nh = mock_nh_class.return_value
         mock_nh.NOISE_START_PATTERN = b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'
         mock_nh.start = MagicMock()
@@ -91,53 +88,73 @@ async def test_do_handshake_success():
             SAMPLE_STATIC_DECRYPTED,  # First call returns static_decrypted
             SAMPLE_CERT_DECRYPTED     # Second call returns cert_decrypted
         ])
-        mock_nh.encrypt = MagicMock(return_value=b'encrypted_data')
-        mock_nh.finish = AsyncMock(return_value=MagicMock(spec=NoiseSocket))
+        mock_nh.encrypt = MagicMock(side_effect=[
+            b'encrypted_pubkey',      # First call for client public key
+            b'encrypted_payload'      # Second call for client payload
+        ])
 
-        # Mock _verify_server_cert
-        with patch.object(test_instance, '_verify_server_cert', MagicMock()) as mock_verify:
-            # Call the method under test
-            await test_instance._do_handshake(mock_fs, mock_ephemeral_kp)
+        # Create a mock noise socket
+        mock_noise_socket = MagicMock(spec=NoiseSocket)
+        mock_nh.finish = AsyncMock(return_value=mock_noise_socket)
 
-            # Verify method calls
-            mock_nh.start.assert_called_once_with(mock_nh.NOISE_START_PATTERN, mock_fs.header)
-            mock_nh.authenticate.assert_any_call(mock_ephemeral_kp.pub)
-            mock_nh.authenticate.assert_any_call(SAMPLE_SERVER_RESPONSE['server_ephemeral'])
-            mock_nh.mix_shared_secret_into_key.assert_any_call(
-                mock_ephemeral_kp.priv,
-                SAMPLE_SERVER_RESPONSE['server_ephemeral']
-            )
-            mock_nh.mix_shared_secret_into_key.assert_any_call(
-                mock_ephemeral_kp.priv,
-                SAMPLE_STATIC_DECRYPTED
-            )
-            mock_nh.decrypt.assert_any_call(SAMPLE_SERVER_RESPONSE['server_static_ciphertext'])
-            mock_nh.decrypt.assert_any_call(SAMPLE_SERVER_RESPONSE['certificate_ciphertext'])
-            mock_verify.assert_called_once_with(SAMPLE_CERT_DECRYPTED, SAMPLE_STATIC_DECRYPTED)
-            mock_nh.encrypt.assert_any_call(test_instance.store.noise_key.pub)
-            mock_nh.finish.assert_called_once()
-            assert test_instance.socket is not None
+        # Mock verify_server_cert function
+        with patch('pymeow.pymeow.handshake.verify_server_cert', MagicMock()) as mock_verify:
+            # Mock get_client_payload function
+            with patch('pymeow.pymeow.handshake.get_client_payload') as mock_get_payload:
+                mock_payload = MagicMock()
+                mock_payload.SerializeToString = MagicMock(return_value=b'client_payload')
+                mock_get_payload.return_value = mock_payload
 
-@pytest.mark.skip(reason="Needs proper mocking of NoiseHandshake")
+                # Call the function under test
+                await do_handshake(mock_client, mock_fs, mock_ephemeral_kp)
+
+                # Verify NoiseHandshake was created
+                mock_nh_class.assert_called_once()
+
+                # Verify method calls
+                mock_nh.start.assert_called_once_with(mock_nh.NOISE_START_PATTERN, mock_fs.header)
+
+                # Verify authenticate calls (ephemeral and server ephemeral)
+                expected_auth_calls = [
+                    call(mock_ephemeral_kp.pub),
+                    call(SAMPLE_SERVER_RESPONSE['server_ephemeral'])
+                ]
+                mock_nh.authenticate.assert_has_calls(expected_auth_calls)
+
+                # Verify decrypt calls
+                expected_decrypt_calls = [
+                    call(SAMPLE_SERVER_RESPONSE['server_static_ciphertext']),
+                    call(SAMPLE_SERVER_RESPONSE['certificate_ciphertext'])
+                ]
+                mock_nh.decrypt.assert_has_calls(expected_decrypt_calls)
+
+                # Verify certificate verification
+                mock_verify.assert_called_once_with(SAMPLE_CERT_DECRYPTED, SAMPLE_STATIC_DECRYPTED)
+
+                # Verify encryption calls
+                expected_encrypt_calls = [
+                    call(mock_client.store.noise_key.pub),
+                    call(b'client_payload')
+                ]
+                mock_nh.encrypt.assert_has_calls(expected_encrypt_calls)
+
+                # Verify finish was called
+                mock_nh.finish.assert_called_once()
+
+                # Verify client socket was set
+                assert mock_client.socket is mock_noise_socket
+
+
 @pytest.mark.asyncio
 async def test_do_handshake_timeout():
     """Test handshake timeout."""
-    # Create test instance
-    test_instance = TestHandshake()
+    # Create test instances
+    mock_client = create_mock_client()
+    mock_fs = create_mock_frame_socket()
+    mock_ephemeral_kp = create_mock_ephemeral_keypair()
 
-    # Create mock frame socket
-    mock_fs = MagicMock()
-    mock_fs.header = b'test_header'
-    mock_fs.send_frame = AsyncMock()
-    mock_fs.frames = asyncio.Queue()
-
-    # Create mock ephemeral key pair
-    mock_ephemeral_kp = MagicMock(spec=KeyPair)
-    mock_ephemeral_kp.pub = SAMPLE_EPHEMERAL_KEYPAIR['pub']
-    mock_ephemeral_kp.priv = SAMPLE_EPHEMERAL_KEYPAIR['priv']
-
-    # Mock NoiseHandshake methods
-    with patch('pymeow.socket.noisehandshake.NoiseHandshake', autospec=True) as mock_nh_class:
+    # Mock NoiseHandshake
+    with patch('pymeow.pymeow.handshake.NoiseHandshake') as mock_nh_class:
         mock_nh = mock_nh_class.return_value
         mock_nh.NOISE_START_PATTERN = b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'
         mock_nh.start = MagicMock()
@@ -145,27 +162,18 @@ async def test_do_handshake_timeout():
 
         # Mock asyncio.wait_for to raise TimeoutError
         with patch('asyncio.wait_for', AsyncMock(side_effect=asyncio.TimeoutError())):
-            # Call the method under test and expect HandshakeError
+            # Call the function under test and expect HandshakeError
             with pytest.raises(HandshakeError, match="Timed out waiting for handshake response"):
-                await test_instance._do_handshake(mock_fs, mock_ephemeral_kp)
+                await do_handshake(mock_client, mock_fs, mock_ephemeral_kp)
 
-@pytest.mark.skip(reason="Needs proper mocking of NoiseHandshake")
+
 @pytest.mark.asyncio
 async def test_do_handshake_certificate_verification_error():
     """Test handshake with certificate verification error."""
-    # Create test instance
-    test_instance = TestHandshake()
-
-    # Create mock frame socket
-    mock_fs = MagicMock()
-    mock_fs.header = b'test_header'
-    mock_fs.send_frame = AsyncMock()
-    mock_fs.frames = asyncio.Queue()
-
-    # Create mock ephemeral key pair
-    mock_ephemeral_kp = MagicMock(spec=KeyPair)
-    mock_ephemeral_kp.pub = SAMPLE_EPHEMERAL_KEYPAIR['pub']
-    mock_ephemeral_kp.priv = SAMPLE_EPHEMERAL_KEYPAIR['priv']
+    # Create test instances
+    mock_client = create_mock_client()
+    mock_fs = create_mock_frame_socket()
+    mock_ephemeral_kp = create_mock_ephemeral_keypair()
 
     # Create mock server response
     server_response = HandshakeMessage()
@@ -178,8 +186,8 @@ async def test_do_handshake_certificate_verification_error():
     # Add server response to frame socket queue
     await mock_fs.frames.put(server_response.SerializeToString())
 
-    # Mock NoiseHandshake methods
-    with patch('pymeow.socket.noisehandshake.NoiseHandshake', autospec=True) as mock_nh_class:
+    # Mock NoiseHandshake
+    with patch('pymeow.pymeow.handshake.NoiseHandshake') as mock_nh_class:
         mock_nh = mock_nh_class.return_value
         mock_nh.NOISE_START_PATTERN = b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'
         mock_nh.start = MagicMock()
@@ -190,12 +198,185 @@ async def test_do_handshake_certificate_verification_error():
             SAMPLE_CERT_DECRYPTED     # Second call returns cert_decrypted
         ])
 
-        # Mock _verify_server_cert to raise CertificateVerificationError
-        with patch.object(test_instance, '_verify_server_cert',
-                         MagicMock(side_effect=CertificateVerificationError("Test error"))) as mock_verify:
-            # Call the method under test and expect CertificateVerificationError
+        # Mock verify_server_cert to raise CertificateVerificationError
+        with patch('pymeow.pymeow.handshake.verify_server_cert',
+                   MagicMock(side_effect=CertificateVerificationError("Test error"))) as mock_verify:
+            # Call the function under test and expect CertificateVerificationError
             with pytest.raises(CertificateVerificationError, match="Failed to verify server certificate"):
-                await test_instance._do_handshake(mock_fs, mock_ephemeral_kp)
+                await do_handshake(mock_client, mock_fs, mock_ephemeral_kp)
 
             # Verify method calls
             mock_verify.assert_called_once_with(SAMPLE_CERT_DECRYPTED, SAMPLE_STATIC_DECRYPTED)
+
+
+@pytest.mark.asyncio
+async def test_do_handshake_missing_server_response_parts():
+    """Test handshake with missing parts in server response."""
+    # Create test instances
+    mock_client = create_mock_client()
+    mock_fs = create_mock_frame_socket()
+    mock_ephemeral_kp = create_mock_ephemeral_keypair()
+
+    # Create incomplete server response (missing ephemeral)
+    server_response = HandshakeMessage()
+    server_hello = HandshakeMessage.ServerHello()
+    server_hello.ephemeral = b''  # Missing ephemeral key
+    server_hello.static = SAMPLE_SERVER_RESPONSE['server_static_ciphertext']
+    server_hello.payload = SAMPLE_SERVER_RESPONSE['certificate_ciphertext']
+    server_response.serverHello.CopyFrom(server_hello)
+
+    # Add server response to frame socket queue
+    await mock_fs.frames.put(server_response.SerializeToString())
+
+    # Mock NoiseHandshake
+    with patch('pymeow.pymeow.handshake.NoiseHandshake') as mock_nh_class:
+        mock_nh = mock_nh_class.return_value
+        mock_nh.NOISE_START_PATTERN = b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'
+        mock_nh.start = MagicMock()
+        mock_nh.authenticate = MagicMock()
+
+        # Call the function under test and expect HandshakeError
+        with pytest.raises(HandshakeError, match="Missing parts of handshake response"):
+            await do_handshake(mock_client, mock_fs, mock_ephemeral_kp)
+
+
+@pytest.mark.asyncio
+async def test_do_handshake_invalid_static_length():
+    """Test handshake with invalid static key length."""
+    # Create test instances
+    mock_client = create_mock_client()
+    mock_fs = create_mock_frame_socket()
+    mock_ephemeral_kp = create_mock_ephemeral_keypair()
+
+    # Create mock server response
+    server_response = HandshakeMessage()
+    server_hello = HandshakeMessage.ServerHello()
+    server_hello.ephemeral = SAMPLE_SERVER_RESPONSE['server_ephemeral']
+    server_hello.static = SAMPLE_SERVER_RESPONSE['server_static_ciphertext']
+    server_hello.payload = SAMPLE_SERVER_RESPONSE['certificate_ciphertext']
+    server_response.serverHello.CopyFrom(server_hello)
+
+    # Add server response to frame socket queue
+    await mock_fs.frames.put(server_response.SerializeToString())
+
+    # Mock NoiseHandshake
+    with patch('pymeow.pymeow.handshake.NoiseHandshake') as mock_nh_class:
+        mock_nh = mock_nh_class.return_value
+        mock_nh.NOISE_START_PATTERN = b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'
+        mock_nh.start = MagicMock()
+        mock_nh.authenticate = MagicMock()
+        mock_nh.mix_shared_secret_into_key = MagicMock()
+        mock_nh.decrypt = MagicMock(side_effect=[
+            b'invalid_length',  # Wrong length (should be 32 bytes)
+            SAMPLE_CERT_DECRYPTED
+        ])
+
+        # Call the function under test and expect HandshakeError
+        with pytest.raises(HandshakeError, match="Unexpected length of server static plaintext"):
+            await do_handshake(mock_client, mock_fs, mock_ephemeral_kp)
+
+
+@pytest.mark.asyncio
+async def test_do_handshake_invalid_handshake_response():
+    """Test handshake with invalid handshake response format."""
+    # Create test instances
+    mock_client = create_mock_client()
+    mock_fs = create_mock_frame_socket()
+    mock_ephemeral_kp = create_mock_ephemeral_keypair()
+
+    # Add invalid response to frame socket queue
+    await mock_fs.frames.put(b'invalid_protobuf_data')
+
+    # Mock NoiseHandshake
+    with patch('pymeow.pymeow.handshake.NoiseHandshake') as mock_nh_class:
+        mock_nh = mock_nh_class.return_value
+        mock_nh.NOISE_START_PATTERN = b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'
+        mock_nh.start = MagicMock()
+        mock_nh.authenticate = MagicMock()
+
+        # Call the function under test and expect HandshakeError
+        with pytest.raises(HandshakeError, match="Failed to unmarshal handshake response"):
+            await do_handshake(mock_client, mock_fs, mock_ephemeral_kp)
+
+
+@pytest.mark.asyncio
+async def test_do_handshake_decrypt_failure():
+    """Test handshake with decryption failure."""
+    # Create test instances
+    mock_client = create_mock_client()
+    mock_fs = create_mock_frame_socket()
+    mock_ephemeral_kp = create_mock_ephemeral_keypair()
+
+    # Create mock server response
+    server_response = HandshakeMessage()
+    server_hello = HandshakeMessage.ServerHello()
+    server_hello.ephemeral = SAMPLE_SERVER_RESPONSE['server_ephemeral']
+    server_hello.static = SAMPLE_SERVER_RESPONSE['server_static_ciphertext']
+    server_hello.payload = SAMPLE_SERVER_RESPONSE['certificate_ciphertext']
+    server_response.serverHello.CopyFrom(server_hello)
+
+    # Add server response to frame socket queue
+    await mock_fs.frames.put(server_response.SerializeToString())
+
+    # Mock NoiseHandshake
+    with patch('pymeow.pymeow.handshake.NoiseHandshake') as mock_nh_class:
+        mock_nh = mock_nh_class.return_value
+        mock_nh.NOISE_START_PATTERN = b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'
+        mock_nh.start = MagicMock()
+        mock_nh.authenticate = MagicMock()
+        mock_nh.mix_shared_secret_into_key = MagicMock()
+        # First decrypt call fails
+        mock_nh.decrypt = MagicMock(side_effect=Exception("Decryption failed"))
+
+        # Call the function under test and expect HandshakeError
+        with pytest.raises(HandshakeError, match="Failed to decrypt server static ciphertext"):
+            await do_handshake(mock_client, mock_fs, mock_ephemeral_kp)
+
+
+@pytest.mark.asyncio
+async def test_do_handshake_finish_failure():
+    """Test handshake with finish failure."""
+    # Create test instances
+    mock_client = create_mock_client()
+    mock_fs = create_mock_frame_socket()
+    mock_ephemeral_kp = create_mock_ephemeral_keypair()
+
+    # Create mock server response
+    server_response = HandshakeMessage()
+    server_hello = HandshakeMessage.ServerHello()
+    server_hello.ephemeral = SAMPLE_SERVER_RESPONSE['server_ephemeral']
+    server_hello.static = SAMPLE_SERVER_RESPONSE['server_static_ciphertext']
+    server_hello.payload = SAMPLE_SERVER_RESPONSE['certificate_ciphertext']
+    server_response.serverHello.CopyFrom(server_hello)
+
+    # Add server response to frame socket queue
+    await mock_fs.frames.put(server_response.SerializeToString())
+
+    # Mock NoiseHandshake
+    with patch('pymeow.pymeow.handshake.NoiseHandshake') as mock_nh_class:
+        mock_nh = mock_nh_class.return_value
+        mock_nh.NOISE_START_PATTERN = b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'
+        mock_nh.start = MagicMock()
+        mock_nh.authenticate = MagicMock()
+        mock_nh.mix_shared_secret_into_key = MagicMock()
+        mock_nh.decrypt = MagicMock(side_effect=[
+            SAMPLE_STATIC_DECRYPTED,
+            SAMPLE_CERT_DECRYPTED
+        ])
+        mock_nh.encrypt = MagicMock(side_effect=[
+            b'encrypted_pubkey',
+            b'encrypted_payload'
+        ])
+        # finish() fails
+        mock_nh.finish = AsyncMock(side_effect=Exception("Finish failed"))
+
+        # Mock verify_server_cert and get_client_payload
+        with patch('pymeow.pymeow.handshake.verify_server_cert', MagicMock()):
+            with patch('pymeow.pymeow.handshake.get_client_payload') as mock_get_payload:
+                mock_payload = MagicMock()
+                mock_payload.SerializeToString = MagicMock(return_value=b'client_payload')
+                mock_get_payload.return_value = mock_payload
+
+                # Call the function under test and expect HandshakeError
+                with pytest.raises(HandshakeError, match="Failed to create noise socket"):
+                    await do_handshake(mock_client, mock_fs, mock_ephemeral_kp)
