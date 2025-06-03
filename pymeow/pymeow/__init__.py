@@ -31,12 +31,11 @@ from .types.presence import (
 
 from .client import Client as BaseClient
 from .types import Message, GroupInfo, PrivacySetting
-from .newsletter import NewsletterMixin
 from .user import UserMixin
 
 
 # Create enhanced Client class with message handling capabilities
-class Client(BaseClient, NewsletterMixin, UserMixin):
+class Client(BaseClient, UserMixin):
     """
     Client for WhatsApp Web API with message handling and newsletter capabilities.
 
@@ -47,23 +46,7 @@ class Client(BaseClient, NewsletterMixin, UserMixin):
     classes, while maintaining backward compatibility through the mixins.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     # Helper method stubs that should be implemented in the base client or one of the mixins
-    def generate_request_id(self):
-        """Generate a unique request ID.
-
-        This method should be implemented in the base client.
-        """
-        raise NotImplementedError("generate_request_id method must be implemented in the base client")
-
-    def cancel_response(self, request_id, response):
-        """Cancel waiting for a response.
-
-        This method should be implemented in the base client.
-        """
-        raise NotImplementedError("cancel_response method must be implemented in the base client")
 
     def generate_message_id(self):
         """Generate a unique message ID.
@@ -72,29 +55,11 @@ class Client(BaseClient, NewsletterMixin, UserMixin):
         """
         raise NotImplementedError("generate_message_id method must be implemented in the base client")
 
-    def send_node(self, node):
-        """Send a node to the server.
-
-        This method should be implemented in the base client.
-        """
-        raise NotImplementedError("send_node method must be implemented in the base client")
-
-    def wait_response(self, request_id):
-        """Wait for a response to a request.
-
-        This method should be implemented in the base client.
-        """
-        raise NotImplementedError("wait_response method must be implemented in the base client")
-
 
 __all__ = [
     'Client',
     'Message',
     'GroupInfo',
     'PrivacySetting',
-    'MessageHandler',
-    'MessageProcessingHandler',
-    'MessageHandlingMixin',
-    'MessageProcessingMixin',
     'NewsletterMixin',
 ]

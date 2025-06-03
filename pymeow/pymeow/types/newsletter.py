@@ -268,9 +268,9 @@ class GraphQLError:
         return f"{self.extensions.error_code} {self.message} ({self.extensions.severity})"
 
 
-class GraphQLErrors(List[GraphQLError]):
+class GraphQLErrors(Exception, List[GraphQLError]):
     """
-    A list of GraphQL errors.
+    A list of GraphQL errors that can be raised as an exception.
 
     Port of GraphQLErrors in Go.
     """
