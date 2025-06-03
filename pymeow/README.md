@@ -1315,6 +1315,9 @@ except AuthenticationError as e:
 ### Running Tests
 
 ```bash
+set PYTHONIOENCODING=utf-8
+set LANG=en_US.UTF-8
+uv sync
 pytest tests/
 ```
 
