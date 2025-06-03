@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypeVar, Generic, Awaitable, TYPE_CHECKING
 from urllib.parse import urlparse
 
+from .call import handle_call_event
 from .connectionevents import handle_ib
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from .generated.waWa6 import WAWebProtobufsWa6_pb2
@@ -228,7 +229,7 @@ class Client:
             "message": handle_encrypted_message,
             "appdata": handle_encrypted_message,
             "receipt": handle_receipt,
-            "call": self._handle_call_event,
+            "call": handle_call_event,
             "chatstate": self._handle_chat_state,
             "presence": self._handle_presence,
             "notification": self._handle_notification,
@@ -915,124 +916,6 @@ class Client:
             logger.error(f"Failed to store LID-PN mapping for {lid} -> {pn}: {err}")
 
     # Node handler methods
-    async def _handle_call_event(self, node: Node) -> None:
-        """Handle a call event node.
-
-        Args:
-            node: The call event node
-        """
-        from .types.events.call import (
-            CallOffer, CallOfferNotice, CallRelayLatency, CallAccept,
-            CallPreAccept, CallTransport, CallTerminate, CallReject,
-            UnknownCallEvent
-        )
-        from .types.call import BasicCallMeta, CallRemoteMeta
-
-        # Create a deferred acknowledgment function
-        defer_ack = self.maybe_deferred_ack(node)
-
-        try:
-            # Check if the node has exactly one child
-            children = node.get_children()
-            if len(children) != 1:
-                await self.dispatch_event(UnknownCallEvent(node=node))
-                return
-
-            # Get attributes from the node and its child using AttrGetter
-            ag = node.attr_getter()
-            child = children[0]
-            cag = child.attr_getter()
-
-            # Create basic call metadata
-            basic_meta = BasicCallMeta(
-                from_jid=ag.jid("from"),
-                timestamp=ag.unix_time("t"),
-                call_creator=cag.jid("call-creator"),
-                call_id=cag.string("call-id")
-            )
-
-            # Handle different call event types based on the child tag
-            if child.tag == "offer":
-                await self.dispatch_event(CallOffer(
-                    from_jid=basic_meta.from_jid,
-                    timestamp=basic_meta.timestamp,
-                    call_creator=basic_meta.call_creator,
-                    call_id=basic_meta.call_id,
-                    remote_platform=ag.string("platform"),
-                    remote_version=ag.string("version"),
-                    data=child
-                ))
-            elif child.tag == "offer_notice":
-                await self.dispatch_event(CallOfferNotice(
-                    from_jid=basic_meta.from_jid,
-                    timestamp=basic_meta.timestamp,
-                    call_creator=basic_meta.call_creator,
-                    call_id=basic_meta.call_id,
-                    media=cag.string("media"),
-                    type=cag.string("type"),
-                    data=child
-                ))
-            elif child.tag == "relaylatency":
-                await self.dispatch_event(CallRelayLatency(
-                    from_jid=basic_meta.from_jid,
-                    timestamp=basic_meta.timestamp,
-                    call_creator=basic_meta.call_creator,
-                    call_id=basic_meta.call_id,
-                    data=child
-                ))
-            elif child.tag == "accept":
-                await self.dispatch_event(CallAccept(
-                    from_jid=basic_meta.from_jid,
-                    timestamp=basic_meta.timestamp,
-                    call_creator=basic_meta.call_creator,
-                    call_id=basic_meta.call_id,
-                    remote_platform=ag.string("platform"),
-                    remote_version=ag.string("version"),
-                    data=child
-                ))
-            elif child.tag == "preaccept":
-                await self.dispatch_event(CallPreAccept(
-                    from_jid=basic_meta.from_jid,
-                    timestamp=basic_meta.timestamp,
-                    call_creator=basic_meta.call_creator,
-                    call_id=basic_meta.call_id,
-                    remote_platform=ag.string("platform"),
-                    remote_version=ag.string("version"),
-                    data=child
-                ))
-            elif child.tag == "transport":
-                await self.dispatch_event(CallTransport(
-                    from_jid=basic_meta.from_jid,
-                    timestamp=basic_meta.timestamp,
-                    call_creator=basic_meta.call_creator,
-                    call_id=basic_meta.call_id,
-                    remote_platform=ag.string("platform"),
-                    remote_version=ag.string("version"),
-                    data=child
-                ))
-            elif child.tag == "terminate":
-                await self.dispatch_event(CallTerminate(
-                    from_jid=basic_meta.from_jid,
-                    timestamp=basic_meta.timestamp,
-                    call_creator=basic_meta.call_creator,
-                    call_id=basic_meta.call_id,
-                    reason=cag.string("reason"),
-                    data=child
-                ))
-            elif child.tag == "reject":
-                await self.dispatch_event(CallReject(
-                    from_jid=basic_meta.from_jid,
-                    timestamp=basic_meta.timestamp,
-                    call_creator=basic_meta.call_creator,
-                    call_id=basic_meta.call_id,
-                    data=child
-                ))
-            else:
-                await self.dispatch_event(UnknownCallEvent(node=node))
-        finally:
-            # Call the deferred acknowledgment function
-            await defer_ack()
-
     async def _handle_chat_state(self, node: Node) -> None:
         """Handle a chat state node.
 

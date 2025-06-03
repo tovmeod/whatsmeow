@@ -1,115 +1,80 @@
 """
-Call-related event types for PyMeow.
+Call event types for WhatsApp.
 
 Port of whatsmeow/types/events/call.go
 """
+
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional
 
 from ...binary.node import Node
-from ..jid import JID
 from ..call import BasicCallMeta, CallRemoteMeta
 
 
 @dataclass
-class CallOffer(BasicCallMeta, CallRemoteMeta):
-    """
-    Emitted when the user receives a call on WhatsApp.
-
-    This event contains information about an incoming call, including
-    the caller's identity, timestamp, and call metadata.
-    """
-    data: Optional[Node] = None  # The call offer data
-
-
-@dataclass
-class CallAccept(BasicCallMeta, CallRemoteMeta):
-    """
-    Emitted when a call is accepted on WhatsApp.
-
-    This event is triggered when either the user or the remote party
-    accepts a call, containing information about the accepted call.
-    """
+class CallOffer:
+    """Emitted when the user receives a call on WhatsApp."""
+    basic_call_meta: BasicCallMeta
+    call_remote_meta: CallRemoteMeta
     data: Optional[Node] = None
 
 
 @dataclass
-class CallPreAccept(BasicCallMeta, CallRemoteMeta):
-    """
-    Pre-acceptance state for a call.
-
-    This event is emitted during the call setup process before
-    the call is fully accepted.
-    """
+class CallOfferNotice:
+    """Emitted when the user receives a call offer notice."""
+    basic_call_meta: BasicCallMeta
+    media: str
+    type_: str  # Using type_ to avoid conflict with Python keyword
     data: Optional[Node] = None
 
 
 @dataclass
-class CallTransport(BasicCallMeta, CallRemoteMeta):
-    """
-    Call transport details.
-
-    This event contains information about the transport layer
-    of a call, which is used to establish the media connection.
-    """
+class CallRelayLatency:
+    """Emitted for call relay latency information."""
+    basic_call_meta: BasicCallMeta
     data: Optional[Node] = None
 
 
 @dataclass
-class CallOfferNotice(BasicCallMeta):
-    """
-    Emitted when the user receives a notice of a call on WhatsApp.
-
-    This seems to be primarily for group calls (whereas CallOffer is for 1:1 calls).
-    Contains information about the call type and whether it's a group call.
-    """
-    media: str = ""  # "audio" or "video" depending on call type
-    type: str = ""   # "group" when it's a group call
-
+class CallAccept:
+    """Emitted when a call is accepted."""
+    basic_call_meta: BasicCallMeta
+    call_remote_meta: CallRemoteMeta
     data: Optional[Node] = None
 
 
 @dataclass
-class CallRelayLatency(BasicCallMeta):
-    """
-    Emitted slightly after the user receives a call on WhatsApp.
-
-    This event contains information about the latency of the call relay,
-    which is used to establish the connection between the caller and callee.
-    """
+class CallPreAccept:
+    """Emitted when a call is pre-accepted."""
+    basic_call_meta: BasicCallMeta
+    call_remote_meta: CallRemoteMeta
     data: Optional[Node] = None
 
 
 @dataclass
-class CallTerminate(BasicCallMeta):
-    """
-    Emitted when the other party terminates a call on WhatsApp.
-
-    This event contains information about why the call was terminated,
-    including a reason string that explains the termination cause.
-    """
-    reason: str = ""  # Reason for call termination
+class CallTransport:
+    """Emitted for call transport information."""
+    basic_call_meta: BasicCallMeta
+    call_remote_meta: CallRemoteMeta
     data: Optional[Node] = None
 
 
 @dataclass
-class CallReject(BasicCallMeta):
-    """
-    Sent when the other party rejects the call on WhatsApp.
+class CallTerminate:
+    """Emitted when a call is terminated."""
+    basic_call_meta: BasicCallMeta
+    reason: str
+    data: Optional[Node] = None
 
-    This event is triggered when the remote party explicitly
-    rejects an incoming call.
-    """
+
+@dataclass
+class CallReject:
+    """Emitted when a call is rejected."""
+    basic_call_meta: BasicCallMeta
     data: Optional[Node] = None
 
 
 @dataclass
 class UnknownCallEvent:
-    """
-    Emitted when a call element with unknown content is received.
-
-    This is a fallback event for call-related messages that don't
-    match any of the known event types.
-    """
-    node: Optional[Node] = None
+    """Emitted when an unknown call event is received."""
+    node: Node

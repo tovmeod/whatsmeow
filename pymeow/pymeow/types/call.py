@@ -1,17 +1,19 @@
 """
-Call-related types for PyMeow.
+Call-related types for WhatsApp.
 
 Port of whatsmeow/types/call.go
 """
+
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
 
 from .jid import JID
 
 
 @dataclass
 class BasicCallMeta:
-    """Basic metadata about a call."""
+    """Basic metadata for call events."""
     from_jid: JID
     timestamp: datetime
     call_creator: JID
@@ -20,6 +22,6 @@ class BasicCallMeta:
 
 @dataclass
 class CallRemoteMeta:
-    """Information about the remote caller's WhatsApp client."""
-    remote_platform: str  # The platform of the caller's WhatsApp client
-    remote_version: str  # Version of the caller's WhatsApp client
+    """Remote platform metadata for call events."""
+    remote_platform: str
+    remote_version: str
