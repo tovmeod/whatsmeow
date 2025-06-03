@@ -46,8 +46,8 @@ class JID:
     AD JIDs are only used to refer to specific devices of users, so the server is always s.whatsapp.net (DEFAULT_USER_SERVER).
     Regular JIDs can be used for entities on any servers (users, groups, broadcasts).
     """
-    user: str
-    server: str
+    user: str = ""
+    server: str = ""
     raw_agent: int = 0
     device: int = 0
     integrator: int = 0

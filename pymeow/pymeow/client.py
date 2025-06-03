@@ -9,7 +9,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypeVar, Generic, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypeVar, Generic, Awaitable, TYPE_CHECKING
 from urllib.parse import urlparse
 
 from .connectionevents import handle_ib
@@ -43,6 +43,8 @@ EventHandler = Callable[[Any], Awaitable[None]]
 # Constants
 HANDLER_QUEUE_SIZE = 2048
 
+if TYPE_CHECKING:
+    from .request import InfoQuery
 
 @dataclass
 class WrappedEventHandler:

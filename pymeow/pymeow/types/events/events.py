@@ -4,7 +4,7 @@ Events for WhatsApp client.
 Port of whatsmeow/types/events/events.go
 """
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import List, Optional, Protocol, Dict, Any, Union
 
@@ -238,7 +238,7 @@ class TemporaryBan:
     Emitted when there's a connection failure with the ConnectFailureTempBanned reason code.
     """
     code: TempBanReason
-    expire: Optional[datetime] = None
+    expire: Optional[timedelta] = None
 
     def __str__(self) -> str:
         """Returns a human-readable description of the ban."""

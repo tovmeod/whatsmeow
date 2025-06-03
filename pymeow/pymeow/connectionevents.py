@@ -10,6 +10,8 @@ from typing import Optional, TYPE_CHECKING
 
 from .binary.node import Node
 from .prekeys import get_server_prekey_count, upload_prekeys
+from .request import InfoQuery, InfoQueryType
+from .store.clientpayload import get_wa_version
 from .types import jid, events
 from .store import store
 
@@ -150,7 +152,7 @@ async def handle_connect_failure(cli: "Client", node: Node) -> None:
             expire=timedelta(seconds=int(node.attrs.get("expire", 0)))
         )))
     elif reason == events.ConnectFailureReason.CLIENT_OUTDATED:
-        logger.error(f"Client outdated (405) connect failure (client version: {store.get_wa_version()})")
+        logger.error(f"Client outdated (405) connect failure (client version: {get_wa_version()})")
         asyncio.create_task(cli.dispatch_event(events.ClientOutdated()))
     elif reason == events.ConnectFailureReason.CAT_INVALID or reason == events.ConnectFailureReason.CAT_EXPIRED:
         logger.info(f"Got {reason.value}/{message} connect failure, refreshing CAT before reconnecting...")
@@ -277,11 +279,9 @@ async def set_passive(cli: "Client", ctx, passive: bool) -> None:
     """
     tag = "passive" if passive else "active"
 
-    from .send import info_query
-
-    _, err = await cli.send_iq(info_query(
+    _, err = await cli.send_iq(InfoQuery(
         namespace="passive",
-        type="set",
+        type=InfoQueryType.SET,  # Fixed: Use enum value instead of string
         to=jid.SERVER_JID,
         context=ctx,
         content=[Node(tag=tag)]
