@@ -3,9 +3,8 @@ WhatsApp prekeys handling.
 
 Port of whatsmeow/prekeys.go
 """
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple
-import os
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Union, Any, TYPE_CHECKING
 import struct
 import asyncio
 from datetime import datetime, timedelta
@@ -15,60 +14,32 @@ from cryptography.hazmat.primitives import serialization
 from .exceptions import PreKeyError
 from .binary.node import Node
 from .types import JID
+from .util.keys.keypair import PreKey
 
-@dataclass
-class PreKeyData:
-    """Pre-key data structure matching libsignal's prekey."""
-    key_id: int
-    public_key: bytes
-    private_key: bytes
-    uploaded: bool = False
+# Constants matching Go implementation
+WANTED_PREKEY_COUNT = 50  # WantedPreKeyCount
+MIN_PREKEY_COUNT = 5      # MinPreKeyCount
+DJB_TYPE = 5             # ecc.DjbType - curve25519 key type
 
-    def to_node(self) -> Node:
-        """Convert to binary node for server communication."""
-        return Node(
-            tag="key",
-            attributes={
-                "id": str(self.key_id)
-            },
-            content=self.public_key
-        )
-
-@dataclass
-class SignedPreKeyData:
-    """Signed pre-key data structure."""
-    key_id: int
-    public_key: bytes
-    private_key: bytes
-    signature: bytes
-    timestamp: datetime
-
-    def to_node(self) -> Node:
-        """Convert to binary node for server communication."""
-        return Node(
-            tag="skey",
-            attributes={
-                "id": str(self.key_id),
-                "timestamp": str(int(self.timestamp.timestamp()))
-            },
-            content=[
-                Node(tag="key", attributes={}, content=self.public_key),
-                Node(tag="signature", attributes={}, content=self.signature)
-            ]
-        )
-
+if TYPE_CHECKING:
+    from .client import Client
 
 @dataclass
 class PreKeyBundle:
-    """Pre-key bundle for Signal protocol."""
+    """Pre-key bundle for Signal protocol - matches Go's prekey.Bundle."""
     registration_id: int
     device_id: int
-    pre_key: Optional[PreKeyData]
-    signed_pre_key: SignedPreKeyData
+    pre_key: Optional[PreKey]
+    signed_pre_key: PreKey
     identity_key: bytes
 
+@dataclass
+class PreKeyResp:
+    """Response structure for fetch_pre_keys - matches Go's preKeyResp struct."""
+    bundle: Optional[PreKeyBundle]
+    error: Optional[Exception]
 
-def pre_key_to_node(key: 'PreKeyData') -> Node:
+def pre_key_to_node(key: PreKey) -> Node:
     """Port of Go's preKeyToNode function.
 
     Convert a pre-key to a binary Node with proper key ID encoding.
@@ -79,26 +50,25 @@ def pre_key_to_node(key: 'PreKeyData') -> Node:
     Returns:
         Node: The converted node
     """
-    # Encode key ID as 3-byte big-endian integer (matching Go's keyID[1:])
-    key_id_bytes = struct.pack(">I", key.key_id)[1:]  # Skip first byte to get 3 bytes
+    # Encode key ID as 4 bytes, then take last 3 bytes (matching Go's keyID[1:])
+    key_id_bytes = struct.pack(">I", key.key_id)[1:]
 
-    # Create the node with id and value child nodes
     node = Node(
         tag="key",
         content=[
             Node(tag="id", content=key_id_bytes),
-            Node(tag="value", content=key.public_key),
+            Node(tag="value", content=key.pub),
         ]
     )
 
     # If this is a signed pre-key (has signature), use skey tag and add signature
-    if hasattr(key, 'signature') and key.signature:
+    if key.signature is not None:
         node.tag = "skey"
         node.content.append(Node(tag="signature", content=key.signature))
 
     return node
 
-def pre_keys_to_nodes(pre_keys: List['PreKeyData']) -> List[Node]:
+def pre_keys_to_nodes(pre_keys: List[PreKey]) -> List[Node]:
     """Port of Go's preKeysToNodes function.
 
     Convert a list of pre-keys to a list of nodes.
@@ -111,7 +81,7 @@ def pre_keys_to_nodes(pre_keys: List['PreKeyData']) -> List[Node]:
     """
     return [pre_key_to_node(key) for key in pre_keys]
 
-def node_to_pre_key(node: Node) -> Optional['PreKeyData']:
+def node_to_pre_key(node: Node) -> Optional[PreKey]:
     """Port of Go's nodeToPreKey function.
 
     Parse a pre-key from a node.
@@ -120,82 +90,54 @@ def node_to_pre_key(node: Node) -> Optional['PreKeyData']:
         node: The node to parse
 
     Returns:
-        Optional[PreKeyData]: The parsed pre-key, or None if parsing failed
+        Optional[PreKey]: The parsed pre-key
+
+    Raises:
+        PreKeyError: If parsing fails
     """
-    key = PreKeyData(
-        key_id=0,
-        public_key=None,
-        private_key=None,
-        uploaded=False
-    )
+    # Get ID tag
+    id_node = node.get_child_by_tag("id")
+    if not id_node or not isinstance(id_node.content, bytes):
+        raise PreKeyError("prekey node doesn't contain ID tag")
 
-    # Check for id tag
-    id_node = None
-    for child in node.content:
-        if isinstance(child, Node) and child.tag == "id":
-            id_node = child
-            break
+    id_bytes = id_node.content
+    if len(id_bytes) != 3:
+        raise PreKeyError(f"prekey ID has unexpected number of bytes ({len(id_bytes)}, expected 3)")
 
-    if not id_node:
-        return None
+    # Parse key ID from 3-byte big-endian (prepend zero byte)
+    key_id = struct.unpack(">I", bytes([0]) + id_bytes)[0]
 
-    # Parse key ID from id node
-    try:
-        if isinstance(id_node.content, bytes):
-            # Key ID is a 3-byte big-endian integer, prepend a zero byte
-            id_bytes = bytes([0]) + id_node.content
-            if len(id_bytes) != 4:
-                return None
-            key.key_id = struct.unpack(">I", id_bytes)[0]
-        else:
-            return None
-    except (ValueError, TypeError, struct.error):
-        return None
-
-    # Check for value tag
-    value_node = None
-    for child in node.content:
-        if isinstance(child, Node) and child.tag == "value":
-            value_node = child
-            break
-
+    # Get value tag
+    value_node = node.get_child_by_tag("value")
     if not value_node or not isinstance(value_node.content, bytes):
-        return None
+        raise PreKeyError("prekey node doesn't contain value tag")
 
-    # Parse public key
     public_key = value_node.content
     if len(public_key) != 32:
-        return None
+        raise PreKeyError(f"prekey value has unexpected number of bytes ({len(public_key)}, expected 32)")
 
-    key.public_key = public_key
-
-    # If this is a signed pre-key, parse signature
+    signature = None
     if node.tag == "skey":
-        sig_node = None
-        for child in node.content:
-            if isinstance(child, Node) and child.tag == "signature":
-                sig_node = child
-                break
-
+        # This is a signed pre-key, get signature
+        sig_node = node.get_child_by_tag("signature")
         if not sig_node or not isinstance(sig_node.content, bytes):
-            return None
+            raise PreKeyError("signed prekey node doesn't contain signature tag")
 
         signature = sig_node.content
         if len(signature) != 64:
-            return None
+            raise PreKeyError(f"prekey signature has unexpected number of bytes ({len(signature)}, expected 64)")
 
-        # For SignedPreKeyData, create that instead
-        return SignedPreKeyData(
-            key_id=key.key_id,
-            public_key=key.public_key,
-            private_key=None,
-            signature=signature,
-            timestamp=datetime.now()
-        )
+    # Create KeyPair with the public key only (private key is None since we're parsing from network)
+    from .util.keys.keypair import KeyPair
+    key_pair = KeyPair.from_public_key(public_key)
 
-    return key
+    return PreKey(
+        key_pair=key_pair,
+        key_id=key_id,
+        signature=signature
+    )
 
-def node_to_pre_key_bundle(device_id: int, node: Node) -> Optional[PreKeyBundle]:
+def node_to_pre_key_bundle(device_id: int, node: Node) -> PreKeyBundle:
     """Port of Go's nodeToPreKeyBundle function.
 
     Parse a pre-key bundle from a node.
@@ -205,320 +147,297 @@ def node_to_pre_key_bundle(device_id: int, node: Node) -> Optional[PreKeyBundle]
         node: The node to parse
 
     Returns:
-        Optional[PreKeyBundle]: The parsed pre-key bundle, or None if parsing failed
+        PreKeyBundle: The parsed pre-key bundle
 
     Raises:
-        PreKeyError: If there's an error in the node
+        PreKeyError: If parsing fails
     """
     # Check for error node
-    for child in node.content:
-        if isinstance(child, Node) and child.tag == "error":
-            raise PreKeyError(f"Error in pre-key response: {child.xml_string()}")
+    error_node, found = node.get_optional_child_by_tag("error")
+    if error_node and error_node.tag == "error":
+        raise PreKeyError(f"got error getting prekeys: {error_node.xml_string()}")
 
-    # Get registration node
-    registration_node = None
-    for child in node.content:
-        if isinstance(child, Node) and child.tag == "registration":
-            registration_node = child
-            break
-
+    # Get registration ID
+    registration_node = node.get_child_by_tag("registration")
     if not registration_node or not isinstance(registration_node.content, bytes) or len(registration_node.content) != 4:
-        raise PreKeyError("Invalid registration ID in pre-key response")
+        raise PreKeyError("invalid registration ID in prekey response")
 
     registration_id = struct.unpack(">I", registration_node.content)[0]
 
     # Find keys node (might be directly in content or in a "keys" child node)
-    keys_node = None
-    for child in node.content:
-        if isinstance(child, Node) and child.tag == "keys":
-            keys_node = child
-            break
-
+    keys_node, found = node.get_optional_child_by_tag("keys")
     if not keys_node:
         keys_node = node
 
     # Get identity key
-    identity_key_node = None
-    for child in keys_node.content:
-        if isinstance(child, Node) and child.tag == "identity":
-            identity_key_node = child
-            break
-
+    identity_key_node = keys_node.get_child_by_tag("identity")
     if not identity_key_node or not isinstance(identity_key_node.content, bytes) or len(identity_key_node.content) != 32:
-        raise PreKeyError("Invalid identity key in pre-key response")
+        raise PreKeyError("invalid identity key in prekey response")
 
     identity_key = identity_key_node.content
 
     # Get pre-key (optional)
-    pre_key_node = None
-    for child in keys_node.content:
-        if isinstance(child, Node) and child.tag == "key":
-            pre_key_node = child
-            break
-
     pre_key = None
+    pre_key_node, found = keys_node.get_optional_child_by_tag("key")
     if pre_key_node:
         pre_key = node_to_pre_key(pre_key_node)
-        if not pre_key:
-            raise PreKeyError("Invalid pre-key in pre-key response")
 
     # Get signed pre-key (required)
-    signed_pre_key_node = None
-    for child in keys_node.content:
-        if isinstance(child, Node) and child.tag == "skey":
-            signed_pre_key_node = child
-            break
-
+    signed_pre_key_node = keys_node.get_child_by_tag("skey")
     if not signed_pre_key_node:
-        raise PreKeyError("Missing signed pre-key in pre-key response")
+        raise PreKeyError("missing signed prekey in prekey response")
 
     signed_pre_key = node_to_pre_key(signed_pre_key_node)
-    if not signed_pre_key or not isinstance(signed_pre_key, SignedPreKeyData):
-        raise PreKeyError("Invalid signed pre-key in pre-key response")
+    if not signed_pre_key or not signed_pre_key.signature:
+        raise PreKeyError("invalid signed prekey in prekey response")
 
-    # Create bundle
     return PreKeyBundle(
         registration_id=registration_id,
         device_id=device_id,
-        pre_key=pre_key if isinstance(pre_key, PreKeyData) else None,
+        pre_key=pre_key,
         signed_pre_key=signed_pre_key,
         identity_key=identity_key
     )
 
-# Constants matching Go implementation
-WANTED_PREKEY_COUNT = 50  # Number of prekeys to upload in a batch
-MIN_PREKEY_COUNT = 5     # Threshold for when to upload new prekeys
-DJB_TYPE = 5  # curve25519 key type (matching Go's ecc.DjbType)
+# Client method implementations using composition strategy
+async def get_server_prekey_count(client: "Client", ctx: Any = None) -> int:
+    """Port of Go's (*Client).getServerPreKeyCount method.
 
-@dataclass
-class PreKeyResp:
-    """Response structure for fetchPreKeys - matches Go's preKeyResp struct."""
-    bundle: Optional[PreKeyBundle]
-    error: Optional[Exception]
+    Get the number of pre-keys stored on the WhatsApp server.
+
+    Args:
+        client: The client instance
+        ctx: Context (unused in Python)
+
+    Returns:
+        int: Number of pre-keys on server
+
+    Raises:
+        PreKeyError: If the request fails
+    """
+    try:
+        resp, err = await client.send_iq({
+            "namespace": "encrypt",
+            "type": "get",
+            "to": client.server_jid,
+            "content": [Node(tag="count")]
+        })
+
+        count_node = resp.get_child_by_tag("count")
+        value = count_node.attrs.get("value")
+        if value is None:
+            raise PreKeyError("server response missing prekey count value")
+
+        return int(value)
+
+    except Exception as e:
+        raise PreKeyError(f"failed to get prekey count on server: {e}") from e
+
+async def upload_prekeys(client: "Client", ctx: Any = None) -> None:
+    """Port of Go's (*Client).uploadPreKeys method.
+
+    Upload pre-keys to the WhatsApp server with rate limiting.
+
+    Args:
+        client: The client instance
+        ctx: Context (unused in Python)
+    """
+    async with client.upload_prekeys_lock:
+        # Rate limiting - don't upload more than once every 10 minutes
+        if (client.last_pre_key_upload and
+            client.last_pre_key_upload + timedelta(minutes=10) > datetime.now()):
+            try:
+                server_count = await get_server_prekey_count(client, ctx)
+                if server_count >= WANTED_PREKEY_COUNT:
+                    client.send_log.debug("Canceling prekey upload request due to likely race condition")
+                    return
+            except Exception:
+                pass  # Ignore errors getting server count
+
+        # Get registration ID as 4-byte big-endian
+        registration_id_bytes = struct.pack(">I", client.store.registration_id)
+
+        # Get or generate pre-keys
+        try:
+            pre_keys = await client.store.pre_keys.get_or_gen_pre_keys(WANTED_PREKEY_COUNT)
+        except Exception as e:
+            client.send_log.error(f"Failed to get prekeys to upload: {e}")
+            return
+
+        client.send_log.info(f"Uploading {len(pre_keys)} new prekeys to server")
+
+        # Build upload request
+        content = [
+            Node(tag="registration", content=registration_id_bytes),
+            Node(tag="type", content=bytes([DJB_TYPE])),
+            Node(tag="identity", content=client.store.identity_key.pub),
+            Node(tag="list", content=pre_keys_to_nodes(pre_keys)),
+            pre_key_to_node(client.store.signed_pre_key)
+        ]
+
+        try:
+            await client.send_iq({
+                "namespace": "encrypt",
+                "type": "set",
+                "to": client.server_jid,
+                "content": content
+            })
+        except Exception as e:
+            client.send_log.error(f"Failed to send request to upload prekeys: {e}")
+            return
+
+        client.send_log.debug("Got response to uploading prekeys")
+
+        # Mark pre-keys as uploaded
+        try:
+            last_key_id = pre_keys[-1].key_id
+            await client.store.pre_keys.mark_pre_keys_as_uploaded(last_key_id)
+        except Exception as e:
+            client.send_log.warning(f"Failed to mark prekeys as uploaded: {e}")
+            return
+
+        client.last_pre_key_upload = datetime.now()
+
+async def fetch_pre_keys(client: "Client", ctx: Any, users: List[JID]) -> Dict[JID, PreKeyResp]:
+    """Port of Go's (*Client).fetchPreKeys method.
+
+    Fetch pre-key bundles for a list of users.
+
+    Args:
+        client: The client instance
+        ctx: Context (unused in Python)
+        users: List of user JIDs to fetch pre-keys for
+
+    Returns:
+        Dict[JID, PreKeyResp]: Map of JID to pre-key response
+
+    Raises:
+        PreKeyError: If the request fails
+    """
+    # Build user request nodes
+    requests = []
+    for user in users:
+        requests.append(Node(
+            tag="user",
+            attributes={
+                "jid": user,
+                "reason": "identity"
+            }
+        ))
+
+    # Send request
+    try:
+        resp, err = await client.send_iq({
+            "namespace": "encrypt",
+            "type": "get",
+            "to": client.server_jid,
+            "content": [Node(tag="key", content=requests)]
+        })
+    except Exception as e:
+        raise PreKeyError(f"failed to send prekey request: {e}") from e
+
+    children = resp.get_children()
+    if not children:
+        raise PreKeyError("got empty response to prekey request")
+
+    # Parse response
+    list_node = resp.get_child_by_tag("list")
+    resp_data = {}
+
+    for child in list_node.get_children():
+        if child.tag != "user":
+            continue
+
+        jid = JID.from_string(child.attrs.get("jid", ""))
+        try:
+            bundle = node_to_pre_key_bundle(jid.device, child)
+            resp_data[jid] = PreKeyResp(bundle=bundle, error=None)
+        except Exception as e:
+            resp_data[jid] = PreKeyResp(bundle=None, error=e)
+
+    return resp_data
 
 class PreKeyStore:
-    """Manages WhatsApp pre-keys."""
+    """Manages WhatsApp pre-keys - matches Go's store interface."""
 
     def __init__(self):
-        self._pre_keys: Dict[int, PreKeyData] = {}
-        self._next_pre_key_id = 0
-        self._last_upload: Optional[datetime] = None
-        self.registration_id = struct.unpack(">I", os.urandom(4))[0]
-        self._upload_lock = asyncio.Lock()
-        self.signed_pre_key: Optional[SignedPreKeyData] = None
-        self.identity_key: Optional[bytes] = None
+        self._pre_keys: Dict[int, PreKey] = {}
+        self._next_pre_key_id = 1
+        self._uploaded_keys: set = set()
 
-    def can_upload(self) -> bool:
-        """Implements whatsmeow.*Client.canUploadPreKeys.
-
-        Check if we can upload pre-keys now based on the last upload time.
-
-        Returns:
-            bool: True if we can upload pre-keys, False if we've uploaded recently.
-        """
-        if self._last_upload is None:
-            return True
-
-        # Don't allow uploading more than once every 10 minutes
-        min_upload_interval = timedelta(minutes=10)
-        time_since_last_upload = datetime.now() - self._last_upload
-        can_upload = time_since_last_upload >= min_upload_interval
-        return can_upload
-
-    async def get_or_gen_pre_keys(self, wanted_count: int = WANTED_PREKEY_COUNT) -> List[PreKeyData]:
-        """Implements store.PreKeyStore.GetOrGenPreKeys.
-
-        Get existing unuploaded pre-keys or generate new ones if needed.
+    async def get_or_gen_pre_keys(self, wanted_count: int = WANTED_PREKEY_COUNT) -> List[PreKey]:
+        """Get existing unuploaded pre-keys or generate new ones if needed.
 
         Args:
-            wanted_count: Number of pre-keys to return.
+            wanted_count: Number of pre-keys to return
 
         Returns:
-            List of PreKeyData objects, which may include both existing unuploaded
-            keys and newly generated ones.
+            List of PreKey objects
 
         Raises:
-            PreKeyError: If there's an error generating new keys.
+            PreKeyError: If unable to generate sufficient keys
         """
         # Get existing unuploaded keys
-        existing = [k for k in self._pre_keys.values() if not k.uploaded]
+        existing = [k for k in self._pre_keys.values() if k.key_id not in self._uploaded_keys]
 
         # If we don't have enough, generate more
         if len(existing) < wanted_count:
-            # Generate the difference
-            new_keys = self._generate_pre_keys(wanted_count - len(existing))
-            if not new_keys and len(existing) < MIN_PREKEY_COUNT:
-                raise PreKeyError("Failed to generate sufficient pre-keys")
-            # Combine existing and new keys
-            return existing + new_keys
+            needed = wanted_count - len(existing)
+            new_keys = await self._generate_pre_keys(needed)
+            existing.extend(new_keys)
 
-        # If we have enough, return the requested number
         return existing[:wanted_count]
 
-    def _generate_pre_keys(self, count: int = WANTED_PREKEY_COUNT) -> List[PreKeyData]:
-        """Implements store.SQLStore.genOnePreKey.
-
-        Generate a batch of pre-keys.
+    async def _generate_pre_keys(self, count: int) -> List[PreKey]:
+        """Generate new pre-keys.
 
         Args:
-            count: Number of pre-keys to generate.
+            count: Number of keys to generate
 
         Returns:
-            List of generated PreKeyData objects.
+            List of generated PreKey objects
         """
-        if len(self._pre_keys) >= WANTED_PREKEY_COUNT:
-            return []
-
-        # Don't generate more than the maximum allowed
-        count = min(count, WANTED_PREKEY_COUNT - len(self._pre_keys))
-        if count <= 0:
-            return []
-
-
         keys = []
         for _ in range(count):
-            # If we've reached the maximum key ID, stop generating more keys
-            if self._next_pre_key_id > 0xFFFFFF:
+            if self._next_pre_key_id > 0xFFFFFF:  # 24-bit limit
                 break
 
             key_id = self._next_pre_key_id
-            self._next_pre_key_id += 1  # Don't wrap around to 0
+            self._next_pre_key_id += 1
 
-            # Generate X25519 key pair
-            private_key = x25519.X25519PrivateKey.generate()
-            public_key = private_key.public_key()
-
-            key = PreKeyData(
-                key_id=key_id,
-                private_key=private_key.private_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PrivateFormat.Raw,
-                    encryption_algorithm=serialization.NoEncryption()
-                ),
-                public_key=public_key.public_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PublicFormat.Raw
-                )
-            )
+            # Generate PreKey using the class method
+            key = PreKey.generate(key_id)
             self._pre_keys[key_id] = key
             keys.append(key)
 
         return keys
 
-    async def mark_keys_as_uploaded(self, last_key_id: int) -> None:
-        """Implements store.PreKeyStore.MarkPreKeysAsUploaded.
-
-        Mark pre-keys as uploaded up to the specified ID.
+    async def mark_pre_keys_as_uploaded(self, up_to_key_id: int) -> None:
+        """Mark pre-keys as uploaded up to the specified ID.
 
         Args:
-            last_key_id: The highest key ID to mark as uploaded.
-
-        Note:
-            This also updates the last upload timestamp to the current time.
+            up_to_key_id: Highest key ID to mark as uploaded
         """
-        # Update the last upload time first
-        self._last_upload = datetime.now()
+        for key_id in self._pre_keys:
+            if key_id <= up_to_key_id:
+                self._uploaded_keys.add(key_id)
 
-        # Mark all keys up to last_key_id as uploaded
-        for key in self._pre_keys.values():
-            if key.key_id <= last_key_id:
-                key.uploaded = True
-
-
-    async def generate_pre_key(self) -> PreKeyData:
-        """Implements store.PreKeyStore.GenOnePreKey.
-
-        Generate a single pre-key.
-
-        Returns:
-            PreKeyData: The generated pre-key
-
-        Raises:
-            RuntimeError: If the maximum pre-key ID has been reached
-        """
-        if self._next_pre_key_id > 0xFFFFFF:
-            raise RuntimeError("reached maximum pre-key ID")
-
-        key_id = self._next_pre_key_id
-        self._next_pre_key_id += 1
-
-        # Generate X25519 key pair
-        private_key = x25519.X25519PrivateKey.generate()
-        public_key = private_key.public_key()
-
-        key = PreKeyData(
-            key_id=key_id,
-            private_key=private_key.private_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PrivateFormat.Raw,
-                encryption_algorithm=serialization.NoEncryption()
-            ),
-            public_key=public_key.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            ),
-            uploaded=True  # Mark as uploaded by default to match Go behavior
-        )
-
-        # Store the key
-        self._pre_keys[key_id] = key
-        return key
-
-    async def get_uploaded_count(self) -> int:
-        """Implements store.PreKeyStore.UploadedPreKeyCount.
-
-        Get the count of uploaded pre-keys.
-
-        Returns:
-            int: Number of pre-keys marked as uploaded
-        """
-        return sum(1 for key in self._pre_keys.values() if key.uploaded)
-
-    async def mark_keys_as_uploaded(self, up_to_id: int) -> None:
-        """Implements store.PreKeyStore.MarkPreKeysAsUploaded.
-
-        Mark pre-keys as uploaded up to the specified ID.
+    def get_pre_key(self, key_id: int) -> Optional[PreKey]:
+        """Get a pre-key by ID.
 
         Args:
-            up_to_id: The highest key ID to mark as uploaded
-
-        Note:
-            This also updates the last upload timestamp to now.
-        """
-        for key in self._pre_keys.values():
-            if key.key_id <= up_to_id:
-                key.uploaded = True
-
-        # Update the last upload time
-        self._last_upload = datetime.now()
-
-
-
-
-
-
-    def get_pre_key(self, key_id: int) -> Optional[PreKeyData]:
-        """Implements store.PreKeyStore.GetPreKey.
-
-        Get a pre-key by ID.
-
-        Args:
-            key_id: The ID of the pre-key to retrieve.
+            key_id: The ID of the pre-key to retrieve
 
         Returns:
-            The requested PreKeyData or None if not found.
+            The requested PreKey or None if not found
         """
         return self._pre_keys.get(key_id)
 
     async def remove_pre_key(self, key_id: int) -> None:
-        """Implements store.PreKeyStore.RemovePreKey.
-
-        Remove a pre-key from the store.
+        """Remove a pre-key from the store.
 
         Args:
-            key_id: The ID of the pre-key to remove.
-
-        Note:
-            This is a no-op if the key doesn't exist.
+            key_id: The ID of the pre-key to remove
         """
         self._pre_keys.pop(key_id, None)
+        self._uploaded_keys.discard(key_id)

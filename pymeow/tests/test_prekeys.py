@@ -3,14 +3,16 @@ import pytest
 from datetime import datetime, timedelta
 import struct
 import os
-from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives import serialization
+from unittest.mock import MagicMock, AsyncMock, patch
 
 from ..pymeow.prekeys import (
-    PreKeyStore, PreKeyData, SignedPreKeyData, PreKeyBundle, PreKeyError,
-    WANTED_PREKEY_COUNT, MIN_PREKEY_COUNT, DJB_TYPE
+    PreKeyStore, PreKey, PreKeyBundle, PreKeyResp, PreKeyError,
+    WANTED_PREKEY_COUNT, MIN_PREKEY_COUNT, DJB_TYPE,
+    pre_key_to_node, pre_keys_to_nodes, node_to_pre_key, node_to_pre_key_bundle
 )
 from ..pymeow.binary.node import Node
+from ..pymeow.util.keys.keypair import KeyPair
+from ..pymeow.types import JID
 
 def test_pre_key_constants():
     """Test that pre-key constants match Go implementation."""
@@ -18,450 +20,422 @@ def test_pre_key_constants():
     assert MIN_PREKEY_COUNT == 5
     assert DJB_TYPE == 5  # curve25519 key type
 
-def test_generate_pre_keys():
-    """Test pre-key generation."""
-    store = PreKeyStore()
-    keys = store._generate_pre_keys()
+def test_key_pair_creation():
+    """Test KeyPair creation with public key only."""
+    pub_key = b'\x01' * 32
 
-    # Should generate WANTED_PREKEY_COUNT keys
-    assert len(keys) == WANTED_PREKEY_COUNT
+    # Test creating with public key only
+    key_pair = KeyPair.from_public_key(pub_key)
+    assert key_pair.pub == pub_key
+    assert key_pair.priv is None
 
-    # Each key should have unique ID and key material
-    key_ids = set(key.key_id for key in keys)
-    public_keys = set(key.public_key for key in keys)
-    private_keys = set(key.private_key for key in keys)
+    # Test creating full key pair
+    priv_key = b'\x02' * 32
+    key_pair = KeyPair(pub=pub_key, priv=priv_key)
+    assert key_pair.pub == pub_key
+    assert key_pair.priv == priv_key
 
-    assert len(key_ids) == WANTED_PREKEY_COUNT
-    assert len(public_keys) == WANTED_PREKEY_COUNT
-    assert len(private_keys) == WANTED_PREKEY_COUNT
+def test_pre_key_creation():
+    """Test PreKey creation and properties."""
+    # Generate a new PreKey
+    pre_key = PreKey.generate(key_id=123)
 
-def test_x25519_key_generation():
-    """Test that generated keys are valid X25519 keys."""
-    store = PreKeyStore()
-    keys = store._generate_pre_keys(count=1)
-    key = keys[0]
+    assert pre_key.key_id == 123
+    assert len(pre_key.pub) == 32
+    assert len(pre_key.priv) == 32
+    assert pre_key.signature is None
 
-    # Verify key lengths
-    assert len(key.private_key) == 32
-    assert len(key.public_key) == 32
+    # Test with public key only
+    pub_key = b'\x03' * 32
+    key_pair = KeyPair.from_public_key(pub_key)
+    pre_key = PreKey(key_pair=key_pair, key_id=456, signature=b'\x04' * 64)
 
-    # Verify we can load them as X25519 keys
-    try:
-        x25519.X25519PrivateKey.from_private_bytes(key.private_key)
-        x25519.X25519PublicKey.from_public_bytes(key.public_key)
-    except Exception as e:
-        pytest.fail(f"Invalid X25519 keys: {e}")
+    assert pre_key.key_id == 456
+    assert pre_key.pub == pub_key
+    assert pre_key.priv is None
+    assert pre_key.signature == b'\x04' * 64
 
-def test_key_id_wraparound():
-    """Test that key IDs properly wrap around at 0xFFFFFF."""
-    store = PreKeyStore()
-    store._next_pre_key_id = 0xFFFFFF - 2
+def test_pre_key_to_node():
+    """Test converting PreKey to Node."""
+    # Test unsigned pre-key
+    pre_key = PreKey.generate(key_id=123)
+    node = pre_key_to_node(pre_key)
 
-    # Generate exactly 3 keys to test the wrap-around
-    keys = store._generate_pre_keys(count=3)
+    assert node.tag == "key"
+    assert len(node.content) == 2
 
-    # Get the key IDs
-    key_ids = [key.key_id for key in keys]
-    # The key IDs should be [0xFFFFFF-2, 0xFFFFFF-1, 0xFFFFFF] since we don't wrap around to 0
-    expected_ids = [0xFFFFFF - 2, 0xFFFFFF - 1, 0xFFFFFF]
-    assert key_ids == expected_ids
+    # Check ID encoding (3 bytes from 4-byte big-endian)
+    id_node = node.content[0]
+    assert id_node.tag == "id"
+    assert len(id_node.content) == 3
+    assert struct.unpack(">I", b'\x00' + id_node.content)[0] == 123
 
-def test_pre_key_storage():
-    """Test storing and retrieving pre-keys."""
-    store = PreKeyStore()
-    keys = store._generate_pre_keys()
-    first_key = keys[0]
+    # Check value
+    value_node = node.content[1]
+    assert value_node.tag == "value"
+    assert value_node.content == pre_key.pub
+
+    # Test signed pre-key
+    pre_key.signature = b'\x05' * 64
+    node = pre_key_to_node(pre_key)
+
+    assert node.tag == "skey"
+    assert len(node.content) == 3
+
+    sig_node = node.content[2]
+    assert sig_node.tag == "signature"
+    assert sig_node.content == pre_key.signature
+
+def test_pre_keys_to_nodes():
+    """Test converting list of PreKeys to nodes."""
+    pre_keys = [PreKey.generate(i) for i in range(1, 4)]
+    nodes = pre_keys_to_nodes(pre_keys)
+
+    assert len(nodes) == 3
+    for i, node in enumerate(nodes):
+        assert node.tag == "key"
+        # Verify the key ID is encoded correctly
+        id_node = node.content[0]
+        key_id = struct.unpack(">I", b'\x00' + id_node.content)[0]
+        assert key_id == i + 1
+
+def test_node_to_pre_key():
+    """Test parsing PreKey from Node."""
+    # Create test node for unsigned pre-key
+    key_id = 123
+    pub_key = b'\x06' * 32
+
+    node = Node(
+        tag="key",
+        content=[
+            Node(tag="id", content=struct.pack(">I", key_id)[1:]),  # 3 bytes
+            Node(tag="value", content=pub_key)
+        ]
+    )
+
+    pre_key = node_to_pre_key(node)
+    assert pre_key.key_id == key_id
+    assert pre_key.pub == pub_key
+    assert pre_key.priv is None
+    assert pre_key.signature is None
+
+    # Test signed pre-key
+    signature = b'\x07' * 64
+    signed_node = Node(
+        tag="skey",
+        content=[
+            Node(tag="id", content=struct.pack(">I", key_id)[1:]),
+            Node(tag="value", content=pub_key),
+            Node(tag="signature", content=signature)
+        ]
+    )
+
+    signed_pre_key = node_to_pre_key(signed_node)
+    assert signed_pre_key.key_id == key_id
+    assert signed_pre_key.pub == pub_key
+    assert signed_pre_key.priv is None
+    assert signed_pre_key.signature == signature
+
+def test_node_to_pre_key_errors():
+    """Test error handling in node_to_pre_key."""
+    # Missing ID tag
+    with pytest.raises(PreKeyError, match="prekey node doesn't contain ID tag"):
+        node = Node(tag="key", content=[
+            Node(tag="value", content=b'\x08' * 32)
+        ])
+        node_to_pre_key(node)
+
+    # Invalid ID length
+    with pytest.raises(PreKeyError, match="prekey ID has unexpected number of bytes"):
+        node = Node(tag="key", content=[
+            Node(tag="id", content=b'\x01\x02'),  # Only 2 bytes
+            Node(tag="value", content=b'\x08' * 32)
+        ])
+        node_to_pre_key(node)
+
+    # Missing value tag
+    with pytest.raises(PreKeyError, match="prekey node doesn't contain value tag"):
+        node = Node(tag="key", content=[
+            Node(tag="id", content=b'\x01\x02\x03')
+        ])
+        node_to_pre_key(node)
+
+    # Invalid public key length
+    with pytest.raises(PreKeyError, match="prekey value has unexpected number of bytes"):
+        node = Node(tag="key", content=[
+            Node(tag="id", content=b'\x01\x02\x03'),
+            Node(tag="value", content=b'\x08' * 16)  # Wrong length
+        ])
+        node_to_pre_key(node)
+
+    # Missing signature in signed pre-key
+    with pytest.raises(PreKeyError, match="signed prekey node doesn't contain signature tag"):
+        node = Node(tag="skey", content=[
+            Node(tag="id", content=b'\x01\x02\x03'),
+            Node(tag="value", content=b'\x08' * 32)
+        ])
+        node_to_pre_key(node)
+
+def test_pre_key_bundle():
+    """Test PreKeyBundle creation and validation."""
+    pre_key = PreKey.generate(123)
+    signed_pre_key = PreKey.generate(456)
+    signed_pre_key.signature = b'\x09' * 64
+
+    bundle = PreKeyBundle(
+        registration_id=12345,
+        device_id=1,
+        pre_key=pre_key,
+        signed_pre_key=signed_pre_key,
+        identity_key=b'\x0a' * 32
+    )
+
+    assert bundle.registration_id == 12345
+    assert bundle.device_id == 1
+    assert bundle.pre_key == pre_key
+    assert bundle.signed_pre_key == signed_pre_key
+    assert bundle.identity_key == b'\x0a' * 32
+
+def test_node_to_pre_key_bundle():
+    """Test parsing PreKeyBundle from Node."""
+    # Create test bundle node
+    registration_id = 12345
+    device_id = 1
+    identity_key = b'\x0b' * 32
+
+    # Create pre-key and signed pre-key nodes
+    pre_key_node = Node(tag="key", content=[
+        Node(tag="id", content=struct.pack(">I", 123)[1:]),
+        Node(tag="value", content=b'\x0c' * 32)
+    ])
+
+    signed_pre_key_node = Node(tag="skey", content=[
+        Node(tag="id", content=struct.pack(">I", 456)[1:]),
+        Node(tag="value", content=b'\x0d' * 32),
+        Node(tag="signature", content=b'\x0e' * 64)
+    ])
+
+    bundle_node = Node(
+        tag="bundle",
+        content=[
+            Node(tag="registration", content=struct.pack(">I", registration_id)),
+            Node(tag="identity", content=identity_key),
+            pre_key_node,
+            signed_pre_key_node
+        ]
+    )
+
+    bundle = node_to_pre_key_bundle(device_id, bundle_node)
+
+    assert bundle.registration_id == registration_id
+    assert bundle.device_id == device_id
+    assert bundle.pre_key is not None
+    assert bundle.pre_key.key_id == 123
+    assert bundle.signed_pre_key is not None
+    assert bundle.signed_pre_key.key_id == 456
+    assert bundle.signed_pre_key.signature == b'\x0e' * 64
+    assert bundle.identity_key == identity_key
+
+def test_node_to_pre_key_bundle_errors():
+    """Test error handling in node_to_pre_key_bundle."""
+    # Test with error node
+    error_node = Node(tag="bundle", content=[
+        Node(tag="error", content="Test error")
+    ])
+
+    with pytest.raises(PreKeyError, match="got error getting prekeys"):
+        node_to_pre_key_bundle(1, error_node)
+
+    # Missing registration
+    with pytest.raises(PreKeyError, match="invalid registration ID"):
+        node = Node(tag="bundle", content=[
+            Node(tag="identity", content=b'\x0f' * 32)
+        ])
+        node_to_pre_key_bundle(1, node)
+
+    # Invalid registration ID
+    with pytest.raises(PreKeyError, match="invalid registration ID"):
+        node = Node(tag="bundle", content=[
+            Node(tag="registration", content=b'\x01\x02\x03'),  # Wrong length
+            Node(tag="identity", content=b'\x0f' * 32)
+        ])
+        node_to_pre_key_bundle(1, node)
+
+    # Missing identity key
+    with pytest.raises(PreKeyError, match="invalid identity key"):
+        node = Node(tag="bundle", content=[
+            Node(tag="registration", content=struct.pack(">I", 12345))
+        ])
+        node_to_pre_key_bundle(1, node)
+
+    # Missing signed pre-key - the function tries to parse whatever node it finds as a pre-key
+    # Since there's no proper "key" node, it will try to parse the bundle node itself
+    with pytest.raises(PreKeyError, match="prekey node doesn't contain ID tag"):
+        node = Node(tag="bundle", content=[
+            Node(tag="registration", content=struct.pack(">I", 12345)),
+            Node(tag="identity", content=b'\x0f' * 32),
+            # No skey node here
+        ])
+        node_to_pre_key_bundle(1, node)
+
+def test_pre_key_resp():
+    """Test PreKeyResp structure."""
+    # Success case
+    bundle = PreKeyBundle(
+        registration_id=12345,
+        device_id=1,
+        pre_key=None,
+        signed_pre_key=PreKey.generate(123),
+        identity_key=b'\x10' * 32
+    )
+
+    resp = PreKeyResp(bundle=bundle, error=None)
+    assert resp.bundle == bundle
+    assert resp.error is None
+
+    # Error case
+    error = PreKeyError("Test error")
+    resp = PreKeyResp(bundle=None, error=error)
+    assert resp.bundle is None
+    assert resp.error == error
 
 @pytest.mark.asyncio
-async def test_get_or_gen_pre_keys():
-    """Test getting existing or generating new pre-keys."""
+async def test_pre_key_store():
+    """Test PreKeyStore functionality."""
     store = PreKeyStore()
 
-    # First call should generate new keys
+    # Test initial state
+    assert store._next_pre_key_id == 1
+    assert len(store._pre_keys) == 0
+    assert len(store._uploaded_keys) == 0
+
+    # Test key generation
     keys = await store.get_or_gen_pre_keys(wanted_count=10)
     assert len(keys) == 10
-    assert all(not k.uploaded for k in keys)
 
-    # Mark some as uploaded
-    await store.mark_keys_as_uploaded(keys[4].key_id)
+    # All keys should have unique IDs
+    key_ids = [key.key_id for key in keys]
+    assert len(set(key_ids)) == 10
 
-    # Should get remaining non-uploaded keys plus new ones
-    more_keys = await store.get_or_gen_pre_keys(wanted_count=10)
-    assert len(more_keys) == 10
-    assert all(not k.uploaded for k in more_keys)
+    # Keys should be sequential
+    assert key_ids == list(range(1, 11))
 
 @pytest.mark.asyncio
-async def test_upload_timing():
-    """Test upload timing restrictions."""
-    store = PreKeyStore()
-
-    # Should be able to upload initially
-    assert store.can_upload()
-
-    # Mark some keys as uploaded
-    keys = store._generate_pre_keys(count=5)
-    await store.mark_keys_as_uploaded(keys[-1].key_id)
-
-    # Should not be able to upload again immediately
-    assert not store.can_upload()
-
-    # Reset last upload time to simulate time passing
-    store._last_upload = datetime.now() - timedelta(minutes=11)
-    assert store.can_upload()
-
-def test_registration_id():
-    """Test registration ID generation."""
-    store = PreKeyStore()
-    assert isinstance(store.registration_id, int)
-    assert 0 <= store.registration_id <= 0xFFFFFFFF
-    # Registration ID should be exactly 4 bytes when packed
-    packed = struct.pack(">I", store.registration_id)
-    assert len(packed) == 4
-
-@pytest.mark.asyncio
-async def test_server_operations():
-    """Test server-related operations raise appropriate errors."""
-    store = PreKeyStore()
-
-    # get_server_pre_key_count() should raise NotImplementedError
-    with pytest.raises(NotImplementedError):
-        await store._get_server_pre_key_count()
-
-    # upload_pre_keys() should raise PreKeyError with a wrapped NotImplementedError
-    with pytest.raises(PreKeyError) as exc_info:
-        await store._upload_pre_keys()
-    assert "Failed to get server pre-key count" in str(exc_info.value)
-
-def test_pre_key_node_format():
-    """Test pre-key binary node format matches Go implementation."""
-    store = PreKeyStore()
-    keys = store._generate_pre_keys(count=1)
-    key = keys[0]
-
-    node = key.to_node()
-    assert isinstance(node, Node)
-    assert node.tag == "key"
-    assert node.attributes["id"] == str(key.key_id)
-    assert node.content == key.public_key
-
-def test_signed_pre_key_node_format():
-    """Test signed pre-key binary node format matches Go implementation."""
-    timestamp = datetime.now()
-    private_key = x25519.X25519PrivateKey.generate()
-    public_key = private_key.public_key()
-
-    signed_key = SignedPreKeyData(
-        key_id=1,
-        private_key=private_key.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption()
-        ),
-        public_key=public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        ),
-        signature=b"test_signature",
-        timestamp=timestamp
-    )
-
-    node = signed_key.to_node()
-    assert isinstance(node, Node)
-    assert node.tag == "skey"
-    assert node.attributes["id"] == "1"
-    assert node.attributes["timestamp"] == str(int(timestamp.timestamp()))
-
-    # Check child nodes
-    assert len(node.content) == 2
-    key_node = node.content[0]
-    sig_node = node.content[1]
-
-    assert key_node.tag == "key"
-    assert key_node.content == signed_key.public_key
-    assert sig_node.tag == "signature"
-    assert sig_node.content == signed_key.signature
-
-@pytest.mark.asyncio
-async def test_pre_key_bundle():
-    """Test pre-key bundle creation and formatting."""
-    store = PreKeyStore()
-    keys = store._generate_pre_keys(count=1)
-
-    # Create a signed pre-key for the bundle
-    private_key = x25519.X25519PrivateKey.generate()
-    public_key = private_key.public_key()
-    signed_key = SignedPreKeyData(
-        key_id=1,
-        private_key=private_key.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption()
-        ),
-        public_key=public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        ),
-        signature=b"test_signature",
-        timestamp=datetime.now()
-    )
-
-    # Create a bundle
-    bundle = PreKeyBundle(
-        registration_id=store.registration_id,
-        device_id=1,
-        pre_key=keys[0],
-        signed_pre_key=signed_key,
-        identity_key=os.urandom(32)  # Simulated identity key
-    )
-
-    # Verify bundle properties
-    assert bundle.registration_id == store.registration_id
-    assert bundle.device_id == 1
-    assert bundle.pre_key == keys[0]
-    assert bundle.signed_pre_key == signed_key
-    assert len(bundle.identity_key) == 32  # X25519 key size
-
-def test_signed_pre_key():
-    """Test signed pre-key handling."""
-    timestamp = datetime.now()
-
-    # Generate proper X25519 keys
-    private_key = x25519.X25519PrivateKey.generate()
-    public_key = private_key.public_key()
-
-    # Create signed pre-key data
-    signed_key = SignedPreKeyData(
-        key_id=1,
-        private_key=private_key.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption()
-        ),
-        public_key=public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        ),
-        signature=b"test_signature",
-        timestamp=timestamp
-    )
-
-    # Test node conversion
-    node = signed_key.to_node()
-    assert node.tag == "skey"
-    assert node.attributes["id"] == "1"
-    assert node.attributes["timestamp"] == str(int(timestamp.timestamp()))
-    assert len(node.content) == 2
-    assert node.content[0].tag == "key"
-    assert node.content[1].tag == "signature"
-
-
-@pytest.mark.asyncio
-async def test_gen_one_pre_key():
-    """Test generating a single pre-key."""
-    store = PreKeyStore()
-
-    # Generate a single pre-key
-    key = await store.GenOnePreKey()
-
-    # Should return a valid PreKeyData object
-    assert isinstance(key, PreKeyData)
-    assert isinstance(key.key_id, int)
-    assert len(key.public_key) == 32
-    assert len(key.private_key) == 32
-    assert key.uploaded is True  # Should be marked as uploaded by default
-
-
-@pytest.mark.asyncio
-async def test_uploaded_pre_key_count():
-    """Test counting uploaded pre-keys."""
-    store = PreKeyStore()
-
-    # Initially should be 0
-    assert await store.UploadedPreKeyCount() == 0
-
-    # Generate and mark some keys as uploaded
-    keys = store._generate_pre_keys(count=5)
-    for key in keys[:3]:  # Mark first 3 as uploaded
-        key.uploaded = True
-
-    # Should count only uploaded keys
-    assert await store.UploadedPreKeyCount() == 3
-
-    # Mark one more as uploaded
-    keys[3].uploaded = True
-    assert await store.UploadedPreKeyCount() == 4
-
-
-@pytest.mark.asyncio
-async def test_mark_pre_keys_as_uploaded():
+async def test_pre_key_store_upload_marking():
     """Test marking pre-keys as uploaded."""
     store = PreKeyStore()
 
     # Generate some keys
-    keys = store._generate_pre_keys(count=5)
-    key_ids = [key.key_id for key in keys]
+    keys = await store.get_or_gen_pre_keys(wanted_count=5)
+    assert all(key_id not in store._uploaded_keys for key_id in [key.key_id for key in keys])
 
-    # Mark up to the 3rd key as uploaded
-    await store.MarkPreKeysAsUploaded(key_ids[2])
+    # Mark up to key ID 3 as uploaded
+    await store.mark_pre_keys_as_uploaded(3)
 
-    # First 3 keys should be marked as uploaded, others not
-
-    # Last upload time should be updated
-    assert store._last_upload is not None
-
-    # Should be able to upload again after cooldown
-    store._last_upload = datetime.now() - timedelta(minutes=11)
-    assert store.can_upload()
-
+    # Keys 1, 2, 3 should be marked as uploaded
+    assert 1 in store._uploaded_keys
+    assert 2 in store._uploaded_keys
+    assert 3 in store._uploaded_keys
+    assert 4 not in store._uploaded_keys
+    assert 5 not in store._uploaded_keys
 
 @pytest.mark.asyncio
-async def test_pre_key_id_generation():
-    """Test pre-key ID generation sequence."""
+async def test_pre_key_store_key_exhaustion():
+    """Test pre-key ID exhaustion."""
     store = PreKeyStore()
+    store._next_pre_key_id = 0xFFFFFF - 1  # Near the limit
 
-    # Generate some keys and verify ID sequence
-    key1 = await store.GenOnePreKey()
-    key2 = await store.GenOnePreKey()
+    # Generate keys up to the limit
+    keys = await store._generate_pre_keys(2)
+    assert len(keys) == 2
+    assert keys[0].key_id == 0xFFFFFF - 1
+    assert keys[1].key_id == 0xFFFFFF
 
-    assert key2.key_id == key1.key_id + 1
+    # Should not generate more keys beyond the limit
+    more_keys = await store._generate_pre_keys(1)
+    assert len(more_keys) == 0
 
-    # Test ID wrap-around at 0xFFFFFF
-    store._next_pre_key_id = 0xFFFFFF - 1
-    key3 = await store.GenOnePreKey()
-    key4 = await store.GenOnePreKey()
+def test_key_pair_signing():
+    """Test KeyPair signing functionality."""
+    # Test with full key pair
+    signing_key = KeyPair.generate()
+    target_key = KeyPair.generate()
 
-    assert key3.key_id == 0xFFFFFF - 1
-    assert key4.key_id == 0xFFFFFF  # Should not wrap around to 0
+    # Should be able to sign
+    signature = signing_key.sign(target_key)
+    assert len(signature) == 64
 
-    # Next key should fail due to ID exhaustion
-    with pytest.raises(RuntimeError, match="reached maximum pre-key ID"):
-        await store.GenOnePreKey()
+    # Test with public-key-only KeyPair
+    pub_only_key = KeyPair.from_public_key(b'\x11' * 32)
 
+    # Should raise error when trying to sign
+    with pytest.raises(ValueError, match="Cannot sign with a public-key-only KeyPair"):
+        pub_only_key.sign(target_key)
 
-def test_node_to_pre_key():
-    """Test parsing a pre-key from a node."""
-    from ..pymeow.binary.node import Node
-    from ..pymeow.prekeys import PreKeyData
-    
-    store = PreKeyStore()
-    
-    # Test with valid node
-    valid_node = Node(
-        tag="key",
-        attributes={"id": "123"},
-        content=[
-            Node(tag="id", attributes={}, content=b"123"),
-            Node(tag="value", attributes={}, content=b"\x05" + b"\x00" * 32)
-        ]
-    )
-    
-    pre_key = store._node_to_pre_key(valid_node)
-    assert isinstance(pre_key, PreKeyData)
-    assert pre_key.key_id == 123
-    assert len(pre_key.public_key) == 33
-    assert pre_key.private_key is None
-    assert not pre_key.uploaded
-    
-    # Test with invalid node (missing id)
-    invalid_node = Node(
-        tag="key",
-        attributes={},
-        content=[
-            Node(tag="value", attributes={}, content=b"\x05" + b"\x00" * 32)
-        ]
-    )
-    assert store._node_to_pre_key(invalid_node) is None
-    
-    # Test with invalid node (missing value)
-    invalid_node = Node(
-        tag="key",
-        attributes={},
-        content=[
-            Node(tag="id", attributes={}, content=b"123")
-        ]
-    )
-    assert store._node_to_pre_key(invalid_node) is None
-    
-    # Test with invalid public key length
-    invalid_key_node = Node(
-        tag="key",
-        attributes={"id": "123"},
-        content=[
-            Node(tag="id", attributes={}, content=b"123"),
-            Node(tag="value", attributes={}, content=b"too_short")
-        ]
-    )
-    assert store._node_to_pre_key(invalid_key_node) is None
-    
-    # Test with non-node input
-    assert store._node_to_pre_key("not a node") is None
-    assert store._node_to_pre_key(None) is None
+    # Should raise error when trying to create signed pre-key
+    with pytest.raises(ValueError, match="Cannot sign with a public-key-only KeyPair"):
+        pub_only_key.create_signed_pre_key(123)
 
+def test_serialization_roundtrip():
+    """Test that pre-key serialization and deserialization work correctly."""
+    # Create original pre-key
+    original = PreKey.generate(key_id=789)
+    original.signature = b'\x12' * 64
 
-def test_pre_key_serialization_roundtrip():
-    """Test that pre-key can be serialized and deserialized correctly."""
-    from ..pymeow.binary.node import Node
-    
-    store = PreKeyStore()
-    
-    # Generate a test pre-key
-    original_key = store._generate_pre_keys(count=1)[0]
-    
-    # Convert to node and back
-    node = store._pre_key_to_node(original_key)
-    deserialized_key = store._node_to_pre_key(node)
-    
-    # Should have same key ID and public key
-    assert deserialized_key is not None
-    assert deserialized_key.key_id == original_key.key_id
-    assert deserialized_key.public_key == original_key.public_key
-    
+    # Convert to node
+    node = pre_key_to_node(original)
+
+    # Convert back to pre-key
+    deserialized = node_to_pre_key(node)
+
+    # Should have same public data
+    assert deserialized.key_id == original.key_id
+    assert deserialized.pub == original.pub
+    assert deserialized.signature == original.signature
+
     # Private key should not be included in serialization
-    assert deserialized_key.private_key is None
-    
-    # Upload status should be reset
-    assert not deserialized_key.uploaded
+    assert deserialized.priv is None
 
+@pytest.mark.asyncio
+async def test_client_integration_methods():
+    """Test client integration methods with mocking."""
+    from unittest.mock import MagicMock, AsyncMock
 
-def test_pre_key_bundle_validation():
-    """Test validation of pre-key bundle fields."""
-    from ..pymeow.binary.node import Node
-    from ..pymeow.prekeys import PreKeyError
-    
-    store = PreKeyStore()
-    
-    # Create a minimal valid bundle
-    def create_minimal_bundle():
-        return Node(
-            tag="bundle",
-            attributes={"registration": "123", "device_id": "456"},
-            content=[
-                Node(tag="identity", attributes={}, content=b"\x05" + b"\x00" * 32),
-                Node(tag="skey", 
-                     attributes={"id": "789"},
-                     content=[
-                         Node(tag="key", attributes={}, content=b"\x05" + b"\x00" * 32),
-                         Node(tag="signature", attributes={}, content=b"\x00" * 64)
-                     ])
-            ]
-        )
-    
-    # Test missing required fields
-    bundle = create_minimal_bundle()
-    bundle.attributes.pop("registration")
-    with pytest.raises(PreKeyError, match="missing registration"):
-        store._parse_pre_key_bundle(bundle)
-    
-    # Test invalid key format
-    bundle = create_minimal_bundle()
-    # Find the identity node in the content
-    for node in bundle.content:
-        if node.tag == "identity":
-            node.content = b"invalid"
-            break
-    with pytest.raises(PreKeyError, match="invalid identity key"):
-        store._parse_pre_key_bundle(bundle)
-    
-    # Test invalid node type
-    with pytest.raises(PreKeyError, match="Invalid node type"):
-        store._parse_pre_key_bundle("not a node")
+    # Mock client
+    mock_client = MagicMock()
+    mock_client.send_iq = AsyncMock()
+    mock_client.server_jid = "server@whatsapp.net"
+    mock_client.upload_prekeys_lock = AsyncMock().__aenter__()
+    mock_client.last_pre_key_upload = None
+    mock_client.store = MagicMock()
+    mock_client.store.registration_id = 12345
+    mock_client.store.identity_key = MagicMock()
+    mock_client.store.identity_key.pub = b'\x13' * 32
+    mock_client.store.signed_pre_key = PreKey.generate(999)
+    mock_client.store.signed_pre_key.signature = b'\x14' * 64
+    mock_client.store.pre_keys = PreKeyStore()
+    mock_client.send_log = MagicMock()
+
+    # Mock successful response for get_server_prekey_count
+    from ..pymeow.prekeys import get_server_prekey_count
+
+    mock_response = MagicMock()
+    mock_count_node = MagicMock()
+    mock_count_node.attrs = {"value": "25"}
+    mock_response.get_child_by_tag.return_value = mock_count_node
+    mock_client.send_iq.return_value = (mock_response, None)
+
+    # Test get_server_prekey_count
+    count = await get_server_prekey_count(mock_client)
+    assert count == 25
+
+    # Test with missing value
+    mock_count_node.attrs = {}
+    with pytest.raises(PreKeyError, match="server response missing prekey count value"):
+        await get_server_prekey_count(mock_client)
+
+def test_jid_parsing():
+    """Test JID parsing in fetch_pre_keys response."""
+    # This would test the JID.from_string call in fetch_pre_keys
+    # but requires proper JID implementation
+    pass

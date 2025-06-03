@@ -10,9 +10,8 @@ from cryptography.hazmat.primitives import serialization
 
 from .config import get_tortoise_config
 from .models.device import Device
-from ...prekeys import SignedPreKeyData
 from ...store import Device as DeviceStore
-from ...util.keys.keypair import KeyPair
+from ...util.keys.keypair import KeyPair, PreKey
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,7 @@ class Container:
 
     async def new_device(self, jid: str) -> DeviceStore:
         """Create a new device with proper default values"""
-        # Generate noise key (this was missing!)
+        # Generate noise key
         noise_key = KeyPair.generate()
 
         # Generate identity key pair
@@ -80,7 +79,7 @@ class Container:
         device = await Device.create(
             id=jid,
             registration_id=registration_id,
-            noise_key_private=noise_key.priv,  # Add noise key fields!
+            noise_key_private=noise_key.priv,
             noise_key_public=noise_key.pub,
             signed_pre_key=signed_pre_key.pub,
             signed_pre_key_id=signed_pre_key.key_id,
@@ -91,10 +90,10 @@ class Container:
         )
 
         store = self._device_to_store(device)
-        # Set the noise key in the store (this was the missing piece!)
+        # Set the keys in the store
         store.noise_key = noise_key
         store.identity_key = identity_key
-        store.signed_pre_key_pair = signed_pre_key
+        store.signed_pre_key = signed_pre_key
 
         return store
 
@@ -111,13 +110,13 @@ class Container:
             # Delete device and cascade to related tables
             await Device.filter(id=jid).delete()
             # Additional cleanup for related tables
-            from .models.session import IdentityKey, Session, PreKey, SenderKey
+            from .models.session import IdentityKey, Session, PreKeyModel, SenderKey
             from .models.contacts import Contact
             from .models.appstate import AppStateSyncKey, AppStateVersion
 
             await IdentityKey.filter(our_jid=jid).delete()
             await Session.filter(our_jid=jid).delete()
-            await PreKey.filter(jid=jid).delete()
+            await PreKeyModel.filter(jid=jid).delete()
             await SenderKey.filter(our_jid=jid).delete()
             await Contact.filter(our_jid=jid).delete()
             await AppStateSyncKey.filter(jid=jid).delete()
@@ -137,14 +136,16 @@ class Container:
         if device.identity_key_private:
             store.identity_key = KeyPair(priv=device.identity_key_private, pub=device.identity_key_public)
 
-        # Reconstruct signed pre-key properly using SignedPreKeyData
+        # Reconstruct signed pre-key using PreKey (matches Go's keys.PreKey)
         if device.signed_pre_key and device.signed_pre_key_id and device.signed_pre_key_signature:
-            store.signed_pre_key = SignedPreKeyData(
+            # Create a KeyPair from the stored public key bytes
+            # Note: We need the private key to create a proper KeyPair
+            # For now, we'll create a PreKey with just the public key info
+            key_pair = KeyPair(pub=device.signed_pre_key, priv=b'')  # Empty private key for now
+            store.signed_pre_key = PreKey(
+                key_pair=key_pair,
                 key_id=device.signed_pre_key_id,
-                public_key=device.signed_pre_key,
-                private_key=b'',  # You might need to store this separately if needed
-                signature=device.signed_pre_key_signature,
-                timestamp=datetime.now()  # You might want to store the actual timestamp
+                signature=device.signed_pre_key_signature
             )
 
         store.phone_id = device.phone_id
@@ -156,16 +157,35 @@ class Container:
 
     def _store_to_device_dict(self, store: DeviceStore) -> dict:
         """Convert DeviceStore to Device model dict"""
-        return {
+        data = {
             "registration_id": store.registration_id,
-            "signed_pre_key": store.signed_pre_key,
-            "signed_pre_key_id": store.signed_pre_key_id,
-            "signed_pre_key_signature": store.signed_pre_key_signature,
-            "identity_key_private": store.identity_key_private,
-            "identity_key_public": store.identity_key_public,
             "phone_id": store.phone_id,
             "device_id": store.device_id,
             "platform": store.platform or "android",
             "business_name": store.business_name,
             "push_name": store.push_name,
         }
+
+        # Add noise key if available
+        if store.noise_key:
+            data.update({
+                "noise_key_private": store.noise_key.priv,
+                "noise_key_public": store.noise_key.pub,
+            })
+
+        # Add identity key if available
+        if store.identity_key:
+            data.update({
+                "identity_key_private": store.identity_key.priv,
+                "identity_key_public": store.identity_key.pub,
+            })
+
+        # Add signed pre-key if available
+        if store.signed_pre_key:
+            data.update({
+                "signed_pre_key": store.signed_pre_key.pub,
+                "signed_pre_key_id": store.signed_pre_key.key_id,
+                "signed_pre_key_signature": store.signed_pre_key.signature,
+            })
+
+        return data
