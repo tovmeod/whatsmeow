@@ -146,7 +146,7 @@ class BroadcastClient:
             namespace="status",
             type=InfoQueryType.GET,
             to=SERVER_JID,
-            content=[binary_node.Node(tag="privacy", attributes={})]
+            content=[binary_node.Node(tag="privacy")]
         )
 
         response, err = await self.client.send_iq(query)

@@ -1657,7 +1657,7 @@ class Client(MediaConnMixin):
             namespace="urn:xmpp:whatsapp:push",
             type=InfoQueryType.GET,
             to=self.server_jid,
-            content=[Node(tag="settings", attributes={})]
+            content=[Node(tag="settings")]
         ))
 
         if err:

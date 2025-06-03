@@ -18,7 +18,7 @@ from .exceptions import PymeowError, IQError, TimeoutError, ProtocolError
 
 
 # XML stream end node used to detect disconnections
-XML_STREAM_END_NODE = Node(tag="xmlstreamend", attributes={}, content=None)
+XML_STREAM_END_NODE = Node(tag="xmlstreamend", content=None)
 
 # Default timeout for requests in seconds
 DEFAULT_REQUEST_TIMEOUT = 75.0

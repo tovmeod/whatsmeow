@@ -4,7 +4,7 @@ Node handling for WhatsApp binary protocol.
 Port of whatsmeow/binary/node.go
 """
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Any, Optional, Union, List, Tuple, TypeVar, Generic, cast
 
@@ -115,7 +115,7 @@ class Node:
     containing a tag, attributes, and optional content.
     """
     tag: str
-    attributes: Attrs
+    attributes: Optional[Attrs] = field(default_factory=dict)
     content: Optional[Any] = None
 
     @property

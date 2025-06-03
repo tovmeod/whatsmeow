@@ -247,7 +247,6 @@ async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_i
             },
             content=[Node(
                 tag="pair-device-sign",
-                attributes={},
                 content=[Node(
                     tag="device-identity",
                     attributes={

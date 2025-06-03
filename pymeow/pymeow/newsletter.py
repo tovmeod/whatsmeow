@@ -132,7 +132,6 @@ class NewsletterMixin:
             to=jid,
             content=[Node(
                 tag="live_updates",
-                attributes={}
             )]
         ))
 
