@@ -38,7 +38,7 @@ class IdentityStore(ABC):
         pass
 
     @abstractmethod
-    async def is_trusted_identity(self, address: str, key: bytes) -> Tuple[bool, Optional[Exception]]:
+    async def is_trusted_identity(self, address: str, key: bytes) -> bool:
         """Check if an identity key is trusted."""
         pass
 
@@ -52,7 +52,7 @@ class SessionStore(ABC):
         pass
 
     @abstractmethod
-    async def has_session(self, address: str) -> Tuple[bool, Optional[Exception]]:
+    async def has_session(self, address: str) -> bool:
         """Check if a session exists for an address."""
         pass
 
@@ -91,7 +91,7 @@ class PreKeyStore(ABC):
         pass
 
     @abstractmethod
-    async def get_pre_key(self, key_id: int) -> Tuple[Optional[PreKey], Optional[Exception]]:
+    async def get_pre_key(self, key_id: int) -> Optional[PreKey]:
         """Get a pre-key by ID."""
         pass
 
@@ -417,7 +417,7 @@ class AllStores(AllSessionSpecificStores, AllGlobalStores):
 
 
 @dataclass
-class BaseDevice:
+class Device:
     """Device data and associated stores."""
 
     log: Optional[logging.Logger] = None
