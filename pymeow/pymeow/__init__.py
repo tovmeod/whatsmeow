@@ -31,11 +31,10 @@ from .types.presence import (
 
 from .client import Client as BaseClient
 from .types import Message, GroupInfo, PrivacySetting
-from .user import UserMixin
 
 
 # Create enhanced Client class with message handling capabilities
-class Client(BaseClient, UserMixin):
+class Client(BaseClient):
     """
     Client for WhatsApp Web API with message handling and newsletter capabilities.
 
@@ -61,5 +60,4 @@ __all__ = [
     'Message',
     'GroupInfo',
     'PrivacySetting',
-    'NewsletterMixin',
 ]
