@@ -18,7 +18,7 @@ class KeyPair:
     This class represents a keypair for use with curve25519.
     """
     pub: bytes
-    priv: bytes
+    priv: Optional[bytes] = None  # Allow None for public-key-only instances
 
     @classmethod
     def generate(cls) -> 'KeyPair':
@@ -90,6 +90,19 @@ class KeyPair:
 
             return cls(pub=pub, priv=priv)
 
+    @classmethod
+    def from_public_key(cls, pub: bytes) -> 'KeyPair':
+        """
+        Create a new KeyPair from only a public key.
+
+        Args:
+            pub: The public key bytes (32 bytes)
+
+        Returns:
+            A new KeyPair instance with only the public key
+        """
+        return cls(pub=pub, priv=None)
+
     def create_signed_pre_key(self, key_id: int) -> 'PreKey':
         """
         Create a signed pre-key from this keypair.
@@ -99,7 +112,13 @@ class KeyPair:
 
         Returns:
             A new PreKey instance signed by this keypair
+
+        Raises:
+            ValueError: If this keypair doesn't have a private key
         """
+        if self.priv is None:
+            raise ValueError("Cannot sign with a public-key-only KeyPair")
+
         new_key = PreKey.generate(key_id)
         # Sign the KeyPair part of the PreKey
         new_key.signature = self.sign(new_key.key_pair)
@@ -114,7 +133,13 @@ class KeyPair:
 
         Returns:
             The signature bytes (64 bytes)
+
+        Raises:
+            ValueError: If this keypair doesn't have a private key
         """
+        if self.priv is None:
+            raise ValueError("Cannot sign with a public-key-only KeyPair")
+
         # Create the public key format for signing (0x05 + 32 bytes)
         pub_key_for_signature = bytearray(33)
         pub_key_for_signature[0] = 0x05  # DJB_TYPE
@@ -159,7 +184,7 @@ class PreKey:
         return self.key_pair.pub
 
     @property
-    def priv(self) -> bytes:
+    def priv(self) -> Optional[bytes]:
         """Get the private key from the underlying KeyPair."""
         return self.key_pair.priv
 
