@@ -18,6 +18,7 @@ from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
 from .generated.waCert import WACert_pb2
 from .mediaconn import MediaConnMixin
+from .pair import handle_iq
 
 from .socket.framesocket import FrameSocket
 from .socket.noisesocket import NoiseSocket
@@ -231,7 +232,7 @@ class Client(MediaConnMixin):
             "success": self._handle_connect_success,
             "failure": self._handle_connect_failure,
             "stream:error": self._handle_stream_error,
-            "iq": self._handle_iq,
+            "iq": handle_iq,
             "ib": self._handle_ib,
         }
 
@@ -1188,15 +1189,6 @@ class Client(MediaConnMixin):
             node: The stream error node
         """
         # TODO: Implement stream error handling
-        pass
-
-    async def _handle_iq(self, node: Node) -> None:
-        """Handle an IQ node.
-
-        Args:
-            node: The IQ node
-        """
-        # TODO: Implement IQ handling
         pass
 
     async def _handle_ib(self, node: Node) -> None:
