@@ -3,17 +3,15 @@ Presence handling for WhatsApp.
 
 Port of whatsmeow/presence.go
 """
-import asyncio
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
 from .binary.node import Node, Attrs
-from .exceptions import NoPushNameError, NoPrivacyTokenError
+from .exceptions import NoPushNameError, ErrNotLoggedIn, NoPrivacyTokenError
 from .types.jid import JID
 from .types.presence import Presence, ChatPresence, ChatPresenceMedia
-from .types.events import PresenceEvent, ChatPresenceEvent
-from .types.message import MessageSource
+from .types.events.events import PresenceEvent, ChatPresenceEvent
 
 logger = logging.getLogger(__name__)
 
@@ -27,27 +25,25 @@ async def handle_chat_state(client, node: Node) -> None:
         node: The chat state node
     """
     try:
-        source, err = client.parse_message_source(node, True)
-        if err:
-            logger.warning(f"Failed to parse chat state update: {err}")
+        source = await client.parse_message_source(node, True)
+        if source is None:
+            logger.warning("Failed to parse chat state update")
             return
 
-        if len(node.children) != 1:
-            logger.warning(f"Failed to parse chat state update: unexpected number of children in element ({len(node.children)})")
+        children = node.get_children()
+        if len(children) != 1:
+            logger.warning(f"Failed to parse chat state update: unexpected number of children in element ({len(children)})")
             return
 
-        child = node.children[0]
+        child = children[0]
         presence = ChatPresence(child.tag)
 
         if presence != ChatPresence.COMPOSING and presence != ChatPresence.PAUSED:
             logger.warning(f"Unrecognized chat presence state {child.tag}")
             return
 
-        media = ChatPresenceMedia.TEXT
-        if presence == ChatPresence.COMPOSING:
-            media_attr = child.attrs.get("media", "")
-            if media_attr:
-                media = ChatPresenceMedia(media_attr)
+        ag = child.attr_getter()
+        media = ChatPresenceMedia(ag.optional_string("media") or "")
 
         await client.dispatch_event(ChatPresenceEvent(
             message_source=source,
@@ -67,26 +63,29 @@ async def handle_presence(client, node: Node) -> None:
         node: The presence node
     """
     try:
+        ag = node.attr_getter()
+        from_jid = ag.jid("from")
+
         evt = PresenceEvent(
-            from_jid=JID.from_string(node.attrs.get("from", "")),
-            unavailable=False
+            from_jid=from_jid,
+            unavailable=False,
+            last_seen=None
         )
 
-        presence_type = node.attrs.get("type", "")
+        presence_type = ag.optional_string("type")
         if presence_type == "unavailable":
             evt.unavailable = True
         elif presence_type:
             logger.debug(f"Unrecognized presence type '{presence_type}' in presence event from {evt.from_jid}")
 
-        last_seen = node.attrs.get("last", "")
+        last_seen = ag.optional_string("last")
         if last_seen and last_seen != "deny":
-            try:
-                timestamp = int(last_seen)
-                evt.last_seen = datetime.fromtimestamp(timestamp)
-            except ValueError:
-                logger.warning(f"Invalid last seen timestamp: {last_seen}")
+            evt.last_seen = ag.unix_time("last")
 
-        await client.dispatch_event(evt)
+        if not ag.ok():
+            logger.warning(f"Error parsing presence event: {ag.errors}")
+        else:
+            await client.dispatch_event(evt)
     except Exception as e:
         logger.error(f"Error handling presence: {e}")
 
@@ -105,19 +104,19 @@ async def send_presence(client, state: Presence) -> None:
     Raises:
         NoPushNameError: If the client's push name is not set
     """
-    if not client.store.push_name:
+    if not len(client.store.push_name):
         raise NoPushNameError()
 
     if state == Presence.AVAILABLE:
-        client.send_active_receipts = 1
+        client.send_active_receipts.compare_and_swap(0, 1)
     else:
-        client.send_active_receipts = 0
+        client.send_active_receipts.compare_and_swap(1, 0)
 
     await client.send_node(Node(
         tag="presence",
-        attrs=Attrs({
+        attributes=Attrs({
             "name": client.store.push_name,
-            "type": state.value
+            "type": str(state)
         })
     ))
 
@@ -132,7 +131,7 @@ async def subscribe_presence(client, jid: JID) -> None:
     Also, it seems that the WhatsApp servers require you to be online to receive presence status
     from other users, so you should mark yourself as online before trying to use this function:
 
-        await client.send_presence(Presence.AVAILABLE)
+        await send_presence(client, Presence.AVAILABLE)
 
     Args:
         client: The client instance
@@ -140,27 +139,25 @@ async def subscribe_presence(client, jid: JID) -> None:
 
     Raises:
         NoPrivacyTokenError: If the client doesn't have a privacy token for the user and
-                            ErrorOnSubscribePresenceWithoutToken is set
+                          error_on_subscribe_presence_without_token is set
     """
-    privacy_token, err = await client.store.privacy_tokens.get_privacy_token(None, jid)
-    if err:
-        raise Exception(f"Failed to get privacy token: {err}")
-    elif not privacy_token:
+    privacy_token = await client.store.privacy_tokens.get_privacy_token(None, jid)
+    if privacy_token is None:
         if client.error_on_subscribe_presence_without_token:
-            raise NoPrivacyTokenError(f"No privacy token for {jid}")
+            raise NoPrivacyTokenError(f"for {jid.to_non_ad()}")
         else:
             logger.debug(f"Trying to subscribe to presence of {jid} without privacy token")
 
     req = Node(
         tag="presence",
-        attrs=Attrs({
+        attributes=Attrs({
             "type": "subscribe",
             "to": str(jid)
         })
     )
 
-    if privacy_token:
-        req.children = [Node(
+    if privacy_token is not None:
+        req.content = [Node(
             tag="tctoken",
             content=privacy_token.token
         )]
@@ -180,23 +177,26 @@ async def send_chat_presence(client, jid: JID, state: ChatPresence, media: ChatP
         jid: The JID of the chat
         state: The chat presence state
         media: The media type (only used with COMPOSING state)
+
+    Raises:
+        ErrNotLoggedIn: If the client is not logged in
     """
     own_id = client.get_own_id()
     if own_id.is_empty():
-        raise Exception("Not logged in")
+        raise ErrNotLoggedIn()
 
-    content = [Node(tag=state.value)]
+    content = [Node(tag=str(state))]
 
-    if state == ChatPresence.COMPOSING and media:
-        content[0].attrs = Attrs({
-            "media": media.value
+    if state == ChatPresence.COMPOSING and media and len(str(media)) > 0:
+        content[0].attributes = Attrs({
+            "media": str(media)
         })
 
     await client.send_node(Node(
         tag="chatstate",
-        attrs=Attrs({
+        attributes=Attrs({
             "from": str(own_id),
             "to": str(jid)
         }),
-        children=content
+        content=content
     ))

@@ -21,6 +21,7 @@ from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
 from .generated.waCert import WACert_pb2
 from .message import handle_encrypted_message
 from .pair import handle_iq
+from .presence import handle_chat_state, handle_presence
 from .receipt import handle_receipt
 
 from .socket.framesocket import FrameSocket
@@ -230,8 +231,8 @@ class Client:
             "appdata": handle_encrypted_message,
             "receipt": handle_receipt,
             "call": handle_call_event,
-            "chatstate": self._handle_chat_state,
-            "presence": self._handle_presence,
+            "chatstate": handle_chat_state,
+            "presence": handle_presence,
             "notification": self._handle_notification,
             "success": self._handle_connect_success,
             "failure": self._handle_connect_failure,
@@ -916,15 +917,6 @@ class Client:
             logger.error(f"Failed to store LID-PN mapping for {lid} -> {pn}: {err}")
 
     # Node handler methods
-    async def _handle_chat_state(self, node: Node) -> None:
-        """Handle a chat state node.
-
-        Args:
-            node: The chat state node
-        """
-        from .presence import handle_chat_state
-        await handle_chat_state(self, node)
-
     async def _handle_presence(self, node: Node) -> None:
         """Handle a presence node.
 
