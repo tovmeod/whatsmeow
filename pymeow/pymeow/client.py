@@ -25,7 +25,7 @@ from .socket.framesocket import FrameSocket
 from .socket.noisesocket import NoiseSocket
 from .socket.noisehandshake import NoiseHandshake
 from .binary.node import Node, Attrs
-from .store import Device
+from .store.store import Device
 from .types import message
 # Types module is now ported
 from .types.events import Disconnected, QR, Message, PrivacySettingsEvent

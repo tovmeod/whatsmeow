@@ -25,7 +25,7 @@ from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
 from . import appstate
 from .appstate.keys import ALL_PATCH_NAMES
 from .binary import node as binary_node
-from .store import AppStateSyncKey, PrivacyToken, MessageSecretInsert
+from .store.store import AppStateSyncKey, PrivacyToken, MessageSecretInsert
 # types module is now ported
 from .types import events, jid, message
 from .types.user import VerifiedName

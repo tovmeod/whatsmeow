@@ -8,7 +8,10 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch, call
 from datetime import datetime, timedelta
 
-from ..pymeow.keepalive import KeepAliveMixin, KEEP_ALIVE_RESPONSE_DEADLINE, KEEP_ALIVE_MAX_FAIL_TIME
+from ..pymeow.keepalive import (
+    keepalive_loop, send_keep_alive, dispatch_keepalive_timeout, dispatch_keepalive_restored,
+    KeepAliveManager, KEEP_ALIVE_RESPONSE_DEADLINE, KEEP_ALIVE_MAX_FAIL_TIME
+)
 from ..pymeow.types.events.events import KeepAliveTimeout, KeepAliveRestored
 from ..pymeow.binary.node import Node
 
@@ -17,16 +20,18 @@ SAMPLE_PING_NODE_XML = '<iq id="b7e0afa7-e9da-4ed7-8c3b-0247dbb98a6e" type="get"
 # No response in logs, but we can use a similar format to the ping
 SAMPLE_RESPONSE_XML = '<iq id="b7e0afa7-e9da-4ed7-8c3b-0247dbb98a6e" type="result" from="s.whatsapp.net" to="user@s.whatsapp.net"></iq>'
 
-class TestKeepAlive(KeepAliveMixin):
-    """Test class for keepalive functionality."""
+
+class MockClient:
+    """Mock client for keepalive functionality testing."""
 
     def __init__(self):
-        """Initialize the test class."""
+        """Initialize the mock client."""
         self.enable_auto_reconnect = True
         self.dispatch_event = AsyncMock()
         self.disconnect = AsyncMock()
         self._auto_reconnect = AsyncMock()
         self.send_iq_async = AsyncMock()
+
 
 # Patch keepalive intervals to very short durations for fast testing
 @pytest.fixture(autouse=True)
@@ -36,17 +41,20 @@ def fast_keepalive_intervals():
         with patch('pymeow.pymeow.keepalive.KEEP_ALIVE_INTERVAL_MAX', timedelta(milliseconds=20)):
             yield
 
+
 # Properly mock asyncio.sleep to avoid actual delays
 @pytest.fixture
 def mock_asyncio_sleep():
     with patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
         yield mock_sleep
 
+
 # Properly mock random.randint to return a fixed value
 @pytest.fixture
 def mock_random():
     with patch('pymeow.pymeow.keepalive.random.randint', return_value=15) as mock_rand:  # 15ms interval
         yield mock_rand
+
 
 # Properly mock datetime.now for predictable timestamps
 @pytest.fixture
@@ -59,63 +67,55 @@ def mock_datetime():
         mock_dt.datetime = datetime
         yield mock_dt
 
-# Remove this fixture as it's not working properly
-# @pytest.fixture
-# def mock_create_task():
-#     """Mock asyncio.create_task to execute coroutines immediately."""
-#     async def immediate_execution(coro):
-#         return await coro
-#
-#     with patch('asyncio.create_task', side_effect=immediate_execution) as mock:
-#         yield mock
 
 @pytest.mark.asyncio
 async def test_keepalive_loop_success(mock_asyncio_sleep, mock_random):
     """Test keepalive loop with successful pings."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
-    # Mock _send_keep_alive to return success twice, then stop
+    # Mock send_keep_alive to return success twice, then stop
     call_count = 0
-    async def mock_send_keep_alive():
+    async def mock_send_keep_alive(client):
         nonlocal call_count
         call_count += 1
         if call_count >= 2:  # Stop after 2 calls
             return False, False  # Should stop
         return True, True  # Success
 
-    test_instance._send_keep_alive = AsyncMock(side_effect=mock_send_keep_alive)
+    # Patch the send_keep_alive function
+    with patch('pymeow.pymeow.keepalive.send_keep_alive', side_effect=mock_send_keep_alive) as mock_send:
+        # Use timeout to prevent infinite hanging
+        try:
+            await asyncio.wait_for(keepalive_loop(mock_client), timeout=1.0)
+        except asyncio.TimeoutError:
+            pytest.fail("Keepalive loop did not stop within timeout - check mock logic")
 
-    # Use timeout to prevent infinite hanging
-    try:
-        await asyncio.wait_for(test_instance._keepalive_loop(), timeout=1.0)
-    except asyncio.TimeoutError:
-        pytest.fail("Keepalive loop did not stop within timeout - check mock logic")
+        # Verify send_keep_alive was called exactly 2 times
+        assert mock_send.call_count == 2
 
-    # Verify _send_keep_alive was called exactly 2 times
-    assert test_instance._send_keep_alive.call_count == 2
+        # Verify asyncio.sleep was called with the expected short interval (15ms = 0.015s)
+        mock_asyncio_sleep.assert_called_with(0.015)
 
-    # Verify asyncio.sleep was called with the expected short interval (15ms = 0.015s)
-    mock_asyncio_sleep.assert_called_with(0.015)
+        # Verify no timeout events were dispatched (all successful)
+        timeout_events = [call for call in mock_client.dispatch_event.call_args_list
+                         if isinstance(call[0][0], KeepAliveTimeout)]
+        assert len(timeout_events) == 0
 
-    # Verify no timeout events were dispatched (all successful)
-    timeout_events = [call for call in test_instance.dispatch_event.call_args_list
-                     if isinstance(call[0][0], KeepAliveTimeout)]
-    assert len(timeout_events) == 0
+        # Verify no reconnect was attempted
+        mock_client.disconnect.assert_not_called()
+        mock_client._auto_reconnect.assert_not_called()
 
-    # Verify no reconnect was attempted
-    test_instance.disconnect.assert_not_called()
-    test_instance._auto_reconnect.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_keepalive_loop_failure_and_recovery(mock_asyncio_sleep, mock_random):
     """Test keepalive loop with failure and recovery."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
-    # Mock _send_keep_alive to return failure then success then stop
+    # Mock send_keep_alive to return failure then success then stop
     call_count = 0
-    async def mock_send_keep_alive():
+    async def mock_send_keep_alive(client):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -124,8 +124,6 @@ async def test_keepalive_loop_failure_and_recovery(mock_asyncio_sleep, mock_rand
             return True, True   # Second call: success but continue
         else:
             return False, False  # Third call and beyond: stop the loop
-
-    test_instance._send_keep_alive = AsyncMock(side_effect=mock_send_keep_alive)
 
     # Track created tasks so we can wait for them
     created_tasks = []
@@ -139,53 +137,55 @@ async def test_keepalive_loop_failure_and_recovery(mock_asyncio_sleep, mock_rand
 
     # Patch create_task in the keepalive module
     with patch('pymeow.pymeow.keepalive.asyncio.create_task', side_effect=tracking_create_task):
-        # Use timeout to prevent infinite hanging
-        try:
-            await asyncio.wait_for(test_instance._keepalive_loop(), timeout=1.0)
-        except asyncio.TimeoutError:
-            pytest.fail("Keepalive loop did not stop within timeout - check mock logic")
-
-        # Wait for all background tasks to complete
-        if created_tasks:
+        with patch('pymeow.pymeow.keepalive.send_keep_alive', side_effect=mock_send_keep_alive) as mock_send:
+            # Use timeout to prevent infinite hanging
             try:
-                await asyncio.wait_for(asyncio.gather(*created_tasks, return_exceptions=True), timeout=0.5)
+                await asyncio.wait_for(keepalive_loop(mock_client), timeout=1.0)
             except asyncio.TimeoutError:
-                # Cancel any remaining tasks
-                for task in created_tasks:
-                    if not task.done():
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                pytest.fail("Keepalive loop did not stop within timeout - check mock logic")
+
+            # Wait for all background tasks to complete
+            if created_tasks:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*created_tasks, return_exceptions=True), timeout=0.5)
+                except asyncio.TimeoutError:
+                    # Cancel any remaining tasks
+                    for task in created_tasks:
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
 
     # Give a small additional delay to ensure all async operations complete
     await asyncio.sleep(0.01)
 
-    # Verify _send_keep_alive was called exactly 3 times
-    assert test_instance._send_keep_alive.call_count == 3
+    # Verify send_keep_alive was called exactly 3 times
+    assert mock_send.call_count == 3
 
     # Verify timeout event was dispatched for the first failure
-    timeout_events = [call for call in test_instance.dispatch_event.call_args_list
+    timeout_events = [call for call in mock_client.dispatch_event.call_args_list
                      if isinstance(call[0][0], KeepAliveTimeout)]
     assert len(timeout_events) == 1
     timeout_event = timeout_events[0][0][0]
     assert timeout_event.error_count == 1
 
     # Verify restored event was dispatched after recovery
-    restored_events = [call for call in test_instance.dispatch_event.call_args_list
+    restored_events = [call for call in mock_client.dispatch_event.call_args_list
                       if isinstance(call[0][0], KeepAliveRestored)]
     assert len(restored_events) == 1
 
     # Verify no reconnect was attempted
-    test_instance.disconnect.assert_not_called()
-    test_instance._auto_reconnect.assert_not_called()
+    mock_client.disconnect.assert_not_called()
+    mock_client._auto_reconnect.assert_not_called()
+
 
 @pytest.mark.asyncio
 async def test_keepalive_loop_multiple_failures():
     """Test keepalive loop with multiple failures triggering reconnect."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Set up datetime mock to trigger reconnect
     initial_time = datetime(2024, 1, 1, 12, 0, 0)
@@ -207,24 +207,24 @@ async def test_keepalive_loop_multiple_failures():
                     return await coro
 
                 with patch('pymeow.pymeow.keepalive.asyncio.create_task', side_effect=immediate_task):
-                    # Mock _send_keep_alive to always return failure
-                    test_instance._send_keep_alive = AsyncMock(return_value=(False, True))
+                    # Mock send_keep_alive to always return failure
+                    with patch('pymeow.pymeow.keepalive.send_keep_alive', return_value=(False, True)):
+                        # Use timeout to prevent infinite hanging
+                        try:
+                            await asyncio.wait_for(keepalive_loop(mock_client), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            pytest.fail("Keepalive loop did not stop within timeout")
 
-                    # Use timeout to prevent infinite hanging
-                    try:
-                        await asyncio.wait_for(test_instance._keepalive_loop(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        pytest.fail("Keepalive loop did not stop within timeout")
+                        # Verify disconnect and auto_reconnect were called
+                        mock_client.disconnect.assert_called_once()
+                        mock_client._auto_reconnect.assert_called_once()
 
-                    # Verify disconnect and auto_reconnect were called
-                    test_instance.disconnect.assert_called_once()
-                    test_instance._auto_reconnect.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_send_keep_alive_success():
     """Test successful keepalive ping."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Create a mock Node for the response
     mock_response = MagicMock(spec=Node)
@@ -235,119 +235,125 @@ async def test_send_keep_alive_success():
     await response_queue.put(mock_response)
 
     # Mock send_iq_async to return (queue, None) tuple as per the new interface
-    test_instance.send_iq_async = AsyncMock(return_value=(response_queue, None))
+    mock_client.send_iq_async = AsyncMock(return_value=(response_queue, None))
 
     # Call the method under test
-    is_success, should_continue = await test_instance._send_keep_alive()
+    is_success, should_continue = await send_keep_alive(mock_client)
 
     # Verify results
     assert is_success is True
     assert should_continue is True
 
     # Verify send_iq_async was called
-    test_instance.send_iq_async.assert_called_once()
+    mock_client.send_iq_async.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_send_keep_alive_timeout():
     """Test keepalive ping timeout."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
-    # Create a future that will never complete (simulates timeout)
-    response_future = asyncio.Future()
+    # Create a queue that will never complete (simulates timeout)
+    response_queue = asyncio.Queue()
 
-    # Mock send_iq_async to return the future
-    test_instance.send_iq_async = AsyncMock(return_value=response_future)
+    # Mock send_iq_async to return the queue
+    mock_client.send_iq_async = AsyncMock(return_value=(response_queue, None))
 
     # Mock asyncio.wait_for to raise TimeoutError
     with patch('asyncio.wait_for', AsyncMock(side_effect=asyncio.TimeoutError())):
         # Call the method under test
-        is_success, should_continue = await test_instance._send_keep_alive()
+        is_success, should_continue = await send_keep_alive(mock_client)
 
         # Verify results
         assert is_success is False
         assert should_continue is True
 
         # Verify send_iq_async was called
-        test_instance.send_iq_async.assert_called_once()
+        mock_client.send_iq_async.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_send_keep_alive_cancelled():
     """Test keepalive ping cancelled."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Mock send_iq_async to raise CancelledError
-    test_instance.send_iq_async = AsyncMock(side_effect=asyncio.CancelledError())
+    mock_client.send_iq_async = AsyncMock(side_effect=asyncio.CancelledError())
 
     # Call the method under test
-    is_success, should_continue = await test_instance._send_keep_alive()
+    is_success, should_continue = await send_keep_alive(mock_client)
 
     # Verify results
     assert is_success is False
     assert should_continue is False
 
     # Verify send_iq_async was called
-    test_instance.send_iq_async.assert_called_once()
+    mock_client.send_iq_async.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_send_keep_alive_error():
     """Test keepalive ping with error."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Mock send_iq_async to raise Exception
-    test_instance.send_iq_async = AsyncMock(side_effect=Exception("Test error"))
+    mock_client.send_iq_async = AsyncMock(side_effect=Exception("Test error"))
 
     # Call the method under test
-    is_success, should_continue = await test_instance._send_keep_alive()
+    is_success, should_continue = await send_keep_alive(mock_client)
 
     # Verify results
     assert is_success is False
     assert should_continue is True
 
     # Verify send_iq_async was called
-    test_instance.send_iq_async.assert_called_once()
+    mock_client.send_iq_async.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_dispatch_keepalive_timeout():
     """Test dispatching keepalive timeout event."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Call the method under test
     error_count = 3
     last_success = datetime.now() - timedelta(seconds=30)
-    await test_instance._dispatch_keepalive_timeout(error_count, last_success)
+    await dispatch_keepalive_timeout(mock_client, error_count, last_success)
 
     # Verify dispatch_event was called with KeepAliveTimeout
-    test_instance.dispatch_event.assert_called_once()
-    event = test_instance.dispatch_event.call_args[0][0]
+    mock_client.dispatch_event.assert_called_once()
+    event = mock_client.dispatch_event.call_args[0][0]
     assert isinstance(event, KeepAliveTimeout)
     assert event.error_count == error_count
     assert event.last_success == last_success
 
+
 @pytest.mark.asyncio
 async def test_dispatch_keepalive_restored():
     """Test dispatching keepalive restored event."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Call the method under test
-    await test_instance._dispatch_keepalive_restored()
+    await dispatch_keepalive_restored(mock_client)
 
     # Verify dispatch_event was called with KeepAliveRestored
-    test_instance.dispatch_event.assert_called_once()
-    event = test_instance.dispatch_event.call_args[0][0]
+    mock_client.dispatch_event.assert_called_once()
+    event = mock_client.dispatch_event.call_args[0][0]
     assert isinstance(event, KeepAliveRestored)
+
 
 @pytest.mark.asyncio
 async def test_send_keep_alive_node_structure():
     """Test that the keepalive query has the correct structure."""
     from ..pymeow.request import InfoQueryType, InfoQuery  # Import the classes we need
 
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Mock send_iq_async to capture the query
     captured_query = None
@@ -359,10 +365,10 @@ async def test_send_keep_alive_node_structure():
         await response_queue.put(MagicMock())
         return response_queue, None
 
-    test_instance.send_iq_async = capture_query
+    mock_client.send_iq_async = capture_query
 
     # Call the method under test
-    await test_instance._send_keep_alive()
+    await send_keep_alive(mock_client)
 
     # Verify the query structure
     assert captured_query is not None
@@ -382,248 +388,44 @@ async def test_send_keep_alive_node_structure():
     assert captured_query.content == []  # Empty content for ping
     assert captured_query.id is not None  # Should have a UUID
 
+
 @pytest.mark.asyncio
 async def test_keepalive_loop_exception_handling():
     """Test that exceptions in the keepalive loop are handled properly."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
-    # Mock _send_keep_alive to raise an exception, then return stop
+    # Mock send_keep_alive to raise an exception, then return stop
     call_count = 0
-    async def mock_send_keep_alive():
+    async def mock_send_keep_alive(client):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
             raise RuntimeError("Test exception")
         return False, False  # Stop after first exception
 
-    test_instance._send_keep_alive = AsyncMock(side_effect=mock_send_keep_alive)
-
     # Mock the logger to capture error logs
     with patch('pymeow.pymeow.keepalive.logger') as mock_logger:
         with patch('pymeow.pymeow.keepalive.random.randint', return_value=15):  # 15ms
             with patch('asyncio.sleep', new_callable=AsyncMock):
-                # Use timeout to prevent infinite hanging
-                try:
-                    await asyncio.wait_for(test_instance._keepalive_loop(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pytest.fail("Keepalive loop did not stop within timeout")
+                with patch('pymeow.pymeow.keepalive.send_keep_alive', side_effect=mock_send_keep_alive):
+                    # Use timeout to prevent infinite hanging
+                    try:
+                        await asyncio.wait_for(keepalive_loop(mock_client), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Keepalive loop did not stop within timeout")
 
-                # Verify the error was logged
-                mock_logger.error.assert_called()
-                error_call = mock_logger.error.call_args
-                assert "Unexpected error in keepalive loop" in error_call[0][0]
+                    # Verify the error was logged
+                    mock_logger.error.assert_called()
+                    error_call = mock_logger.error.call_args
+                    assert "Unexpected error in keepalive loop" in error_call[0][0]
 
-# Integration test with real timing (marked as slow)
-@pytest.mark.slow
-@pytest.mark.asyncio
-async def test_keepalive_real_timing():
-    """Integration test with real timing (takes a few seconds)."""
-    # Create test instance
-    test_instance = TestKeepAlive()
-
-    # Track calls
-    call_times = []
-
-    async def track_calls():
-        call_times.append(datetime.now())
-        if len(call_times) >= 3:  # Stop after 3 calls
-            return False, False
-        return True, True
-
-    test_instance._send_keep_alive = AsyncMock(side_effect=track_calls)
-
-    # Use fast intervals for this test too
-    with patch('pymeow.pymeow.keepalive.KEEP_ALIVE_INTERVAL_MIN', timedelta(milliseconds=50)):
-        with patch('pymeow.pymeow.keepalive.KEEP_ALIVE_INTERVAL_MAX', timedelta(milliseconds=100)):
-            # Start the keepalive loop
-            start_time = datetime.now()
-            await test_instance._keepalive_loop()
-            end_time = datetime.now()
-
-    # Verify timing
-    assert len(call_times) == 3
-    total_duration = end_time - start_time
-    assert total_duration.total_seconds() < 1  # Should complete quickly with short intervals
-
-    # Verify calls were spaced out
-    if len(call_times) >= 2:
-        interval = call_times[1] - call_times[0]
-        assert 0.025 < interval.total_seconds() < 0.15  # Between 25ms and 150ms
-
-# Test specifically for the .value attribute issue
-@pytest.mark.asyncio
-async def test_send_iq_async_interface():
-    """Test what send_iq_async actually expects to debug the .value issue."""
-    # Create test instance
-    test_instance = TestKeepAlive()
-
-    # Create a comprehensive mock that logs all attribute access
-    class AttributeTracker:
-        def __init__(self):
-            self.accessed_attributes = []
-
-        def __getattr__(self, name):
-            self.accessed_attributes.append(name)
-            if name == 'value':
-                return "mock_value"
-            elif name == 'id':
-                return "mock_id"
-            elif name == 'namespace':
-                return "w:p"
-            elif name == 'type':
-                return "get"
-            else:
-                return f"mock_{name}"
-
-    tracker = AttributeTracker()
-
-    # Mock send_iq_async to use our tracker
-    async def mock_send_iq_with_tracking(query):
-        # Try to access attributes that might be causing the issue
-        try:
-            _ = query.value  # This is where the error occurs
-        except AttributeError as e:
-            # Log what we tried to access
-            print(f"AttributeError accessing .value: {e}")
-            print(f"Query type: {type(query)}")
-            print(f"Query attributes: {dir(query) if hasattr(query, '__dict__') else 'no __dict__'}")
-
-        future = asyncio.Future()
-        future.set_result(tracker)
-        return future
-
-    test_instance.send_iq_async = mock_send_iq_with_tracking
-
-    # Call the method under test
-    try:
-        await test_instance._send_keep_alive()
-    except Exception as e:
-        # If it fails, we want to see what attributes were accessed
-        print(f"Exception during test: {e}")
-        print(f"Accessed attributes: {tracker.accessed_attributes}")
-        raise
-
-    # Print what attributes were accessed for debugging
-    print(f"Successfully accessed attributes: {tracker.accessed_attributes}")
-
-@pytest.mark.asyncio
-async def test_send_keep_alive_with_real_client_interface():
-    """Test to reproduce the 'str' object has no attribute 'value' error."""
-    # Create test instance
-    test_instance = TestKeepAlive()
-
-    # Mock send_iq_async to simulate what the real client does
-    # The error suggests that somewhere in the chain, a string is being treated as an object with a .value attribute
-
-    # Let's mock send_iq_async to behave more like the real client
-    async def mock_send_iq_async(query):
-        # Print debug info about what we received
-        print(f"send_iq_async called with: {type(query)} - {query}")
-        print(f"Query attributes: {dir(query)}")
-
-        # Try to access the .value attribute like the real client might
-        try:
-            if hasattr(query, 'value'):
-                print(f"Query.value: {query.value}")
-        except AttributeError as e:
-            print(f"AttributeError accessing query.value: {e}")
-
-        # Return a string instead of a proper response object to trigger the error
-        # This might be what's happening in the real client
-        return "fake_response_string"
-
-    test_instance.send_iq_async = mock_send_iq_async
-
-    # Call the method under test - this should reproduce the error
-    try:
-        is_success, should_continue = await test_instance._send_keep_alive()
-        print(f"Result: is_success={is_success}, should_continue={should_continue}")
-    except Exception as e:
-        print(f"Exception caught: {type(e).__name__}: {e}")
-        # This is expected - we want to see this error
-        assert "'str' object has no attribute 'value'" in str(e) or "AttributeError" in str(type(e).__name__)
-
-@pytest.mark.asyncio
-async def test_send_keep_alive_debug_real_error():
-    """Debug test to understand the exact error from the real client."""
-    # Create test instance
-    test_instance = TestKeepAlive()
-
-    # Mock send_iq_async to return the new interface properly
-    async def problematic_send_iq_async(query):
-        # Create a queue
-        response_queue = asyncio.Queue()
-
-        # Put a proper mock response in the queue
-        mock_response = MagicMock()
-        mock_response.xml_string = MagicMock(return_value="<response/>")
-        await response_queue.put(mock_response)
-
-        # Return the correct tuple interface
-        return response_queue, None
-
-    test_instance.send_iq_async = problematic_send_iq_async
-
-    # Call the method under test
-    is_success, should_continue = await test_instance._send_keep_alive()
-
-    # Should succeed now
-    assert is_success is True
-    assert should_continue is True
-
-@pytest.mark.asyncio
-async def test_send_keep_alive_investigate_response_handling():
-    """Investigate how the response is being handled to find the .value access."""
-    # Create test instance
-    test_instance = TestKeepAlive()
-
-    # Track what happens with the response
-    response_interactions = []
-
-    class TrackedResponse:
-        def __init__(self, data):
-            self._data = data
-            response_interactions.append(f"Created TrackedResponse with: {data}")
-
-        def __getattr__(self, name):
-            response_interactions.append(f"Accessed attribute: {name}")
-            if name == 'value':
-                response_interactions.append("ERROR: Tried to access .value on response")
-                raise AttributeError(f"'str' object has no attribute 'value'")
-            elif name == 'xml_string':
-                return lambda: "<fake>response</fake>"
-            return f"tracked_{name}"
-
-    async def tracking_send_iq_async(query):
-        response_interactions.append(f"send_iq_async called with query type: {type(query)}")
-
-        # Create a queue and put the tracked response in it
-        response_queue = asyncio.Queue()
-        await response_queue.put(TrackedResponse("fake_response_data"))
-
-        # Return the correct tuple interface
-        return response_queue, None
-
-    test_instance.send_iq_async = tracking_send_iq_async
-
-    # Call the method and see what interactions happen
-    is_success, should_continue = await test_instance._send_keep_alive()
-
-    # Print all interactions for debugging
-    print("Response interactions:")
-    for interaction in response_interactions:
-        print(f"  {interaction}")
-
-    # The method should succeed if we handle the response correctly
-    assert is_success is True
-    assert should_continue is True
 
 @pytest.mark.asyncio
 async def test_send_keep_alive_with_correct_interface():
     """Test send_keep_alive with the correct send_iq_async interface."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Create a mock response queue
     response_queue = asyncio.Queue()
@@ -637,39 +439,41 @@ async def test_send_keep_alive_with_correct_interface():
     async def correct_send_iq_async(query):
         return response_queue, None  # (queue, error)
 
-    test_instance.send_iq_async = correct_send_iq_async
+    mock_client.send_iq_async = correct_send_iq_async
 
     # Call the method under test
-    is_success, should_continue = await test_instance._send_keep_alive()
+    is_success, should_continue = await send_keep_alive(mock_client)
 
     # Verify results
     assert is_success is True
     assert should_continue is True
 
+
 @pytest.mark.asyncio
 async def test_send_keep_alive_with_error():
     """Test send_keep_alive when send_iq_async returns an error."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Mock send_iq_async to return an error
     async def error_send_iq_async(query):
         return None, Exception("Test error")  # (queue, error)
 
-    test_instance.send_iq_async = error_send_iq_async
+    mock_client.send_iq_async = error_send_iq_async
 
     # Call the method under test
-    is_success, should_continue = await test_instance._send_keep_alive()
+    is_success, should_continue = await send_keep_alive(mock_client)
 
     # Verify results
     assert is_success is False
     assert should_continue is True
 
+
 @pytest.mark.asyncio
 async def test_send_keep_alive_queue_timeout():
     """Test send_keep_alive when the response queue times out."""
-    # Create test instance
-    test_instance = TestKeepAlive()
+    # Create mock client
+    mock_client = MockClient()
 
     # Create an empty queue that will timeout
     response_queue = asyncio.Queue()
@@ -678,13 +482,101 @@ async def test_send_keep_alive_queue_timeout():
     async def timeout_send_iq_async(query):
         return response_queue, None  # (queue, error)
 
-    test_instance.send_iq_async = timeout_send_iq_async
+    mock_client.send_iq_async = timeout_send_iq_async
 
     # Mock the response deadline to be very short for fast testing
     with patch('pymeow.pymeow.keepalive.KEEP_ALIVE_RESPONSE_DEADLINE', timedelta(milliseconds=10)):
         # Call the method under test
-        is_success, should_continue = await test_instance._send_keep_alive()
+        is_success, should_continue = await send_keep_alive(mock_client)
 
         # Verify results
         assert is_success is False
         assert should_continue is True
+
+
+# Tests for KeepAliveManager class
+@pytest.mark.asyncio
+async def test_keepalive_manager_start_stop():
+    """Test KeepAliveManager start and stop functionality."""
+    # Create mock client
+    mock_client = MockClient()
+
+    # Create manager
+    manager = KeepAliveManager(mock_client)
+
+    # Initially not running
+    assert not manager.is_keepalive_running()
+
+    # Mock the keepalive_loop to complete quickly
+    with patch('pymeow.pymeow.keepalive.keepalive_loop') as mock_loop:
+        mock_loop.return_value = asyncio.create_task(asyncio.sleep(0.01))
+
+        # Start the loop
+        await manager.start_keepalive_loop()
+
+        # Should be running
+        assert manager.is_keepalive_running()
+
+        # Stop the loop
+        await manager.stop_keepalive_loop()
+
+        # Should not be running
+        assert not manager.is_keepalive_running()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_manager_send_keepalive():
+    """Test KeepAliveManager send_keepalive method."""
+    # Create mock client
+    mock_client = MockClient()
+
+    # Create manager
+    manager = KeepAliveManager(mock_client)
+
+    # Mock send_keep_alive
+    with patch('pymeow.pymeow.keepalive.send_keep_alive', return_value=(True, True)) as mock_send:
+        # Call send_keepalive
+        result = await manager.send_keepalive()
+
+        # Verify result
+        assert result == (True, True)
+
+        # Verify send_keep_alive was called with the client
+        mock_send.assert_called_once_with(mock_client)
+
+
+# Integration test with real timing (marked as slow)
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_keepalive_real_timing():
+    """Integration test with real timing (takes a few seconds)."""
+    # Create mock client
+    mock_client = MockClient()
+
+    # Track calls
+    call_times = []
+
+    async def track_calls(client):
+        call_times.append(datetime.now())
+        if len(call_times) >= 3:  # Stop after 3 calls
+            return False, False
+        return True, True
+
+    # Use fast intervals for this test too
+    with patch('pymeow.pymeow.keepalive.KEEP_ALIVE_INTERVAL_MIN', timedelta(milliseconds=50)):
+        with patch('pymeow.pymeow.keepalive.KEEP_ALIVE_INTERVAL_MAX', timedelta(milliseconds=100)):
+            with patch('pymeow.pymeow.keepalive.send_keep_alive', side_effect=track_calls):
+                # Start the keepalive loop
+                start_time = datetime.now()
+                await keepalive_loop(mock_client)
+                end_time = datetime.now()
+
+    # Verify timing
+    assert len(call_times) == 3
+    total_duration = end_time - start_time
+    assert total_duration.total_seconds() < 1  # Should complete quickly with short intervals
+
+    # Verify calls were spaced out
+    if len(call_times) >= 2:
+        interval = call_times[1] - call_times[0]
+        assert 0.025 < interval.total_seconds() < 0.15  # Between 25ms and 150ms

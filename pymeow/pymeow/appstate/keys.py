@@ -8,7 +8,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
-from ..store import Device
+from ..store.store import Device
 from ..util.hkdfutil import expand_hmac
 import logging
 

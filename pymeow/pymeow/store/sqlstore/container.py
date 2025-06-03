@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives import serialization
 
 from .config import get_tortoise_config
 from .models.device import Device
-from ...store import Device as DeviceStore
+from ...store.store import Device as DeviceStore
 from ...util.keys.keypair import KeyPair, PreKey
 
 logger = logging.getLogger(__name__)
