@@ -29,7 +29,6 @@ from .types.presence import (
     ChatPresenceEvent,
 )
 
-from .message import MessageHandlingMixin, MessageProcessingMixin
 from .client import Client as BaseClient
 from .types import Message, GroupInfo, PrivacySetting
 from .newsletter import NewsletterMixin
@@ -37,14 +36,19 @@ from .user import UserMixin
 
 
 # Create enhanced Client class with message handling capabilities
-class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, NewsletterMixin, UserMixin):
+class Client(BaseClient, NewsletterMixin, UserMixin):
     """
     Client for WhatsApp Web API with message handling and newsletter capabilities.
 
     This combines the base Client class with message handling and newsletter mixins,
     similar to how the Device class is enhanced with SignalProtocolMixin.
+
+    The message handling now uses composition via MessageHandler and MessageProcessingHandler
+    classes, while maintaining backward compatibility through the mixins.
     """
-    pass
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
     # Helper method stubs that should be implemented in the base client or one of the mixins
     def generate_request_id(self):
@@ -74,6 +78,7 @@ class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, Newslette
         This method should be implemented in the base client.
         """
         raise NotImplementedError("send_node method must be implemented in the base client")
+
     def wait_response(self, request_id):
         """Wait for a response to a request.
 
@@ -81,11 +86,14 @@ class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, Newslette
         """
         raise NotImplementedError("wait_response method must be implemented in the base client")
 
+
 __all__ = [
     'Client',
     'Message',
     'GroupInfo',
     'PrivacySetting',
+    'MessageHandler',
+    'MessageProcessingHandler',
     'MessageHandlingMixin',
     'MessageProcessingMixin',
     'NewsletterMixin',
