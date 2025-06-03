@@ -23,22 +23,22 @@ class IdentityStore(ABC):
     """Interface for storing identity keys."""
 
     @abstractmethod
-    async def put_identity(self, ctx: Any, address: str, key: bytes) -> None:
+    async def put_identity(self, address: str, key: bytes) -> None:
         """Store an identity key for an address."""
         pass
 
     @abstractmethod
-    async def delete_all_identities(self, ctx: Any, phone: str) -> None:
+    async def delete_all_identities(self, phone: str) -> None:
         """Delete all identity keys for a phone number."""
         pass
 
     @abstractmethod
-    async def delete_identity(self, ctx: Any, address: str) -> None:
+    async def delete_identity(self, address: str) -> None:
         """Delete an identity key for an address."""
         pass
 
     @abstractmethod
-    async def is_trusted_identity(self, ctx: Any, address: str, key: bytes) -> Tuple[bool, Optional[Exception]]:
+    async def is_trusted_identity(self, address: str, key: bytes) -> Tuple[bool, Optional[Exception]]:
         """Check if an identity key is trusted."""
         pass
 
@@ -47,32 +47,32 @@ class SessionStore(ABC):
     """Interface for storing session data."""
 
     @abstractmethod
-    async def get_session(self, ctx: Any, address: str) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_session(self, address: str) -> Tuple[Optional[bytes], Optional[Exception]]:
         """Get a session for an address."""
         pass
 
     @abstractmethod
-    async def has_session(self, ctx: Any, address: str) -> Tuple[bool, Optional[Exception]]:
+    async def has_session(self, address: str) -> Tuple[bool, Optional[Exception]]:
         """Check if a session exists for an address."""
         pass
 
     @abstractmethod
-    async def put_session(self, ctx: Any, address: str, session: bytes) -> None:
+    async def put_session(self, address: str, session: bytes) -> None:
         """Store a session for an address."""
         pass
 
     @abstractmethod
-    async def delete_all_sessions(self, ctx: Any, phone: str) -> None:
+    async def delete_all_sessions(self, phone: str) -> None:
         """Delete all sessions for a phone number."""
         pass
 
     @abstractmethod
-    async def delete_session(self, ctx: Any, address: str) -> None:
+    async def delete_session(self, address: str) -> None:
         """Delete a session for an address."""
         pass
 
     @abstractmethod
-    async def migrate_pn_to_lid(self, ctx: Any, pn: JID, lid: JID) -> None:
+    async def migrate_pn_to_lid(self, pn: JID, lid: JID) -> None:
         """Migrate a session from a phone number to a LID."""
         pass
 
@@ -81,32 +81,32 @@ class PreKeyStore(ABC):
     """Interface for storing pre-keys."""
 
     @abstractmethod
-    async def get_or_gen_pre_keys(self, ctx: Any, count: int) -> Tuple[List[PreKey], Optional[Exception]]:
+    async def get_or_gen_pre_keys(self, count: int) -> Tuple[List[PreKey], Optional[Exception]]:
         """Get or generate pre-keys."""
         pass
 
     @abstractmethod
-    async def gen_one_pre_key(self, ctx: Any) -> Tuple[Optional[PreKey], Optional[Exception]]:
+    async def gen_one_pre_key(self) -> Tuple[Optional[PreKey], Optional[Exception]]:
         """Generate a single pre-key."""
         pass
 
     @abstractmethod
-    async def get_pre_key(self, ctx: Any, id: int) -> Tuple[Optional[PreKey], Optional[Exception]]:
+    async def get_pre_key(self, key_id: int) -> Tuple[Optional[PreKey], Optional[Exception]]:
         """Get a pre-key by ID."""
         pass
 
     @abstractmethod
-    async def remove_pre_key(self, ctx: Any, id: int) -> None:
+    async def remove_pre_key(self, key_id: int) -> None:
         """Remove a pre-key by ID."""
         pass
 
     @abstractmethod
-    async def mark_pre_keys_as_uploaded(self, ctx: Any, up_to_id: int) -> None:
+    async def mark_pre_keys_as_uploaded(self, up_to_id: int) -> None:
         """Mark pre-keys as uploaded up to a specific ID."""
         pass
 
     @abstractmethod
-    async def uploaded_pre_key_count(self, ctx: Any) -> Tuple[int, Optional[Exception]]:
+    async def uploaded_prekey_count(self, ctx: Any) -> int:
         """Get the count of uploaded pre-keys."""
         pass
 
@@ -115,12 +115,12 @@ class SenderKeyStore(ABC):
     """Interface for storing sender keys."""
 
     @abstractmethod
-    async def put_sender_key(self, ctx: Any, group: str, user: str, session: bytes) -> None:
+    async def put_sender_key(self, group: str, user: str, session: bytes) -> None:
         """Store a sender key for a group and user."""
         pass
 
     @abstractmethod
-    async def get_sender_key(self, ctx: Any, group: str, user: str) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_sender_key(self, group: str, user: str) -> Tuple[Optional[bytes], Optional[Exception]]:
         """Get a sender key for a group and user."""
         pass
 
@@ -138,17 +138,17 @@ class AppStateSyncKeyStore(ABC):
     """Interface for storing app state sync keys."""
 
     @abstractmethod
-    async def put_app_state_sync_key(self, ctx: Any, id: bytes, key: AppStateSyncKey) -> None:
+    async def put_app_state_sync_key(self, id: bytes, key: AppStateSyncKey) -> None:
         """Store an app state sync key."""
         pass
 
     @abstractmethod
-    async def get_app_state_sync_key(self, ctx: Any, id: bytes) -> Tuple[Optional[AppStateSyncKey], Optional[Exception]]:
+    async def get_app_state_sync_key(self, id: bytes) -> Tuple[Optional[AppStateSyncKey], Optional[Exception]]:
         """Get an app state sync key by ID."""
         pass
 
     @abstractmethod
-    async def get_latest_app_state_sync_key_id(self, ctx: Any) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_latest_app_state_sync_key_id(self) -> Tuple[Optional[bytes], Optional[Exception]]:
         """Get the latest app state sync key ID."""
         pass
 
@@ -165,32 +165,32 @@ class AppStateStore(ABC):
     """Interface for storing app state data."""
 
     @abstractmethod
-    async def put_app_state_version(self, ctx: Any, name: str, version: int, hash: bytes) -> None:
+    async def put_app_state_version(self, name: str, version: int, hash: bytes) -> None:
         """Store an app state version."""
         pass
 
     @abstractmethod
-    async def get_app_state_version(self, ctx: Any, name: str) -> Tuple[int, bytes, Optional[Exception]]:
+    async def get_app_state_version(self, name: str) -> Tuple[int, bytes, Optional[Exception]]:
         """Get an app state version by name."""
         pass
 
     @abstractmethod
-    async def delete_app_state_version(self, ctx: Any, name: str) -> None:
+    async def delete_app_state_version(self, name: str) -> None:
         """Delete an app state version by name."""
         pass
 
     @abstractmethod
-    async def put_app_state_mutation_macs(self, ctx: Any, name: str, version: int, mutations: List[AppStateMutationMAC]) -> None:
+    async def put_app_state_mutation_macs(self, name: str, version: int, mutations: List[AppStateMutationMAC]) -> None:
         """Store app state mutation MACs."""
         pass
 
     @abstractmethod
-    async def delete_app_state_mutation_macs(self, ctx: Any, name: str, index_macs: List[bytes]) -> None:
+    async def delete_app_state_mutation_macs(self, name: str, index_macs: List[bytes]) -> None:
         """Delete app state mutation MACs."""
         pass
 
     @abstractmethod
-    async def get_app_state_mutation_mac(self, ctx: Any, name: str, index_mac: bytes) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_app_state_mutation_mac(self, name: str, index_mac: bytes) -> Tuple[Optional[bytes], Optional[Exception]]:
         """Get an app state mutation MAC by name and index MAC."""
         pass
 
@@ -208,17 +208,17 @@ class ContactStore(ABC):
     """Interface for storing contact data."""
 
     @abstractmethod
-    async def put_push_name(self, ctx: Any, user: JID, push_name: str) -> Tuple[bool, str, Optional[Exception]]:
+    async def put_push_name(self, user: JID, push_name: str) -> Tuple[bool, str, Optional[Exception]]:
         """Store a push name for a user."""
         pass
 
     @abstractmethod
-    async def put_business_name(self, ctx: Any, user: JID, business_name: str) -> Tuple[bool, str, Optional[Exception]]:
+    async def put_business_name(self, user: JID, business_name: str) -> Tuple[bool, str, Optional[Exception]]:
         """Store a business name for a user."""
         pass
 
     @abstractmethod
-    async def put_contact_name(self, ctx: Any, user: JID, full_name: str, first_name: str) -> None:
+    async def put_contact_name(self, user: JID, full_name: str, first_name: str) -> None:
         """Store a contact name for a user."""
         pass
 
@@ -228,12 +228,12 @@ class ContactStore(ABC):
         pass
 
     @abstractmethod
-    async def get_contact(self, ctx: Any, user: JID) -> Tuple[Any, Optional[Exception]]:
+    async def get_contact(self, user: JID) -> Tuple[Any, Optional[Exception]]:
         """Get contact info for a user."""
         pass
 
     @abstractmethod
-    async def get_all_contacts(self, ctx: Any) -> Tuple[Dict[JID, Any], Optional[Exception]]:
+    async def get_all_contacts(self) -> Tuple[Dict[JID, Any], Optional[Exception]]:
         """Get contact info for all users."""
         pass
 
