@@ -18,7 +18,9 @@ from .generated.waWa6 import WAWebProtobufsWa6_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
 from .generated.waCert import WACert_pb2
+from .message import handle_encrypted_message
 from .pair import handle_iq
+from .receipt import handle_receipt
 
 from .socket.framesocket import FrameSocket
 from .socket.noisesocket import NoiseSocket
@@ -223,9 +225,9 @@ class Client:
     def _init_node_handlers(self):
         """Initialize the node handlers dictionary."""
         self.node_handlers = {
-            "message": self._handle_encrypted_message,
-            "appdata": self._handle_encrypted_message,
-            "receipt": self._handle_receipt,
+            "message": handle_encrypted_message,
+            "appdata": handle_encrypted_message,
+            "receipt": handle_receipt,
             "call": self._handle_call_event,
             "chatstate": self._handle_chat_state,
             "presence": self._handle_presence,
@@ -913,24 +915,6 @@ class Client:
             logger.error(f"Failed to store LID-PN mapping for {lid} -> {pn}: {err}")
 
     # Node handler methods
-    async def _handle_encrypted_message(self, node: Node) -> None:
-        """Handle an encrypted message node.
-
-        Args:
-            node: The message node
-        """
-        # TODO: Implement message handling
-        pass
-
-    async def _handle_receipt(self, node: Node) -> None:
-        """Handle a receipt node.
-
-        Args:
-            node: The receipt node
-        """
-        # TODO: Implement receipt handling
-        pass
-
     async def _handle_call_event(self, node: Node) -> None:
         """Handle a call event node.
 

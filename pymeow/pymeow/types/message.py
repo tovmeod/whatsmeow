@@ -95,12 +95,6 @@ class MessageServerID(int):
     pass
 
 
-class ReceiptType(str, Enum):
-    """Receipt types for messages."""
-    PEER_MSG = "peer_msg"
-    HISTORY_SYNC = "history_sync"
-
-
 @dataclass
 class MsgBotInfo:
     """Bot information for messages.
