@@ -22,7 +22,7 @@ class Session(Model):
         table = "pymeow_sessions"
         unique_together = (("our_jid", "their_id"),)
 
-class PreKey(Model):
+class PreKeyModel(Model):
     """Pre-keys for Signal protocol"""
     jid = fields.CharField(max_length=255)
     key_id = fields.IntField()
