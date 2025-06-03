@@ -1,490 +1,526 @@
 """
-Python port of error types from whatsmeow.
+Exceptions and error handling for the PyMeow WhatsApp Web client.
 
-This module defines the exception hierarchy used throughout the pymeow
-library, mapping to the error types defined in the original Go implementation.
-
-Go equivalent: errors/errors.go
+This module defines custom exceptions used throughout the library.
+Port of whatsmeow/errors.go
 """
 
-from typing import Optional, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .binary.node import Node
-
+from typing import Optional, Dict, Any
 
 class PymeowError(Exception):
-    """Base exception for all pymeow errors."""
+    """Base exception for all PyMeow errors."""
     pass
 
 
-# Miscellaneous errors
+# Protocol-related errors
+class ProtocolError(PymeowError):
+    """Base class for protocol-related errors."""
+    pass
+
+
+class AuthenticationError(PymeowError):
+    """Base class for authentication-related errors."""
+    pass
+
+
+# Pre-key related errors
+class PreKeyError(PymeowError):
+    """Raised when there's an error with pre-key operations."""
+    pass
+
+
+# Connection and session errors
 class ErrClientIsNil(PymeowError):
-    """Raised when client is nil."""
+    """Raised when the client is nil."""
 
     def __init__(self):
-        super().__init__("client is nil")
+        super().__init__("the client is not initialized")
 
 
 class ErrNoSession(PymeowError):
-    """Raised when can't encrypt message for device: no signal session established."""
+    """Raised when there's no session available."""
 
-    def __init__(self):
-        super().__init__("can't encrypt message for device: no signal session established")
+    def __init__(self, action: str = ""):
+        if action:
+            super().__init__(f"can't {action} without being logged in")
+        else:
+            super().__init__("no session available")
 
 
 class ErrIQTimedOut(PymeowError):
-    """Raised when info query timed out."""
+    """Raised when an IQ request times out."""
 
-    def __init__(self):
-        super().__init__("info query timed out")
+    def __init__(self, request_type: str = ""):
+        if request_type:
+            super().__init__(f"IQ request {request_type} timed out")
+        else:
+            super().__init__("IQ request timed out")
 
 
 class ErrNotConnected(PymeowError):
-    """Raised when websocket not connected."""
+    """Raised when trying to perform an action that requires a connection."""
 
-    def __init__(self):
-        super().__init__("websocket not connected")
+    def __init__(self, action: str = ""):
+        if action:
+            super().__init__(f"can't {action} when not connected")
+        else:
+            super().__init__("not connected to WhatsApp")
 
 
 class ErrNotLoggedIn(PymeowError):
-    """Raised when the store doesn't contain a device JID."""
+    """Raised when trying to perform an action that requires being logged in."""
 
-    def __init__(self):
-        super().__init__("the store doesn't contain a device JID")
+    def __init__(self, action: str = ""):
+        if action:
+            super().__init__(f"can't {action} when not logged in")
+        else:
+            super().__init__("not logged in")
 
 
 class ErrMessageTimedOut(PymeowError):
-    """Raised when timed out waiting for message send response."""
+    """Raised when a message send times out."""
 
-    def __init__(self):
-        super().__init__("timed out waiting for message send response")
+    def __init__(self, message_id: str = ""):
+        if message_id:
+            super().__init__(f"message {message_id} send timed out")
+        else:
+            super().__init__("message send timed out")
 
 
 class ErrAlreadyConnected(PymeowError):
-    """Raised when websocket is already connected."""
+    """Raised when trying to connect while already connected."""
 
     def __init__(self):
-        super().__init__("websocket is already connected")
+        super().__init__("already connected")
 
 
 class ErrQRAlreadyConnected(PymeowError):
-    """Raised when GetQRChannel must be called before connecting."""
+    """Raised when trying to get QR code while already connected."""
 
     def __init__(self):
-        super().__init__("GetQRChannel must be called before connecting")
+        super().__init__("already connected, can't get QR code")
 
 
 class ErrQRStoreContainsID(PymeowError):
-    """Raised when GetQRChannel can only be called when there's no user ID in the client's Store."""
+    """Raised when the store already contains a device ID."""
 
     def __init__(self):
-        super().__init__("GetQRChannel can only be called when there's no user ID in the client's Store")
+        super().__init__("device store already contains a device ID, pairing is not possible")
 
 
-class ErrNoPushName(PymeowError):
-    """Raised when can't send presence without PushName set."""
+class NoPushNameError(PymeowError):
+    """Raised when push name is required but not set.
+
+    Port of Go's ErrNoPushName: "can't send presence without PushName set"
+    """
 
     def __init__(self):
         super().__init__("can't send presence without PushName set")
 
 
-class ErrNoPrivacyToken(PymeowError):
-    """Raised when no privacy token stored."""
+class NoPrivacyTokenError(PymeowError):
+    """Raised when privacy token is required but not available.
+
+    Port of Go's ErrNoPrivacyToken: "no privacy token stored"
+    """
 
     def __init__(self):
         super().__init__("no privacy token stored")
 
 
 class ErrAppStateUpdate(PymeowError):
-    """Raised when server returned error updating app state."""
+    """Raised when there's an error updating app state."""
 
-    def __init__(self):
-        super().__init__("server returned error updating app state")
+    def __init__(self, message: str):
+        super().__init__(f"app state update error: {message}")
 
 
 # Pairing errors
-class ErrPairInvalidDeviceIdentityHMAC(PymeowError):
-    """Raised when invalid device identity HMAC in pair success message."""
+class ErrPairInvalidDeviceIdentityHMAC(AuthenticationError):
+    """Raised when device identity HMAC is invalid during pairing."""
 
     def __init__(self):
-        super().__init__("invalid device identity HMAC in pair success message")
+        super().__init__("invalid device identity HMAC")
 
 
-class ErrPairInvalidDeviceSignature(PymeowError):
-    """Raised when invalid device signature in pair success message."""
-
-    def __init__(self):
-        super().__init__("invalid device signature in pair success message")
-
-
-class ErrPairRejectedLocally(PymeowError):
-    """Raised when local PrePairCallback rejected pairing."""
+class ErrPairInvalidDeviceSignature(AuthenticationError):
+    """Raised when device signature is invalid during pairing."""
 
     def __init__(self):
-        super().__init__("local PrePairCallback rejected pairing")
+        super().__init__("invalid device signature")
 
 
-class PairProtoError(PymeowError):
-    """Included in an events.PairError if the pairing failed due to a protobuf error."""
+class ErrPairRejectedLocally(AuthenticationError):
+    """Raised when pairing is rejected locally."""
+
+    def __init__(self):
+        super().__init__("pairing was rejected locally")
+
+
+class PairProtoError(ProtocolError):
+    """Raised when there's a protocol error during pairing."""
 
     def __init__(self, message: str, proto_err: Exception):
         self.message = message
         self.proto_err = proto_err
-        super().__init__(f"{message}: {proto_err}")
+        super().__init__(f"pairing protocol error: {message}")
 
 
 class PairDatabaseError(PymeowError):
-    """Included in an events.PairError if the pairing failed due to being unable to save credentials."""
+    """Raised when there's a database error during pairing."""
 
     def __init__(self, message: str, db_err: Exception):
         self.message = message
         self.db_err = db_err
-        super().__init__(f"{message}: {db_err}")
+        super().__init__(f"pairing database error: {message}")
 
 
-# Profile and media errors
-class ErrProfilePictureUnauthorized(PymeowError):
-    """Raised when the user has hidden their profile picture from you."""
+# Profile and group errors
+class ErrProfilePictureUnauthorized(AuthenticationError):
+    """Raised when not authorized to access profile picture."""
 
     def __init__(self):
-        super().__init__("the user has hidden their profile picture from you")
+        super().__init__("unauthorized to view profile picture")
 
 
 class ErrProfilePictureNotSet(PymeowError):
-    """Raised when that user or group does not have a profile picture."""
+    """Raised when profile picture is not set."""
 
     def __init__(self):
-        super().__init__("that user or group does not have a profile picture")
+        super().__init__("profile picture is not set")
 
 
-class ErrGroupInviteLinkUnauthorized(PymeowError):
-    """Raised when you don't have the permission to get the group's invite link."""
+class ErrGroupInviteLinkUnauthorized(AuthenticationError):
+    """Raised when not authorized to access group invite link."""
 
     def __init__(self):
-        super().__init__("you don't have the permission to get the group's invite link")
+        super().__init__("unauthorized to view group invite link")
 
 
 class ErrNotInGroup(PymeowError):
-    """Raised when you're not participating in that group."""
+    """Raised when trying to perform a group action while not in the group."""
 
     def __init__(self):
-        super().__init__("you're not participating in that group")
+        super().__init__("not in group")
 
 
 class ErrGroupNotFound(PymeowError):
-    """Raised when that group does not exist."""
+    """Raised when a group is not found."""
 
     def __init__(self):
-        super().__init__("that group does not exist")
+        super().__init__("group not found")
 
 
 class ErrInviteLinkInvalid(PymeowError):
-    """Raised when that group invite link is not valid."""
+    """Raised when an invite link is invalid."""
 
     def __init__(self):
-        super().__init__("that group invite link is not valid")
+        super().__init__("invite link is invalid")
 
 
 class ErrInviteLinkRevoked(PymeowError):
-    """Raised when that group invite link has been revoked."""
+    """Raised when an invite link has been revoked."""
 
     def __init__(self):
-        super().__init__("that group invite link has been revoked")
+        super().__init__("invite link has been revoked")
 
 
 class ErrBusinessMessageLinkNotFound(PymeowError):
-    """Raised when that business message link does not exist or has been revoked."""
+    """Raised when a business message link is not found."""
 
     def __init__(self):
-        super().__init__("that business message link does not exist or has been revoked")
+        super().__init__("business message link not found")
 
 
 class ErrContactQRLinkNotFound(PymeowError):
-    """Raised when that contact QR link does not exist or has been revoked."""
+    """Raised when a contact QR link is not found."""
 
     def __init__(self):
-        super().__init__("that contact QR link does not exist or has been revoked")
+        super().__init__("contact QR link not found")
 
 
 class ErrInvalidImageFormat(PymeowError):
-    """Raised when the given data is not a valid image."""
+    """Raised when image format is invalid."""
 
     def __init__(self):
-        super().__init__("the given data is not a valid image")
+        super().__init__("invalid image format")
 
 
 class ErrMediaNotAvailableOnPhone(PymeowError):
-    """Raised when media no longer available on phone."""
+    """Raised when media is not available on phone."""
 
     def __init__(self):
-        super().__init__("media no longer available on phone")
+        super().__init__("media is not available on phone")
 
 
 class ErrUnknownMediaRetryError(PymeowError):
-    """Raised when unknown media retry error."""
+    """Raised when there's an unknown media retry error."""
 
     def __init__(self):
         super().__init__("unknown media retry error")
 
 
 class ErrInvalidDisappearingTimer(PymeowError):
-    """Raised when invalid disappearing timer provided."""
+    """Raised when disappearing timer value is invalid."""
 
     def __init__(self):
-        super().__init__("invalid disappearing timer provided")
+        super().__init__("invalid disappearing timer value")
 
 
-# Message sending errors
+# Broadcast and server errors
 class ErrBroadcastListUnsupported(PymeowError):
-    """Raised when sending to non-status broadcast lists is not yet supported."""
+    """Raised when broadcast lists are not supported."""
 
     def __init__(self):
-        super().__init__("sending to non-status broadcast lists is not yet supported")
+        super().__init__("broadcast lists are not supported")
 
 
 class ErrUnknownServer(PymeowError):
-    """Raised when can't send message to unknown server."""
+    """Raised when connecting to an unknown server."""
 
     def __init__(self):
-        super().__init__("can't send message to unknown server")
+        super().__init__("unknown server")
 
 
 class ErrRecipientADJID(PymeowError):
-    """Raised when message recipient must be a user JID with no device part."""
+    """Raised when recipient has an AD JID."""
 
     def __init__(self):
-        super().__init__("message recipient must be a user JID with no device part")
+        super().__init__("recipient has an AD JID")
 
 
-class ErrServerReturnedError(PymeowError):
-    """Raised when server returned error."""
+class ErrServerReturnedError(ProtocolError):
+    """Raised when server returns an error."""
 
     def __init__(self):
-        super().__init__("server returned error")
+        super().__init__("server returned an error")
 
 
 class ErrInvalidInlineBotID(PymeowError):
-    """Raised when invalid inline bot ID."""
+    """Raised when inline bot ID is invalid."""
 
     def __init__(self):
         super().__init__("invalid inline bot ID")
 
 
-# Download errors
+# Media download errors
 class DownloadHTTPError(PymeowError):
-    """Raised when download failed with HTTP error."""
+    """Raised when there's an HTTP error during media download."""
 
-    def __init__(self, status_code: int):
+    def __init__(self, status_code: int, response_body: str = ""):
         self.status_code = status_code
-        super().__init__(f"download failed with status code {status_code}")
+        if response_body:
+            super().__init__(f"download failed with HTTP {status_code}: {response_body}")
+        else:
+            super().__init__(f"download failed with HTTP {status_code}")
 
     def __eq__(self, other):
-        """Allow comparison with other DownloadHTTPError instances."""
-        return isinstance(other, DownloadHTTPError) and self.status_code == other.status_code
+        if isinstance(other, DownloadHTTPError):
+            return self.status_code == other.status_code
+        return False
 
 
-# Predefined download errors
+# Predefined HTTP error instances
 ErrMediaDownloadFailedWith403 = DownloadHTTPError(403)
 ErrMediaDownloadFailedWith404 = DownloadHTTPError(404)
 ErrMediaDownloadFailedWith410 = DownloadHTTPError(410)
 
 
 class ErrNoURLPresent(PymeowError):
-    """Raised when no url present."""
+    """Raised when no URL is present for download."""
 
     def __init__(self):
-        super().__init__("no url present")
+        super().__init__("no URL present")
 
 
 class ErrFileLengthMismatch(PymeowError):
-    """Raised when file length does not match."""
+    """Raised when file length doesn't match expected."""
 
     def __init__(self):
-        super().__init__("file length does not match")
+        super().__init__("file length mismatch")
 
 
 class ErrTooShortFile(PymeowError):
-    """Raised when file too short."""
+    """Raised when file is too short."""
 
     def __init__(self):
         super().__init__("file too short")
 
 
 class ErrInvalidMediaHMAC(PymeowError):
-    """Raised when invalid media hmac."""
+    """Raised when media HMAC is invalid."""
 
     def __init__(self):
-        super().__init__("invalid media hmac")
+        super().__init__("invalid media HMAC")
 
 
 class ErrInvalidMediaEncSHA256(PymeowError):
-    """Raised when hash of media ciphertext doesn't match."""
+    """Raised when media encrypted SHA256 is invalid."""
 
     def __init__(self):
-        super().__init__("hash of media ciphertext doesn't match")
+        super().__init__("invalid media encrypted SHA256")
 
 
 class ErrInvalidMediaSHA256(PymeowError):
-    """Raised when hash of media plaintext doesn't match."""
+    """Raised when media SHA256 is invalid."""
 
     def __init__(self):
-        super().__init__("hash of media plaintext doesn't match")
+        super().__init__("invalid media SHA256")
 
 
 class ErrUnknownMediaType(PymeowError):
-    """Raised when unknown media type."""
+    """Raised when media type is unknown."""
 
     def __init__(self):
         super().__init__("unknown media type")
 
 
 class ErrNothingDownloadableFound(PymeowError):
-    """Raised when didn't find any attachments in message."""
+    """Raised when nothing downloadable is found."""
 
     def __init__(self):
-        super().__init__("didn't find any attachments in message")
+        super().__init__("nothing downloadable found")
 
 
-# Message secret errors
+# Message handling errors
 class ErrOriginalMessageSecretNotFound(PymeowError):
-    """Raised when original message secret key not found."""
+    """Raised when original message secret is not found."""
 
     def __init__(self):
-        super().__init__("original message secret key not found")
+        super().__init__("original message secret not found")
 
 
 class ErrNotEncryptedReactionMessage(PymeowError):
-    """Raised when given message isn't an encrypted reaction message."""
+    """Raised when reaction message is not encrypted."""
 
     def __init__(self):
-        super().__init__("given message isn't an encrypted reaction message")
+        super().__init__("message is not an encrypted reaction message")
 
 
 class ErrNotEncryptedCommentMessage(PymeowError):
-    """Raised when given message isn't an encrypted comment message."""
+    """Raised when comment message is not encrypted."""
 
     def __init__(self):
-        super().__init__("given message isn't an encrypted comment message")
+        super().__init__("message is not an encrypted comment message")
 
 
 class ErrNotPollUpdateMessage(PymeowError):
-    """Raised when given message isn't a poll update message."""
+    """Raised when message is not a poll update."""
 
     def __init__(self):
-        super().__init__("given message isn't a poll update message")
+        super().__init__("message is not a poll update message")
 
 
-# Wrapper for IQ errors with human-readable messages
+# IQ error handling
 class WrappedIQError(PymeowError):
     """Wrapper for IQ errors with human-readable messages."""
 
-    def __init__(self, human_error: Exception, iq_error: Exception):
+    def __init__(self, human_error: str, iq_error: 'IQError'):
         self.human_error = human_error
         self.iq_error = iq_error
-        super().__init__(str(human_error))
+        super().__init__(human_error)
 
 
-def wrap_iq_error(human_error: Exception, iq_error: Exception) -> WrappedIQError:
-    """Wrap an IQ error with a human-readable error."""
+def wrap_iq_error(human_error: str, iq_error: 'IQError') -> WrappedIQError:
+    """Wrap an IQ error with a human-readable message."""
     return WrappedIQError(human_error, iq_error)
 
 
-# IQ Error implementation
-class IQError(PymeowError):
-    """Generic error container for info queries."""
+class IQError(ProtocolError):
+    """Represents an IQ error response."""
 
-    def __init__(self, code: int = 0, text: str = "", error_node: Optional['Node'] = None, raw_node: Optional['Node'] = None):
+    def __init__(self, code: int, text: str, error_node: 'Node', raw_node: 'Node'):
         self.code = code
         self.text = text
         self.error_node = error_node
         self.raw_node = raw_node
 
-        if code == 0:
-            if error_node is not None:
-                super().__init__(f"info query returned unknown error: {error_node.xml_string()}")
-            elif raw_node is not None:
-                super().__init__(f"info query returned unexpected response: {raw_node.xml_string()}")
-            else:
-                super().__init__("unknown info query error")
+        error_type = ""
+        if 400 <= code < 500:
+            error_type = "client"
+        elif 500 <= code < 600:
+            error_type = "server"
         else:
-            super().__init__(f"info query returned status {code}: {text}")
+            error_type = "unknown"
+
+        if text:
+            super().__init__(f"IQ {error_type} error {code}: {text}")
+        else:
+            super().__init__(f"IQ {error_type} error {code}")
 
     def __eq__(self, other):
-        """Allow comparison with other IQError instances."""
-        if not isinstance(other, IQError):
-            return False
-        if self.code != 0 and other.code != 0:
-            return other.code == self.code and other.text == self.text
-        elif self.error_node is not None and other.error_node is not None:
-            return self.error_node.xml_string() == other.error_node.xml_string()
-        else:
-            return False
+        if isinstance(other, IQError):
+            return (self.code == other.code and
+                   self.text == other.text and
+                   self.error_node == other.error_node)
+        return False
 
 
-# Common IQ errors for use with equality comparison
-ErrIQBadRequest = IQError(400, "bad-request")
-ErrIQNotAuthorized = IQError(401, "not-authorized")
-ErrIQForbidden = IQError(403, "forbidden")
-ErrIQNotFound = IQError(404, "item-not-found")
-ErrIQNotAllowed = IQError(405, "not-allowed")
-ErrIQNotAcceptable = IQError(406, "not-acceptable")
-ErrIQGone = IQError(410, "gone")
-ErrIQResourceLimit = IQError(419, "resource-limit")
-ErrIQLocked = IQError(423, "locked")
-ErrIQRateOverLimit = IQError(429, "rate-overlimit")
-ErrIQInternalServerError = IQError(500, "internal-server-error")
-ErrIQServiceUnavailable = IQError(503, "service-unavailable")
-ErrIQPartialServerError = IQError(530, "partial-server-error")
+# Predefined IQ error instances
+ErrIQBadRequest = IQError(400, "bad-request", None, None)
+ErrIQNotAuthorized = IQError(401, "not-authorized", None, None)
+ErrIQForbidden = IQError(403, "forbidden", None, None)
+ErrIQNotFound = IQError(404, "not-found", None, None)
+ErrIQNotAllowed = IQError(405, "not-allowed", None, None)
+ErrIQNotAcceptable = IQError(406, "not-acceptable", None, None)
+ErrIQGone = IQError(410, "gone", None, None)
+ErrIQResourceLimit = IQError(419, "resource-limit", None, None)
+ErrIQLocked = IQError(423, "locked", None, None)
+ErrIQRateOverLimit = IQError(429, "rate-over-limit", None, None)
+ErrIQInternalServerError = IQError(500, "internal-server-error", None, None)
+ErrIQServiceUnavailable = IQError(503, "service-unavailable", None, None)
+ErrIQPartialServerError = IQError(520, "partial-server-error", None, None)
 
 
-def parse_iq_error(node: 'Node') -> IQError:
-    """
-    Parse an IQ error node into an IQError exception.
-
-    Args:
-        node: The error node to parse
-
-    Returns:
-        An IQError instance
-    """
-    error_node = None
-    code = 0
+def parse_iq_error(error_node: 'Node') -> IQError:
+    """Parse an IQ error from a node."""
+    code = 500  # default to server error
     text = ""
 
-    error_child, found = node.get_optional_child_by_tag("error")
-    if found and error_child:
-        error_node = error_child
-        ag = error_child.attr_getter()
-        code = ag.optional_int("code")
-        text = ag.optional_string("text")
+    if error_node.attrs:
+        code_str = error_node.attrs.get("code", "500")
+        try:
+            code = int(code_str)
+        except ValueError:
+            code = 500
 
-    return IQError(code=code, text=text, error_node=error_node, raw_node=node)
+        text = error_node.attrs.get("text", "")
+
+    # Try to get more specific error info from child nodes
+    if hasattr(error_node, 'children') and error_node.children:
+        for child in error_node.children:
+            if hasattr(child, 'tag'):
+                if not text:
+                    text = child.tag
+                break
+
+    return IQError(code, text, error_node, error_node)
 
 
-# ElementMissingError is returned by various functions that parse XML elements when a required element is missing.
-class ElementMissingError(PymeowError):
-    """Raised when an expected XML element is missing from a server response."""
+# XML and parsing errors
+class ElementMissingError(ProtocolError):
+    """Raised when a required XML element is missing."""
 
     def __init__(self, tag: str, in_location: str):
         self.tag = tag
         self.in_location = in_location
-        super().__init__(f"missing <{tag}> element in {in_location}")
+        super().__init__(f"missing element {tag} in {in_location}")
 
 
-# DisconnectedError is returned if the websocket disconnects before an info query or other request gets a response.
-class DisconnectedError(PymeowError):
-    """Returned if the websocket disconnects before an info query or other request gets a response."""
+# Disconnection errors
+class DisconnectedError(ProtocolError):
+    """Raised when connection is lost."""
 
-    def __init__(self, action: str, node: Optional['Node'] = None):
-        self.action = action
+    def __init__(self, node: 'Node', action: str):
         self.node = node
-        super().__init__(f"websocket disconnected before {action} returned response")
+        self.action = action
+        super().__init__(f"disconnected while {action}")
 
     def __eq__(self, other):
-        """Allow comparison with other DisconnectedError instances."""
-        return isinstance(other, DisconnectedError) and other.action == self.action
+        if isinstance(other, DisconnectedError):
+            return self.node == other.node and self.action == other.action
+        return False
 
 
-# Predefined disconnected error
-ErrIQDisconnected = DisconnectedError("info query")
+# Special disconnection marker
+ErrIQDisconnected = DisconnectedError(None, "waiting for IQ response")

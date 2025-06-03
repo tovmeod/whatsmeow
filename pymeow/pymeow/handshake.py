@@ -8,7 +8,7 @@ import logging
 import time
 import json
 from dataclasses import dataclass
-from typing import Optional, Tuple, Callable, Any, List
+from typing import Optional, Tuple, Callable, Any, List, TYPE_CHECKING
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.exceptions import InvalidSignature
@@ -19,9 +19,13 @@ from .generated.waCert import WACert_pb2
 from .socket.framesocket import FrameSocket
 from .socket.noisehandshake import NoiseHandshake
 from .socket.noisesocket import NoiseSocket
+from .store.clientpayload import get_client_payload
 from .types.events import Disconnected
 from .util.keys.keypair import KeyPair
 from .exceptions import PymeowError, ProtocolError, AuthenticationError
+
+if TYPE_CHECKING:
+    from .client import Client
 
 # Constants
 NOISE_HANDSHAKE_RESPONSE_TIMEOUT = 20  # seconds
@@ -44,345 +48,340 @@ class CertificateVerificationError(AuthenticationError):
     """Raised when certificate verification fails."""
     pass
 
-class HandshakeMixin:
-    """Client for WhatsApp Web API.
 
-    This is a partial implementation that only includes the handshake functionality.
+async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair) -> None:
+    """Perform the handshake with the server.
+
+    Args:
+        client: The client instance
+        fs: The frame socket
+        ephemeral_kp: The ephemeral key pair
+
+    Raises:
+        HandshakeError: If the handshake fails
+        CertificateVerificationError: If certificate verification fails
+        asyncio.TimeoutError: If handshake times out
     """
+    logger.info(f"Current DICT_VERSION is: {DICT_VERSION}")
+    if hasattr(fs, 'header') and fs.header:
+        logger.info(f"FrameSocket initial fs.header (WA_CONN_HEADER) to be used: {fs.header.hex()} (raw bytes: {list(fs.header)})")
+    else:
+        logger.warning("FrameSocket fs.header is not set or is empty before handshake.")
 
-    def __init__(self):
-        """Initialize the client."""
-        self.socket: Optional[NoiseSocket] = None
-        self.store = None
-        self.get_client_payload: Optional[Callable] = None
+    # Log test values for mocking
+    test_log.info("HANDSHAKE_START: Capturing values for test mocking")
+    test_log.info(f"HANDSHAKE_EPHEMERAL_KEYPAIR: {{'pub': {ephemeral_kp.pub.hex()}, 'priv': {ephemeral_kp.priv.hex()}}}")
 
-    async def _do_handshake(self, fs: FrameSocket, ephemeral_kp: KeyPair) -> None:
-        """Perform the handshake with the server.
+    try:
+        # Create a new noise handshake instance
+        nh = NoiseHandshake()
+        # Start the handshake with the Noise_XX pattern
+        # This matches the Go implementation which uses socket.NoiseStartPattern
+        nh.start(nh.NOISE_START_PATTERN, fs.header)
+        # Authenticate the ephemeral public key
+        nh.authenticate(ephemeral_kp.pub)
 
-        Args:
-            fs: The frame socket
-            ephemeral_kp: The ephemeral key pair
+        # Create and send client hello message
+        data = WAWebProtobufsWa6_pb2.HandshakeMessage(
+            clientHello=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientHello(
+                ephemeral=ephemeral_kp.pub
+            )
+        ).SerializeToString()
 
-        Raises:
-            HandshakeError: If the handshake fails
-            CertificateVerificationError: If certificate verification fails
-            asyncio.TimeoutError: If handshake times out
-        """
-        logger.info(f"Current DICT_VERSION is: {DICT_VERSION}")
-        if hasattr(fs, 'header') and fs.header:
-            logger.info(f"FrameSocket initial fs.header (WA_CONN_HEADER) to be used: {fs.header.hex()} (raw bytes: {list(fs.header)})")
-        else:
-            logger.warning("FrameSocket fs.header is not set or is empty before handshake.")
+        logger.info(f"Sending ClientHello with ephemeral key length: {len(ephemeral_kp.pub)}")
+        logger.info(f"ClientHello serialized data (hex): {data.hex()}")
+        logger.info(f"ClientHello serialized data length: {len(data)}")
+
+        await fs.send_frame(data)
+
+        # Wait for server response
+        try:
+            resp = await asyncio.wait_for(fs.frames.get(), NOISE_HANDSHAKE_RESPONSE_TIMEOUT)
+        except asyncio.TimeoutError as e:
+            raise HandshakeError("Timed out waiting for handshake response") from e
+
+        # Parse server response
+        try:
+            handshake_response = WAWebProtobufsWa6_pb2.HandshakeMessage()
+            handshake_response.ParseFromString(resp)
+        except Exception as e:
+            raise HandshakeError(f"Failed to unmarshal handshake response") from e
+
+        server_ephemeral = handshake_response.serverHello.ephemeral
+        server_static_ciphertext = handshake_response.serverHello.static
+        certificate_ciphertext = handshake_response.serverHello.payload
 
         # Log test values for mocking
-        test_log.info("HANDSHAKE_START: Capturing values for test mocking")
-        test_log.info(f"HANDSHAKE_EPHEMERAL_KEYPAIR: {{'pub': {ephemeral_kp.pub.hex()}, 'priv': {ephemeral_kp.priv.hex()}}}")
-        try:
-            # Create a new noise handshake instance
-            nh = NoiseHandshake()
-            # Start the handshake with the Noise_XX pattern
-            # This matches the Go implementation which uses socket.NoiseStartPattern
-            nh.start(nh.NOISE_START_PATTERN, fs.header)
-            # Authenticate the ephemeral public key
-            nh.authenticate(ephemeral_kp.pub)
+        test_log.info(f"HANDSHAKE_SERVER_RESPONSE: {{'server_ephemeral': {server_ephemeral.hex()}, 'server_static_ciphertext': {server_static_ciphertext.hex()}, 'certificate_ciphertext': {certificate_ciphertext.hex()}}}")
 
-            # Create and send client hello message
+        if (len(server_ephemeral) != 32 or
+            not server_static_ciphertext or
+            not certificate_ciphertext):
+            raise HandshakeError("Missing parts of handshake response")
+
+        # Process server ephemeral key
+        nh.authenticate(server_ephemeral)
+        try:
+            nh.mix_shared_secret_into_key(ephemeral_kp.priv, server_ephemeral)
+        except Exception as e:
+            raise HandshakeError(f"Failed to mix server ephemeral key in") from e
+
+        # Decrypt server static key
+        try:
+            static_decrypted = nh.decrypt(server_static_ciphertext)
+        except Exception as e:
+            raise HandshakeError(f"Failed to decrypt server static ciphertext") from e
+
+        # Log test values for mocking
+        test_log.info(f"HANDSHAKE_STATIC_DECRYPTED: {static_decrypted.hex()}")
+
+        if len(static_decrypted) != 32:
+            raise HandshakeError(f"Unexpected length of server static plaintext {len(static_decrypted)} (expected 32)")
+
+        # Mix server static key into handshake
+        try:
+            nh.mix_shared_secret_into_key(ephemeral_kp.priv, static_decrypted)
+        except Exception as e:
+            raise HandshakeError(f"Failed to mix server static key in") from e
+
+        # Decrypt and verify certificate
+        try:
+            cert_decrypted = nh.decrypt(certificate_ciphertext)
+            # Log test values for mocking
+            test_log.info(f"HANDSHAKE_CERT_DECRYPTED: {cert_decrypted.hex()}")
+        except Exception as e:
+            raise HandshakeError(f"Failed to decrypt noise certificate ciphertext") from e
+
+        try:
+            verify_server_cert(cert_decrypted, static_decrypted)
+        except Exception as e:
+            raise CertificateVerificationError("Failed to verify server certificate") from e
+
+        # Send client finish message
+        encrypted_pubkey = nh.encrypt(client.store.noise_key.pub)
+        try:
+            nh.mix_shared_secret_into_key(client.store.noise_key.priv, server_ephemeral)
+        except Exception as e:
+            raise HandshakeError(f"Failed to mix noise private key in") from e
+
+        client_payload = get_client_payload(client.store)
+
+        # Serialize and encrypt client payload
+        try:
+            client_finish_payload_bytes = client_payload.SerializeToString()
+        except Exception as e:
+            raise HandshakeError(f"Failed to marshal client finish payload") from e
+        encrypted_client_finish_payload = nh.encrypt(client_finish_payload_bytes)
+
+        # Create and send client finish message
+        try:
             data = WAWebProtobufsWa6_pb2.HandshakeMessage(
-                clientHello=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientHello(
-                    ephemeral=ephemeral_kp.pub
+                clientFinish=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientFinish(
+                    static=encrypted_pubkey,
+                    payload=encrypted_client_finish_payload
                 )
             ).SerializeToString()
-
-            logger.info(f"Sending ClientHello with ephemeral key length: {len(ephemeral_kp.pub)}")
-            logger.info(f"ClientHello serialized data (hex): {data.hex()}")
-            logger.info(f"ClientHello serialized data length: {len(data)}")
-
-            await fs.send_frame(data)
-
-            # Wait for server response
-            try:
-                resp = await asyncio.wait_for(fs.frames.get(), 20)  # 20 seconds timeout
-            except asyncio.TimeoutError as e:
-                raise HandshakeError("Timed out waiting for handshake response") from e
-
-            # Parse server response
-            try:
-                handshake_response = WAWebProtobufsWa6_pb2.HandshakeMessage()
-                handshake_response.ParseFromString(resp)
-            except Exception as e:
-                raise HandshakeError(f"Failed to unmarshal handshake response") from e
-
-            server_ephemeral = handshake_response.serverHello.ephemeral
-            server_static_ciphertext = handshake_response.serverHello.static
-            certificate_ciphertext = handshake_response.serverHello.payload
-
-            # Log test values for mocking
-            test_log.info(f"HANDSHAKE_SERVER_RESPONSE: {{'server_ephemeral': {server_ephemeral.hex()}, 'server_static_ciphertext': {server_static_ciphertext.hex()}, 'certificate_ciphertext': {certificate_ciphertext.hex()}}}")
-
-            if (len(server_ephemeral) != 32 or
-                not server_static_ciphertext or
-                not certificate_ciphertext):
-                raise HandshakeError("Missing parts of handshake response")
-
-            # Process server ephemeral key
-            nh.authenticate(server_ephemeral)
-            try:
-                nh.mix_shared_secret_into_key(ephemeral_kp.priv, server_ephemeral)
-            except Exception as e:
-                raise HandshakeError(f"Failed to mix server ephemeral key in") from e
-
-            # Decrypt server static key
-            try:
-                static_decrypted = nh.decrypt(server_static_ciphertext)
-            except Exception as e:
-                raise HandshakeError(f"Failed to decrypt server static ciphertext") from e
-
-            # Log test values for mocking
-            test_log.info(f"HANDSHAKE_STATIC_DECRYPTED: {static_decrypted.hex()}")
-
-            if len(static_decrypted) != 32:
-                raise HandshakeError(f"Unexpected length of server static plaintext {len(static_decrypted)} (expected 32)")
-
-            # Mix server static key into handshake
-            try:
-                nh.mix_shared_secret_into_key(ephemeral_kp.priv, static_decrypted)
-            except Exception as e:
-                raise HandshakeError(f"Failed to mix server static key in") from e
-
-            # Decrypt and verify certificate
-            try:
-                cert_decrypted = nh.decrypt(certificate_ciphertext)
-                # Log test values for mocking
-                test_log.info(f"HANDSHAKE_CERT_DECRYPTED: {cert_decrypted.hex()}")
-            except Exception as e:
-                raise HandshakeError(f"Failed to decrypt noise certificate ciphertext") from e
-
-            try:
-                self._verify_server_cert(cert_decrypted, static_decrypted)
-            except Exception as e:
-                raise CertificateVerificationError("Failed to verify server certificate") from e
-
-            # Send client finish message
-            encrypted_pubkey = nh.encrypt(self.store.noise_key.pub)
-            try:
-                nh.mix_shared_secret_into_key(self.store.noise_key.priv, server_ephemeral)
-            except Exception as e:
-                raise HandshakeError(f"Failed to mix noise private key in") from e
-
-            # Get client payload
-            client_payload = None
-            if self.get_client_payload:
-                client_payload = self.get_client_payload()
-            else:
-                client_payload = self.store.get_client_payload()
-
-            # Serialize and encrypt client payload
-            try:
-                client_finish_payload_bytes = client_payload.SerializeToString()
-            except Exception as e:
-                raise HandshakeError(f"Failed to marshal client finish payload") from e
-            encrypted_client_finish_payload = nh.encrypt(client_finish_payload_bytes)
-
-            # Create and send client finish message
-            try:
-                data = WAWebProtobufsWa6_pb2.HandshakeMessage(
-                    clientFinish=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientFinish(
-                        static=encrypted_pubkey,
-                        payload=encrypted_client_finish_payload
-                    )
-                ).SerializeToString()
-            except Exception as e:
-                raise HandshakeError(f"Failed to marshal handshake finish message") from e
-
-            await fs.send_frame(data)
-
-            # Finish handshake and create noise socket
-            try:
-                ns = await nh.finish(fs, self._handle_frame, self._on_disconnect)
-            except Exception as e:
-                raise HandshakeError(f"Failed to create noise socket") from e
-            self.socket = ns
-        except (HandshakeError, CertificateVerificationError, asyncio.TimeoutError):
-            raise
         except Exception as e:
-            raise HandshakeError(f"Unexpected handshake error") from e
+            raise HandshakeError(f"Failed to marshal handshake finish message") from e
 
-    async def _handle_frame(self, data: bytes) -> None:
-        """Handle a frame received from the server.
+        await fs.send_frame(data)
 
-        Args:
-            data: The frame data
-        """
-        from .binary.node import Node  # import here to avoid circular import
-
-        # First, decompress the frame
+        # Finish handshake and create noise socket
         try:
-            unpack_result = Node.unpack(data)
-            # Check if unpack returned a tuple (result, error)
-            if isinstance(unpack_result, tuple):
-                decompressed, unpack_error = unpack_result
-                if unpack_error is not None:
-                    logger.warning(f"Failed to decompress frame: {unpack_error}")
-                    logger.debug(f"Errored frame hex: {data.hex()}")
-                    return
-            else:
-                # If unpack returns just the data (not a tuple)
-                decompressed = unpack_result
-        except Exception as err:
-            logger.warning(f"Failed to decompress frame: {err}")
-            logger.debug(f"Errored frame hex: {data.hex()}")
-            return
+            ns = await nh.finish(fs, lambda data: handle_frame(client, data), lambda ns, remote: on_disconnect(client, ns, remote))
+        except Exception as e:
+            raise HandshakeError(f"Failed to create noise socket") from e
 
-        # Then, unmarshal the decompressed data into a Node
+        client.socket = ns
+
+    except (HandshakeError, CertificateVerificationError, asyncio.TimeoutError):
+        raise
+    except Exception as e:
+        raise HandshakeError(f"Unexpected handshake error") from e
+
+
+async def handle_frame(client: 'Client', data: bytes) -> None:
+    """Handle a frame received from the server.
+
+    Args:
+        client: The client instance
+        data: The frame data
+    """
+    from .binary.node import Node  # import here to avoid circular import
+
+    # First, decompress the frame
+    try:
+        unpack_result = Node.unpack(data)
+        # Check if unpack returned a tuple (result, error)
+        if isinstance(unpack_result, tuple):
+            decompressed, unpack_error = unpack_result
+            if unpack_error is not None:
+                logger.warning(f"Failed to decompress frame: {unpack_error}")
+                logger.debug(f"Errored frame hex: {data.hex()}")
+                return
+        else:
+            # If unpack returns just the data (not a tuple)
+            decompressed = unpack_result
+    except Exception as err:
+        logger.warning(f"Failed to decompress frame: {err}")
+        logger.debug(f"Errored frame hex: {data.hex()}")
+        return
+
+    # Then, unmarshal the decompressed data into a Node
+    try:
+        unmarshal_result = Node.unmarshal(decompressed)
+        # Check if unmarshal returned a tuple (result, error)
+        if isinstance(unmarshal_result, tuple):
+            node, unmarshal_error = unmarshal_result
+            if unmarshal_error is not None:
+                logger.warning(f"Failed to decode node in frame: {unmarshal_error}")
+                logger.debug(f"Errored frame hex: {decompressed.hex()}")
+                return
+        else:
+            # If unmarshal returns just the node (not a tuple)
+            node = unmarshal_result
+    except Exception as err:
+        logger.warning(f"Failed to decode node in frame: {err}")
+        logger.debug(f"Errored frame hex: {decompressed.hex()}")
+        return
+
+    # Only proceed if we have a valid node
+    if node is None:
+        logger.warning("Node is None after successful parsing")
+        return
+
+    recv_log.debug(f"{node.xml_string()}")
+
+    if node.tag == "xmlstreamend":
+        if not client._is_expected_disconnect():
+            logger.warning("Received stream end frame")
+        # TODO: Should we do something else?
+    elif await client._receive_response(node):
+        # Handled by response waiter
+        pass
+    elif node.tag in client.node_handlers:
         try:
-            unmarshal_result = Node.unmarshal(decompressed)
-            # Check if unmarshal returned a tuple (result, error)
-            if isinstance(unmarshal_result, tuple):
-                node, unmarshal_error = unmarshal_result
-                if unmarshal_error is not None:
-                    logger.warning(f"Failed to decode node in frame: {unmarshal_error}")
-                    logger.debug(f"Errored frame hex: {decompressed.hex()}")
-                    return
+            await client.handler_queue.put(node)
+        except asyncio.QueueFull:
+            logger.warning("Handler queue is full, message ordering is no longer guaranteed")
+            asyncio.create_task(client._put_in_handler_queue(node))
+    elif node.tag != "ack":
+        logger.debug(f"Didn't handle WhatsApp node {node.tag}")
+
+
+async def on_disconnect(client: 'Client', ns: NoiseSocket, remote: bool) -> None:
+    """Handle a disconnection event.
+
+    Args:
+        client: The client instance
+        ns: The noise socket that was disconnected
+        remote: True if the disconnection was initiated by the remote end
+    """
+    await ns.stop(False)
+
+    async with client.socket_lock:
+        if client.socket is ns:
+            client.socket = None
+            await client._clear_response_waiters("xmlstreamend")
+
+            if not client._is_expected_disconnect() and remote:
+                logger.debug("Emitting Disconnected event")
+                asyncio.create_task(client.dispatch_event(Disconnected()))
+                asyncio.create_task(client._auto_reconnect())
+            elif remote:
+                logger.debug("OnDisconnect() called, but it was expected, so not emitting event")
             else:
-                # If unmarshal returns just the node (not a tuple)
-                node = unmarshal_result
-        except Exception as err:
-            logger.warning(f"Failed to decode node in frame: {err}")
-            logger.debug(f"Errored frame hex: {decompressed.hex()}")
-            return
+                logger.debug("OnDisconnect() called after manual disconnection")
+        else:
+            logger.debug("Ignoring OnDisconnect on different socket")
 
-        # Only proceed if we have a valid node
-        if node is None:
-            logger.warning("Node is None after successful parsing")
-            return
 
-        recv_log.debug(f"{node.xml_string()}")
+def verify_server_cert(cert_decrypted: bytes, static_decrypted: bytes) -> None:
+    """Verify the server certificate.
 
-        if node.tag == "xmlstreamend":
-            if not self._is_expected_disconnect():
-                logger.warning("Received stream end frame")
-            # TODO: Should we do something else?
-        elif await self._receive_response(node):
-            # Handled by response waiter
-            pass
-        elif node.tag in self.node_handlers:
-            try:
-                await self.handler_queue.put(node)
-            except asyncio.QueueFull:
-                logger.warning("Handler queue is full, message ordering is no longer guaranteed")
-                asyncio.create_task(self._put_in_handler_queue(node))
-        elif node.tag != "ack":
-            logger.debug(f"Didn't handle WhatsApp node {node.tag}")
+    Args:
+        cert_decrypted: The decrypted certificate
+        static_decrypted: The decrypted static key
 
-    async def _on_disconnect(self, ns: NoiseSocket, remote: bool) -> None:
-        """Handle a disconnection event.
+    Raises:
+        CertificateVerificationError: If certificate verification fails
+    """
+    # Log test values for mocking
+    test_log.info("CERT_VERIFY_START: Capturing values for test mocking")
+    test_log.info(f"CERT_VERIFY_INPUTS: {{'cert_decrypted': {cert_decrypted.hex()}, 'static_decrypted': {static_decrypted.hex()}}}")
 
-        Args:
-            ns: The noise socket that was disconnected
-            remote: True if the disconnection was initiated by the remote end
-        """
-        await ns.stop(False)
+    try:
+        try:
+            # Parse certificate chain
+            cert_chain = WACert_pb2.CertChain()
+            cert_chain.ParseFromString(cert_decrypted)
+        except Exception as e:
+            raise CertificateVerificationError(f"Failed to unmarshal noise certificate") from e
 
-        async with self.socket_lock:
-            if self.socket is ns:
-                self.socket = None
-                await self._clear_response_waiters("xmlstreamend")
+        # Extract certificate details
+        intermediate_cert_details_raw = cert_chain.intermediate.details
+        intermediate_cert_signature = cert_chain.intermediate.signature
+        leaf_cert_details_raw = cert_chain.leaf.details
+        leaf_cert_signature = cert_chain.leaf.signature
 
-                if not self._is_expected_disconnect() and remote:
-                    logger.debug("Emitting Disconnected event")
-                    asyncio.create_task(self.dispatch_event(Disconnected()))
-                    asyncio.create_task(self._auto_reconnect())
-                elif remote:
-                    logger.debug("OnDisconnect() called, but it was expected, so not emitting event")
-                else:
-                    logger.debug("OnDisconnect() called after manual disconnection")
-            else:
-                logger.debug("Ignoring OnDisconnect on different socket")
-
-    def _verify_server_cert(self, cert_decrypted: bytes, static_decrypted: bytes) -> None:
-        """Verify the server certificate.
-
-        Args:
-            cert_decrypted: The decrypted certificate
-            static_decrypted: The decrypted static key
-
-        Returns:
-            True if the certificate is valid, False otherwise
-        """
         # Log test values for mocking
-        test_log.info("CERT_VERIFY_START: Capturing values for test mocking")
-        test_log.info(f"CERT_VERIFY_INPUTS: {{'cert_decrypted': {cert_decrypted.hex()}, 'static_decrypted': {static_decrypted.hex()}}}")
+        test_log.info(f"CERT_CHAIN_DETAILS: {{'intermediate_cert_details_raw': {intermediate_cert_details_raw.hex()}, 'intermediate_cert_signature': {intermediate_cert_signature.hex()}, 'leaf_cert_details_raw': {leaf_cert_details_raw.hex()}, 'leaf_cert_signature': {leaf_cert_signature.hex()}}}")
+
+        # Validate certificate parts
+        if (not intermediate_cert_details_raw or
+            not intermediate_cert_signature or
+            not leaf_cert_details_raw or
+            not leaf_cert_signature):
+            raise CertificateVerificationError("Missing parts of noise certificate")
+
+        if len(intermediate_cert_signature) != 64:
+            raise CertificateVerificationError(f"Unexpected length of intermediate cert signature {len(intermediate_cert_signature)} (expected 64)")
+
+        if len(leaf_cert_signature) != 64:
+            raise CertificateVerificationError(f"Unexpected length of leaf cert signature {len(leaf_cert_signature)} (expected 64)")
+
+        # Verify intermediate certificate signature
+        if not verify_signature(WA_CERT_PUB_KEY, intermediate_cert_details_raw, intermediate_cert_signature):
+            raise CertificateVerificationError("Failed to verify intermediate cert signature")
+
+        # Parse intermediate certificate details
         try:
-            try:
-                # Parse certificate chain
-                cert_chain = WACert_pb2.CertChain()
-                cert_chain.ParseFromString(cert_decrypted)
-            except Exception as e:
-                raise CertificateVerificationError(f"Failed to unmarshal noise certificate") from e
-
-            # Extract certificate details
-            intermediate_cert_details_raw = cert_chain.intermediate.details
-            intermediate_cert_signature = cert_chain.intermediate.signature
-            leaf_cert_details_raw = cert_chain.leaf.details
-            leaf_cert_signature = cert_chain.leaf.signature
-
-            # Log test values for mocking
-            test_log.info(f"CERT_CHAIN_DETAILS: {{'intermediate_cert_details_raw': {intermediate_cert_details_raw.hex()}, 'intermediate_cert_signature': {intermediate_cert_signature.hex()}, 'leaf_cert_details_raw': {leaf_cert_details_raw.hex()}, 'leaf_cert_signature': {leaf_cert_signature.hex()}}}")
-
-            # Validate certificate parts
-            if (not intermediate_cert_details_raw or
-                not intermediate_cert_signature or
-                not leaf_cert_details_raw or
-                not leaf_cert_signature):
-                raise CertificateVerificationError("Missing parts of noise certificate")
-
-            if len(intermediate_cert_signature) != 64:
-                raise CertificateVerificationError(f"Unexpected length of intermediate cert signature {len(intermediate_cert_signature)} (expected 64)")
-
-            if len(leaf_cert_signature) != 64:
-                raise CertificateVerificationError(f"Unexpected length of leaf cert signature {len(leaf_cert_signature)} (expected 64)")
-
-            # Verify intermediate certificate signature
-            if not verify_signature(WA_CERT_PUB_KEY, intermediate_cert_details_raw, intermediate_cert_signature):
-                raise CertificateVerificationError("Failed to verify intermediate cert signature")
-
-            # Parse intermediate certificate details
-            try:
-                intermediate_cert_details = WACert_pb2.CertChain.NoiseCertificate.Details()
-                intermediate_cert_details.ParseFromString(intermediate_cert_details_raw)
-            except Exception as e:
-                raise CertificateVerificationError(f"Failed to unmarshal intermediate certificate details") from e
-
-            # Verify issuer serial - use issuerSerial (camelCase) not issuer_serial (snake_case)
-            if intermediate_cert_details.issuerSerial != 0:  # WA_CERT_ISSUER_SERIAL
-                raise CertificateVerificationError(f"Unexpected intermediate issuer serial {intermediate_cert_details.issuerSerial} (expected {WA_CERT_ISSUER_SERIAL})")
-
-            # Verify intermediate key length
-            if len(intermediate_cert_details.key) != 32:
-                raise CertificateVerificationError(f"Unexpected length of intermediate cert key {len(intermediate_cert_details.key)} (expected 32)")
-
-            # Verify leaf certificate signature
-            if not verify_signature(intermediate_cert_details.key, leaf_cert_details_raw, leaf_cert_signature):
-                raise CertificateVerificationError("Failed to verify leaf cert signature")
-
-            # Parse leaf certificate details
-            try:
-                leaf_cert_details = WACert_pb2.CertChain.NoiseCertificate.Details()
-                leaf_cert_details.ParseFromString(leaf_cert_details_raw)
-            except Exception as e:
-                raise CertificateVerificationError(f"Failed to unmarshal leaf certificate details") from e
-
-            # Verify leaf issuer serial - use issuerSerial (camelCase) not issuer_serial (snake_case)
-            if leaf_cert_details.issuerSerial != intermediate_cert_details.serial:
-                raise CertificateVerificationError(f"Unexpected leaf issuer serial {leaf_cert_details.issuerSerial} (expected {intermediate_cert_details.serial})")
-
-            # Verify leaf key matches static key
-            if leaf_cert_details.key != static_decrypted:
-                raise CertificateVerificationError("Cert key doesn't match decrypted static")
-
+            intermediate_cert_details = WACert_pb2.CertChain.NoiseCertificate.Details()
+            intermediate_cert_details.ParseFromString(intermediate_cert_details_raw)
         except Exception as e:
-            logger.error(f"Error verifying server certificate: {e}")
-            raise
+            raise CertificateVerificationError(f"Failed to unmarshal intermediate certificate details") from e
+
+        # Verify issuer serial - use issuerSerial (camelCase) not issuer_serial (snake_case)
+        if intermediate_cert_details.issuerSerial != WA_CERT_ISSUER_SERIAL:
+            raise CertificateVerificationError(f"Unexpected intermediate issuer serial {intermediate_cert_details.issuerSerial} (expected {WA_CERT_ISSUER_SERIAL})")
+
+        # Verify intermediate key length
+        if len(intermediate_cert_details.key) != 32:
+            raise CertificateVerificationError(f"Unexpected length of intermediate cert key {len(intermediate_cert_details.key)} (expected 32)")
+
+        # Verify leaf certificate signature
+        if not verify_signature(intermediate_cert_details.key, leaf_cert_details_raw, leaf_cert_signature):
+            raise CertificateVerificationError("Failed to verify leaf cert signature")
+
+        # Parse leaf certificate details
+        try:
+            leaf_cert_details = WACert_pb2.CertChain.NoiseCertificate.Details()
+            leaf_cert_details.ParseFromString(leaf_cert_details_raw)
+        except Exception as e:
+            raise CertificateVerificationError(f"Failed to unmarshal leaf certificate details") from e
+
+        # Verify leaf issuer serial - use issuerSerial (camelCase) not issuer_serial (snake_case)
+        if leaf_cert_details.issuerSerial != intermediate_cert_details.serial:
+            raise CertificateVerificationError(f"Unexpected leaf issuer serial {leaf_cert_details.issuerSerial} (expected {intermediate_cert_details.serial})")
+
+        # Verify leaf key matches static key
+        if leaf_cert_details.key != static_decrypted:
+            raise CertificateVerificationError("Cert key doesn't match decrypted static")
+
+    except Exception as e:
+        logger.error(f"Error verifying server certificate: {e}")
+        raise
+
 
 def verify_signature(public_key: bytes, message: bytes, signature: bytes) -> bool:
     """Verify a signature using the signal-protocol library (which supports Ed25519/XEdDSA).
@@ -404,6 +403,7 @@ def verify_signature(public_key: bytes, message: bytes, signature: bytes) -> boo
 
     # Return True to allow handshake to continue for testing
     return True
+
     try:
         # Use the signal_protocol library that's already in your dependencies
         from signal_protocol import curve

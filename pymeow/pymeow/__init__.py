@@ -20,7 +20,6 @@ asyncio for efficient asynchronous I/O.
 
 __version__ = "0.1.0"
 
-from .handshake import HandshakeMixin
 # Re-export presence-related types and enums
 from .types.presence import (
     Presence,
@@ -38,8 +37,7 @@ from .user import UserMixin
 
 
 # Create enhanced Client class with message handling capabilities
-class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, NewsletterMixin, UserMixin,
-             HandshakeMixin):
+class Client(BaseClient, MessageHandlingMixin, MessageProcessingMixin, NewsletterMixin, UserMixin):
     """
     Client for WhatsApp Web API with message handling and newsletter capabilities.
 

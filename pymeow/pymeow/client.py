@@ -194,7 +194,6 @@ class Client:
         # Return True to proceed with retry, False to cancel
         self.pre_retry_callback = None
         self.pre_pair_callback = None
-        self.get_client_payload = None
 
         # Settings
         self.auto_trust_identity = True
