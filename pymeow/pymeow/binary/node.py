@@ -5,106 +5,11 @@ Port of whatsmeow/binary/node.go
 """
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, Any, Optional, List, Tuple, TypeVar
+from typing import Optional, List, Union
 
+from .attrs import AttrUtility, Attrs
 from ..types.jid import JID, DEFAULT_USER_SERVER, GROUP_SERVER, NEWSLETTER_SERVER, BROADCAST_SERVER
 
-# Type alias for attributes
-Attrs = Dict[str, Any]
-
-T = TypeVar('T')
-
-class AttrGetter:
-    """
-    Helper class for safely extracting attributes from a Node with type conversion.
-    """
-    def __init__(self, attrs: Attrs):
-        self.attrs = attrs
-
-    def string(self, key: str) -> str:
-        """Get a string attribute or empty string if not found."""
-        return str(self.attrs.get(key, ""))
-
-    def optional_string(self, key: str) -> Optional[str]:
-        """Get a string attribute or None if not found."""
-        value = self.attrs.get(key)
-        return str(value) if value is not None else None
-
-    def int(self, key: str) -> int:
-        """Get an integer attribute or 0 if not found or not convertible."""
-        try:
-            return int(self.attrs.get(key, 0))
-        except (ValueError, TypeError):
-            return 0
-
-    def optional_int(self, key: str) -> Optional[int]:
-        """Get an integer attribute or None if not found or not convertible."""
-        value = self.attrs.get(key)
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (ValueError, TypeError):
-            return None
-
-    def jid(self, key: str) -> JID:
-        """Get a JID attribute or empty JID if not found."""
-        value = self.attrs.get(key, "")
-        if isinstance(value, JID):
-            return value
-        return JID.from_string(str(value))
-
-    def optional_jid(self, key: str) -> Optional[JID]:
-        """Get a JID attribute or None if not found."""
-        value = self.attrs.get(key)
-        if value is None:
-            return None
-        if isinstance(value, JID):
-            return value
-        return JID.from_string(str(value))
-
-    def unix_time(self, key: str) -> datetime:
-        """Get a unix timestamp attribute as datetime or epoch if not found or not convertible."""
-        try:
-            timestamp = int(self.attrs.get(key, 0))
-            return datetime.fromtimestamp(timestamp)
-        except (ValueError, TypeError):
-            return datetime.fromtimestamp(0)
-
-    def unix_milli(self, key: str) -> datetime:
-        """Get a unix millisecond timestamp attribute as datetime or epoch if not found or not convertible."""
-        try:
-            timestamp = int(self.attrs.get(key, 0)) / 1000
-            return datetime.fromtimestamp(timestamp)
-        except (ValueError, TypeError):
-            return datetime.fromtimestamp(0)
-
-    def get_string(self, key: str, required: bool = False) -> Tuple[str, bool]:
-        """Get a string attribute with existence check."""
-        value = self.attrs.get(key)
-        if value is None:
-            return "", False
-        return str(value), True
-
-    def get_int(self, key: str, required: bool = False) -> Tuple[int, bool]:
-        """Get an integer attribute with existence and conversion check."""
-        value = self.attrs.get(key)
-        if value is None:
-            return 0, False
-        try:
-            return int(value), True
-        except (ValueError, TypeError):
-            return 0, False
-
-    def get_jid(self, key: str, required: bool = False) -> Tuple[JID, bool]:
-        """Get a JID attribute with existence check."""
-        value = self.attrs.get(key)
-        if value is None:
-            return JID(), False
-        if isinstance(value, JID):
-            return value, True
-        return JID.from_string(str(value)), True
 
 @dataclass
 class Node:
@@ -115,24 +20,16 @@ class Node:
     containing a tag, attributes, and optional content.
     """
     tag: str
-    attributes: Optional[Attrs] = field(default_factory=dict)
-    content: Optional[Any] = None
+    attrs: Attrs = field(default_factory=dict)
+    content: Optional[Union[List['Node'], bytes]] = None
 
-    @property
-    def attrs(self) -> Attrs:
-        """Alias for attributes for compatibility with Go code."""
-        return self.attributes
-
-    def attr_getter(self) -> AttrGetter:
+    def attr_getter(self) -> AttrUtility:
         """
-        Returns an AttrGetter for this node's attributes.
+        Returns the AttrUtility for this Node.
 
-        This provides type-safe attribute extraction methods.
-
-        Returns:
-            An AttrGetter instance for this node's attributes
+        This is equivalent to Go's (n *Node) AttrGetter() *AttrUtility
         """
-        return AttrGetter(self.attributes)
+        return AttrUtility(self.attrs)
 
     def xml_string(self) -> str:
         """
@@ -143,7 +40,7 @@ class Node:
         Returns:
             String representation of the node
         """
-        attrs_str = " ".join(f'{k}="{v}"' for k, v in self.attributes.items())
+        attrs_str = " ".join(f'{k}="{v}"' for k, v in self.attrs.items())
         if attrs_str:
             attrs_str = " " + attrs_str
 
@@ -163,55 +60,6 @@ class Node:
         else:
             return f"<{self.tag}{attrs_str}>{self.content}</{self.tag}>"
 
-    def marshal(self) -> bytes:
-        """
-        Encodes this node into WhatsApp's binary XML representation.
-
-        Returns:
-            Binary XML representation of the node
-
-        Raises:
-            Exception: If encoding fails
-        """
-        from .encoder import new_encoder
-
-        w = new_encoder()
-        w.write_node(self)
-        return w.get_data()
-
-    @staticmethod
-    def unmarshal(data: bytes) -> Tuple[Optional['Node'], Optional[Exception]]:
-        """
-        Decodes WhatsApp's binary XML representation into a Node.
-
-        Args:
-            data: Binary XML data to decode
-
-        Returns:
-            Tuple of (node, error) where error is None if decoding was successful
-        """
-        from .decoder import unmarshal as decoder_unmarshal
-
-        return decoder_unmarshal(data)
-
-    @staticmethod
-    def unpack(data: bytes) -> bytes:
-        """
-        Unpack the given decrypted data from the WhatsApp web API.
-
-        Args:
-            data: The encrypted data to unpack
-
-        Returns:
-            The unpacked data
-
-        Raises:
-            ValueError: If the data is compressed but cannot be decompressed
-        """
-        from .unpack import unpack as unpack_data
-
-        return unpack_data(data)
-
     def get_children(self) -> List['Node']:
         """
         Returns the Content of the node as a list of nodes.
@@ -224,8 +72,10 @@ class Node:
         if self.content is None:
             return []
 
-        children = self.content if isinstance(self.content, list) else []
-        return [child for child in children if isinstance(child, Node)]
+        if isinstance(self.content, list):
+            return [child for child in self.content if isinstance(child, Node)]
+
+        return []
 
     def get_children_by_tag(self, tag: str) -> List['Node']:
         """
@@ -239,7 +89,7 @@ class Node:
         """
         return [node for node in self.get_children() if node.tag == tag]
 
-    def get_optional_child_by_tag(self, *tags: str) -> Tuple['Node', bool]:
+    def get_optional_child_by_tag(self, *tags: str) -> tuple['Node', bool]:
         """
         Finds the first child with the given tag and returns it.
 
@@ -295,7 +145,8 @@ class Node:
         mn = json.loads(data)
 
         # Process attributes
-        for key, val in mn.get('attrs', {}).items():
+        attrs = mn.get('attrs', {})
+        for key, val in attrs.items():
             if isinstance(val, str):
                 # Try to parse JIDs
                 try:
@@ -304,25 +155,28 @@ class Node:
                                    parsed.server == NEWSLETTER_SERVER or
                                    parsed.server == GROUP_SERVER or
                                    parsed.server == BROADCAST_SERVER)):
-                        mn['attrs'][key] = parsed
+                        attrs[key] = parsed
                 except:
                     pass
             elif isinstance(val, float):
                 # Convert floats to ints
-                mn['attrs'][key] = int(val)
+                attrs[key] = int(val)
 
         self.tag = mn.get('tag', '')
-        self.attributes = mn.get('attrs', {})
+        self.attrs = attrs
 
         # Process content
         content = mn.get('content')
         if content:
             if isinstance(content, list):
                 # Content is a list of nodes
-                self.content = [Node(tag=n.get('tag', ''),
-                                    attributes=n.get('attrs', {}),
-                                    content=n.get('content'))
-                               for n in content]
+                nodes = []
+                for n in content:
+                    node = Node(tag=n.get('tag', ''),
+                               attrs=n.get('attrs', {}),
+                               content=n.get('content'))
+                    nodes.append(node)
+                self.content = nodes
             elif isinstance(content, str):
                 # Content is a binary string
                 self.content = content.encode('utf-8')
@@ -350,7 +204,7 @@ def marshal(n: Node) -> bytes:
     return w.get_data()
 
 
-def unmarshal(data: bytes) -> Tuple[Optional[Node], Optional[Exception]]:
+def unmarshal(data: bytes) -> tuple[Optional[Node], Optional[Exception]]:
     """
     Decodes WhatsApp's binary XML representation into a Node.
 
