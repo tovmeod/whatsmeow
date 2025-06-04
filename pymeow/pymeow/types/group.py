@@ -28,7 +28,7 @@ class GroupMembershipApprovalMode:
 class GroupParent:
     """Information about a parent group."""
     is_parent: bool = False
-    default_membership_approval_mode: str = ""  # request_required
+    default_membership_approval_mode: str = ""
 
 
 @dataclass
@@ -92,8 +92,6 @@ class GroupParticipantAddRequest:
 @dataclass
 class GroupParticipant:
     """Contains info about a participant of a WhatsApp group chat."""
-    # The primary JID that should be used to send messages to this participant.
-    # Always equals either the LID or phone number.
     jid: Optional[JID] = None
     phone_number: Optional[JID] = None
     lid: Optional[JID] = None
@@ -101,11 +99,8 @@ class GroupParticipant:
     is_admin: bool = False
     is_super_admin: bool = False
 
-    # This is only present for anonymous users in announcement groups, it's an obfuscated phone number
     display_name: str = ""
 
-    # When creating groups, adding some participants may fail.
-    # In such cases, the error code will be here.
     error: int = 0
     add_request: Optional[GroupParticipantAddRequest] = None
 
@@ -158,8 +153,6 @@ class GroupParticipantRequest:
     """Information about a request to join a group."""
     jid: Optional[JID] = None
     requested_at: Optional[datetime] = None
-
-
 
 
 @dataclass
