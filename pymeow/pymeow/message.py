@@ -3,25 +3,39 @@ Message handling for PyMeow.
 
 Port of whatsmeow/message.go - handles encrypted and plaintext messages.
 """
-
+import asyncio
 import hashlib
 import logging
+import os
 import time
+import traceback
+import zlib
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Any, TYPE_CHECKING, Callable, Awaitable, List
+from typing import Tuple, Optional
 
-from .binary.node import Node, AttrGetter
+from .armadillomessage import handle_decrypted_armadillo
+from .types import MessageInfo
+from .appstate.keys import ALL_PATCH_NAMES
+from .binary.attrs import Attrs
+from .binary.node import Node
+from .download import download
 from .exceptions import ErrNotLoggedIn
+from .generated import waE2E
+from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
+from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .msgsecret import decrypt_bot_message
-from .types import JID, MessageInfo
-from .types.events import (
-    Message as MessageEvent,
-    UndecryptableMessage,
-    HistorySync,
-    NewsletterMessageMeta
-)
-from .types.message import MessageSource, AddressingMode, MessageID
+from .receipt import maybe_deferred_ack, send_message_receipt
+from .retry import delayed_request_message_from_phone, send_retry_receipt, cancel_delayed_request_from_phone
+from .store import store
+from .types import JID, ReceiptType
+from .types import events
+from .types.jid import NEWSLETTER_SERVER, GROUP_SERVER, BROADCAST_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, \
+    BOT_SERVER, EMPTY_JID, LEGACY_USER_SERVER
+from .types.message import MessageSource, AddressingMode, MessageID, MessageServerID, EditAttribute, MsgBotInfo, \
+    BotEditType, MsgMetaInfo
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
+from .user import parse_verified_name_content, update_business_name, update_push_name, handle_historical_push_names
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +55,9 @@ ENC_SECRET_BOT_MSG = "bot_msg_enc"
 
 pb_serializer = None  # Will be set when store is initialized
 
+if TYPE_CHECKING:
+    from .client import Client
+
 # Define EventAlreadyProcessed locally as it's defined in the Go code
 class EventAlreadyProcessed(Exception):
     """Error indicating that an event was already processed."""
@@ -48,30 +65,111 @@ class EventAlreadyProcessed(Exception):
         super().__init__(message)
 
 
-def parse_message_source(node: Node, require_participant: bool = True, client_id: Optional[JID] = None, client_lid: Optional[JID] = None) -> MessageSource:
-    """Parse message source information from a binary node.
+async def handle_encrypted_message(client: 'Client', node: Node) -> None:
+    """
+    Port of Go method handleEncryptedMessage from client.go.
+
+    Handles an encrypted message node by parsing message info, storing mappings,
+    updating names, and either handling as plaintext or decrypting based on sender server.
 
     Args:
+        client: The WhatsApp client instance
+        node: The encrypted message node
+    """
+    # TODO: Review context implementation
+    # TODO: Review parse_message_info implementation
+    # TODO: Review store_lid_pn_mapping implementation
+    # TODO: Review update_business_name implementation
+    # TODO: Review update_push_name implementation
+    # TODO: Review maybe_deferred_ack implementation
+    # TODO: Review handle_plaintext_message implementation
+    # TODO: Review decrypt_messages implementation
+    # TODO: Review types.NewsletterServer implementation
+
+    # ctx = None  # Python equivalent of context.TODO()
+
+    try:
+        info, err = parse_message_info(client, node)
+        err = None
+    except Exception as e:
+        info = None
+        err = e
+
+    if err is not None:
+        logger.warning("Failed to parse message: %v", err)
+    else:
+        if not info.sender_alt.is_empty():
+            await client.store_lid_pn_mapping(info.sender_alt, info.sender)
+        elif not info.recipient_alt.is_empty():
+            await client.store_lid_pn_mapping(info.recipient_alt, info.chat)
+
+        if (info.verified_name is not None and
+            len(info.verified_name.details.get_verified_name()) > 0):
+            # Go goroutine equivalent - async task
+            def update_business_name_async():
+                update_business_name(client, info.sender, info,
+                                     info.verified_name.details.get_verified_name())
+
+            asyncio.create_task(asyncio.to_thread(update_business_name_async))
+
+        if len(info.push_name) > 0 and info.push_name != "-":
+            # Go goroutine equivalent - async task
+            def update_push_name_async():
+                update_push_name(client, info.sender, info, info.push_name)
+
+            asyncio.create_task(asyncio.to_thread(update_push_name_async))
+
+        # Defer the ack (Go's defer equivalent)
+        ack_func = maybe_deferred_ack(client, node)
+        try:
+            if info.sender.server == NEWSLETTER_SERVER:
+                await handle_plaintext_message(client, info, node)
+            else:
+                decrypt_messages(client, info, node)
+        finally:
+            ack_func()
+
+
+async def parse_message_source(client: 'Client', node: Node, require_participant: bool) -> Tuple[
+    Optional['MessageSource'], Optional[Exception]]:
+    """
+    Port of Go method parseMessageSource from client.go.
+
+    Parses message source information from a binary node including chat, sender,
+    addressing mode, and other metadata based on message type.
+
+    Args:
+        client: The WhatsApp client instance
         node: The binary node containing message information
         require_participant: Whether to require participant attribute for group messages
-        client_id: The client's JID
-        client_lid: The client's LID
 
     Returns:
-        MessageSource object with parsed information
-
-    Raises:
-        NotLoggedInError: If client_id is empty
+        Tuple containing (MessageSource object, error) or (None, error)
     """
-    if not client_id or client_id.is_empty():
-        raise ErrNotLoggedIn("Client ID is required to parse message source")
+    # TODO: Review MessageSource implementation
+    # TODO: Review get_own_id implementation
+    # TODO: Review Store.get_lid implementation
+    # TODO: Review AttrGetter implementation
+    # TODO: Review types.GroupServer implementation
+    # TODO: Review types.BroadcastServer implementation
+    # TODO: Review types.NewsletterServer implementation
+    # TODO: Review types.AddressingMode implementation
+    # TODO: Review types.AddressingModeLID implementation
+    # TODO: Review ErrNotLoggedIn implementation
 
-    ag = AttrGetter(node.attrs)
-    from_jid = ag.jid("from")
     source = MessageSource()
-    source.addressing_mode = AddressingMode(ag.optional_string("addressing_mode") or "")
 
-    if from_jid.server in ["g.us", "broadcast"]:  # Group or broadcast
+    client_id = client.get_own_id()
+    client_lid = client.store.get_lid()
+
+    if client_id.is_empty():
+        return None, ErrNotLoggedIn
+
+    ag = node.attr_getter()
+    from_jid = ag.jid("from")
+    source.addressing_mode = AddressingMode(ag.optional_string("addressing_mode"))
+
+    if from_jid.server == GROUP_SERVER or from_jid.server == BROADCAST_SERVER:
         source.is_group = True
         source.chat = from_jid
         if require_participant:
@@ -84,22 +182,22 @@ def parse_message_source(node: Node, require_participant: bool = True, client_id
         else:
             source.sender_alt = ag.optional_jid_or_empty("participant_lid")
 
-        if source.sender.user == client_id.user or (client_lid and source.sender.user == client_lid.user):
+        if source.sender.user == client_id.user or source.sender.user == client_lid.user:
             source.is_from_me = True
 
-        if from_jid.server == "broadcast":
+        if from_jid.server == BROADCAST_SERVER:
             source.broadcast_list_owner = ag.optional_jid_or_empty("recipient")
 
-    elif from_jid.server == "newsletter":
+    elif from_jid.server == NEWSLETTER_SERVER:
         source.chat = from_jid
         source.sender = from_jid
-        # TODO: IsFromMe for newsletters?
+        # TODO IsFromMe?
 
-    elif from_jid.user == client_id.user or (client_lid and from_jid.user == client_lid.user):
+    elif from_jid.user == client_id.user or from_jid.user == client_lid.user:
         source.is_from_me = True
         source.sender = from_jid
         recipient = ag.optional_jid("recipient")
-        if recipient:
+        if recipient is not None:
             source.chat = recipient
         else:
             source.chat = from_jid.to_non_ad()
@@ -112,15 +210,13 @@ def parse_message_source(node: Node, require_participant: bool = True, client_id
     elif from_jid.is_bot():
         source.sender = from_jid
         meta = node.get_child_by_tag("meta")
-        if meta:
-            meta_ag = AttrGetter(meta.attrs)
-            target_chat_jid = meta_ag.optional_jid("target_chat_jid")
-            if target_chat_jid:
-                source.chat = target_chat_jid.to_non_ad()
-            else:
-                source.chat = from_jid
+        ag = meta.attr_getter()
+        target_chat_jid = ag.optional_jid("target_chat_jid")
+        if target_chat_jid is not None:
+            source.chat = target_chat_jid.to_non_ad()
         else:
             source.chat = from_jid
+
     else:
         source.chat = from_jid.to_non_ad()
         source.sender = from_jid
@@ -130,195 +226,246 @@ def parse_message_source(node: Node, require_participant: bool = True, client_id
             source.sender_alt = ag.optional_jid_or_empty("sender_lid")
 
     if not source.sender_alt.is_empty() and source.sender_alt.device == 0:
-        source.sender_alt.device = source.sender.device
+        # Create a new JID with the updated device
+        source.sender_alt = JID(
+            user=source.sender_alt.user,
+            server=source.sender_alt.server,
+            device=source.sender.device
+        )
 
-    ag.raise_on_error()
-    return source
+    err = ag.error()
+    return source, err
 
 
-def parse_msg_bot_info(node: Node) -> dict:
-    """Parse bot information from a message node.
-
-    Args:
-        node: The binary node containing bot information
-
-    Returns:
-        Dictionary with bot information
+def parse_msg_bot_info(node: 'Node') -> Tuple[Optional['MsgBotInfo'], Optional[Exception]]:
     """
-    bot_node = node.get_child_by_tag("bot")
-    if not bot_node:
-        return {}
+    Port of Go method parseMsgBotInfo from message.go.
 
-    ag = AttrGetter(bot_node.attrs)
-    bot_info = {
-        "edit_type": ag.string("edit") if ag.has_attr("edit") else None
-    }
-
-    if bot_info["edit_type"] in ["inner", "last"]:
-        bot_info["edit_target_id"] = MessageID(ag.string("edit_target_id"))
-        bot_info["edit_sender_timestamp_ms"] = ag.unix_milli("sender_timestamp_ms")
-
-    ag.raise_on_error()
-    return bot_info
-
-
-def parse_msg_meta_info(node: Node) -> dict:
-    """Parse meta information from a message node.
-
-    Args:
-        node: The binary node containing meta information
-
-    Returns:
-        Dictionary with meta information
-    """
-    meta_node = node.get_child_by_tag("meta")
-    if not meta_node:
-        return {}
-
-    ag = AttrGetter(meta_node.attrs)
-    meta_info = {
-        "target_id": MessageID(ag.optional_string("target_id")) if ag.has_attr("target_id") else None,
-        "target_sender": ag.optional_jid_or_empty("target_sender_jid"),
-        "thread_message_id": MessageID(ag.optional_string("thread_msg_id")) if ag.has_attr("thread_msg_id") else None,
-        "thread_message_sender_jid": ag.optional_jid_or_empty("thread_msg_sender_jid")
-    }
-
-    if ag.has_attr("deprecated_lid_session"):
-        meta_info["deprecated_lid_session"] = ag.get_bool("deprecated_lid_session")
-    else:
-        meta_info["deprecated_lid_session"] = None
-
-    ag.raise_on_error()
-    return meta_info
-
-
-def parse_message_info(node: Node, client_id: JID, client_lid: Optional[JID] = None) -> MessageInfo:
-    """Parse complete message information from a binary node.
+    Parses bot information from a message node including edit type,
+    target ID, and sender timestamp for bot messages.
 
     Args:
         node: The binary node containing message information
-        client_id: The client's JID
-        client_lid: The client's LID (optional)
 
     Returns:
-        MessageInfo object with parsed information
+        Tuple containing (MsgBotInfo object, error) or (None, error)
     """
-    source = parse_message_source(node, True, client_id, client_lid)
+    # TODO: Review MsgBotInfo implementation
+    # TODO: Review BotEditType implementation
+    # TODO: Review MessageID implementation
+    # TODO: Review types.EditTypeInner implementation
+    # TODO: Review types.EditTypeLast implementation
+    # TODO: Review AttrGetter implementation
 
-    ag = AttrGetter(node.attrs)
+    bot_info = MsgBotInfo()
+
+    bot_node = node.get_child_by_tag("bot")
+
+    ag = bot_node.attr_getter()
+    bot_info.edit_type = BotEditType(ag.string("edit"))
+
+    if bot_info.edit_type == BotEditType.INNER or bot_info.edit_type == BotEditType.LAST:
+        bot_info.edit_target_id = MessageID(ag.string("edit_target_id"))
+        bot_info.edit_sender_timestamp_ms = ag.unix_milli("sender_timestamp_ms")
+
+    err = ag.error()
+    return bot_info, err
+
+
+def parse_msg_meta_info(node: Node) -> Tuple[MsgMetaInfo, Optional[Exception]]:
+    """
+    Port of Go method parseMsgMetaInfo from message.go.
+
+    Parses meta information from a message node including target ID,
+    target sender, thread information, and deprecated LID session flag.
+
+    Args:
+        node: The binary node containing message information
+
+    Returns:
+        Tuple containing (MsgMetaInfo object, error or None)
+    """
+    # TODO: Review MsgMetaInfo implementation
+    # TODO: Review MessageID implementation
+    # TODO: Review Node.get_child_by_tag implementation
+    # TODO: Review AttrGetter implementation
+    # TODO: Review AttrGetter.optional_string implementation
+    # TODO: Review AttrGetter.optional_jid_or_empty implementation
+    # TODO: Review AttrGetter.get_bool implementation
+
+    meta_info = MsgMetaInfo()
+
+    meta_node = node.get_child_by_tag("meta")
+
+    ag = meta_node.attr_getter()
+    meta_info.target_id = MessageID(ag.optional_string("target_id"))
+    meta_info.target_sender = ag.optional_jid_or_empty("target_sender_jid")
+
+    deprecated_lid_session, ok = ag.get_bool("deprecated_lid_session", False)
+    if ok:
+        meta_info.deprecated_lid_session = deprecated_lid_session
+
+    meta_info.thread_message_id = MessageID(ag.optional_string("thread_msg_id"))
+    meta_info.thread_message_sender_jid = ag.optional_jid_or_empty("thread_msg_sender_jid")
+
+    err = ag.error()
+    return meta_info, err
+
+
+async def parse_message_info(client: 'Client', node: Node) -> Tuple[Optional['MessageInfo'], Optional[Exception]]:
+    """
+    Port of Go method parseMessageInfo from client.go.
+
+    Parses complete message information from a binary node including message source,
+    attributes, and child node content.
+
+    Args:
+        client: The WhatsApp client instance
+        node: The binary node containing message information
+
+    Returns:
+        Tuple containing (MessageInfo object, error) or (None, error)
+    """
+    # TODO: Review MessageInfo implementation
+    # TODO: Review parse_message_source implementation
+    # TODO: Review AttrGetter implementation
+    # TODO: Review parse_verified_name_content implementation
+    # TODO: Review parse_msg_bot_info implementation
+    # TODO: Review parse_msg_meta_info implementation
+    # TODO: Review types.MessageID implementation
+    # TODO: Review types.MessageServerID implementation
+    # TODO: Review types.EditAttribute implementation
+
     info = MessageInfo()
-    info.message_source = source
-    info.id = MessageID(ag.string("id"))
-    info.server_id = ag.optional_int("server_id")
-    info.timestamp = ag.unix_time("t")
-    info.push_name = ag.optional_string("notify") or ""
-    info.category = ag.optional_string("category") or ""
-    info.type = ag.optional_string("type") or ""
-    info.edit = ag.optional_string("edit") or ""
 
-    ag.raise_on_error()
+    # Parse message source first
+    try:
+        message_source, err = await parse_message_source(client, node, True)
+        if err is not None:
+            return None, err
+        info.message_source = message_source
+    except Exception as e:
+        return None, e
+
+    # Parse attributes
+    ag = node.attr_getter()
+    info.id = MessageID(ag.string("id"))
+    info.server_id = MessageServerID(ag.optional_int("server_id"))
+    info.timestamp = ag.unix_time("t")
+    info.push_name = ag.optional_string("notify")
+    info.category = ag.optional_string("category")
+    info.type = ag.optional_string("type")
+    info.edit = EditAttribute(ag.optional_string("edit"))
+
+    if not ag.ok():
+        return None, ag.error()
 
     # Parse child nodes
-    for child in node.children:
+    for child in node.get_children():
         if child.tag == "multicast":
             info.multicast = True
         elif child.tag == "verified_name":
-            # TODO: Parse verified name
-            info.verified_name = child
+            try:
+                verified_name, err = parse_verified_name_content(child)
+                if err is not None:
+                    logger.warning("Failed to parse verified_name node in %s: %v", info.id, err)
+                else:
+                    info.verified_name = verified_name
+            except Exception as e:
+                logger.warning("Failed to parse verified_name node in %s: %v", info.id, e)
         elif child.tag == "bot":
-            info.msg_bot_info = parse_msg_bot_info(node)
+            try:
+                bot_info, err = parse_msg_bot_info(child)
+                if err is not None:
+                    logger.warning("Failed to parse <bot> node in %s: %v", info.id, err)
+                else:
+                    info.msg_bot_info = bot_info
+            except Exception as e:
+                logger.warning("Failed to parse <bot> node in %s: %v", info.id, e)
         elif child.tag == "meta":
-            info.msg_meta_info = parse_msg_meta_info(node)
+            try:
+                meta_info, err = parse_msg_meta_info(child)
+                if err is not None:
+                    logger.warning("Failed to parse <meta> node in %s: %v", info.id, err)
+                else:
+                    info.msg_meta_info = meta_info
+            except Exception as e:
+                logger.warning("Failed to parse <meta> node in %s: %v", info.id, e)
         elif child.tag == "franking":
-            # TODO: Handle franking
+            # TODO
             pass
         elif child.tag == "trace":
-            # TODO: Handle trace
+            # TODO
             pass
         else:
-            # Check for media type
-            if "mediatype" in child.attrs:
-                info.media_type = child.attrs["mediatype"]
+            child_ag = child.attr_getter()
+            media_type, ok = child_ag.get_string("mediatype", False)
+            if ok:
+                info.media_type = media_type
 
-    return info
+    return info, None
 
 
-async def handle_encrypted_message(client, node: Node):
-    """Handle an encrypted message node.
+async def handle_plaintext_message(client: 'Client', info: 'MessageInfo', node: 'Node') -> None:
+    """
+    Port of Go method handlePlaintextMessage from message.go.
+
+    Handles plaintext messages (typically from newsletters) by unmarshaling
+    the protobuf content and dispatching the resulting message event.
 
     Args:
         client: The WhatsApp client instance
-        node: The encrypted message node
+        info: Message information containing sender, timestamp, etc.
+        node: The binary node containing the plaintext message
+
+    Returns:
+        None
     """
+    # TODO: Review Node.get_optional_child_by_tag implementation
+    # TODO: Review MessageInfo.source_string implementation
+    # TODO: Review store_message_secret implementation
+    # TODO: Review events.Message implementation
+    # TODO: Review events.NewsletterMessageMeta implementation
+    # TODO: Review dispatch_event implementation
+    # TODO: Review waE2E_pb2.Message implementation
+
+    # TODO edits have an additional <meta msg_edit_t="1696321271735" original_msg_t="1696321248"/> node
+    plaintext, ok = node.get_optional_child_by_tag("plaintext")
+    if not ok:
+        # 3:
+        return
+
+    if not isinstance(plaintext.content, bytes):
+        logger.warning("Plaintext message from %s doesn't have byte content", info.source_string())
+        return
+
+    plaintext_body = plaintext.content
+
+    msg = waE2E_pb2.Message()
     try:
-        info = parse_message_info(node, client.get_own_id(), client.get_own_lid())
-    except Exception as e:
-        logger.warning(f"Failed to parse message: {e}")
-        return
-
-    # Store LID/PN mappings
-    if not info.sender_alt.is_empty():
-        await client.store_lid_pn_mapping(info.sender_alt, info.sender)
-    elif not info.recipient_alt.is_empty():
-        await client.store_lid_pn_mapping(info.recipient_alt, info.chat)
-
-    # Update business name if available
-    if info.verified_name and hasattr(info.verified_name, 'details'):
-        verified_name = getattr(info.verified_name.details, 'verified_name', '')
-        if verified_name:
-            client.schedule_task(client.update_business_name(info.sender, info, verified_name))
-
-    # Update push name if available
-    if info.push_name and info.push_name != "-":
-        client.schedule_task(client.update_push_name(info.sender, info, info.push_name))
-
-    # Handle the message based on sender server
-    if info.sender.server == "newsletter":
-        await handle_plaintext_message(client, info, node)
-    else:
-        await decrypt_messages(client, info, node)
-
-
-async def handle_plaintext_message(client, info: MessageInfo, node: Node):
-    """Handle a plaintext message (typically from newsletters).
-
-    Args:
-        client: The WhatsApp client instance
-        info: Message information
-        node: The message node
-    """
-    plaintext_node = node.get_optional_child_by_tag("plaintext")
-    if not plaintext_node:
-        return
-
-    if not isinstance(plaintext_node.content, bytes):
-        logger.warning(f"Plaintext message from {info.source_string()} doesn't have byte content")
-        return
-
-    try:
-        msg = waE2E_pb2.Message()
-        msg.ParseFromString(plaintext_node.content)
-    except Exception as e:
-        logger.warning(f"Error unmarshaling plaintext message from {info.source_string()}: {e}")
+        msg.ParseFromString(plaintext_body)
+    except Exception as err:
+        logger.warning("Error unmarshaling plaintext message from %s: %v", info.source_string(), err)
         return
 
     await store_message_secret(client, info, msg)
 
-    evt = MessageEvent(info=info, raw_message=msg)
+    evt = events.Message(
+        info=info,  # Go uses *info which becomes info in Python
+        raw_message=msg
+    )
 
-    # Check for newsletter metadata
-    meta_node = node.get_optional_child_by_tag("meta")
-    if meta_node:
-        meta_ag = AttrGetter(meta_node.attrs)
-        evt.newsletter_meta = NewsletterMessageMeta(
-            edit_ts=meta_ag.unix_milli("msg_edit_t"),
-            original_ts=meta_ag.unix_time("original_msg_t")
+    meta, ok = node.get_optional_child_by_tag("meta")
+    if ok:
+        evt.newsletter_meta = events.NewsletterMessageMeta(
+            edit_ts=meta.attr_getter().unix_milli("msg_edit_t"),
+            original_ts=meta.attr_getter().unix_time("original_msg_t")
         )
 
-    client.dispatch_event(evt.unwrap_raw())
+    await client.dispatch_event(evt.unwrap_raw())
 
 
-def migrate_session_store(client, pn: JID, lid: JID):
+async def migrate_session_store(client, pn: JID, lid: JID):
     """Migrate session store from phone number to LID.
 
     Args:
@@ -327,337 +474,471 @@ def migrate_session_store(client, pn: JID, lid: JID):
         lid: LID JID
     """
     try:
-        client.store.sessions.migrate_pn_to_lid(pn, lid)
+        await client.store.sessions.migrate_pn_to_lid(pn, lid)
     except Exception as e:
         logger.error(f"Failed to migrate signal store from {pn} to {lid}: {e}")
 
 
-async def decrypt_messages(client, info: MessageInfo, node: Node):
-    """Decrypt encrypted messages from a node.
+async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> None:
+    """
+    Port of Go method decryptMessages from client.go.
+
+    Decrypts encrypted messages from a binary node and handles different
+    encryption types (pkmsg, msg, skmsg, msmsg).
 
     Args:
         client: The WhatsApp client instance
-        info: Message information
-        node: The message node containing encrypted content
-    """
-    # Check for unavailable message
-    unavailable_node = node.get_optional_child_by_tag("unavailable")
-    enc_nodes = node.get_children_by_tag("enc")
+        info: Message information containing sender, timestamp, etc.
+        node: The binary node containing encrypted messages
 
-    if unavailable_node and not enc_nodes:
-        u_type = unavailable_node.attrs.get("type", "")
-        logger.warning(f"Unavailable message {info.id} from {info.source_string()} (type: {u_type})")
-        client.schedule_task(delayed_request_message_from_phone(client, info))
-        client.dispatch_event(UndecryptableMessage(
-            info=info,
+    Returns:
+        None
+    """
+    # TODO: Review Node.get_optional_child_by_tag implementation
+    # TODO: Review Node.get_children_by_tag implementation
+    # TODO: Review events.UnavailableType implementation
+    # TODO: Review events.UndecryptableMessage implementation
+    # TODO: Review delayed_request_message_from_phone implementation
+    # TODO: Review dispatch_event implementation
+    # TODO: Review migrate_session_store implementation
+    # TODO: Review decrypt_dm implementation
+    # TODO: Review decrypt_group_msg implementation
+    # TODO: Review decrypt_bot_message implementation
+    # TODO: Review handle_decrypted_message implementation
+    # TODO: Review handle_decrypted_armadillo implementation
+    # TODO: Review send_retry_receipt implementation
+    # TODO: Review send_message_receipt implementation
+    # TODO: Review EventAlreadyProcessed exception
+    # TODO: Review signalerror.ErrNoSenderKeyForUser exception
+
+    unavailable_node, ok = node.get_optional_child_by_tag("unavailable")
+    if ok and len(node.get_children_by_tag("enc")) == 0:
+        u_type = events.UnavailableType(unavailable_node.attr_getter().string("type"))
+        logger.warning("Unavailable message %s from %s (type: %q)", info.id, info.source_string(), u_type)
+        # Go's `go` keyword becomes asyncio.create_task or similar
+        asyncio.create_task(delayed_request_message_from_phone(client, info))  # todo store the returned task so it is not gc'ed
+        await client.dispatch_event(events.UndecryptableMessage(
+            info=info,  # Go uses *info, Python uses info directly
             is_unavailable=True,
             unavailable_type=u_type
         ))
         return
 
-    logger.debug(f"Decrypting message from {info.source_string()}")
+    children = node.get_children()
+    logger.debug("Decrypting message from %s", info.source_string())
     handled = False
     contains_direct_msg = False
     sender_encryption_jid = info.sender
 
-    # Handle LID migration
-    if info.sender.server == "s.whatsapp.net" and not info.sender.is_bot():
-        if info.sender_alt.server == "lid":
+    if info.sender.server == DEFAULT_USER_SERVER and not info.sender.is_bot():
+        if info.sender_alt.server == HIDDEN_USER_SERVER:
             sender_encryption_jid = info.sender_alt
-            migrate_session_store(client, info.sender, info.sender_alt)
+            await migrate_session_store(client, info.sender, info.sender_alt)
         else:
-            try:
-                lid = await client.store.lids.get_lid_for_pn(info.sender)
-                if not lid.is_empty():
-                    migrate_session_store(client, info.sender, lid)
-                    sender_encryption_jid = lid
-                    info.sender_alt = lid
-                else:
-                    logger.warning(f"No LID found for {info.sender}")
-            except Exception as e:
-                logger.error(f"Failed to get LID for {info.sender}: {e}")
+            lid, err = client.store.lids.get_lid_for_pn(info.sender)
+            if err is not None:
+                logger.error("Failed to get LID for %s: %v", info.sender, err)
+            elif not lid.is_empty():
+                await migrate_session_store(client, info.sender, lid)
+                sender_encryption_jid = lid
+                info.message_source.sender_alt = lid
+            else:
+                logger.warning("No LID found for %s", info.sender)
 
-    for child in node.children:
+    for child in children:
         if child.tag != "enc":
             continue
 
-        ag = AttrGetter(child.attrs)
-        enc_type = ag.optional_string("type")
-        if not enc_type:
+        ag = child.attr_getter()
+        enc_type, ok = ag.get_string("type", False)
+        if not ok:
             continue
 
         decrypted = None
         ciphertext_hash = None
-        error = None
+        err = None
 
-        try:
-            if enc_type in ["pkmsg", "msg"]:
-                decrypted, ciphertext_hash = await decrypt_dm(
-                    client, child, sender_encryption_jid,
-                    enc_type == "pkmsg", info.timestamp
-                )
-                contains_direct_msg = True
-            elif info.is_group and enc_type == "skmsg":
-                decrypted, ciphertext_hash = await decrypt_group_msg(
-                    client, child, sender_encryption_jid, info.chat, info.timestamp
-                )
-            elif enc_type == "msmsg" and info.sender.is_bot():
-                decrypted = await decrypt_bot_message_secret(
-                    client, child, info
-                )
+        if enc_type == "pkmsg" or enc_type == "msg":
+            decrypted, ciphertext_hash, err = decrypt_dm(
+                client, child, sender_encryption_jid, enc_type == "pkmsg", info.timestamp
+            )
+            contains_direct_msg = True
+        elif info.message_source.is_group and enc_type == "skmsg":
+            decrypted, ciphertext_hash, err = decrypt_group_msg(
+                client, child, sender_encryption_jid, info.chat, info.timestamp
+            )
+        elif enc_type == "msmsg" and info.sender.is_bot():
+            target_sender_jid = info.msg_meta_info.target_sender
+            message_secret_sender_jid = target_sender_jid
+            if target_sender_jid.user == "":
+                if info.sender.server == BOT_SERVER:
+                    target_sender_jid = client.store.get_lid()
+                else:
+                    target_sender_jid = client.get_own_id()
+                message_secret_sender_jid = client.get_own_id()
+
+            decrypt_message_id = ""
+            if (info.msg_bot_info.edit_type == BotEditType.INNER or
+                info.msg_bot_info.edit_type == BotEditType.LAST):
+                decrypt_message_id = info.msg_bot_info.edit_target_id
             else:
-                logger.warning(f"Unhandled encrypted message (type {enc_type}) from {info.source_string()}")
-                continue
+                decrypt_message_id = info.id
 
-        except Exception as e:
-            error = e
+            ms_msg = waE2E_pb2.MessageSecretMessage()
+            message_secret, err = client.store.msg_secrets.get_message_secret(
+                info.chat, message_secret_sender_jid, info.msg_meta_info.target_id
+            )
+            if err is not None:
+                err = Exception(f"failed to get message secret for {info.msg_meta_info.target_id}: {err}")
+            elif message_secret is None:
+                err = Exception(f"message secret for {info.msg_meta_info.target_id} not found")
+            else:
+                try:
+                    ms_msg.ParseFromString(child.content)
+                except Exception as parse_err:
+                    err = Exception(f"failed to unmarshal MessageSecretMessage protobuf: {parse_err}")
+                else:
+                    decrypted, err = decrypt_bot_message(
+                        client, message_secret, ms_msg, decrypt_message_id, target_sender_jid, info
+                    )
+        else:
+            logger.warning("Unhandled encrypted message (type %s) from %s", enc_type, info.source_string())
+            continue
 
-        if isinstance(error, EventAlreadyProcessed):
-            logger.debug(f"Ignoring message {info.id} from {info.source_string()}: {error}")
+        if isinstance(err, EventAlreadyProcessed):
+            logger.debug("Ignoring message %s from %s: %v", info.id, info.source_string(), err)
             return
-        elif error:
-            logger.warning(f"Error decrypting message from {info.source_string()}: {error}")
+        elif err is not None:
+            logger.warning("Error decrypting message from %s: %v", info.source_string(), err)
             is_unavailable = (enc_type == "skmsg" and not contains_direct_msg and
-                            "no sender key" in str(error).lower())
+                              isinstance(err, signalerror.ErrNoSenderKeyForUser)) # todo: check the correct type from signal_protocol
             if enc_type != "msmsg":
-                client.schedule_task(send_retry_receipt(client, node, info, is_unavailable))
-            client.dispatch_event(UndecryptableMessage(
+                # Go's context.WithoutCancel becomes a new context
+                asyncio.create_task(send_retry_receipt(client, node, info, is_unavailable))
+            await client.dispatch_event(events.UndecryptableMessage(
                 info=info,
                 is_unavailable=is_unavailable,
-                decrypt_fail_mode=ag.optional_string("decrypt-fail")
+                decrypt_fail_mode=events.DecryptFailMode(ag.optional_string("decrypt-fail"))
             ))
             return
 
         retry_count = ag.optional_int("count")
-        client.cancel_delayed_request_from_phone(info.id)
+        cancel_delayed_request_from_phone(client, info.id)
 
-        # Parse decrypted message
+        msg = waE2E_pb2.Message()
         version = ag.int("v")
         if version == 2:
             try:
-                msg = waE2E_pb2.Message()
                 msg.ParseFromString(decrypted)
-                await handle_decrypted_message(client, info, msg, retry_count)
-                handled = True
-            except Exception as e:
-                logger.warning(f"Error unmarshaling decrypted message from {info.source_string()}: {e}")
+            except Exception as parse_err:
+                logger.warning("Error unmarshaling decrypted message from %s: %v", info.source_string(), parse_err)
                 continue
+            await handle_decrypted_message(client, info, msg, retry_count)
+            handled = True
         elif version == 3:
-            handled = await handle_decrypted_armadillo(client, info, decrypted, retry_count)
+            handled = handle_decrypted_armadillo(client, info, decrypted, retry_count)
         else:
-            logger.warning(f"Unknown version {version} in decrypted message from {info.source_string()}")
+            logger.warning("Unknown version %d in decrypted message from %s", version, info.source_string())
 
-        # Clean up event buffer if enabled
-        if ciphertext_hash and client.enable_decrypted_event_buffer:
-            try:
-                await client.store.event_buffer.clear_buffered_event_plaintext(ciphertext_hash)
-                logger.debug(f"Deleted event plaintext from buffer")
+        if ciphertext_hash is not None and client.enable_decrypted_event_buffer:
+            # Use the context passed to decrypt_messages
+            err = client.store.event_buffer.clear_buffered_event_plaintext(ciphertext_hash)
+            if err is not None:
+                logger.error(
+                    "Failed to clear buffered event plaintext: %s (ciphertext_hash: %s)",
+                    err,
+                    ciphertext_hash.hex() if ciphertext_hash else "None"
+                )
+            else:
+                logger.debug(
+                    "Deleted event plaintext from buffer (ciphertext_hash: %s)",
+                    ciphertext_hash.hex() if ciphertext_hash else "None"
+                )
 
-                # Periodic cleanup
-                if time.time() - client.last_decrypted_buffer_clear > 12 * 3600:  # 12 hours
-                    client.last_decrypted_buffer_clear = time.time()
-                    client.schedule_task(client.store.event_buffer.delete_old_buffered_hashes())
-            except Exception as e:
-                logger.error(f"Failed to clear buffered event plaintext: {e}")
+            if time.time() - client.last_decrypted_buffer_clear > 12 * 3600:  # 12 hours
+                client.last_decrypted_buffer_clear = time.time()
+
+                def cleanup_task():
+                    # Go's context.WithoutCancel becomes a new context
+                    err = client.store.event_buffer.delete_old_buffered_hashes()
+                    if err is not None:
+                        logger.error("Failed to delete old buffered hashes", exc_info=err if isinstance(err, Exception) else None)
+
+                asyncio.create_task(asyncio.to_thread(cleanup_task)) # todo save task object so it is not gc'ed
 
     if handled:
-        client.schedule_task(client.send_message_receipt(info))
+        asyncio.create_task(send_message_receipt(client, info))
 
 
-async def decrypt_bot_message_secret(client, child: Node, info: MessageInfo) -> bytes:
-    """Decrypt a bot message secret.
+async def clear_untrusted_identity(
+    client: 'Client',
+    target: JID
+) -> Optional[Exception]:
+    """
+    Port of Go method clearUntrustedIdentity from client.go.
+
+    Clears an untrusted identity by deleting both the identity and session for the target JID,
+    then dispatches an IdentityChange event.
 
     Args:
-        client: The WhatsApp client instance
-        child: The encrypted node
-        info: Message information
+        ctx: Context for the operation
+        target: The target JID whose identity should be cleared
 
     Returns:
-        Decrypted message bytes
+        Optional[Exception]: Any error that occurred, None on success
     """
-    target_sender_jid = info.msg_meta_info.get("target_sender", JID())
-    message_secret_sender_jid = target_sender_jid
+    # TODO: Review Store.Identities.DeleteIdentity implementation
+    # TODO: Review Store.Sessions.DeleteSession implementation
+    # TODO: Review dispatchEvent implementation
+    # TODO: Review events.IdentityChange implementation
 
-    if not target_sender_jid.user:
-        if info.sender.server == "bot":
-            target_sender_jid = client.get_own_lid()
-        else:
-            target_sender_jid = client.get_own_id()
-        message_secret_sender_jid = client.get_own_id()
+    err = await client.store.identities.delete_identity(target.signal_address().string())
+    if err is not None:
+        return Exception(f"failed to delete identity: {err}")
 
-    # Determine message ID for decryption
-    if info.msg_bot_info.get("edit_type") in ["inner", "last"]:
-        decrypt_message_id = info.msg_bot_info["edit_target_id"]
-    else:
-        decrypt_message_id = info.id
+    err = await client.store.sessions.delete_session(target.signal_address().string())
+    if err is not None:
+        return Exception(f"failed to delete session: {err}")
 
-    # Get message secret
-    target_id = info.msg_meta_info.get("target_id")
-    message_secret = await client.store.msg_secrets.get_message_secret(
-        info.chat, message_secret_sender_jid, target_id
-    )
+    asyncio.create_task(client.dispatch_event(events.IdentityChange(
+        jid=target,
+        timestamp=datetime.now(),
+        implicit=True
+    )))  # todo maybe just await instead of creating task
 
-    if not message_secret:
-        raise Exception(f"Message secret for {target_id} not found")
-
-    # Parse MessageSecretMessage
-    ms_msg = waE2E_pb2.MessageSecretMessage()
-    ms_msg.ParseFromString(child.content)
-
-    return await decrypt_bot_message(
-        client, message_secret, ms_msg, decrypt_message_id, target_sender_jid, info
-    )
+    return None
 
 
-async def store_message_secret(client, info: MessageInfo, msg):
-    """Store message secret for future decryption.
+async def buffered_decrypt(
+    client: 'Client',
+    ciphertext: bytes,
+    server_timestamp: datetime,
+    decrypt: Callable[[], Awaitable[Tuple[bytes, Optional[Exception]]]]
+) -> Tuple[Optional[bytes], Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go method bufferedDecrypt from client.go.
+
+    Performs buffered decryption with caching to avoid re-decrypting the same message.
+    If buffering is disabled, directly calls the decrypt function.
 
     Args:
-        client: The WhatsApp client instance
-        info: Message information
-        msg: The message protobuf
-    """
-    # This would store secrets for bot message decryption
-    # Implementation depends on the specific message secret storage system
-    pass
-
-
-async def handle_decrypted_message(client, info: MessageInfo, msg, retry_count: int):
-    """Handle a decrypted message.
-
-    Args:
-        client: The WhatsApp client instance
-        info: Message information
-        msg: Decrypted message protobuf
-        retry_count: Number of retry attempts
-    """
-    await store_message_secret(client, info, msg)
-
-    evt = MessageEvent(info=info, raw_message=msg)
-    client.dispatch_event(evt.unwrap_raw())
-
-
-async def handle_decrypted_armadillo(client, info: MessageInfo, decrypted: bytes, retry_count: int) -> bool:
-    """Handle a decrypted armadillo message.
-
-    Args:
-        client: The WhatsApp client instance
-        info: Message information
-        decrypted: Decrypted message bytes
-        retry_count: Number of retry attempts
+        ctx: Context for the operation
+        ciphertext: The encrypted message bytes
+        server_timestamp: Timestamp from the server
+        decrypt: Function that performs the actual decryption
 
     Returns:
-        True if handled successfully
+        Tuple containing (plaintext, ciphertext_hash, error)
     """
-    # TODO: Implement armadillo message handling
-    logger.warning(f"Armadillo message handling not implemented for {info.source_string()}")
-    return False
+    # TODO: Review Store.EventBuffer.GetBufferedEvent implementation
+    # TODO: Review Store.EventBuffer.DoDecryptionTxn implementation
+    # TODO: Review Store.EventBuffer.PutBufferedEvent implementation
+    # TODO: Review store.BufferedEvent implementation
+    # TODO: Review EventAlreadyProcessed exception
+
+    if not client.enable_decrypted_event_buffer:
+        plaintext, err = decrypt()
+        return plaintext, None, err
+
+    ciphertext_hash = hashlib.sha256(ciphertext).digest()
+    buf, err = client.store.event_buffer.get_buffered_event(ciphertext_hash)
+    if err is not None:
+        err = Exception(f"failed to get buffered event: {err}")
+        return None, ciphertext_hash, err
+    elif buf is not None:
+        if buf.plaintext is None:
+            logger.debug(
+                "Returning event already processed error (ciphertext_hash: %s, insertion_time: %s)",
+                ciphertext_hash.hex(),
+                buf.insert_time
+            )
+            err = Exception(f"{EventAlreadyProcessed} at {buf.insert_time}")
+            return None, ciphertext_hash, err
+
+        logger.debug(
+            "Returning previously decrypted plaintext (ciphertext_hash: %s, insertion_time: %s)",
+            ciphertext_hash.hex(),
+            buf.insert_time
+        )
+        return buf.plaintext, ciphertext_hash, None
+
+    plaintext = None
+
+    async def txn_func() -> Optional[Exception]:
+        nonlocal plaintext
+        plaintext, inner_err = decrypt()
+        if inner_err is not None:
+            return inner_err
+
+        inner_err = await client.store.event_buffer.put_buffered_event(ciphertext_hash, plaintext, server_timestamp)
+        if inner_err is not None:
+            return Exception(f"failed to save decrypted event to buffer: {inner_err}")
+        return None
+
+    err = await client.store.event_buffer.do_decryption_txn(txn_func)
+    if err is None:
+        logger.debug(
+            "Successfully decrypted and saved event (ciphertext_hash: %s)",
+            ciphertext_hash.hex()
+        )
+
+    return plaintext, ciphertext_hash, err
 
 
-async def decrypt_dm(client, child: Node, from_jid: JID, is_pre_key: bool, server_ts: datetime) -> Tuple[bytes, bytes]:
-    """Decrypt a direct message.
+def decrypt_dm(
+    client: 'Client',
+    child: Node,
+    from_jid: JID,
+    is_pre_key: bool,
+    server_ts: datetime
+) -> Tuple[Optional[bytes], Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go method decryptDM from client.go.
+
+    Decrypts a direct message using Signal protocol, handling both prekey and normal messages.
+    Uses buffered decryption to avoid re-decrypting the same message.
 
     Args:
-        client: The WhatsApp client instance
-        child: The encrypted node
-        from_jid: Sender JID
+        ctx: Context for the operation
+        child: The binary node containing the encrypted message
+        from_jid: The sender's JID
         is_pre_key: Whether this is a prekey message
         server_ts: Server timestamp
 
     Returns:
-        Tuple of (decrypted_bytes, ciphertext_hash)
+        Tuple containing (plaintext, ciphertext_hash, error)
     """
+    # TODO: Review waBinary.Node implementation
+    # TODO: Review session.NewBuilderFromSignal implementation
+    # TODO: Review session.NewCipher implementation
+    # TODO: Review protocol.NewPreKeySignalMessageFromBytes implementation
+    # TODO: Review protocol.NewSignalMessageFromBytes implementation
+    # TODO: Review pbSerializer implementation
+    # TODO: Review signalerror.ErrUntrustedIdentity implementation
+    # TODO: Review unpad_message implementation
+
     content = child.content
     if not isinstance(content, bytes):
-        raise ValueError("Message content is not a byte slice")
+        return None, None, Exception("message content is not a byte slice")
 
-    # Use signal protocol for decryption
-    address = from_jid.signal_address()
+    builder = session.new_builder_from_signal(client.store, from_jid.signal_address(), pb_serializer)
+    cipher = session.new_cipher(builder, from_jid.signal_address())
 
     if is_pre_key:
-        # Handle prekey message
-        plaintext = await client.signal_store.decrypt_prekey_message(address, content)
+        pre_key_msg, err = protocol.new_pre_key_signal_message_from_bytes(
+            content,
+            pb_serializer.pre_key_signal_message,
+            pb_serializer.signal_message
+        )
+        if err is not None:
+            return None, None, Exception(f"failed to parse prekey message: {err}")
+
+        async def decrypt_func() -> Tuple[Optional[bytes], Optional[Exception]]:
+            pt, inner_err = cipher.decrypt_message(pre_key_msg)
+            if client.auto_trust_identity and isinstance(inner_err, signalerror.UntrustedIdentityError):
+                logger.warning(
+                    "Got %s error while trying to decrypt prekey message from %s, clearing stored identity and retrying",
+                    inner_err, from_jid
+                )
+                inner_err = await clear_untrusted_identity(client, from_jid)
+                if inner_err is not None:
+                    return None, Exception(f"failed to clear untrusted identity: {inner_err}")
+                pt, inner_err = cipher.decrypt_message(pre_key_msg)
+            return pt, inner_err
+
+        plaintext, ciphertext_hash, err = buffered_decrypt(client, content, server_ts, decrypt_func)
+        if err is not None:
+            return None, None, Exception(f"failed to decrypt prekey message: {err}")
     else:
-        # Handle normal message
-        plaintext = await client.signal_store.decrypt_message(address, content)
+        msg, err = protocol.new_signal_message_from_bytes(content, pb_serializer.signal_message)
+        if err is not None:
+            return None, None, Exception(f"failed to parse normal message: {err}")
 
-    # Unpad the message
-    version = AttrGetter(child.attrs).int("v")
-    plaintext = unpad_message(plaintext, version)
+        async def decrypt_func() -> Tuple[Optional[bytes], Optional[Exception]]:
+            return cipher.decrypt(decrypt_ctx, msg)
 
-    # Calculate ciphertext hash for buffer management
-    ciphertext_hash = hashlib.sha256(content).digest()
+        plaintext, ciphertext_hash, err = buffered_decrypt(client, content, server_ts, decrypt_func)
+        if err is not None:
+            return None, None, Exception(f"failed to decrypt normal message: {err}")
 
-    return plaintext, ciphertext_hash
+    plaintext, err = unpad_message(plaintext, child.attr_getter().int("v"))
+    if err is not None:
+        return None, None, Exception(f"failed to unpad message: {err}")
+
+    return plaintext, ciphertext_hash, None
 
 
-async def decrypt_group_msg(client, child: Node, from_jid: JID, chat: JID, server_ts: datetime) -> Tuple[bytes, bytes]:
-    """Decrypt a group message.
+def decrypt_group_msg(
+    client: 'Client',
+    ctx: Any,
+    child: Node,
+    from_jid: JID,
+    chat: JID,
+    server_ts: datetime
+) -> Tuple[Optional[bytes], Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go method decryptGroupMsg from client.go.
+
+    Decrypts a group message using Signal protocol sender key.
+    Uses buffered decryption to avoid re-decrypting the same message.
 
     Args:
-        client: The WhatsApp client instance
-        child: The encrypted node
-        from_jid: Sender JID
-        chat: Group chat JID
+        ctx: Context for the operation
+        child: The binary node containing the encrypted message
+        from_jid: The sender's JID
+        chat: The group chat JID
         server_ts: Server timestamp
 
     Returns:
-        Tuple of (decrypted_bytes, ciphertext_hash)
+        Tuple containing (plaintext, ciphertext_hash, error)
     """
+    # TODO: Review waBinary.Node implementation
+    # TODO: Review protocol.NewSenderKeyName implementation
+    # TODO: Review groups.NewGroupSessionBuilder implementation
+    # TODO: Review groups.NewGroupCipher implementation
+    # TODO: Review protocol.NewSenderKeyMessageFromBytes implementation
+    # TODO: Review pbSerializer implementation
+    # TODO: Review unpad_message implementation
+
     content = child.content
     if not isinstance(content, bytes):
-        raise ValueError("Message content is not a byte slice")
+        return None, None, Exception("message content is not a byte slice")
 
-    # Use signal protocol for group decryption
-    sender_key_name = f"{chat}::{from_jid.signal_address()}"
-    plaintext = await client.signal_store.decrypt_sender_key_message(sender_key_name, content)
+    sender_key_name = protocol.new_sender_key_name(chat.string(), from_jid.signal_address())
+    builder = groups.new_group_session_builder(client.store, pb_serializer)
+    cipher = groups.new_group_cipher(builder, sender_key_name, client.store)
 
-    # Unpad the message
-    version = AttrGetter(child.attrs).int("v")
-    plaintext = unpad_message(plaintext, version)
+    msg, err = protocol.new_sender_key_message_from_bytes(content, pb_serializer.sender_key_message)
+    if err is not None:
+        return None, None, Exception(f"failed to parse group message: {err}")
 
-    # Calculate ciphertext hash for buffer management
-    ciphertext_hash = hashlib.sha256(content).digest()
+    async def decrypt_func() -> Tuple[Optional[bytes], Optional[Exception]]:
+        return cipher.decrypt(msg)
 
-    return plaintext, ciphertext_hash
+    plaintext, ciphertext_hash, err = buffered_decrypt(ctx, content, server_ts, decrypt_func)
+    if err is not None:
+        return None, None, Exception(f"failed to decrypt group message: {err}")
 
+    plaintext, err = unpad_message(plaintext, child.attr_getter().int("v"))
+    if err is not None:
+        return None, None, err
 
-async def send_retry_receipt(client, node: Node, info: MessageInfo, is_unavailable: bool):
-    """Send a retry receipt for a failed decryption.
-
-    Args:
-        client: The WhatsApp client instance
-        node: The original message node
-        info: Message information
-        is_unavailable: Whether the message is unavailable
-    """
-    # TODO: Implement retry receipt sending
-    logger.debug(f"Sending retry receipt for {info.id} from {info.source_string()}")
-
-
-async def delayed_request_message_from_phone(client, info: MessageInfo):
-    """Request a message from phone after a delay.
-
-    Args:
-        client: The WhatsApp client instance
-        info: Message information
-    """
-    await client.schedule_delayed_task(
-        REQUEST_FROM_PHONE_DELAY,
-        client.request_message_from_phone,
-        info
-    )
+    return plaintext, ciphertext_hash, None
 
 
 def is_valid_padding(plaintext: bytes) -> bool:
-    """Check if message padding is valid.
-
-    Args:
-        plaintext: The message bytes to check
-
-    Returns:
-        True if padding is valid
     """
+        Port of Go function isValidPadding from padding.go.
+
+        Validates PKCS#7 padding by checking if the last byte value
+        matches the number of padding bytes at the end.
+
+        Args:
+            plaintext: The byte array to validate padding for
+
+        Returns:
+            True if padding is valid, False otherwise
+        """
     if not plaintext:
         return False
 
@@ -666,43 +947,684 @@ def is_valid_padding(plaintext: bytes) -> bool:
     return plaintext.endswith(expected_padding)
 
 
-def unpad_message(plaintext: bytes, version: int) -> bytes:
-    """Remove padding from a decrypted message.
+def unpad_message(plaintext: bytes, version: int) -> Tuple[Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go function unpadMessage from padding.go.
+
+    Removes PKCS#7 padding from plaintext based on version.
+    Version 3 messages don't use padding, others do.
 
     Args:
-        plaintext: The padded message bytes
-        version: Protocol version
+        plaintext: The byte array to remove padding from
+        version: Message version (3 = no padding, others = padded)
 
     Returns:
-        Unpadded message bytes
-
-    Raises:
-        ValueError: If padding is invalid
+        Tuple containing (unpadded_bytes, error)
     """
+    # TODO: Review checkPadding global variable implementation
+    # TODO: Review is_valid_padding implementation
+
     if version == 3:
-        return plaintext
-    elif not plaintext:
-        raise ValueError("Plaintext is empty")
+        return plaintext, None
+    elif len(plaintext) == 0:
+        return None, Exception("plaintext is empty")
     elif CHECK_PADDING and not is_valid_padding(plaintext):
-        raise ValueError("Plaintext doesn't have expected padding")
+        return None, Exception("plaintext doesn't have expected padding")
     else:
-        padding_length = plaintext[-1]
-        return plaintext[:-padding_length]
+        padding_length = plaintext[len(plaintext) - 1]
+        return plaintext[:len(plaintext) - padding_length], None
 
 
 def pad_message(plaintext: bytes) -> bytes:
-    """Add padding to a message before encryption.
+    """
+    Port of Go function padMessage from padding.go.
+
+    Adds PKCS#7-style padding to plaintext using a random padding byte.
+    The padding length is between 1-15 bytes, determined by the random byte value.
 
     Args:
-        plaintext: The message bytes to pad
+        plaintext: The byte array to add padding to
 
     Returns:
-        Padded message bytes
+        The padded byte array
     """
-    import os
-    pad_byte = os.urandom(1)[0] & 0xf
+    pad = os.urandom(1)
+    pad_byte = pad[0] & 0xf
     if pad_byte == 0:
         pad_byte = 0xf
 
-    padding = bytes([pad_byte] * pad_byte)
+    padding = bytes([pad_byte]) * pad_byte
     return plaintext + padding
+
+
+async def handle_sender_key_distribution_message(
+    client: 'Client',
+    chat: JID,
+    from_jid: JID,
+    axolotl_skdm: bytes
+) -> None:
+    """
+    Port of Go method handleSenderKeyDistributionMessage from client.go.
+
+    Processes a sender key distribution message for group chat encryption.
+    Parses the message and updates the group session builder with the new key.
+
+    Args:
+        ctx: Context for the operation
+        chat: The group chat JID
+        from_jid: The sender's JID
+        axolotl_skdm: The sender key distribution message bytes
+
+    Returns:
+        None
+    """
+    # TODO: Review groups.NewGroupSessionBuilder implementation
+    # TODO: Review protocol.NewSenderKeyName implementation
+    # TODO: Review protocol.NewSenderKeyDistributionMessageFromBytes implementation
+    # TODO: Review pbSerializer implementation
+
+    builder = groups.new_group_session_builder(client.store, pb_serializer)
+    sender_key_name = protocol.new_sender_key_name(chat.string(), from_jid.signal_address())
+
+    sdk_msg, err = protocol.new_sender_key_distribution_message_from_bytes(
+        axolotl_skdm,
+        pb_serializer.sender_key_distribution_message
+    )
+    if err is not None:
+        logger.error(
+            "Failed to parse sender key distribution message from %s for %s: %v",
+            from_jid, chat, err
+        )
+        return
+
+    err = builder.process(sender_key_name, sdk_msg)
+    if err is not None:
+        logger.error(
+            "Failed to process sender key distribution message from %s for %s: %v",
+            from_jid, chat, err
+        )
+        return
+
+    logger.debug(
+        "Processed sender key distribution message from %s in %s",
+        sender_key_name.sender().string(),
+        sender_key_name.group_id()
+    )
+
+
+async def handle_history_sync_notification_loop(client: 'Client') -> None:
+    """
+    Port of Go method handleHistorySyncNotificationLoop from client.go.
+
+    Processes history sync notifications in a loop with error recovery.
+    Automatically restarts if new notifications appear after the loop stops.
+
+    Returns:
+        None
+    """
+    # TODO: Review handle_history_sync_notification implementation
+    # TODO: Review history_sync_notifications async iterator implementation
+    # TODO: Review history_sync_handler_started atomic implementation
+
+    try:
+        # Process notifications from the async iterator/queue
+        async for notif in client.history_sync_notifications:
+            await handle_history_sync_notification(notif)
+
+    except Exception as err:
+        logger.error("History sync handler panicked: %v\n%s", err, traceback.format_exc())
+
+    finally:
+        # Mark handler as stopped
+        client.history_sync_handler_started.store(False)
+
+        # Check if new notifications appeared while stopping
+        if (len(client.history_sync_notifications) > 0 and
+            client.history_sync_handler_started.compare_and_swap(False, True)):
+            logger.warning("New history sync notifications appeared after loop stopped, restarting loop...")
+
+            # Start new async task for the loop
+            asyncio.create_task(handle_history_sync_notification_loop(client))
+
+
+async def handle_history_sync_notification(
+    client: 'Client',
+    notif: waE2E.HistorySyncNotification
+) -> None:
+    """
+    Port of Go method handleHistorySyncNotification from client.go.
+
+    Downloads, decompresses, and processes a history sync notification.
+    Handles push names and conversation data, then dispatches a HistorySync event.
+
+    Args:
+        ctx: Context for the operation
+        notif: The history sync notification to process
+
+    Returns:
+        None
+    """
+    # TODO: Review Download implementation
+    # TODO: Review handle_historical_push_names implementation
+    # TODO: Review store_historical_message_secrets implementation
+    # TODO: Review dispatch_event implementation
+    # TODO: Review proto.unmarshal implementation
+
+    history_sync: Optional[WAWebProtobufsHistorySync_pb2.HistorySync] = None
+
+    try:
+        # Download the history sync data
+        data = await download(client, notif)
+    except Exception as err:
+        logger.error("Failed to download history sync data: %v", err)
+        return
+
+    try:
+        # Create zlib reader and decompress
+        reader = zlib.decompressobj()
+        raw_data = reader.decompress(data)
+        raw_data += reader.flush()
+    except Exception as err:
+        logger.error("Failed to decompress history sync data: %v", err)
+        return
+
+    try:
+        # Unmarshal protobuf data
+        history_sync = WAWebProtobufsHistorySync_pb2.HistorySync()
+        history_sync.ParseFromString(raw_data)
+    except Exception as err:
+        logger.error("Failed to unmarshal history sync data: %v", err)
+        return
+
+    # Successfully processed - handle the data
+    logger.debug(
+        "Received history sync (type %s, chunk %d)",
+        history_sync.syncType,
+        history_sync.chunkOrder
+    )
+
+    # Handle different sync types
+    if history_sync.syncType == WAWebProtobufsHistorySync_pb2.HistorySync.PUSH_NAME:
+        # Start async task for handling push names
+        asyncio.create_task(
+            handle_historical_push_names(client, history_sync.pushnames)
+        )
+    elif len(history_sync.conversations) > 0:
+        # Start async task for storing message secrets
+        asyncio.create_task(
+            store_historical_message_secrets(client, history_sync.conversations)
+        )
+
+    # Dispatch the history sync event
+    await client.dispatch_event(events.HistorySync(data=history_sync))
+
+
+async def handle_app_state_sync_key_share(
+    client: 'Client',
+    keys: waE2E_pb2.AppStateSyncKeyShare
+) -> None:
+    """
+    Port of Go method handleAppStateSyncKeyShare from client.go.
+
+    Handles incoming app state sync key shares by storing the keys
+    and triggering fetches for all app state patch types.
+
+    Args:
+        ctx: Context for the operation
+        keys: The app state sync key share containing new keys
+
+    Returns:
+        None
+    """
+    # TODO: Review Store.AppStateKeys implementation
+    # TODO: Review FetchAppState implementation
+    # TODO: Review appstate.AllPatchNames implementation
+    # TODO: Review store.AppStateSyncKey implementation
+
+    only_resync_if_not_synced = True
+
+    logger.debug("Got %d new app state keys", len(keys.get_keys()))
+
+    async with client.app_state_key_requests_lock:
+        for key in keys.get_keys():
+            try:
+                # Marshal fingerprint using protobuf's built-in method
+                marshaled_fingerprint = key.get_key_data().get_fingerprint().SerializeToString()
+            except Exception as err:
+                logger.error(
+                    "Failed to marshal fingerprint of app state sync key %s",
+                    key.get_key_id().get_key_id().hex().upper()
+                )
+                continue
+
+            key_id_hex = key.get_key_id().get_key_id().hex()
+            is_re_request = key_id_hex in client.app_state_key_requests
+
+            if is_re_request:
+                only_resync_if_not_synced = False
+
+            try:
+                await client.store.app_state_keys.put_app_state_sync_key(
+                    key.get_key_id().get_key_id(),
+                    store.AppStateSyncKey(
+                        data=key.get_key_data().get_key_data(),
+                        fingerprint=marshaled_fingerprint,
+                        timestamp=key.get_key_data().get_timestamp()
+                    )
+                )
+            except Exception as err:
+                logger.error(
+                    "Failed to store app state sync key %s: %v",
+                    key.get_key_id().get_key_id().hex().upper(),
+                    err
+                )
+                continue
+
+            logger.debug(
+                "Received app state sync key %s (ts: %d)",
+                key.get_key_id().get_key_id().hex().upper(),
+                key.get_key_data().get_timestamp()
+            )
+
+    # Fetch app state for all patch names
+    for name in ALL_PATCH_NAMES:
+        try:
+            from pymeow.pymeow.appstate import fetch_app_state
+            await fetch_app_state(client, name, False, only_resync_if_not_synced)
+        except Exception as err:
+            logger.error("Failed to do initial fetch of app state %s: %v", name, err)
+
+
+async def handle_placeholder_resend_response(
+    client: 'Client',
+    msg: waE2E_pb2.PeerDataOperationRequestResponseMessage
+) -> None:
+    """
+    Port of Go method handlePlaceholderResendResponse from client.go.
+
+    Handles responses to placeholder resend requests by parsing the web messages
+    and dispatching events for successfully parsed messages.
+
+    Args:
+        msg: The peer data operation request response message
+
+    Returns:
+        None
+    """
+    # TODO: Review ParseWebMessage implementation
+    # TODO: Review dispatch_event implementation
+    # TODO: Review types.EmptyJID implementation
+
+    req_id = msg.get_stanza_id()
+    parts = msg.get_peer_data_operation_result()
+
+    logger.debug(
+        "Handling response to placeholder resend request %s with %d items",
+        req_id,
+        len(parts)
+    )
+
+    for i, part in enumerate(parts):
+        resp = part.get_placeholder_message_resend_response()
+        if resp is None:
+            logger.warning(
+                "Missing response in item #%d of response to %s",
+                i + 1,
+                req_id
+            )
+            continue
+
+        # Create new WebMessageInfo and parse protobuf data
+        web_msg = WAWebProtobufsWeb_pb2.WebMessageInfo()
+        try:
+            web_msg.ParseFromString(resp.get_web_message_info_bytes())
+        except Exception as err:
+            logger.warning(
+                "Failed to unmarshal protobuf web message in item #%d of response to %s: %v",
+                i + 1,
+                req_id,
+                err
+            )
+            continue
+
+        # Parse the web message
+        try:
+            msg_evt = client.parse_web_message(EMPTY_JID, web_msg)
+        except Exception as err:
+            logger.warning(
+                "Failed to parse web message info in item #%d of response to %s: %v",
+                i + 1,
+                req_id,
+                err
+            )
+            continue
+
+        # Set the unavailable request ID and dispatch the event
+        msg_evt.unavailable_request_id = req_id
+        await client.dispatch_event(msg_evt)
+
+
+async def handle_protocol_message(
+    client: 'Client',
+    info: MessageInfo,
+    msg: waE2E_pb2.Message
+) -> None:
+    """
+    Port of Go method handleProtocolMessage from client.go.
+
+    Handles protocol messages by processing different types of protocol operations
+    including history sync notifications, placeholder resend responses, and app state sync.
+
+    Args:
+        ctx: Context for the operation
+        info: Message information
+        msg: The protocol message to handle
+
+    Returns:
+        None
+    """
+    # TODO: Review types.MessageInfo implementation
+    # TODO: Review handle_history_sync_notification_loop implementation
+    # TODO: Review send_protocol_message_receipt implementation
+    # TODO: Review handle_placeholder_resend_response implementation
+    # TODO: Review handle_app_state_sync_key_share implementation
+    # TODO: Review types.ReceiptTypeHistorySync implementation
+    # TODO: Review types.ReceiptTypePeerMsg implementation
+
+    proto_msg = msg.get_protocol_message()
+
+    # Handle history sync notification
+    if proto_msg.get_history_sync_notification() is not None and info.is_from_me:
+        # Send notification to channel (using asyncio queue)
+        await client.history_sync_notifications.put(proto_msg.history_sync_notification)
+
+        # Start handler loop if not already started (atomic compare and swap equivalent)
+        if not client.history_sync_handler_started:
+            client.history_sync_handler_started = True
+            asyncio.create_task(handle_history_sync_notification_loop(client))  # todo get the task object so is not gc'ed
+
+        # Send receipt asynchronously
+        asyncio.create_task(
+            send_protocol_message_receipt(client, info.id, RECEIPT_TYPE_HISTORY_SYNC) # todo get the task object so is not gc'ed
+        )
+
+    # Handle placeholder message resend response
+    peer_data_msg = proto_msg.get_peer_data_operation_request_response_message()
+    if (peer_data_msg.get_peer_data_operation_request_type() ==
+        waE2E_pb2.PeerDataOperationRequestType.PLACEHOLDER_MESSAGE_RESEND):
+        asyncio.create_task(
+            handle_placeholder_resend_response(client, peer_data_msg)
+        )
+
+    # Handle app state sync key share
+    if proto_msg.get_app_state_sync_key_share() is not None and info.is_from_me:
+        # Note: Go's context.WithoutCancel creates a context that won't be cancelled
+        # In Python, we'll pass the original context since cancellation is handled differently
+        asyncio.create_task(
+            handle_app_state_sync_key_share(client, proto_msg.app_state_sync_key_share)
+        )
+
+    # Handle peer category messages
+    if info.category == "peer":
+        asyncio.create_task(
+            send_protocol_message_receipt(client, info.id, RECEIPT_TYPE_PEER_MSG) # todo get the task object so is not gc'ed
+        )
+
+
+async def process_protocol_parts(
+    client: 'Client',
+    info: MessageInfo,
+    msg: waE2E_pb2.Message
+) -> None:
+    """
+    Port of Go method processProtocolParts from client.go.
+
+    Processes protocol-related parts of a message including storing message secrets,
+    handling device-sent messages, sender key distribution, and protocol messages.
+
+    Args:
+        ctx: Context for the operation
+        info: Message information
+        msg: The message to process
+
+    Returns:
+        None
+    """
+    # TODO: Review store_message_secret implementation
+    # TODO: Review handle_sender_key_distribution_message implementation
+    # TODO: Review handle_protocol_message implementation
+    # TODO: Review types.DEFAULT_USER_SERVER implementation
+    # TODO: Review types.HIDDEN_USER_SERVER implementation
+
+    await store_message_secret(client, info, msg)
+
+    # Hopefully sender key distribution messages and protocol messages can't be inside ephemeral messages
+    if msg.get_device_sent_message().get_message() is not None:
+        msg = msg.get_device_sent_message().get_message()
+
+    if msg.get_sender_key_distribution_message() is not None:
+        if not info.is_group:
+            logger.warning(
+                "Got sender key distribution message in non-group chat from %s",
+                info.sender
+            )
+        else:
+            encryption_identity = info.sender
+            if (encryption_identity.server == DEFAULT_USER_SERVER and
+                info.sender_alt.server == HIDDEN_USER_SERVER):
+                encryption_identity = info.sender_alt
+
+            await handle_sender_key_distribution_message(
+                client,
+                info.chat,
+                encryption_identity,
+                msg.sender_key_distribution_message.axolotl_sender_key_distribution_message
+            )
+
+    # N.B. Edits are protocol messages, but they're also wrapped inside EditedMessage,
+    # which is only unwrapped after process_protocol_parts, so this won't trigger for edits.
+    if msg.get_protocol_message() is not None:
+        await handle_protocol_message(client, info, msg)
+
+
+async def store_message_secret(
+    client: 'Client',
+    info: MessageInfo,
+    msg: waE2E_pb2.Message
+) -> None:
+    """
+    Port of Go method storeMessageSecret from client.go.
+
+    Stores the message secret key if present in the message context info.
+
+    Args:
+        ctx: Context for the operation
+        info: Message information containing chat, sender, and message ID
+        msg: The message containing potential secret information
+
+    Returns:
+        None
+    """
+    # TODO: Review Store.MsgSecrets.put_message_secret implementation
+
+    msg_secret = msg.get_message_context_info().get_message_secret()
+    if len(msg_secret) > 0:
+        try:
+            await client.store.msg_secrets.put_message_secret(
+                info.chat,
+                info.sender,
+                info.id,
+                msg_secret
+            )
+            logger.debug("Stored message secret key for %s", info.id)
+        except Exception as err:
+            logger.error("Failed to store message secret key for %s: %v", info.id, err)
+
+
+async def store_historical_message_secrets(
+    client: 'Client',
+    conversations: List[waHistorySync_pb2.Conversation]
+) -> None:
+    """
+    Port of Go method storeHistoricalMessageSecrets from client.go.
+
+    Stores message secrets and privacy tokens from historical conversations.
+
+    Args:
+        ctx: Context for the operation
+        conversations: List of conversations from history sync
+
+    Returns:
+        None
+    """
+    # TODO: Review store.MessageSecretInsert implementation
+    # TODO: Review store.PrivacyToken implementation
+    # TODO: Review get_own_id implementation
+    # TODO: Review types.parse_jid implementation
+    # TODO: Review types.DEFAULT_USER_SERVER implementation
+
+    secrets: List[store.MessageSecretInsert] = []
+    privacy_tokens: List[store.PrivacyToken] = []
+
+    own_id = client.get_own_id().to_non_ad()
+    if own_id.is_empty():
+        return
+
+    for conv in conversations:
+        chat_jid, _ = JID.parse_jid(conv.get_id())
+        if chat_jid.is_empty():
+            continue
+
+        # Handle privacy tokens for direct chats
+        if chat_jid.server == DEFAULT_USER_SERVER and conv.get_tc_token() is not None:
+            ts = conv.get_tc_token_sender_timestamp()
+            if ts == 0:
+                ts = conv.get_tc_token_timestamp()
+
+            privacy_tokens.append(store.PrivacyToken(
+                user=chat_jid,
+                token=conv.get_tc_token(),
+                timestamp=datetime.fromtimestamp(ts)
+            ))
+
+        # Process messages in conversation
+        for msg in conv.get_messages():
+            secret = msg.get_message().get_message_secret()
+            if secret is not None:
+                sender_jid = JID()
+                msg_key = msg.get_message().get_key()
+
+                # Determine sender JID based on message properties
+                if msg_key.get_from_me():
+                    sender_jid = own_id
+                elif chat_jid.server == DEFAULT_USER_SERVER:
+                    sender_jid = chat_jid
+                elif msg_key.get_participant() != "":
+                    sender_jid, _ = JID.parse_jid(msg_key.get_participant())
+                elif msg.get_message().get_participant() != "":
+                    sender_jid, _ = JID.parse_jid(msg.get_message().get_participant())
+
+                if sender_jid.is_empty() or msg_key.get_id() == "":
+                    continue
+
+                secrets.append(store.MessageSecretInsert(
+                    chat=chat_jid,
+                    sender=sender_jid,
+                    id=msg_key.get_id(),
+                    secret=secret
+                ))
+
+    # Store message secrets if any were found
+    if len(secrets) > 0:
+        logger.debug("Storing %d message secret keys in history sync", len(secrets))
+        try:
+            await client.store.msg_secrets.put_message_secrets(secrets)
+            logger.info("Stored %d message secret keys from history sync", len(secrets))
+        except Exception as err:
+            logger.error("Failed to store message secret keys in history sync: %v", err)
+
+    # Store privacy tokens if any were found
+    if len(privacy_tokens) > 0:
+        logger.debug("Storing %d privacy tokens in history sync", len(privacy_tokens))
+        try:
+            await client.store.privacy_tokens.put_privacy_tokens(*privacy_tokens)
+            logger.info("Stored %d privacy tokens from history sync", len(privacy_tokens))
+        except Exception as err:
+            logger.error("Failed to store privacy tokens in history sync: %v", err)
+
+
+async def handle_decrypted_message(
+    client: 'Client',
+    info: MessageInfo,
+    msg: waE2E_pb2.Message,
+    retry_count: int
+) -> None:
+    """
+    Port of Go method handleDecryptedMessage from client.go.
+
+    Handles a decrypted message by processing protocol parts and dispatching the message event.
+
+    Args:
+        ctx: Context for the operation
+        info: Message information
+        msg: The decrypted message
+        retry_count: Number of retry attempts for this message
+
+    Returns:
+        None
+    """
+    # TODO: Review process_protocol_parts implementation
+    # TODO: Review events.Message implementation
+    # TODO: Review dispatch_event implementation
+
+    await process_protocol_parts(client, info, msg)
+
+    evt = events.Message(
+        info=info,  # Python: pass by reference (object), Go: pass by value with *info
+        raw_message=msg,
+        retry_count=retry_count
+    )
+
+    await client.dispatch_event(evt.unwrap_raw())
+
+
+async def send_protocol_message_receipt(
+    client: 'Client',
+    id: MessageID,
+    msg_type: ReceiptType
+) -> None:
+    """
+    Port of Go method sendProtocolMessageReceipt from client.go.
+
+    Sends a protocol message receipt acknowledgement.
+
+    Args:
+        id: Message ID to acknowledge
+        msg_type: Type of receipt to send
+
+    Returns:
+        None
+    """
+    # TODO: Review Store.ID implementation
+    # TODO: Review send_node implementation
+    # TODO: Review waBinary.Node implementation
+    # TODO: Review types.new_jid implementation
+    # TODO: Review types.LEGACY_USER_SERVER implementation
+
+    client_id = client.store.id
+    if len(id) == 0 or client_id is None:
+        return
+
+    try:
+        await client._send_node(Node(
+            tag="receipt",
+            attrs=Attrs({
+                "id": str(id),
+                "type": str(msg_type),
+                "to": JID.new_jid(client_id.user, LEGACY_USER_SERVER),
+            }),
+            content=None
+        ))
+    except Exception as err:
+        logger.warn("Failed to send acknowledgement for protocol message %s: %v", id, err)
+

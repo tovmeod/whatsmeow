@@ -181,3 +181,12 @@ class MessageInfo:
     def recipient_alt(self):
         """Get the alternative recipient JID from the message source."""
         return self.message_source.recipient_alt
+
+    def source_string(self) -> str:
+        """Returns a log-friendly representation of who sent the message and where."""
+        return self.message_source.source_string()
+
+    @property
+    def is_from_me(self):
+        """Get the is_from_me flag from the message source."""
+        return self.message_source.is_from_me
