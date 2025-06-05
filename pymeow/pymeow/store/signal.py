@@ -3,7 +3,7 @@ Signal protocol store implementation for WhatsApp.
 
 Port of whatsmeow/store/signal.go
 """
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Tuple
 import logging
 
 # Signal protocol imports
@@ -23,22 +23,31 @@ SignalProtobufSerializer = None
 logger = logging.getLogger(__name__)
 
 
-# IdentityKeyStore implementation
-async def get_identity_key_pair(device: 'Device', ctx: Any = None) -> identity_key.IdentityKeyPair:
+def get_identity_key_pair(device: 'Device') -> 'IdentityKeyPair':
     """
-    Get the identity key pair for this device.
+    Port of Go method GetIdentityKeyPair from Device.
 
-    Go equivalent: func (device *Device) GetIdentityKeyPair() *identity.KeyPair
+    Returns the identity key pair for this device by creating a new KeyPair
+    with the device's identity keys.
+
+    Returns:
+        IdentityKeyPair containing the device's public and private identity keys
     """
-    public_key = curve.PublicKey(device.identity_key.pub)
-    private_key = curve.PrivateKey(device.identity_key.priv)
-    return identity_key.IdentityKeyPair(
-        identity_key.IdentityKey(public_key),
-        private_key
+    # TODO: Review identity.KeyPair implementation
+    # TODO: Review identity.Key implementation
+    # TODO: Review ecc.DjbECPublicKey implementation
+    # TODO: Review ecc.DjbECPrivateKey implementation
+
+    from .identity import KeyPair, Key # this should be from libsignal
+    from .ecc import DjbECPublicKey, DjbECPrivateKey # this should be from libsignal
+
+    return KeyPair(
+        Key(DjbECPublicKey(device.identity_key.pub)),
+        DjbECPrivateKey(device.identity_key.priv)
     )
 
 
-async def get_local_registration_id(device: 'Device', ctx: Any = None) -> int:
+async def get_local_registration_id(device: 'Device') -> int:
     """
     Get the registration ID for this device.
 
@@ -47,70 +56,128 @@ async def get_local_registration_id(device: 'Device', ctx: Any = None) -> int:
     return device.registration_id
 
 
-async def save_identity(device: 'Device', ctx: Any, addr: address.ProtocolAddress, identity_key_obj: identity_key.IdentityKey) -> None:
+def save_identity(
+    device: 'Device',
+    address: 'ProtocolAddress',
+    identity_key: 'IdentityKey'
+) -> Optional[Exception]:
     """
-    Save an identity key for a remote address.
+    Port of Go method SaveIdentity from Device.
 
-    Go equivalent: func (device *Device) SaveIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) error
+    Saves an identity key for the given address.
+
+    Args:
+        ctx: Context for the operation
+        address: The protocol address to save identity for
+        identity_key: The identity key to save
+
+    Returns:
+        None if successful, Exception if error occurred
     """
-    addr_string = f"{addr.name}:{addr.device_id}"
+    # TODO: Review ProtocolAddress.string method implementation
+    # TODO: Review IdentityKey.public_key method implementation
+    # TODO: Review PublicKey.public_key method implementation
+    # TODO: Review Identities.put_identity implementation
+
     try:
-        await device.identities.put_identity(addr_string, identity_key_obj.public_key.serialize())
+        addr_string = address.string()
+        err = device.identities.put_identity(addr_string, identity_key.public_key().public_key())
+        if err is not None:
+            return Exception(f"failed to save identity of {addr_string}: {err}")
+        return None
     except Exception as e:
-        logger.error(f"Failed to save identity of {addr_string}: {e}")
-        raise Exception(f"failed to save identity of {addr_string}: {e}")
+        return Exception(f"failed to save identity of {address.string()}: {e}")
 
 
-async def is_trusted_identity(device: 'Device', ctx: Any, addr: address.ProtocolAddress, identity_key_obj: identity_key.IdentityKey) -> bool:
+def is_trusted_identity(
+    device: 'Device',
+    address: 'ProtocolAddress',
+    identity_key: 'IdentityKey'
+) -> Tuple[bool, Optional[Exception]]:
     """
-    Check if an identity key is trusted for a remote address.
+    Port of Go method IsTrustedIdentity from Device.
 
-    Go equivalent: func (device *Device) IsTrustedIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) (bool, error)
+    Checks if an identity key is trusted for the given address.
+
+    Args:
+        device:
+        address: The protocol address to check trust for
+        identity_key: The identity key to verify trust for
+
+    Returns:
+        Tuple containing (is_trusted: bool, error: Optional[Exception])
     """
-    addr_string = f"{addr.name}:{addr.device_id}"
-    try:
-        is_trusted = await device.identities.is_trusted_identity(addr_string, identity_key_obj.public_key.serialize())
-        return is_trusted
-    except Exception as e:
-        logger.error(f"Failed to check if {addr_string}'s identity is trusted: {e}")
-        raise Exception(f"failed to check if {addr_string}'s identity is trusted: {e}")
+    # TODO: Review ProtocolAddress.string method implementation
+    # TODO: Review IdentityKey.public_key method implementation
+    # TODO: Review PublicKey.public_key method implementation
+    # TODO: Review Identities.is_trusted_identity implementation
+
+    addr_string = address.string()
+    is_trusted, err = device.identities.is_trusted_identity(addr_string, identity_key.public_key().public_key())
+    if err is not None:
+        return False, Exception(f"failed to check if {addr_string}'s identity is trusted: {err}")
+    return is_trusted, None
 
 
-# PreKeyStore implementation
-async def load_pre_key(device: 'Device', ctx: Any, pre_key_id: int) -> Optional[PreKeyRecord]:
+async def load_pre_key(
+    device: 'Device',
+    id_: int
+) -> Tuple[Optional['PreKey'], Optional[Exception]]:
     """
-    Load a pre-key by ID.
+    Port of Go method LoadPreKey from Device.
 
-    Go equivalent: func (device *Device) LoadPreKey(ctx context.Context, id uint32) (*record.PreKey, error)
+    Loads a pre-key record by ID.
+
+    Args:
+        ctx: Context for the operation
+        id_: The pre-key ID to load
+
+    Returns:
+        Tuple containing (pre_key: Optional[PreKey], error: Optional[Exception])
     """
-    try:
-        pre_key = await device.pre_keys.get_pre_key(pre_key_id)
-        if pre_key is None:
-            return None
+    # TODO: Review PreKeys.get_pre_key implementation
+    # TODO: Review PreKey record implementation
+    # TODO: Review ecc.ECKeyPair implementation
+    # TODO: Review ecc.DjbECPublicKey implementation
+    # TODO: Review ecc.DjbECPrivateKey implementation
 
-        # Create a new pre-key record with the key pair
-        # In Go: record.NewPreKey(preKey.KeyID, ecc.NewECKeyPair(...), nil)
-        public_key = curve.PublicKey(pre_key.pub)
-        private_key = curve.PrivateKey(pre_key.priv)
-        key_pair = curve.KeyPair(public_key, private_key)
+    pre_key, err = await device.pre_keys.get_pre_key(id_)
+    if err is not None:
+        return None, Exception(f"failed to load prekey {id_}: {err}")
+    if pre_key is None:
+        return None, None
 
-        return PreKeyRecord.new(pre_key.key_id, key_pair)
-    except Exception as e:
-        logger.error(f"Failed to load pre-key {pre_key_id}: {e}")
-        raise Exception(f"failed to load prekey {pre_key_id}: {e}")
+    return PreKey(
+        pre_key.key_id,
+        ECKeyPair(
+            DjbECPublicKey(pre_key.pub),
+            DjbECPrivateKey(pre_key.priv)
+        ),
+        None
+    ), None
 
 
-async def remove_pre_key(device: 'Device', ctx: Any, pre_key_id: int) -> None:
+async def remove_pre_key(
+    device: 'Device',
+    id_: int
+) -> Optional[Exception]:
     """
-    Remove a pre-key.
+        Port of Go method RemovePreKey from Device.
 
-    Go equivalent: func (device *Device) RemovePreKey(ctx context.Context, id uint32) error
-    """
-    try:
-        await device.pre_keys.remove_pre_key(pre_key_id)
-    except Exception as e:
-        logger.error(f"Failed to remove pre-key {pre_key_id}: {e}")
-        raise Exception(f"failed to remove prekey {pre_key_id}: {e}")
+        Removes a pre-key by ID.
+
+        Args:
+            ctx: Context for the operation
+            id_: The pre-key ID to remove
+
+        Returns:
+            None if successful, Exception if error occurred
+        """
+    # TODO: Review PreKeys.remove_pre_key implementation
+    err = await device.pre_keys.remove_pre_key(id_)
+    if err is not None:
+        return Exception(f"failed to remove prekey {id_}: {err}")
+    return None
 
 
 async def store_pre_key(device: 'Device', ctx: Any, pre_key_id: int, pre_key_record: PreKeyRecord) -> None:
@@ -132,30 +199,51 @@ async def contains_pre_key(device: 'Device', ctx: Any, pre_key_id: int) -> bool:
 
 
 # SessionStore implementation
-async def load_session(device: 'Device', ctx: Any, addr: address.ProtocolAddress) -> SessionRecord:
+async def load_session(
+    device: 'Device',
+    address: address.ProtocolAddress
+) -> Tuple[Optional[SessionRecord], Optional[Exception]]:
     """
-    Load a session for a remote address.
+        Port of Go method LoadSession from Device.
 
-    Go equivalent: func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalAddress) (*record.Session, error)
-    """
-    addr_string = f"{addr.name}:{addr.device_id}"
-    try:
-        raw_sess = await device.sessions.get_session(addr_string)
-        if raw_sess is None:
-            # Create a new empty session record
-            # In Go: record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
-            return SessionRecord.new()
+        Loads a session record for the given address.
 
-        try:
-            # Deserialize the existing session record from bytes
-            # In Go: record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
-            return SessionRecord.deserialize(raw_sess)
-        except Exception as e:
-            logger.error(f"Failed to deserialize session with {addr_string}: {e}")
-            raise Exception(f"failed to deserialize session with {addr_string}: {e}")
-    except Exception as e:
-        logger.error(f"Failed to load session with {addr_string}: {e}")
-        raise Exception(f"failed to load session with {addr_string}: {e}")
+        Args:
+            device: Context for the operation
+            address: The protocol address to load session for
+
+        Returns:
+            Tuple containing (session: Optional[Session], error: Optional[Exception])
+        """
+    # TODO: Review ProtocolAddress.string method implementation
+    # TODO: Review Sessions.get_session implementation
+    # TODO: Review Session record implementation
+    # TODO: Review SignalProtobufSerializer implementation
+    # TODO: Review Session.new_session implementation
+    # TODO: Review Session.new_session_from_bytes implementation
+    addr_string = address.string()
+
+    raw_sess, err = await device.sessions.get_session(addr_string)
+    if err is not None:
+        return None, Exception(f"failed to load session with {addr_string}: {err}")
+    if raw_sess is None:
+        # return SessionRecord.new()
+        return SessionRecord.new_session(
+            SignalProtobufSerializer.session,
+            SignalProtobufSerializer.state
+        ), None
+
+    # Deserialize the existing session record from bytes
+    # In Go: record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+    # return SessionRecord.deserialize(raw_sess)
+    sess, err = SessionRecord.new_session_from_bytes(
+        raw_sess,
+        SignalProtobufSerializer.session,
+        SignalProtobufSerializer.state
+    )
+    if err is not None:
+        return None, Exception(f"failed to deserialize session with {addr_string}: {err}")
+    return sess, None
 
 
 async def get_sub_device_sessions(device: 'Device', ctx: Any, name: str) -> list[int]:
@@ -167,33 +255,57 @@ async def get_sub_device_sessions(device: 'Device', ctx: Any, name: str) -> list
     raise NotImplementedError("get_sub_device_sessions is not implemented")
 
 
-async def store_session(device: 'Device', ctx: Any, addr: address.ProtocolAddress, record: SessionRecord) -> None:
+async def store_session(
+    device: 'Device',
+    address: address.ProtocolAddress,
+    record: SessionRecord
+) -> Optional[Exception]:
     """
-    Store a session for a remote address.
+        Port of Go method StoreSession from Device.
 
-    Go equivalent: func (device *Device) StoreSession(ctx context.Context, address *protocol.SignalAddress, record *record.Session) error
+        Stores a session record for the given address.
+
+        Args:
+            ctx: Context for the operation
+            address: The protocol address to store session for
+            record: The session record to store
+
+        Returns:
+            None if successful, Exception if error occurred
+        """
+    # TODO: Review ProtocolAddress.string method implementation
+    # TODO: Review Sessions.put_session implementation
+    # TODO: Review Session.serialize method implementation
+    addr_string = address.string()
+    err = await device.sessions.put_session(addr_string, record.serialize())
+    if err is not None:
+        return Exception(f"failed to store session with {addr_string}: {err}")
+    return None
+
+async def contains_session(
+    device: 'Device',
+    remote_address: address.ProtocolAddress
+) -> Tuple[bool, Optional[Exception]]:
     """
-    addr_string = f"{addr.name}:{addr.device_id}"
-    try:
-        await device.sessions.put_session(addr_string, record.serialize())
-    except Exception as e:
-        logger.error(f"Failed to store session with {addr_string}: {e}")
-        raise Exception(f"failed to store session with {addr_string}: {e}")
+    Port of Go method ContainsSession from Device.
 
+    Checks if a session exists for the given remote address.
 
-async def contains_session(device: 'Device', ctx: Any, remote_addr: address.ProtocolAddress) -> bool:
+    Args:
+        ctx: Context for the operation
+        remote_address: The remote protocol address to check
+
+    Returns:
+        Tuple containing (has_session: bool, error: Optional[Exception])
     """
-    Check if a session exists for a remote address.
+    # TODO: Review ProtocolAddress.string method implementation
+    # TODO: Review Sessions.has_session implementation
 
-    Go equivalent: func (device *Device) ContainsSession(ctx context.Context, remoteAddress *protocol.SignalAddress) (bool, error)
-    """
-    addr_string = f"{remote_addr.name}:{remote_addr.device_id}"
-    try:
-        has_session = await device.sessions.has_session(addr_string)
-        return has_session
-    except Exception as e:
-        logger.error(f"Failed to check if store has session for {addr_string}: {e}")
-        raise Exception(f"failed to check if store has session for {addr_string}: {e}")
+    addr_string = remote_address.string()
+    has_session, err = await device.sessions.has_session(addr_string)
+    if err is not None:
+        return False, Exception(f"failed to check if store has session for {addr_string}: {err}")
+    return has_session, None
 
 
 async def delete_session(device: 'Device', ctx: Any, remote_address: address.ProtocolAddress) -> None:
@@ -215,27 +327,45 @@ async def delete_all_sessions(device: 'Device', ctx: Any) -> None:
 
 
 # SignedPreKeyStore implementation
-async def load_signed_pre_key(device: 'Device', ctx: Any, signed_pre_key_id: int) -> Optional[SignedPreKeyRecord]:
+def load_signed_pre_key(
+    device: 'Device',
+    signed_pre_key_id: int
+) -> Tuple[Optional[SignedPreKeyRecord], Optional[Exception]]:
     """
-    Load a signed pre-key by ID.
+    Port of Go method LoadSignedPreKey from Device.
 
-    Go equivalent: func (device *Device) LoadSignedPreKey(ctx context.Context, signedPreKeyID uint32) (*record.SignedPreKey, error)
+    Loads a signed pre-key by ID. Returns the device's signed pre-key if the ID matches,
+    otherwise returns None.
+
+    Args:
+        device: The device instance
+        ctx: Context for the operation
+        signed_pre_key_id: The signed pre-key ID to load
+
+    Returns:
+        Tuple containing (signed_pre_key: Optional[SignedPreKeyRecord], error: Optional[Exception])
     """
-    # This doesn't need to be async since it accesses the device's signed_pre_key directly,
-    # similar to how it's done in the Go implementation
+    # TODO: Review SignedPreKeyRecord implementation
+    # TODO: Review ECKeyPair implementation
+    # TODO: Review DjbECPublicKey implementation
+    # TODO: Review DjbECPrivateKey implementation
+    # TODO: Review SignedPreKeyRecord.new_signed_pre_key implementation
+
+    from .record import SignedPreKeyRecord
+    from .ecc import ECKeyPair, DjbECPublicKey, DjbECPrivateKey
+
     if signed_pre_key_id == device.signed_pre_key.key_id:
-        # In Go: record.NewSignedPreKey(signedPreKeyID, 0, ecc.NewECKeyPair(...), *device.SignedPreKey.Signature, nil)
-        public_key = curve.PublicKey(device.signed_pre_key.pub)
-        private_key = curve.PrivateKey(device.signed_pre_key.priv)
-        key_pair = curve.KeyPair(public_key, private_key)
-
-        return SignedPreKeyRecord.new(
+        return SignedPreKeyRecord.new_signed_pre_key(
             signed_pre_key_id,
-            0,  # timestamp, not used in whatsmeow
-            key_pair,
-            device.signed_pre_key.signature
-        )
-    return None
+            0,
+            ECKeyPair.new_ec_key_pair(
+                DjbECPublicKey.new_djb_ec_public_key(device.signed_pre_key.pub),
+                DjbECPrivateKey.new_djb_ec_private_key(device.signed_pre_key.priv),
+            ),
+            device.signed_pre_key.signature,
+            None
+        ), None
+    return None, None
 
 
 async def load_signed_pre_keys(device: 'Device', ctx: Any) -> list[SignedPreKeyRecord]:
@@ -274,46 +404,87 @@ async def remove_signed_pre_key(device: 'Device', ctx: Any, signed_pre_key_id: i
     raise NotImplementedError("remove_signed_pre_key is not implemented")
 
 
-# SenderKeyStore implementation
-async def store_sender_key(device: 'Device', ctx: Any, sender_key_name: SenderKeyName, key_record: SenderKeyRecord) -> None:
+async def store_sender_key(
+    device: 'Device',
+    sender_key_name: SenderKeyName,
+    key_record: SenderKeyRecord
+) -> Optional[Exception]:
     """
-    Store a sender key.
+    Port of Go method StoreSenderKey from Device.
 
-    Go equivalent: func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName, keyRecord *groupRecord.SenderKey) error
+    Stores a sender key for the given sender key name and group.
+
+    Args:
+        device: The device instance
+        sender_key_name: The sender key name containing group ID and sender info
+        key_record: The sender key record to store
+
+    Returns:
+        None if successful, Exception if error occurred
     """
-    group_id = sender_key_name.group_id
-    sender = sender_key_name.sender
-    sender_string = f"{sender.name}:{sender.device_id}"
-    try:
-        await device.sender_keys.put_sender_key(group_id, sender_string, key_record.serialize())
-    except Exception as e:
-        logger.error(f"Failed to store sender key from {sender_string} for {group_id}: {e}")
-        raise Exception(f"failed to store sender key from {sender_string} for {group_id}: {e}")
+    # TODO: Review SenderKeyName.group_id method implementation
+    # TODO: Review SenderKeyName.sender method implementation
+    # TODO: Review SenderKeyName.sender.string method implementation
+    # TODO: Review SenderKeys.put_sender_key implementation
+    # TODO: Review SenderKeyRecord.serialize implementation
+
+    group_id = sender_key_name.group_id()
+    sender_string = sender_key_name.sender().string()
+
+    err = await device.sender_keys.put_sender_key(group_id, sender_string, key_record.serialize())
+    if err is not None:
+        return Exception(f"failed to store sender key from {sender_string} for {group_id}: {err}")
+    return None
 
 
-async def load_sender_key(device: 'Device', ctx: Any, sender_key_name: SenderKeyName) -> SenderKeyRecord:
+async def load_sender_key(
+    device: 'Device',
+    sender_key_name: SenderKeyName
+) -> Tuple[Optional[SenderKeyRecord], Optional[Exception]]:
     """
-    Load a sender key.
+    Port of Go method LoadSenderKey from Device.
 
-    Go equivalent: func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName) (*groupRecord.SenderKey, error)
+    Loads a sender key for the given sender key name and group. Creates a new empty
+    sender key if none exists, or deserializes an existing one from storage.
+
+    Args:
+        device: The device instance
+        sender_key_name: The sender key name containing group ID and sender info
+
+    Returns:
+        Tuple containing (sender_key: Optional[SenderKeyRecord], error: Optional[Exception])
     """
-    group_id = sender_key_name.group_id
-    sender = sender_key_name.sender
-    sender_string = f"{sender.name}:{sender.device_id}"
-    try:
-        raw_key = await device.sender_keys.get_sender_key(group_id, sender_string)
-        if raw_key is None:
-            # Create a new empty sender key record
-            # In Go: groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
-            return SenderKeyRecord.new()
+    # TODO: Review SenderKeyName.group_id method implementation
+    # TODO: Review SenderKeyName.sender method implementation
+    # TODO: Review SenderKeyName.sender.string method implementation
+    # TODO: Review SenderKeys.get_sender_key implementation
+    # TODO: Review SenderKeyRecord.new_sender_key implementation
+    # TODO: Review SenderKeyRecord.new_sender_key_from_bytes implementation
+    # TODO: Review SignalProtobufSerializer implementation
 
-        try:
-            # Deserialize the existing sender key record from bytes
-            # In Go: groupRecord.NewSenderKeyFromBytes(rawKey, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
-            return SenderKeyRecord.deserialize(raw_key)
-        except Exception as e:
-            logger.error(f"Failed to deserialize sender key from {sender_string} for {group_id}: {e}")
-            raise Exception(f"failed to deserialize sender key from {sender_string} for {group_id}: {e}")
-    except Exception as e:
-        logger.error(f"Failed to load sender key from {sender_string} for {group_id}: {e}")
-        raise Exception(f"failed to load sender key from {sender_string} for {group_id}: {e}")
+    from .group_record import SenderKeyRecord
+    from .serializer import SignalProtobufSerializer
+
+    group_id = sender_key_name.group_id()
+    sender_string = sender_key_name.sender().string()
+
+    raw_key, err = await device.sender_keys.get_sender_key(group_id, sender_string)
+    if err is not None:
+        return None, Exception(f"failed to load sender key from {sender_string} for {group_id}: {err}")
+
+    if raw_key is None:
+        return SenderKeyRecord.new_sender_key(
+            SignalProtobufSerializer.SENDER_KEY_RECORD,
+            SignalProtobufSerializer.SENDER_KEY_STATE
+        ), None
+
+    key, err = SenderKeyRecord.new_sender_key_from_bytes(
+        raw_key,
+        SignalProtobufSerializer.SENDER_KEY_RECORD,
+        SignalProtobufSerializer.SENDER_KEY_STATE
+    )
+    if err is not None:
+        return None, Exception(f"failed to deserialize sender key from {sender_string} for {group_id}: {err}")
+
+    return key, None
+
