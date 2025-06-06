@@ -8,19 +8,21 @@ import base64
 import hashlib
 import hmac
 import os
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, Any, BinaryIO, List, Protocol, Tuple, Union, TypeVar, cast
+from typing import Optional, Dict, Any, BinaryIO, List, Protocol, Tuple, Union, TypeVar, cast, TYPE_CHECKING, \
+    runtime_checkable
 import aiohttp
 from io import BytesIO
 
+from . import mediaconn
 from .exceptions import PymeowError
 from .generated.waE2E import waE2E_pb2
 from .generated.waHistorySync import waHistorySync_pb2
 from .generated.waMediaTransport import WAMediaTransport_pb2
 from .generated.waServerSync import waServerSync_pb2
-from .mediaconn import MediaConn
 from .util.cbcutil import decrypt, decrypt_file, File
 from .util.hkdfutil import sha256 as hkdf_sha256
 
@@ -77,6 +79,7 @@ class DownloadableMessage(Protocol):
     def GetFileEncSHA256(self) -> bytes: ...
 
 
+@runtime_checkable
 class MediaTypeable(Protocol):
     """Protocol for objects that can provide a media type."""
     def GetMediaType(self) -> MediaType: ...
@@ -93,11 +96,13 @@ class DownloadableThumbnail(Protocol):
 
 
 # Additional protocols for messages with length/size information
+@runtime_checkable
 class DownloadableMessageWithLength(DownloadableMessage, Protocol):
     """Protocol for downloadable messages that include file length."""
     def GetFileLength(self) -> int: ...
 
 
+@runtime_checkable
 class DownloadableMessageWithSizeBytes(DownloadableMessage, Protocol):
     """Protocol for downloadable messages that include file size in bytes."""
     def GetFileSizeBytes(self) -> int: ...
@@ -139,570 +144,619 @@ MEDIA_HMAC_LENGTH = 10
 
 logger = logging.getLogger(__name__)
 
-class MediaDownloader:
-    """Handles downloading media from WhatsApp servers."""
 
-    def __init__(self, client=None):
-        """Initialize the media downloader.
+# Global HTTP session management
+_http_session = None
 
-        Args:
-            client: The WhatsApp client instance
-        """
-        self.client = client
-        self.media_conn = MediaConn()
-        self.http_session = None
+if TYPE_CHECKING:
+    from .client import Client
 
-    async def ensure_http_session(self):
-        """Ensure an HTTP session exists."""
-        if self.http_session is None:
-            self.http_session = aiohttp.ClientSession()
+async def download_any(client: 'Client', msg: Optional[waE2E_pb2.Message]) -> Tuple[
+    Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go method DownloadAny from download.go.
 
-    async def download_any(self, message: waE2E_pb2.Message) -> bytes:
-        """Download the first downloadable content from a message.
+    Loops through the downloadable parts of the given message and downloads the first non-nil item.
 
-        Args:
-            message: The message containing media
+    Args:
+        client: The Client instance
+        msg: The message containing potential downloadable content
 
-        Returns:
-            The downloaded and decrypted media data
+    Returns:
+        Tuple containing (data: bytes or None, error: Exception or None)
+    """
+    if msg is None:
+        return None, ErrNothingDownloadableFound
 
-        Raises:
-            DownloadError: If no downloadable content is found or download fails
-        """
-        if message is None:
-            raise ErrNothingDownloadableFound
+    if msg.imageMessage is not None:
+        return await download(client, msg.imageMessage), None
+    elif msg.videoMessage is not None:
+        return await download(client, msg.videoMessage), None
+    elif msg.audioMessage is not None:
+        return await download(client, msg.audioMessage), None
+    elif msg.documentMessage is not None:
+        return await download(client, msg.documentMessage), None
+    elif msg.stickerMessage is not None:
+        return await download(client, msg.stickerMessage), None
+    else:
+        return None, ErrNothingDownloadableFound
 
-        if message.HasField("imageMessage"):
-            return await self.download(message.imageMessage)
-        elif message.HasField("videoMessage"):
-            return await self.download(message.videoMessage)
-        elif message.HasField("audioMessage"):
-            return await self.download(message.audioMessage)
-        elif message.HasField("documentMessage"):
-            return await self.download(message.documentMessage)
-        elif message.HasField("stickerMessage"):
-            return await self.download(message.stickerMessage)
-        else:
-            raise ErrNothingDownloadableFound
 
-    def get_size(self, msg: DownloadableMessage) -> int:
-        """Get the size of a downloadable message.
+def get_size(msg: 'DownloadableMessage') -> int:
+    """
+    Port of Go function getSize from download.go.
 
-        Args:
-            msg: The downloadable message
+    Gets the size of a downloadable message by checking for different size field types.
 
-        Returns:
-            The size in bytes, or -1 if not available
-        """
-        try:
-            return cast(DownloadableMessageWithLength, msg).GetFileLength()
-        except (AttributeError, TypeError):
-            pass
+    Args:
+        msg: A downloadable message object
 
-        try:
-            return cast(DownloadableMessageWithSizeBytes, msg).GetFileSizeBytes()
-        except (AttributeError, TypeError):
-            pass
+    Returns:
+        The file size in bytes, or -1 if size cannot be determined
+    """
+    # TODO: Review downloadable_message_with_length interface implementation
+    # TODO: Review downloadable_message_with_size_bytes interface implementation
 
+    # Go's type switch equivalent using isinstance checks
+    if isinstance(msg, DownloadableMessageWithLength):
+        return int(msg.get_file_length())
+    elif isinstance(msg, DownloadableMessageWithSizeBytes):
+        return int(msg.get_file_size_bytes())
+    else:
         return -1
 
-    async def download_thumbnail(self, msg: DownloadableThumbnail) -> bytes:
-        """Download a thumbnail from a message.
 
-        This is primarily intended for downloading link preview thumbnails.
+def download_thumbnail(
+    client: 'Client',
+    ctx,
+    msg: DownloadableThumbnail
+) -> Tuple[Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go method DownloadThumbnail from download.go.
 
-        Args:
-            msg: The message containing a thumbnail
+    Downloads a thumbnail from a message.
 
-        Returns:
-            The downloaded and decrypted thumbnail data
+    This is primarily intended for downloading link preview thumbnails, which are in ExtendedTextMessage:
 
-        Raises:
-            DownloadError: If download fails
-        """
-        descriptor_name = msg.ProtoReflect().Descriptor().Name()
-        media_type = CLASS_TO_THUMBNAIL_MEDIA_TYPE.get(descriptor_name)
+        msg = ...  # waE2E.Message
+        thumbnail_image_bytes, err = download_thumbnail(client, ctx, msg.get_extended_text_message())
 
-        if not media_type:
-            raise ErrUnknownMediaType(f"'{descriptor_name}'")
+    Args:
+        client: The Client instance
+        ctx: Context for the operation
+        msg: A downloadable thumbnail message object
 
-        if msg.GetThumbnailDirectPath():
-            return await self.download_media_with_path(
-                msg.GetThumbnailDirectPath(),
-                msg.GetThumbnailEncSHA256(),
-                msg.GetThumbnailSHA256(),
-                msg.GetMediaKey(),
-                -1,
-                media_type,
-                MEDIA_TYPE_TO_MMS_TYPE[media_type]
-            )
-        else:
-            raise ErrNoURLPresent
+    Returns:
+        Tuple containing (thumbnail data: bytes or None, error: Exception or None)
+    """
+    # TODO: Review class_to_thumbnail_media_type mapping implementation
+    # TODO: Review media_type_to_mms_type mapping implementation
 
-    def get_media_type(self, msg: DownloadableMessage) -> MediaType:
-        """Get the MediaType for a downloadable message.
+    # Get the protobuf descriptor name (equivalent to msg.ProtoReflect().Descriptor().Name())
+    descriptor_name = msg.DESCRIPTOR.name
 
-        Args:
-            msg: The downloadable message
+    # Check if media type exists in mapping (equivalent to Go's map lookup with ok pattern)
+    if descriptor_name not in class_to_thumbnail_media_type:
+        error_msg = f"{ErrUnknownMediaType} '{descriptor_name}'"
+        return None, Exception(error_msg)
 
-        Returns:
-            The MediaType enum value
+    media_type = class_to_thumbnail_media_type[descriptor_name]
 
-        Raises:
-            DownloadError: If the media type cannot be determined
-        """
-        try:
-            # Try to get media type from MediaTypeable protocol
-            return cast(MediaTypeable, msg).GetMediaType()
-        except (AttributeError, TypeError):
-            pass
-
-        try:
-            # Try to get media type from protobuf message type
-            descriptor_name = msg.ProtoReflect().Descriptor().Name()
-            return CLASS_TO_MEDIA_TYPE.get(descriptor_name, MediaType(""))
-        except (AttributeError, TypeError):
-            return MediaType("")
-
-    async def download(self, msg: DownloadableMessage) -> bytes:
-        """Download media from a message.
-
-        Args:
-            msg: The downloadable message part
-
-        Returns:
-            The downloaded and decrypted media data
-
-        Raises:
-            DownloadError: If download fails
-        """
-        if self.client is None:
-            raise ErrClientIsNil
-
-        media_type = self.get_media_type(msg)
-        if not media_type:
-            raise ErrUnknownMediaType(f"{type(msg)}")
-
-        # Check if message has URL
-        url = ""
-        is_web_whatsapp_net_url = False
-
-        try:
-            url = cast(DownloadableMessageWithURL, msg).GetURL()
-            is_web_whatsapp_net_url = url.startswith("https://web.whatsapp.net")
-        except (AttributeError, TypeError):
-            pass
-
-        if url and not is_web_whatsapp_net_url:
-            return await self.download_and_decrypt(
-                url,
-                msg.GetMediaKey(),
-                media_type,
-                self.get_size(msg),
-                msg.GetFileEncSHA256(),
-                msg.GetFileSHA256()
-            )
-        elif msg.GetDirectPath():
-            return await self.download_media_with_path(
-                msg.GetDirectPath(),
-                msg.GetFileEncSHA256(),
-                msg.GetFileSHA256(),
-                msg.GetMediaKey(),
-                self.get_size(msg),
-                media_type,
-                MEDIA_TYPE_TO_MMS_TYPE[media_type]
-            )
-        else:
-            logger.warning(f"Got a media message with a web.whatsapp.net URL ({url}) and no direct path")
-            raise ErrNoURLPresent
-
-    async def download_fb(
-        self,
-        transport: WAMediaTransport_pb2.WAMediaTransport_Integral,
-        media_type: MediaType
-    ) -> bytes:
-        """Download media from a Facebook transport message.
-
-        Args:
-            transport: The transport message
-            media_type: The media type
-
-        Returns:
-            The downloaded and decrypted media data
-
-        Raises:
-            DownloadError: If download fails
-        """
-        return await self.download_media_with_path(
-            transport.GetDirectPath(),
-            transport.GetFileEncSHA256(),
-            transport.GetFileSHA256(),
-            transport.GetMediaKey(),
+    # Check if thumbnail direct path exists and has content (equivalent to len(msg.GetThumbnailDirectPath()) > 0)
+    if len(msg.get_thumbnail_direct_path()) > 0:
+        return client.download_media_with_path(
+            ctx,
+            msg.get_thumbnail_direct_path(),
+            msg.get_thumbnail_enc_sha256(),
+            msg.get_thumbnail_sha256(),
+            msg.get_media_key(),
             -1,
+            media_type,
+            media_type_to_mms_type[media_type]
+        )
+    else:
+        return None, ErrNoURLPresent
+
+
+def get_media_type(msg: DownloadableMessage) -> MediaType:
+    """
+    Port of Go function GetMediaType from download.go.
+
+    Returns the MediaType value corresponding to the given protobuf message.
+
+    Args:
+        msg: The downloadable message object
+
+    Returns:
+        The MediaType value for the message
+    """
+    # TODO: Review MediaTypeable interface implementation
+    # TODO: Review class_to_media_type mapping implementation
+    # TODO: Review MediaTypeable interfaces/classes
+    # TODO: Review class_to_media_type dict mapping and MediaType enum/type
+
+    from google.protobuf.message import Message as ProtoMessage
+    if isinstance(msg, ProtoMessage):
+        return class_to_media_type.get(msg.DESCRIPTOR.name, "")
+
+    if isinstance(msg, MediaTypeable):
+        return msg.get_media_type()
+
+    return ""
+
+
+async def download(client: 'Client', msg: DownloadableMessage) -> Optional[bytes]:
+    """
+    Port of Go method `Download` from client.go.
+
+    Downloads the attachment from the given protobuf message.
+    The attachment is a specific part of a Message protobuf struct, not the message itself.
+
+    Args:
+        client: The WhatsApp client instance.
+        msg: A DownloadableMessage representing a media submessage (e.g. ImageMessage).
+
+    Returns:
+        The downloaded and decrypted media data.
+
+    Raises:
+        ErrClientIsNil: If the client is None.
+        ErrUnknownMediaType: If the media type cannot be determined.
+        ErrNoURLPresent: If the message has no URL or direct path to download from.
+    """
+    # TODO: Review Client.download_and_decrypt implementation
+    # TODO: Review Client.download_media_with_path implementation
+    # TODO: Review get_media_type implementation
+    # TODO: Review get_size implementation
+
+    if client is None:
+        raise ErrClientIsNil
+
+    media_type = get_media_type(msg)
+    if not media_type:
+        raise ErrUnknownMediaType(f"{type(msg)}")
+
+    url = ""
+    is_web_whatsapp_net_url = False
+
+    try:
+        url = cast(DownloadableMessageWithURL, msg).GetURL()
+        is_web_whatsapp_net_url = url.startswith("https://web.whatsapp.net")
+    except (AttributeError, TypeError):
+        pass
+
+    if url and not is_web_whatsapp_net_url:
+        data, err = await download_and_decrypt(
+            client,
+            url,
+            msg.GetMediaKey(),
+            media_type,
+            get_size(msg),
+            msg.GetFileEncSHA256(),
+            msg.GetFileSHA256()
+        )
+        return data
+    elif msg.GetDirectPath():
+        return await download_media_with_path(
+            client,
+            msg.GetDirectPath(),
+            msg.GetFileEncSHA256(),
+            msg.GetFileSHA256(),
+            msg.GetMediaKey(),
+            get_size(msg),
             media_type,
             MEDIA_TYPE_TO_MMS_TYPE[media_type]
         )
+    else:
+        if is_web_whatsapp_net_url:
+            logger.warning(f"Got a media message with a web.whatsapp.net URL ({url}) and no direct path")
+        raise ErrNoURLPresent
 
-    async def download_media_with_path(
-        self,
-        direct_path: str,
-        enc_file_hash: bytes,
-        file_hash: bytes,
-        media_key: bytes,
-        file_length: int,
-        media_type: MediaType,
-        mms_type: str
-    ) -> bytes:
-        """Download media using a direct path.
+async def download_fb(
+    client,
+    transport: WAMediaTransport_pb2.WAMediaTransport_Integral,
+    media_type: MediaType
+) -> bytes:
+    """Download media from a Facebook transport message.
 
-        Args:
-            direct_path: The direct path to the media
-            enc_file_hash: The encrypted file hash
-            file_hash: The file hash
-            media_key: The media key
-            file_length: The expected file length
-            media_type: The media type
-            mms_type: The MMS type
+    Args:
+        client: The WhatsApp client instance
+        transport: The transport message
+        media_type: The media type
 
-        Returns:
-            The downloaded and decrypted media data
+    Returns:
+        The downloaded and decrypted media data
 
-        Raises:
-            DownloadError: If download fails
-        """
-        # TODO: Implement refreshMediaConn when it's ported
-        # For now, we'll use a hardcoded host
-        hosts = [{"Hostname": "mmg.whatsapp.net"}]
+    Raises:
+        DownloadError: If download fails
+    """
+    return await download_media_with_path(
+        client,
+        transport.GetDirectPath(),
+        transport.GetFileEncSHA256(),
+        transport.GetFileSHA256(),
+        transport.GetMediaKey(),
+        -1,
+        media_type,
+        MEDIA_TYPE_TO_MMS_TYPE[media_type]
+    )
 
-        if not mms_type:
-            mms_type = MEDIA_TYPE_TO_MMS_TYPE[media_type]
+async def download_media_with_path(
+    client: "Client",
+    direct_path: str,
+    enc_file_hash: bytes,
+    file_hash: bytes,
+    media_key: bytes,
+    file_length: int,
+    media_type: "MediaType",  # TODO: Review MediaType enum/type
+    mms_type: Optional[str]
+) -> bytes:
+    """
+    Port of Go method DownloadMediaWithPath from client.go.
 
-        for i, host in enumerate(hosts):
-            media_url = (
-                f"https://{host['Hostname']}{direct_path}"
-                f"&hash={base64.urlsafe_b64encode(enc_file_hash).decode().rstrip('=')}"
-                f"&mms-type={mms_type}&__wa-mms="
-            )
+    Downloads an attachment by manually specifying the path and encryption details.
 
-            try:
-                data = await self.download_and_decrypt(
-                    media_url,
-                    media_key,
-                    media_type,
-                    file_length,
-                    enc_file_hash,
-                    file_hash
-                )
-                return data
-            except DownloadError as e:
-                if (isinstance(e, (ErrFileLengthMismatch, ErrInvalidMediaSHA256)) or
-                    str(e) in (str(ErrMediaDownloadFailedWith403),
-                              str(ErrMediaDownloadFailedWith404),
-                              str(ErrMediaDownloadFailedWith410))):
-                    raise
+    Args:
+        client: The WhatsApp client instance
+        direct_path: Media direct path
+        enc_file_hash: Encrypted file hash
+        file_hash: SHA256 of the decrypted file
+        media_key: Media encryption key
+        file_length: Expected file size
+        media_type: Media type identifier
+        mms_type: Optional MMS type string
 
-                if i >= len(hosts) - 1:
-                    raise DownloadError(f"Failed to download media from last host: {e}")
+    Returns:
+        The downloaded and decrypted media bytes
 
-                logger.warning(f"Failed to download media: {e}, trying with next host...")
+    Raises:
+        Exception if download fails on all hosts
+    """
+    # TODO: Review MediaConn implementation
+    # TODO: Review refresh_media_conn method on Client
+    # TODO: Review download_and_decrypt method on Client
 
-        # This should never be reached due to the exception handling above
-        raise DownloadError("Failed to download media")
+    if client is None:
+        raise ErrClientIsNil
 
-    async def download_and_decrypt(
-        self,
-        url: str,
-        media_key: bytes,
-        app_info: MediaType,
-        file_length: int,
-        file_enc_sha256: bytes,
-        file_sha256: bytes
-    ) -> bytes:
-        """Download and decrypt media.
+    media_conn = await mediaconn.refresh_media_conn(client, force=False)
 
-        Args:
-            url: The URL to download from
-            media_key: The media key
-            app_info: The media type
-            file_length: The expected file length
-            file_enc_sha256: The encrypted file hash
-            file_sha256: The file hash
+    if not mms_type:
+        mms_type = MEDIA_TYPE_TO_MMS_TYPE[media_type]  # TODO: Review MEDIA_TYPE_TO_MMS_TYPE mapping
 
-        Returns:
-            The downloaded and decrypted media data
-
-        Raises:
-            DownloadError: If download or decryption fails
-        """
-        iv, cipher_key, mac_key, _ = self.get_media_keys(media_key, app_info)
-
+    for i, host in enumerate(media_conn.hosts):
+        media_url = (
+            f"https://{host.hostname}{direct_path}"
+            f"&hash={base64.urlsafe_b64encode(enc_file_hash).decode().rstrip('=')}"
+            f"&mms-type={mms_type}&__wa-mms="
+        )
         try:
-            ciphertext, mac = await self.download_possibly_encrypted_media_with_retries(
-                url, file_enc_sha256
+            data, err = await download_and_decrypt(
+                client,
+                media_url,
+                media_key,
+                media_type,
+                file_length,
+                enc_file_hash,
+                file_hash
             )
-
-            # Handle unencrypted media
-            if media_key is None and file_enc_sha256 is None and mac is None:
-                return ciphertext
-
-            # Validate media
-            self.validate_media(iv, ciphertext, mac_key, mac)
-
-            # Decrypt media
-            data = decrypt(cipher_key, iv, ciphertext)
-
-            # Validate length if provided
-            if file_length >= 0 and len(data) != file_length:
-                raise ErrFileLengthMismatch(f"Expected {file_length}, got {len(data)}")
-
-            # Validate SHA256 if provided
-            if len(file_sha256) == 32:
-                data_hash = hashlib.sha256(data).digest()
-                if data_hash != file_sha256:
-                    raise ErrInvalidMediaSHA256
-
             return data
+        except (
+            ErrFileLengthMismatch,
+            ErrInvalidMediaSHA256,
+            ErrMediaDownloadFailedWith403,
+            ErrMediaDownloadFailedWith404,
+            ErrMediaDownloadFailedWith410
+        ) as err:
+            return data  # These are allowed partial errors
+
+        except Exception as err:
+            if i >= len(media_conn.hosts) - 1:
+                raise RuntimeError(f"failed to download media from last host: {err}") from err
+            logger.warning(f"Failed to download media: {err}, trying with next host...")
+
+    raise RuntimeError("Media download failed unexpectedly without error capture")
+
+async def download_and_decrypt(
+    client: "Client",
+    url: str,
+    media_key: Optional[bytes],
+    app_info: MediaType,
+    file_length: int,
+    file_enc_sha256: Optional[bytes],
+    file_sha256: Optional[bytes],
+) -> Tuple[Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go method downloadAndDecrypt from media.go.
+
+    Downloads the media from the given URL and decrypts it using the media key.
+
+    Args:
+        client: The Client instance
+        url: The media download URL
+        media_key: The encryption key used to derive keys for decryption
+        app_info: The media type
+        file_length: Expected file length (used for validation)
+        file_enc_sha256: Optional SHA256 hash of encrypted file
+        file_sha256: Optional SHA256 hash of decrypted file
+
+    Returns:
+        Tuple of (decrypted media bytes or None, error or None)
+    """
+    # TODO: Review get_media_keys implementation
+    # TODO: Review client.download_possibly_encrypted_media_with_retries implementation
+    # TODO: Review validate_media implementation
+    # TODO: Review cbcutil.decrypt implementation
+
+    iv, cipher_key, mac_key, _ = get_media_keys(media_key, app_info)
+
+    ciphertext, mac = await download_possibly_encrypted_media_with_retries(client, url, file_enc_sha256)
+
+    if media_key is None and file_enc_sha256 is None and mac is None:
+        # Unencrypted media, just return the downloaded data
+        return ciphertext, None
+
+    validate_media(iv, ciphertext, mac_key, mac)
+
+    try:
+        data = decrypt(cipher_key, iv, ciphertext)
+    except Exception as e:
+        return None, Exception(f"failed to decrypt file: {e}")
+
+    if file_length >= 0 and len(data) != file_length:
+        return None, ErrFileLengthMismatch(file_length, len(data))  # custom error assumed to exist
+
+    if file_sha256 is not None and len(file_sha256) == 32:
+        calculated_sha256 = hashlib.sha256(data).digest()
+        if calculated_sha256 != file_sha256:
+            return None, ErrInvalidMediaSHA256
+
+    return data, None
+
+def get_media_keys(media_key: bytes, app_info: MediaType) -> Tuple[bytes, bytes, bytes, bytes]:
+    """Generate media keys from a media key and app info.
+
+    Args:
+        media_key: The media key
+        app_info: The media type
+
+    Returns:
+        A tuple of (iv, cipher_key, mac_key, ref_key)
+    """
+    media_key_expanded = hkdf_sha256(media_key, None, str(app_info).encode(), 112)
+    return (
+        media_key_expanded[:16],
+        media_key_expanded[16:48],
+        media_key_expanded[48:80],
+        media_key_expanded[80:]
+    )
+
+def should_retry_media_download(err: Exception) -> bool:
+    """
+    Port of Go method shouldRetryMediaDownload from media_download.go.
+
+    Determine whether a media download should be retried based on the error encountered.
+
+    Args:
+        err: The exception that occurred.
+
+    Returns:
+        True if the download should be retried, False otherwise.
+    """
+    # TODO: Review DownloadHTTPError implementation
+    # TODO: Review retryafter.should implementation
+
+    if isinstance(err, (asyncio.TimeoutError, aiohttp.ClientError)):
+        return True
+
+    if isinstance(err, DownloadHTTPError):
+        # Retry depending on status code
+        return retryafter.should(err.status_code, retry_after=True)
+
+    if isinstance(err, Exception) and "stream error" in str(err).lower():
+        return True
+
+    return False
+
+async def download_possibly_encrypted_media_with_retries(
+    client: 'Client',
+    url: str,
+    checksum: Optional[bytes],
+) -> Tuple[bytes, Optional[bytes]]:
+    """
+    Port of Go method downloadPossiblyEncryptedMediaWithRetries from client_media.go.
+
+    Attempt to download media (possibly encrypted) with retries.
+
+    Args:
+        client: The WhatsApp client instance
+        url: The URL to download from
+        checksum: Optional checksum used to verify encrypted download
+
+    Returns:
+        Tuple of (file_data, mac), where mac is only present for encrypted media
+
+    Raises:
+        DownloadError: If the download fails after all retry attempts
+    """
+    # TODO: Review download_media_raw implementation
+    # TODO: Review download_encrypted_media implementation
+    # TODO: Review should_retry_media_download implementation
+    # TODO: Review DownloadHTTPError class definition
+
+    for retry_num in range(5):
+        try:
+            if checksum is None:
+                file_data, err = await download_media(client, url)
+                return file_data, None
+            else:
+                file_data, mac, err = await download_encrypted_media(client, url, checksum)
+                return file_data, mac
 
         except Exception as e:
-            if isinstance(e, DownloadError):
+            if not should_retry_media_download(e):
                 raise
-            raise DownloadError(f"Failed to download and decrypt media: {e}")
 
-    def get_media_keys(self, media_key: bytes, app_info: MediaType) -> Tuple[bytes, bytes, bytes, bytes]:
-        """Generate media keys from a media key and app info.
+            retry_duration = retry_num + 1  # seconds by default
 
-        Args:
-            media_key: The media key
-            app_info: The media type
-
-        Returns:
-            A tuple of (iv, cipher_key, mac_key, ref_key)
-        """
-        media_key_expanded = hkdf_sha256(media_key, None, str(app_info).encode(), 112)
-        return (
-            media_key_expanded[:16],
-            media_key_expanded[16:48],
-            media_key_expanded[48:80],
-            media_key_expanded[80:]
-        )
-
-    def should_retry_media_download(self, err: Exception) -> bool:
-        """Determine if a media download should be retried.
-
-        Args:
-            err: The exception that occurred
-
-        Returns:
-            True if the download should be retried, False otherwise
-        """
-        if isinstance(err, (asyncio.TimeoutError, aiohttp.ClientError)):
-            return True
-
-        if isinstance(err, DownloadHTTPError):
-            # Retry for 5xx errors and some 4xx errors
-            status = err.status_code
-            return status >= 500 or status in (408, 429)
-
-        # Check for http2 stream errors
-        if isinstance(err, Exception) and "stream error" in str(err).lower():
-            return True
-
-        return False
-
-    async def download_possibly_encrypted_media_with_retries(
-        self,
-        url: str,
-        checksum: Optional[bytes]
-    ) -> Tuple[bytes, Optional[bytes]]:
-        """Download possibly encrypted media with retries.
-
-        Args:
-            url: The URL to download from
-            checksum: The checksum to validate
-
-        Returns:
-            A tuple of (file_data, mac)
-
-        Raises:
-            DownloadError: If download fails after retries
-        """
-        for retry_num in range(5):
-            try:
-                if checksum is None:
-                    file_data = await self.download_media_raw(url)
-                    return file_data, None
-                else:
-                    file_data, mac = await self.download_encrypted_media(url, checksum)
-                    return file_data, mac
-            except Exception as e:
-                if not self.should_retry_media_download(e) or retry_num >= 4:
-                    raise
-
-                retry_duration = (retry_num + 1)
-
-                if isinstance(e, DownloadHTTPError) and e.response.headers.get("Retry-After"):
+            if isinstance(e, DownloadHTTPError):
+                retry_after_header = e.response.headers.get("Retry-After")
+                if retry_after_header:
+                    # TODO: Review retryafter.Parse logic if custom parsing needed
                     try:
-                        retry_duration = int(e.response.headers.get("Retry-After", "1"))
+                        retry_duration = int(retry_after_header)
                     except ValueError:
                         pass
 
-                logger.warning(
-                        f"Failed to download media due to network error: {e}, "
-                        f"retrying in {retry_duration}s..."
-                    )
+            logger.warning(
+                f"Failed to download media due to network error: {e}, "
+                f"retrying in {retry_duration}s..."
+            )
 
-                await asyncio.sleep(retry_duration)
+            try:
+                await asyncio.wait_for(asyncio.sleep(retry_duration), timeout=None)
+            except asyncio.CancelledError:
+                raise
 
-        raise DownloadError("Failed to download media after retries")
+    raise DownloadError("Failed to download media after retries")
 
-    async def do_media_download_request(self, url: str) -> aiohttp.ClientResponse:
-        """Make a media download request.
+async def do_media_download_request(client, url: str) -> aiohttp.ClientResponse:
+    """
+    Port of Go method doMediaDownloadRequest from client.go.
 
-        Args:
-            url: The URL to download from
+    Make a GET request to download media with appropriate headers.
 
-        Returns:
-            The HTTP response
+    Args:
+        client: The WhatsApp client instance
+        url: The URL to download media from
 
-        Raises:
-            DownloadError: If the request fails
-        """
-        await self.ensure_http_session()
+    Returns:
+        The aiohttp.ClientResponse object
 
-        headers = {
-            "Origin": "https://web.whatsapp.com",
-            "Referer": "https://web.whatsapp.com/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        }
+    Raises:
+        DownloadHTTPError: If the response status is not 200
+        DownloadError: On network failure
+        ErrMediaDownloadFailedWith403, ErrMediaDownloadFailedWith404, ErrMediaDownloadFailedWith410:
+            Specific failure codes mapped from response
+    """
+    # TODO: Review DownloadHTTPError, DownloadError, ErrMediaDownloadFailedWith403, etc.
 
-        try:
-            response = await self.http_session.get(url, headers=headers)
+    headers = {
+        "Origin": "https://web.whatsapp.com",  # Matches socket.Origin
+        "Referer": "https://web.whatsapp.com/",
+    }
 
-            if response.status != 200:
-                if response.status == 403:
-                    raise ErrMediaDownloadFailedWith403
-                elif response.status == 404:
-                    raise ErrMediaDownloadFailedWith404
-                elif response.status == 410:
-                    raise ErrMediaDownloadFailedWith410
+    if client.MessengerConfig is not None:
+        headers["User-Agent"] = client.MessengerConfig.UserAgent
 
-                raise DownloadHTTPError(response)
+    try:
+        response = await client.http.get(url, headers=headers)
 
-            return response
-        except aiohttp.ClientError as e:
-            raise DownloadError(f"HTTP request failed: {e}")
+        if response.status != 200:
+            if response.status == 403:
+                raise ErrMediaDownloadFailedWith403
+            elif response.status == 404:
+                raise ErrMediaDownloadFailedWith404
+            elif response.status == 410:
+                raise ErrMediaDownloadFailedWith410
 
-    async def download_media_raw(self, url: str) -> bytes:
-        """Download media without decryption.
+            raise DownloadHTTPError(response)
 
-        Args:
-            url: The URL to download from
+        return response
 
-        Returns:
-            The raw media data
+    except aiohttp.ClientError as e:
+        raise DownloadError(f"HTTP request failed: {e}")
 
-        Raises:
-            DownloadError: If download fails
-        """
-        response = await self.do_media_download_request(url)
-        try:
-            return await response.read()
-        finally:
-            response.close()
+async def download_media(
+    client: "Client",
+    url: str
+) -> Tuple[Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go method downloadMedia from client.go.
 
-    async def download_encrypted_media(
-        self,
-        url: str,
-        checksum: bytes
-    ) -> Tuple[bytes, bytes]:
-        """Download encrypted media.
+    Downloads media content from the provided URL.
 
-        Args:
-            url: The URL to download from
-            checksum: The checksum to validate
+    Args:
+        client: The WhatsApp client instance.
+        url: The URL to download media from.
 
-        Returns:
-            A tuple of (file_data, mac)
+    Returns:
+        A tuple containing the response bytes and an exception (if any).
+    """
+    try:
+        response = await do_media_download_request(client, url)
+        data = await response.read()
+        return data, None
+    except Exception as e:
+        return None, e
 
-        Raises:
-            DownloadError: If download fails
-        """
-        data = await self.download_media_raw(url)
 
-        if len(data) <= MEDIA_HMAC_LENGTH:
-            raise ErrTooShortFile
+async def download_encrypted_media(
+    client: "Client",
+    url: str,
+    checksum: bytes
+) -> Tuple[Optional[bytes], Optional[bytes], Optional[Exception]]:
+    """
+    Port of Go method downloadEncryptedMedia from client.go.
 
-        file_data = data[:-MEDIA_HMAC_LENGTH]
-        mac = data[-MEDIA_HMAC_LENGTH:]
+    Downloads and splits encrypted media into file content and MAC.
+    Validates the media's checksum if provided.
 
-        if len(checksum) == 32:
-            data_hash = hashlib.sha256(data).digest()
-            if data_hash != checksum:
-                raise ErrInvalidMediaEncSHA256
+    Args:
+        client: The WhatsApp client instance.
+        url: The URL to download media from.
+        checksum: The expected SHA256 checksum of the full encrypted media.
 
-        return file_data, mac
+    Returns:
+        Tuple containing:
+        - file_data (bytes): the actual file contents (excluding the MAC)
+        - mac (bytes): the trailing media MAC
+        - err (Exception or None): error, if any
+    """
+    # TODO: Review ErrTooShortFile and ErrInvalidMediaEncSHA256 definitions
 
-    def validate_media(self, iv: bytes, file_data: bytes, mac_key: bytes, mac: bytes) -> None:
-        """Validate media using HMAC.
+    try:
+        data, err = await download_media(client, url)
+        if err is not None:
+            return None, None, err
+    except Exception as e:
+        return None, None, e
 
-        Args:
-            iv: The initialization vector
-            file_data: The file data
-            mac_key: The MAC key
-            mac: The MAC to validate
+    if len(data) <= MEDIA_HMAC_LENGTH:
+        return None, None, ErrTooShortFile
 
-        Raises:
-            DownloadError: If validation fails
-        """
-        h = hmac.new(mac_key, digestmod=hashlib.sha256)
-        h.update(iv)
-        h.update(file_data)
+    file_data = data[:-MEDIA_HMAC_LENGTH]
+    mac = data[-MEDIA_HMAC_LENGTH:]
 
-        if not hmac.compare_digest(h.digest()[:MEDIA_HMAC_LENGTH], mac):
-            raise ErrInvalidMediaHMAC
+    if len(checksum) == 32:
+        calculated = hashlib.sha256(data).digest()
+        if calculated != checksum:
+            return None, None, ErrInvalidMediaEncSHA256
 
-    async def download_to_file(
-        self,
-        msg: DownloadableMessage,
-        file_path: Union[str, Path],
-        decrypt: bool = True
-    ) -> None:
-        """Download media to a file.
+    return file_data, mac, None
 
-        Args:
-            msg: The downloadable message
-            file_path: The path to save the file to
-            decrypt: Whether to decrypt the media
 
-        Raises:
-            DownloadError: If download fails
-        """
-        data = await self.download(msg)
+def validate_media(iv: bytes, file_data: bytes, mac_key: bytes, mac: bytes) -> None:
+    """
+    Port of Go method validateMedia from decrypt.go.
 
-        # Write to file
-        if isinstance(file_path, str):
-            file_path = Path(file_path)
+    Validates the integrity of encrypted media using HMAC-SHA256.
 
-        file_path.write_bytes(data)
+    Args:
+        iv: The initialization vector used in encryption
+        file_data: The raw encrypted media bytes
+        mac_key: The HMAC key
+        mac: The MAC tag to validate against
 
-    async def download_any_to_file(
-        self,
-        message: waE2E_pb2.Message,
-        file_path: Union[str, Path]
-    ) -> None:
-        """Download the first downloadable content from a message to a file.
+    Raises:
+        ErrInvalidMediaHMAC: If HMAC validation fails
+    """
+    # TODO: Review ErrInvalidMediaHMAC implementation
+    # TODO: Review MEDIA_HMAC_LENGTH definition
 
-        Args:
-            message: The message containing media
-            file_path: The path to save the file to
+    h = hmac.new(mac_key, digestmod=hashlib.sha256)
+    h.update(iv)
+    h.update(file_data)
 
-        Raises:
-            DownloadError: If no downloadable content is found or download fails
-        """
-        data = await self.download_any(message)
-
-        # Write to file
-        if isinstance(file_path, str):
-            file_path = Path(file_path)
-
-        file_path.write_bytes(data)
+    if not hmac.compare_digest(h.digest()[:MEDIA_HMAC_LENGTH], mac):
+        raise ErrInvalidMediaHMAC
