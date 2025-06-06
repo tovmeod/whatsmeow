@@ -17,7 +17,7 @@ from ...generated.waMsgApplication import WAMsgApplication_pb2
 from ...generated.waMsgTransport import WAMsgTransport_pb2
 from ...generated.waWeb import WAWebProtobufsWeb_pb2 as WAWeb_pb2
 from ..jid import JID
-from ..message import MessageInfo, MessageID, MessageSource
+from ..message import MessageInfo, MessageID, MessageSource, DeviceSentMeta
 from ..presence import ChatPresence, ChatPresenceMedia, ReceiptType
 
 # Deprecated: use types.ReceiptType directly
@@ -360,7 +360,7 @@ class Message:
     Emitted when receiving a new message.
     """
     info: MessageInfo  # Information about the message like the chat and sender IDs
-    message: WAE2E_pb2.Message  # The actual message struct
+    message: Optional[WAE2E_pb2.Message] = None  # The actual message struct
     is_ephemeral: bool = False  # True if the message was unwrapped from an EphemeralMessage
     is_view_once: bool = False  # True if the message was unwrapped from a ViewOnceMessage, ViewOnceMessageV2 or ViewOnceMessageV2Extension
     is_view_once_v2: bool = False  # True if the message was unwrapped from a ViewOnceMessageV2 or ViewOnceMessageV2Extension
@@ -376,7 +376,7 @@ class Message:
 
     def unwrap_raw(self) -> 'Message':
         """
-        Fills the Message, IsEphemeral and IsViewOnce fields based on the raw message in the RawMessage field.
+        Fills the Message, IsEphemeral, and IsViewOnce fields based on the raw message in the RawMessage field.
         """
         if not self.raw_message:
             return self
@@ -386,10 +386,10 @@ class Message:
         # Handle DeviceSentMessage
         device_sent = self.message.deviceSentMessage
         if device_sent and device_sent.message:
-            self.info.device_sent_meta = {
-                'destination_jid': device_sent.destinationJid,
-                'phash': device_sent.phash,
-            }
+            self.info.device_sent_meta = DeviceSentMeta(
+                destination_jid=device_sent.destinationJid,
+                phash=device_sent.phash,
+            )
             self.message = device_sent.message
 
         # Handle EphemeralMessage
@@ -621,7 +621,7 @@ class PrivacySettingsEvent:
     """
     Emitted when the user changes their privacy settings.
     """
-    new_settings: Dict[str, Any]  # types.PrivacySettings
+    new_settings: Optional[Dict[str, Any]] = None  # types.PrivacySettings
     group_add_changed: bool = False
     last_seen_changed: bool = False
     status_changed: bool = False
@@ -629,6 +629,10 @@ class PrivacySettingsEvent:
     read_receipts_changed: bool = False
     online_changed: bool = False
     call_add_changed: bool = False
+
+    def __post_init__(self):
+        if self.new_settings is None:
+            self.new_settings = {}
 
 # OfflineSyncPreview is emitted right after connecting if the server is going to send events that the client missed during downtime.
 @dataclass
