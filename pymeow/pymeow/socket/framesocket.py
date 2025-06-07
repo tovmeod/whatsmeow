@@ -7,10 +7,11 @@ import asyncio
 import contextlib
 import logging
 import struct
-from typing import Optional, Callable, Awaitable, Dict, List, Any
+from typing import Optional, Callable, Awaitable, Dict, List, Any, Coroutine
 
 from aiohttp import ClientSession, ClientWebSocketResponse, WSMessage, WSMsgType
 
+from .noisesocket import NoiseSocket
 from ..binary.token import DICT_VERSION
 from .constants import (
     URL, ORIGIN, WA_CONN_HEADER, FRAME_MAX_SIZE, FRAME_LENGTH_SIZE,
@@ -27,152 +28,142 @@ class FrameSocket:
     handling the framing protocol used by WhatsApp Web.
     """
 
-    def __init__(self):
+    def __init__(self, dialer: ClientSession):
         """
         Initialize a new FrameSocket.
 
         Args:
-            log: Logger to use for logging. If None, a default logger will be created.
+            dialer: aiohttp ClientSession for WebSocket connections
         """
-        self._ws: Optional[ClientWebSocketResponse] = None
-        self._session: Optional[ClientSession] = None
-        self._task: Optional[asyncio.Task] = None
-        self._closed: bool = False
-
+        self.conn: Optional[ClientWebSocketResponse] = None
+        # Go: lock: sync.Mutex -> Python asyncio equivalent
+        self.lock = asyncio.Lock()
         self.url: str = URL
         self.http_headers: Dict[str, str] = {"Origin": ORIGIN}
-
-        self.frames = asyncio.Queue()
-        self.on_disconnect: Optional[Callable[[bool], Awaitable[None]]] = None
+        self.frames: asyncio.Queue[bytes] = asyncio.Queue()
+        self.on_disconnect: Optional[Callable[[bool], Coroutine[Any, Any, None]]] = None
         self.write_timeout: Optional[float] = None
+        self.header: bytes = WA_CONN_HEADER
+        self.dialer: ClientSession = dialer
 
-        self.header: Optional[bytes] = WA_CONN_HEADER
+        # self._task: Optional[asyncio.Task] = None
+
 
         # Frame processing state
         self.incoming_length: int = 0
         self.received_length: int = 0
         self.incoming: Optional[bytearray] = None
-        self.partial_header: Optional[bytearray] = None
+        self.partial_header: Optional[bytes] = None
 
     def is_connected(self) -> bool:
         """
+        Port of Go method IsConnected from framesocket.go.
+
         Check if the socket is connected.
 
         Returns:
             True if the socket is connected, False otherwise
         """
-        return self._ws is not None and not self._closed
+        return self.conn is not None
 
-    def context(self) -> Any:
+    async def close(self, code: int) -> None:
         """
-        Get the context for this connection.
+        Port of Go method Close from framesocket.go.
 
-        Returns:
-            The context object
-        """
-        return self._task
-
-    async def close(self, code: int = 1000) -> None:
-        """
-        Close the WebSocket connection.
+        Close the WebSocket connection with the specified close code.
 
         Args:
-            code: The WebSocket close code
+            code: The WebSocket close code. If > 0, sends a close message.
         """
-        if self._ws is None or self._closed:
-            return
+        # TODO: Review websocket.FormatCloseMessage implementation
+        # TODO: Review websocket.CloseMessage constant
 
-        self._closed = True
+        async with self.lock:
+            if self.conn is None:
+                return
 
-        if code > 0 and self._ws is not None:
+            # Go: if code > 0 { ... send close message ... }
+            if code > 0:
+                try:
+                    # Go: message := websocket.FormatCloseMessage(code, "")
+                    # Go: err := fs.conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(time.Second))
+                    await self.conn.close(code=code, message=b"")
+                except Exception as err:
+                    logger.warning(f"Error sending close message: {err}")
+
+            # Go: err := fs.conn.Close()
             try:
-                await self._ws.close(code=code)
-            except Exception as e:
-                logger.warning(f"Error sending close message: {e}")
+                if not self.conn.closed:
+                    await self.conn.close()
+            except Exception as err:
+                logger.error(f"Error closing websocket: {err}")
 
-        if self._task is not None:
-            self._task.cancel()
-            self._task = None
+            # Go: fs.conn = nil
+            self.conn = None
 
-        # Close the WebSocket and session
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception as e:
-                logger.error(f"Error closing websocket: {e}")
-            self._ws = None
+            # Go: if fs.OnDisconnect != nil { go fs.OnDisconnect(code == 0) }
+            if self.on_disconnect is not None:
+                # Go goroutine equivalent - run in background
+                asyncio.create_task(self.on_disconnect(code == 0))
 
-        if self._session is not None:
-            try:
-                await self._session.close()
-            except Exception as e:
-                logger.error(f"Error closing session: {e}")
-            self._session = None
 
-        if self.on_disconnect:
-            asyncio.create_task(self.on_disconnect(code == 0))
-
-    async def connect(self) -> None:
+    async def connect(self) -> Optional[Exception]:
         """
+        Port of Go method Connect from FrameSocket.
+
         Connect to WhatsApp WebSocket server.
 
-        Raises:
-            SocketAlreadyOpenError: If the socket is already open
-            ConnectionError: If the connection fails
+        Returns:
+            Optional[Exception]: None if successful, Exception if failed
         """
-        if self._ws is not None and not self._closed:
-            raise SocketAlreadyOpenError()
+        # TODO: Review SocketAlreadyOpenError implementation
 
-        self._closed = False
-        logger.debug(f"Dialing {self.url}")
+        async with self.lock:
+            if self.conn is not None:
+                return SocketAlreadyOpenError()
 
-        try:
-            # Create a new session
-            self._session = ClientSession()
+            logger.debug(f"Dialing {self.url}")
 
-            # Connect to the WebSocket
-            self._ws = await self._session.ws_connect(self.url, headers=self.http_headers)
+            try:
+                self.conn = await self.dialer.ws_connect(
+                    self.url,
+                    headers=self.http_headers
+                )
 
-            # Start the receive loop
-            self._task = asyncio.create_task(self._receive_loop())
+                # Start read pump
+                asyncio.create_task(self.read_pump(self.conn))
 
-        except Exception as e:
-            # Clean up if connection fails
-            if self._session:
-                await self._session.close()
-                self._session = None
-            self._ws = None
-            self._closed = True
-            raise ConnectionError(f"Couldn't dial whatsapp web websocket: {e}") from e
+                return None
 
+            except Exception as e:
+                return Exception(f"couldn't dial whatsapp web websocket: {e}")
 
-    async def send_frame(self, data: bytes) -> None:
+    async def send_frame(self, data: bytes) -> Optional[Exception]:
         """
-        Send a frame through the WebSocket.
+        Port of Go method SendFrame from FrameSocket.
+
+        Send a frame through the WebSocket with proper framing protocol.
 
         Args:
             data: The frame data to send
 
-        Raises:
-            SocketClosedError: If the WebSocket is not connected
-            FrameTooLargeError: If the frame is too large
+        Returns:
+            Optional[Exception]: None if successful, Exception if failed
         """
-        if self._ws is None or self._closed:
-            raise SocketClosedError()
+        if  self.conn is None:
+            return SocketClosedError()
 
         data_length = len(data)
         if data_length >= FRAME_MAX_SIZE:
-            raise FrameTooLargeError(f"Got {data_length} bytes, max {FRAME_MAX_SIZE} bytes")
+            return FrameTooLargeError(f"got {len(data)} bytes, max {FRAME_MAX_SIZE} bytes")
 
-        header_length = 0 if self.header is None else len(self.header)
-
+        header_length = len(self.header) if self.header is not None else 0
         # Whole frame is header + 3 bytes for length + data
         whole_frame = bytearray(header_length + FRAME_LENGTH_SIZE + data_length)
 
         # Copy the header if it's there
         if self.header is not None:
-            logger.info(f"Prepending self.header to frame: {self.header.hex()} (raw bytes: {list(self.header)})")
-            whole_frame[0:header_length] = self.header
+            whole_frame[:header_length] = self.header
             # We only want to send the header once
             self.header = None
 
@@ -184,18 +175,24 @@ class FrameSocket:
         # Copy actual frame data
         whole_frame[header_length + FRAME_LENGTH_SIZE:] = data
 
-        logger.info(f"Sending frame: header_length={header_length}, data_length={data_length}")
-        logger.info(f"Complete frame (hex): {whole_frame.hex()}")
-        logger.info(f"Complete frame length: {len(whole_frame)}")
-
-        if self.write_timeout and self.write_timeout > 0:
+        if self.write_timeout > 0:
             try:
-                await asyncio.wait_for(self._ws.send_bytes(whole_frame), timeout=self.write_timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"Write timed out after {self.write_timeout}s")
-                raise
+                await asyncio.wait_for(
+                    self.conn.send_bytes(whole_frame),
+                    timeout=self.write_timeout
+                )
+                return None
+            except asyncio.TimeoutError as e:
+                logger.warning(f"Failed to set write deadline: {e}")
+                return e
+            except Exception as e:
+                return e
         else:
-            await self._ws.send_bytes(whole_frame)
+            try:
+                await self.conn.send_bytes(whole_frame)
+                return None
+            except Exception as e:
+                return e
 
     def _frame_complete(self) -> None:
         """Handle a complete frame."""
@@ -204,98 +201,90 @@ class FrameSocket:
         self.partial_header = None
         self.incoming_length = 0
         self.received_length = 0
-        asyncio.create_task(self.frames.put(bytes(data)))
+        asyncio.create_task(self.frames.put(data)) # todo store task so it is not gc'ed
 
     def _process_data(self, msg: bytes) -> None:
         """
-        Process incoming WebSocket data.
+        Port of Go method processData from FrameSocket.
+
+        Process incoming WebSocket data and reconstruct frames.
 
         Args:
             msg: The raw WebSocket message data
         """
-        data = bytearray(msg)
 
-        while len(data) > 0:
-            # Handle partial header from previous message
+        # TODO: Review FRAME_LENGTH_SIZE constant
+        # TODO: Review frame_complete method implementation
+
+        while len(msg) > 0:
+            # This probably doesn't happen a lot (if at all), so the code is unoptimized
             if self.partial_header is not None:
-                data = self.partial_header + data
+                msg = self.partial_header + msg
                 self.partial_header = None
 
             if self.incoming is None:
-                if len(data) >= FRAME_LENGTH_SIZE:
-                    # Extract frame length from first 3 bytes
-                    length = (data[0] << 16) + (data[1] << 8) + data[2]
+                if len(msg) >= FRAME_LENGTH_SIZE:
+                    length = (int(msg[0]) << 16) + (int(msg[1]) << 8) + int(msg[2])
                     self.incoming_length = length
-                    self.received_length = len(data)
-                    data = data[FRAME_LENGTH_SIZE:]
+                    self.received_length = len(msg)
+                    msg = msg[FRAME_LENGTH_SIZE:]
 
-                    if len(data) >= length:
-                        # We have the complete frame
-                        self.incoming = data[:length]
-                        data = data[length:]
+                    if len(msg) >= length:
+                        self.incoming = msg[:length]
+                        msg = msg[length:]
                         self._frame_complete()
                     else:
-                        # We have a partial frame
                         self.incoming = bytearray(length)
-                        self.incoming[:len(data)] = data
-                        data = bytearray()
+                        self.incoming[:len(msg)] = msg
+                        msg = b''
+                else:
+                    logger.warning("Got partial header")
+                    self.partial_header = msg
+                    msg = b''
             else:
-                # We're continuing a partial frame
-                if self.received_length + len(data) >= self.incoming_length:
-                    # This completes the frame
-                    remaining = self.incoming_length - self.received_length
-                    self.incoming[self.received_length:] = data[:remaining]
-                    data = data[remaining:]
+                if self.received_length + len(msg) >= self.incoming_length:
+                    bytes_needed = self.incoming_length - self.received_length
+                    self.incoming[self.received_length:self.received_length + bytes_needed] = msg[:bytes_needed]
+                    msg = msg[bytes_needed:]
                     self._frame_complete()
                 else:
-                    # Still not complete
-                    self.incoming[self.received_length:self.received_length + len(data)] = data
-                    self.received_length += len(data)
-                    data = bytearray()
+                    self.incoming[self.received_length:self.received_length + len(msg)] = msg
+                    self.received_length += len(msg)
+                    msg = b''
 
-    async def _receive_loop(self) -> None:
-        """Handle incoming WebSocket messages."""
-        logger.debug(f"Frame websocket receive loop starting {id(self)}")
-        ws_closed_before_loop = self._ws.closed if self._ws else "N/A"
-        logger.debug(f"Initial self._ws.closed state: {ws_closed_before_loop}, self._closed flag: {self._closed}")
+    async def read_pump(self, conn: 'ClientWebSocketResponse') -> None:
+        """
+        Port of Go method readPump from FrameSocket.
+
+        Continuously read messages from the WebSocket connection and process them.
+
+        Args:
+            conn: The WebSocket connection
+        """
+        # TODO: Review process_data method implementation
+        # TODO: Review close method implementation
+
+        logger.debug(f"Frame websocket read pump starting {id(self)}")
 
         try:
-            async for msg in self._ws:
-                logger.debug(f"Received message of type: {msg.type}")
+            async for msg in conn:
                 if msg.type == WSMsgType.BINARY:
-                    logger.info(f"Received BINARY message data (hex): {msg.data.hex() if msg.data else 'None'}")
                     self._process_data(msg.data)
-                elif msg.type == WSMsgType.CLOSE:
-                    logger.info(f"Server closed websocket with status: {msg.data}, WebSocket close code: {self._ws.close_code}")
-                    break
                 elif msg.type == WSMsgType.ERROR:
-                    logger.error(f"WebSocket error message received: {msg.data}. Exception from _ws.exception(): {self._ws.exception()}", exc_info=True)
+                    logger.error(f"Error reading from websocket: {conn.exception()}")
+                    break
+                elif msg.type == WSMsgType.CLOSE:
+                    logger.debug("WebSocket connection closed")
                     break
                 else:
-                    logger.warning(f"Got unexpected websocket message type: {msg.type}, data: {msg.data}")
+                    logger.warning(f"Got unexpected websocket message type {msg.type}")
+                    continue
         except asyncio.CancelledError:
-            logger.debug("Frame websocket receive loop cancelled (asyncio.CancelledError).")
-        except Exception as e:
-            if not self._closed:
-                logger.error(f"Error reading from websocket: {e}", exc_info=True)
-            else:
-                logger.info(f"Error reading from websocket after it was already marked closed: {e}", exc_info=True)
+            # Ignore cancellation errors (equivalent to context.Canceled)
+            pass
+        except Exception as err:
+            logger.error(f"Error reading from websocket: {err}")
         finally:
-            ws_closed_after_loop = self._ws.closed if self._ws else "N/A"
-            ws_close_code_after_loop = self._ws.close_code if self._ws else "N/A"
-            ws_exception_obj_after_loop = self._ws.exception() if self._ws else None
-            ws_exception_after_loop_str = str(ws_exception_obj_after_loop) if ws_exception_obj_after_loop else "N/A"
-
-            logger.debug(
-                f"Frame websocket receive loop ending. "
-                f"self._ws.closed: {ws_closed_after_loop}, "
-                f"self._ws.close_code: {ws_close_code_after_loop}, "
-                f"self._ws.exception(): {ws_exception_after_loop_str}, "
-                f"self._closed flag: {self._closed}"
-            )
-
-            if not self._closed:
-                logger.info(f"Calling self.close(0) from _receive_loop finally as self._closed was False. Loop ID: {id(self)}")
-                asyncio.create_task(self.close(0))
-            else:
-                logger.info(f"self.close(0) not called from _receive_loop finally as self._closed was True. Loop ID: {id(self)}")
+            logger.debug(f"Frame websocket read pump exiting {id(self)}")
+            # Schedule close in background (equivalent to go fs.Close(0))
+            asyncio.create_task(self.close(0))  # todo store task so it is not gc'ed
