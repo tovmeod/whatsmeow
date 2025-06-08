@@ -7,13 +7,13 @@ import logging
 import time
 from typing import Any, List, TYPE_CHECKING
 
-from pymeow.pymeow.generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
-from pymeow.pymeow.binary import node as binary_node
-from pymeow.pymeow.exceptions import ErrAppStateUpdate
-from pymeow.pymeow.request import InfoQuery
-from pymeow.pymeow.send import SendRequestExtra
-from pymeow.pymeow.store.store import ContactEntry
-from pymeow.pymeow.types import events, JID
+from .. import download
+from ..generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
+from ..binary import node as binary_node
+from ..exceptions import ErrAppStateUpdate
+from ..request import InfoQuery, InfoQueryType
+from ..store.store import ContactEntry
+from ..types import events, JID
 
 if TYPE_CHECKING:
     from pymeow.pymeow.client import Client
@@ -64,10 +64,10 @@ async def fetch_app_state(
             has_more = patches.has_more_patches
 
             try:
-                mutations, new_state = await client.app_state_proc.decode_patches(ctx, patches, state, True)
+                mutations, new_state = await client.app_state_proc.decode_patches(patches, state, True)
             except Exception as err:
                 if "key not found" in str(err).lower():
-                    await request_missing_app_state_keys(client, ctx, patches)
+                    await request_missing_app_state_keys(client, patches)
                 raise Exception(f"failed to decode app state {name} patches: {err}")
 
             was_full_sync = state.version == 0 and patches.snapshot is not None
@@ -77,12 +77,12 @@ async def fetch_app_state(
                 mutations, contacts = filter_contacts(mutations)
                 logger.debug(f"Mass inserting app state snapshot with {len(contacts)} contacts into the store")
                 try:
-                    await client.store.contacts.put_all_contact_names(ctx, contacts)
+                    await client.store.contacts.put_all_contact_names(contacts)
                 except Exception as err:
                     raise Exception(f"failed to update contact store with data from snapshot: {err}")
 
             for mutation in mutations:
-                await dispatch_app_state(client, ctx, mutation, full_sync, client.emit_app_state_events_on_full_sync)
+                await dispatch_app_state(client, mutation, full_sync, client.emit_app_state_events_on_full_sync)
 
         if full_sync:
             logger.debug(f"Full sync of app state {name} completed. Current version: {state.version}")
@@ -114,7 +114,6 @@ def filter_contacts(mutations: List[Any]) -> tuple[List[Any], List[Any]]:
 
 async def dispatch_app_state(
     client: "Client",
-    ctx: Any,
     mutation: Any,
     full_sync: bool,
     emit_on_full_sync: bool
@@ -161,7 +160,7 @@ async def dispatch_app_state(
 
             if client.store.chat_settings:
                 try:
-                    await client.store.chat_settings.put_muted_until(ctx, jid, muted_until)
+                    await client.store.chat_settings.put_muted_until(jid, muted_until)
                 except Exception as err:
                     store_update_error = err
 
@@ -177,7 +176,7 @@ async def dispatch_app_state(
 
             if client.store.chat_settings:
                 try:
-                    await client.store.chat_settings.put_pinned(ctx, jid, getattr(act, 'pinned', False))
+                    await client.store.chat_settings.put_pinned(jid, getattr(act, 'pinned', False))
                 except Exception as err:
                     store_update_error = err
 
@@ -193,7 +192,7 @@ async def dispatch_app_state(
 
             if client.store.chat_settings:
                 try:
-                    await client.store.chat_settings.put_archived(ctx, jid, getattr(act, 'archived', False))
+                    await client.store.chat_settings.put_archived(jid, getattr(act, 'archived', False))
                 except Exception as err:
                     store_update_error = err
 
@@ -210,7 +209,7 @@ async def dispatch_app_state(
             if client.store.contacts:
                 try:
                     await client.store.contacts.put_contact_name(
-                        ctx, jid,
+                        jid,
                         getattr(act, 'first_name', ''),
                         getattr(act, 'full_name', '')
                     )
@@ -262,7 +261,7 @@ async def dispatch_app_state(
                 from_full_sync=full_sync
             )
             if mutation.index[4] != "0":
-                evt.sender_jid = JID.parse(mutation.index[4])
+                evt.sender_jid = JID.parse_jid(mutation.index[4])
             event_to_dispatch = evt
 
     elif index_type == "markChatAsRead":
@@ -283,7 +282,7 @@ async def dispatch_app_state(
         if hasattr(mutation.action, 'push_name_setting') and hasattr(mutation.action.push_name_setting, 'name'):
             client.store.push_name = mutation.action.push_name_setting.name
             try:
-                await client.store.save(ctx)
+                await client.store.save()
             except Exception as err:
                 logger.error(f"Failed to save device store after updating push name: {err}")
 
@@ -340,9 +339,9 @@ async def dispatch_app_state(
         await client.dispatch_event(event_to_dispatch)
 
 
-async def download_external_app_state_blob(client: "Client", ctx: Any, ref: Any) -> bytes:
+async def download_external_app_state_blob(client: "Client", ref: Any) -> bytes:
     """Download external app state blob."""
-    return await client.download(ctx, ref)
+    return await download.download(client, ref)
 
 
 async def fetch_app_state_patches(
@@ -367,19 +366,19 @@ async def fetch_app_state_patches(
             tag="sync",
             content=[binary_node.Node(
                 tag="collection",
-                attributes=attrs
+                attrs=attrs
             )]
         )]
     ))
 
-    from .__init__.decode import parse_patch_list
-    return await parse_patch_list(ctx, resp, lambda ref: download_external_app_state_blob(client, ctx, ref))
+    from .decode import parse_patch_list
+    return await parse_patch_list(resp, lambda ref: download_external_app_state_blob(client, ref))
 
 
-async def request_missing_app_state_keys(client: "Client", ctx: Any, patches: Any) -> None:
+async def request_missing_app_state_keys(client: "Client", patches: Any) -> None:
     """Request missing app state keys from the server."""
     async with client.app_state_key_requests_lock:
-        raw_key_ids = await client.app_state_proc.get_missing_key_ids(ctx, patches)
+        raw_key_ids = await client.app_state_proc.get_missing_key_ids(patches)
         filtered_key_ids = []
         now = time.time()
 
@@ -391,11 +390,12 @@ async def request_missing_app_state_keys(client: "Client", ctx: Any, patches: An
                 client.app_state_key_requests[string_key_id] = now
                 filtered_key_ids.append(key_id)
 
-    await request_app_state_keys(client, ctx, filtered_key_ids)
+    await request_app_state_keys(client, filtered_key_ids)
 
 
-async def request_app_state_keys(client: "Client", ctx: Any, raw_key_ids: List[bytes]) -> None:
+async def request_app_state_keys(client: "Client", raw_key_ids: List[bytes]) -> None:
     """Request app state keys from the server."""
+    from ..send import SendRequestExtra
     if not raw_key_ids:
         return
 
@@ -453,17 +453,15 @@ async def send_app_state(client: "Client", ctx: Any, patch: Any) -> None:
 
     encoded_patch = await client.app_state_proc.encode_patch(ctx, latest_key_id, state, patch)
 
-    from .types.iq import InfoQuery
     resp = await client.send_iq(InfoQuery(
-        context=ctx,
         namespace="w:sync:app:state",
-        type="set",
+        type=InfoQueryType.SET,
         to=client.store.server_jid,
         content=[binary_node.Node(
             tag="sync",
             content=[binary_node.Node(
                 tag="collection",
-                attributes={
+                attrs={
                     "name": patch.type,
                     "version": version,
                     "return_snapshot": False,

@@ -43,14 +43,13 @@ Port of whatsmeow/qrchan.go
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional, List, Callable, Any, Dict, cast, Protocol, AsyncIterator, TypeVar, Generic, AsyncGenerator
-from enum import Enum
+from typing import Optional, List, Any
 
 from .types.events.events import (
     QR, PairSuccess, PairError, QRScannedWithoutMultidevice,
     Connected, ConnectFailure, LoggedOut, TemporaryBan, Disconnected, ClientOutdated
 )
-from .exceptions import ClientIsNilError, QRAlreadyConnectedError, QRStoreContainsIDError
+from .exceptions import ErrClientIsNil, ErrQRAlreadyConnected, ErrQRStoreContainsID
 from . import Client
 
 
@@ -379,11 +378,11 @@ async def get_qr_channel(client: Client, max_size: int = 8) -> QRChannel:
         QRStoreContainsIDError: If the client store already contains an ID
     """
     if client is None:
-        raise ClientIsNilError("Client is nil")
+        raise ErrClientIsNil()
     if client.is_connected():
-        raise QRAlreadyConnectedError("Client is already connected")
+        raise ErrQRAlreadyConnected()
     if client.store.id is not None:
-        raise QRStoreContainsIDError("Store already contains ID")
+        raise ErrQRStoreContainsID()
 
     output = asyncio.Queue(maxsize=max_size)
     qrc = await QRChannel(

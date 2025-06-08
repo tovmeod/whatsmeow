@@ -6,18 +6,18 @@ Port of whatsmeow/privacysettings.go
 import logging
 from datetime import timedelta
 from enum import Enum
-from typing import Optional, Tuple, TYPE_CHECKING, Any
+from typing import Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
 
-from pymeow.pymeow.binary.attrs import Attrs
-from pymeow.pymeow.binary.node import Node
-from pymeow.pymeow.exceptions import ErrClientIsNil, ElementMissingError
-from pymeow.pymeow.request import InfoQuery, InfoQueryType
-from pymeow.pymeow.types.jid import SERVER_JID
+from .exceptions import ErrClientIsNil, ElementMissingError
+from .request import InfoQuery, InfoQueryType
+from .types.jid import SERVER_JID
+from . import request
 from .types.events import PrivacySettingsEvent
 
 if TYPE_CHECKING:
     from .client import Client
+    from .binary.node import Node
 
 class PrivacySettingType(str, Enum):
     """Types of WhatsApp privacy settings."""
@@ -76,16 +76,17 @@ async def try_fetch_privacy_settings(
     # TODO: Review Node implementation
     # TODO: Review ElementMissingError implementation
     # TODO: Review parse_privacy_settings implementation
+    from .binary.node import Node
 
     if client is None:
         return None, ErrClientIsNil
 
     if not ignore_cache:
-        val = client.privacy_settings_cache.load()
+        val = client._privacy_settings_cache.load()
         if val is not None:
             return val, None
 
-    resp, err = await client.send_iq(InfoQuery(
+    resp, err = await request.send_iq(client, InfoQuery(
         namespace="privacy",
         type=InfoQueryType.GET,
         to=SERVER_JID,
@@ -104,7 +105,7 @@ async def try_fetch_privacy_settings(
 
     settings = PrivacySettings()
     parse_privacy_settings(client, privacy_node, settings)
-    client.privacy_settings_cache.store(settings)
+    client._privacy_settings_cache.store(settings)
     return settings, None
 
 
@@ -172,6 +173,8 @@ async def set_privacy_setting(
     # TODO: Review Attrs implementation
     # TODO: Review PRIVACY_SETTING_TYPE_* constants implementation
     # TODO: Review privacy_settings_cache implementation
+    from .binary.attrs import Attrs
+    from .binary.node import Node
 
     settings = PrivacySettings()
 
@@ -179,7 +182,7 @@ async def set_privacy_setting(
     if err is not None:
         return settings, err
 
-    _, err = await client.send_iq(InfoQuery(
+    _, err = await request.send_iq(client, InfoQuery(
         namespace="privacy",
         type=InfoQueryType.SET,
         to=SERVER_JID,
@@ -215,7 +218,7 @@ async def set_privacy_setting(
     elif name == PrivacySettingType.CALL_ADD:
         settings.call_add = value
 
-    client.privacy_settings_cache.store(settings)
+    client._privacy_settings_cache.store(settings)
     return settings, None
 
 
@@ -241,8 +244,10 @@ async def set_default_disappearing_timer(
     # TODO: Review SERVER_JID constant implementation
     # TODO: Review Node implementation
     # TODO: Review Attrs implementation
+    from .binary.attrs import Attrs
+    from .binary.node import Node
 
-    _, err = await client.send_iq(InfoQuery(
+    _, err = await request.send_iq(client, InfoQuery(
         namespace="disappearing_mode",
         type=InfoQueryType.SET,
         to=SERVER_JID,
@@ -259,7 +264,7 @@ async def set_default_disappearing_timer(
 
 def parse_privacy_settings(
     client: 'Client',
-    privacy_node: Node,
+    privacy_node: 'Node',
     settings: PrivacySettings
 ) -> PrivacySettingsEvent:
     """
@@ -321,7 +326,7 @@ def parse_privacy_settings(
 
 async def handle_privacy_settings_notification(
     client: 'Client',
-    privacy_node: Node
+    privacy_node: 'Node'
 ) -> None:
     """
     Port of Go method handlePrivacySettingsNotification from privacy.go.
@@ -349,5 +354,5 @@ async def handle_privacy_settings_notification(
         return
 
     evt = parse_privacy_settings(client, privacy_node, settings)
-    client.privacy_settings_cache.store(settings)
+    client._privacy_settings_cache.store(settings)
     await client.dispatch_event(evt)

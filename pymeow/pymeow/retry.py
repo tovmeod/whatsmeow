@@ -308,7 +308,7 @@ async def handle_retry_receipt(
             else:
                 if msg.wa is not None:
                     msg.wa.sender_key_distribution_message = WAE2E_pb2.SenderKeyDistributionMessage(
-                        groupID=str(receipt.message_source.chat).,
+                        groupID=str(receipt.message_source.chat),
                         axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
                     )
                 else:

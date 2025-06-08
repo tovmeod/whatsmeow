@@ -7,23 +7,16 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import os
 import logging
-from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
-from typing import Optional, Dict, Any, BinaryIO, List, Protocol, Tuple, Union, TypeVar, cast, TYPE_CHECKING, \
-    runtime_checkable
+from typing import Optional, Any, Protocol, Tuple, cast, TYPE_CHECKING, runtime_checkable
 import aiohttp
-from io import BytesIO
 
 from . import mediaconn
 from .exceptions import PymeowError
-from .generated.waE2E import waE2E_pb2
-from .generated.waHistorySync import waHistorySync_pb2
+from .generated.waE2E import WAWebProtobufsE2E_pb2
 from .generated.waMediaTransport import WAMediaTransport_pb2
-from .generated.waServerSync import waServerSync_pb2
-from .util.cbcutil import decrypt, decrypt_file, File
+from .util.cbcutil import decrypt
 from .util.hkdfutil import sha256 as hkdf_sha256
 
 
@@ -151,7 +144,7 @@ _http_session = None
 if TYPE_CHECKING:
     from .client import Client
 
-async def download_any(client: 'Client', msg: Optional[waE2E_pb2.Message]) -> Tuple[
+async def download_any(client: 'Client', msg: Optional[WAWebProtobufsE2E_pb2.Message]) -> Tuple[
     Optional[bytes], Optional[Exception]]:
     """
     Port of Go method DownloadAny from download.go.
@@ -236,11 +229,11 @@ def download_thumbnail(
     descriptor_name = msg.DESCRIPTOR.name
 
     # Check if media type exists in mapping (equivalent to Go's map lookup with ok pattern)
-    if descriptor_name not in class_to_thumbnail_media_type:
+    if descriptor_name not in CLASS_TO_THUMBNAIL_MEDIA_TYPE:
         error_msg = f"{ErrUnknownMediaType} '{descriptor_name}'"
         return None, Exception(error_msg)
 
-    media_type = class_to_thumbnail_media_type[descriptor_name]
+    media_type = CLASS_TO_THUMBNAIL_MEDIA_TYPE[descriptor_name]
 
     # Check if thumbnail direct path exists and has content (equivalent to len(msg.GetThumbnailDirectPath()) > 0)
     if len(msg.get_thumbnail_direct_path()) > 0:
@@ -252,7 +245,7 @@ def download_thumbnail(
             msg.get_media_key(),
             -1,
             media_type,
-            media_type_to_mms_type[media_type]
+            MEDIA_TYPE_TO_MMS_TYPE[media_type]
         )
     else:
         return None, ErrNoURLPresent
@@ -277,7 +270,7 @@ def get_media_type(msg: DownloadableMessage) -> MediaType:
 
     from google.protobuf.message import Message as ProtoMessage
     if isinstance(msg, ProtoMessage):
-        return class_to_media_type.get(msg.DESCRIPTOR.name, "")
+        return CLASS_TO_MEDIA_TYPE.get(msg.DESCRIPTOR.name, "")
 
     if isinstance(msg, MediaTypeable):
         return msg.get_media_type()
@@ -354,7 +347,7 @@ async def download(client: 'Client', msg: DownloadableMessage) -> Optional[bytes
 
 async def download_fb(
     client,
-    transport: WAMediaTransport_pb2.WAMediaTransport_Integral,
+    transport: WAMediaTransport_pb2.WAMediaTransport.Integral,
     media_type: MediaType
 ) -> bytes:
     """Download media from a Facebook transport message.

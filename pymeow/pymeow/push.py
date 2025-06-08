@@ -3,11 +3,17 @@ WhatsApp push notification handling.
 
 Port of whatsmeow/push.go
 """
+import logging
 from abc import ABC, abstractmethod
 import base64
 import secrets
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
+
+from .binary.node import Node
+
+logger = logging.getLogger(__name__)
+
 
 class PushConfig(ABC):
     """Interface for push notification configurations."""

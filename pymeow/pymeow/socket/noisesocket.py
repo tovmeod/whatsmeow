@@ -6,12 +6,13 @@ Port of whatsmeow/socket/noisesocket.go
 import asyncio
 import logging
 import struct
-from typing import Optional, Callable, Awaitable, Any
+from typing import Optional, Callable, Awaitable, Any, TYPE_CHECKING
 
 # TODO: Verify import when cipher is ported
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from pymeow.pymeow.socket.framesocket import FrameSocket
+if TYPE_CHECKING:
+    from .framesocket import FrameSocket
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class NoiseSocket:
     using AEAD ciphers.
     """
 
-    def __init__(self, fs: FrameSocket, write_key: AESGCM, read_key: AESGCM,
+    def __init__(self, fs: 'FrameSocket', write_key: AESGCM, read_key: AESGCM,
                  on_frame: Callable[[bytes], None]):
         """
         Initialize a new NoiseSocket.
@@ -180,7 +181,7 @@ class NoiseSocket:
         return self.fs.is_connected()
 
 
-async def new_noise_socket(fs: FrameSocket, write_key: AESGCM, read_key: AESGCM,
+async def new_noise_socket(fs: 'FrameSocket', write_key: AESGCM, read_key: AESGCM,
                           frame_handler: Callable[[bytes], Awaitable[None]],
                           disconnect_handler: Callable[["NoiseSocket", bool], Awaitable[None]]) -> NoiseSocket:
     """

@@ -10,25 +10,20 @@ This module implements the two main functions from the Go file:
 The Decoder class inherits from Processor (defined in keys.py) to maintain the same
 functionality as the Go implementation where DecodePatches is a method on the Processor struct.
 """
-import asyncio
-import base64
 import json
 import logging
 from dataclasses import dataclass
-from typing import List, Callable, Tuple, Optional, Dict, Any, Awaitable, Union
+from typing import List, Callable, Tuple, Optional, Dict, Awaitable
 
-from ..binary import wabinary
+from ..binary.node import Node
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
-from ..generated.waCommon import WACommon_pb2
-from ..store.store import Store
-from ..util.cbcutil import decrypt_cbc
+from ..util.cbcutil import decrypt
 from .errors import (
     ErrMismatchingContentMAC,
     ErrMismatchingIndexMAC,
     ErrMismatchingLTHash,
     ErrMismatchingPatchMAC,
-    KeyNotFoundError
 )
 from .hash import (
     HashState,
@@ -52,15 +47,14 @@ class PatchList:
 
 
 # Type alias for a function that can download a blob of external app state patches
-DownloadExternalFunc = Callable[[Any, WAServerSync_pb2.ExternalBlobReference], Awaitable[bytes]]
+DownloadExternalFunc = Callable[[WAServerSync_pb2.ExternalBlobReference], Awaitable[bytes]]
 
 
-async def parse_snapshot_internal(ctx: Any, collection: wabinary.Node, download_external: DownloadExternalFunc) -> Optional[WAServerSync_pb2.SyncdSnapshot]:
+async def parse_snapshot_internal(collection: Node, download_external: DownloadExternalFunc) -> Optional[WAServerSync_pb2.SyncdSnapshot]:
     """
     Parse a snapshot from a binary node.
 
     Args:
-        ctx: Context for the operation
         collection: The collection node containing the snapshot
         download_external: Function to download external blobs
 
@@ -79,7 +73,7 @@ async def parse_snapshot_internal(ctx: Any, collection: wabinary.Node, download_
         raise ValueError(f"Failed to unmarshal snapshot: {err}")
 
     try:
-        raw_data = await download_external(ctx, snapshot)
+        raw_data = await download_external(snapshot)
     except Exception as err:
         raise ValueError(f"Failed to download external mutations: {err}")
 
@@ -92,12 +86,11 @@ async def parse_snapshot_internal(ctx: Any, collection: wabinary.Node, download_
     return downloaded
 
 
-async def parse_patch_list_internal(ctx: Any, collection: wabinary.Node, download_external: DownloadExternalFunc) -> List[WAServerSync_pb2.SyncdPatch]:
+async def parse_patch_list_internal(collection: Node, download_external: DownloadExternalFunc) -> List[WAServerSync_pb2.SyncdPatch]:
     """
     Parse patches from a binary node.
 
     Args:
-        ctx: Context for the operation
         collection: The collection node containing the patches
         download_external: Function to download external blobs
 
@@ -119,9 +112,9 @@ async def parse_patch_list_internal(ctx: Any, collection: wabinary.Node, downloa
         except Exception as err:
             raise ValueError(f"Failed to unmarshal patch #{i+1}: {err}")
 
-        if patch.HasField("external_mutations") and download_external is not None:
+        if patch.HasField("externalMutations") and download_external is not None:
             try:
-                raw_data = await download_external(ctx, patch.external_mutations)
+                raw_data = await download_external(patch.externalMutations)
             except Exception as err:
                 raise ValueError(f"Failed to download external mutations: {err}")
 
@@ -141,12 +134,11 @@ async def parse_patch_list_internal(ctx: Any, collection: wabinary.Node, downloa
     return patches
 
 
-async def parse_patch_list(ctx: Any, node: wabinary.Node, download_external: DownloadExternalFunc) -> PatchList:
+async def parse_patch_list(node: Node, download_external: DownloadExternalFunc) -> PatchList:
     """
     Decode an XML node containing app state patches, including downloading any external blobs.
 
     Args:
-        ctx: Context for the operation
         node: The node containing the patches
         download_external: Function to download external blobs
 
@@ -156,8 +148,8 @@ async def parse_patch_list(ctx: Any, node: wabinary.Node, download_external: Dow
     collection = node.get_child_by_tag("sync", "collection")
     ag = collection.attr_getter()
 
-    snapshot = await parse_snapshot_internal(ctx, collection, download_external)
-    patches = await parse_patch_list_internal(ctx, collection, download_external)
+    snapshot = await parse_snapshot_internal(collection, download_external)
+    patches = await parse_patch_list_internal(collection, download_external)
 
     patch_list = PatchList(
         name=WAPatchName(ag.string("name")),
@@ -191,13 +183,12 @@ class PatchOutput:
 class Decoder(Processor):
     """Decoder for app state patches."""
 
-    async def decode_mutations(self, ctx: Any, mutations: List[WAServerSync_pb2.SyncdMutation],
+    async def decode_mutations(self, mutations: List[WAServerSync_pb2.SyncdMutation],
                               out: PatchOutput, validate_macs: bool) -> None:
         """
         Decode mutations from encrypted format.
 
         Args:
-            ctx: Context for the operation
             mutations: The mutations to decode
             out: Output container for decoded mutations
             validate_macs: Whether to validate MACs
@@ -221,7 +212,7 @@ class Decoder(Processor):
 
             iv, content = content[:16], content[16:]
             try:
-                plaintext = decrypt_cbc(keys.value_encryption, iv, content)
+                plaintext = decrypt(keys.value_encryption, iv, content)
             except Exception as err:
                 raise ValueError(f"Failed to decrypt mutation #{i+1}: {err}")
 
@@ -260,18 +251,17 @@ class Decoder(Processor):
                 value_mac=value_mac
             ))
 
-    async def store_macs(self, ctx: Any, name: WAPatchName, current_state: HashState, out: PatchOutput) -> None:
+    async def store_macs(self, name: WAPatchName, current_state: HashState, out: PatchOutput) -> None:
         """
         Store MACs in the database.
 
         Args:
-            ctx: Context for the operation
             name: The patch name
             current_state: The current hash state
             out: The patch output containing MACs to store
         """
         try:
-            await self.store.app_state.put_app_state_version(ctx, str(name), current_state.version, current_state.hash)
+            await self.store.app_state.put_app_state_version(str(name), current_state.version, current_state.hash)
         except Exception as err:
             logger.error(f"Failed to update app state version in the database: {err}")
 
@@ -285,13 +275,12 @@ class Decoder(Processor):
         except Exception as err:
             logger.error(f"Failed to insert added mutation MACs to the database: {err}")
 
-    async def validate_snapshot_mac(self, ctx: Any, name: WAPatchName, current_state: HashState,
+    async def validate_snapshot_mac(self, name: WAPatchName, current_state: HashState,
                                   key_id: bytes, expected_snapshot_mac: bytes) -> Tuple[ExpandedAppStateKeys, Optional[Exception]]:
         """
         Validate a snapshot MAC.
 
         Args:
-            ctx: Context for the operation
             name: The patch name
             current_state: The current hash state
             key_id: The key ID
@@ -310,14 +299,13 @@ class Decoder(Processor):
 
         return keys, None
 
-    async def decode_snapshot(self, ctx: Any, name: WAPatchName, ss: WAServerSync_pb2.SyncdSnapshot,
+    async def decode_snapshot(self, name: WAPatchName, ss: WAServerSync_pb2.SyncdSnapshot,
                             initial_state: HashState, validate_macs: bool,
                             new_mutations_input: List[Mutation]) -> Tuple[List[Mutation], HashState, Optional[Exception]]:
         """
         Decode a snapshot.
 
         Args:
-            ctx: Context for the operation
             name: The patch name
             ss: The snapshot to decode
             initial_state: The initial hash state
@@ -347,26 +335,25 @@ class Decoder(Processor):
             return None, None, ValueError(f"Failed to update state hash: {err}")
 
         if validate_macs:
-            _, err = await self.validate_snapshot_mac(ctx, name, current_state, ss.key_id.id, ss.mac)
+            _, err = await self.validate_snapshot_mac(name, current_state, ss.key_id.id, ss.mac)
             if err:
                 return None, None, err
 
         out = PatchOutput(mutations=new_mutations_input)
         try:
-            await self.decode_mutations(ctx, encrypted_mutations, out, validate_macs)
+            await self.decode_mutations(encrypted_mutations, out, validate_macs)
         except Exception as err:
             return None, None, ValueError(f"Failed to decode snapshot of v{current_state.version}: {err}")
 
-        await self.store_macs(ctx, name, current_state, out)
+        await self.store_macs(name, current_state, out)
         return out.mutations, current_state, None
 
-    async def decode_patches(self, ctx: Any, patch_list: PatchList, initial_state: HashState,
+    async def decode_patches(self, patch_list: PatchList, initial_state: HashState,
                            validate_macs: bool) -> Tuple[List[Mutation], HashState, Optional[Exception]]:
         """
         Decode all the patches in a PatchList into a list of app state mutations.
 
         Args:
-            ctx: Context for the operation
             patch_list: The patch list to decode
             initial_state: The initial hash state
             validate_macs: Whether to validate MACs
@@ -387,7 +374,7 @@ class Decoder(Processor):
 
         if patch_list.snapshot:
             new_mutations, current_state, err = await self.decode_snapshot(
-                ctx, patch_list.name, patch_list.snapshot, current_state, validate_macs, new_mutations
+                patch_list.name, patch_list.snapshot, current_state, validate_macs, new_mutations
             )
             if err:
                 return None, None, err
@@ -416,7 +403,7 @@ class Decoder(Processor):
 
             if validate_macs:
                 keys, err = await self.validate_snapshot_mac(
-                    ctx, patch_list.name, current_state, patch.key_id.id, patch.snapshot_mac
+                    patch_list.name, current_state, patch.key_id.id, patch.snapshot_mac
                 )
                 if err:
                     return None, None, err
@@ -427,11 +414,11 @@ class Decoder(Processor):
 
             out = PatchOutput(mutations=new_mutations)
             try:
-                await self.decode_mutations(ctx, patch.mutations, out, validate_macs)
+                await self.decode_mutations(patch.mutations, out, validate_macs)
             except Exception as err:
                 return None, None, err
 
-            await self.store_macs(ctx, patch_list.name, current_state, out)
+            await self.store_macs(patch_list.name, current_state, out)
             new_mutations = out.mutations
 
         return new_mutations, current_state, None

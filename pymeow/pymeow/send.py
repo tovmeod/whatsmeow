@@ -13,9 +13,10 @@ import struct
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Optional, TYPE_CHECKING, List, Tuple, Dict
+from typing import Any, Optional, TYPE_CHECKING, List, Tuple
 from warnings import deprecated
 
+from . import prekeys
 from .broadcast import get_broadcast_list_participants
 from .exceptions import ErrRecipientADJID, ErrNotLoggedIn, ErrInvalidInlineBotID, ErrUnknownServer, ErrMessageTimedOut, \
     ErrServerReturnedError, ErrNoSession
@@ -27,7 +28,6 @@ from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from .generated.waCommon import WACommon_pb2
 from .prekeys import fetch_pre_keys
 from .request import wait_response, cancel_response, retry_frame, is_disconnect_node, InfoQueryType
-from .retry import add_recent_message
 from .store.signal import contains_session
 from .types import events
 from .types.jid import JID, DEFAULT_USER_SERVER, GROUP_SERVER, BROADCAST_SERVER, HIDDEN_USER_SERVER, BOT_SERVER, \
@@ -165,7 +165,7 @@ def generate_facebook_message_id() -> int:
     return (timestamp_ms << 22) | (random_uint32 & RANDOM_MASK)
 
 
-@deprecated
+@deprecated("Use Client.generate_message_id instead")
 def deprecated_generate_message_id() -> MessageID:
     """
     Generate a random string that can be used as a message ID on WhatsApp.
@@ -280,6 +280,8 @@ async def send_message(
     # TODO: Review is_disconnect_node implementation
     # TODO: Review retry_frame implementation
     # TODO: Review ErrServerReturnedError implementation
+
+    from . import retry
 
     req = SendRequestExtra()
     if len(extra) > 1:
@@ -416,7 +418,7 @@ async def send_message(
         resp_chan = wait_response(client, req.id)
         # Peer message retries aren't implemented yet
         if not req.peer:
-            add_recent_message(client, to, req.id, message, None)
+            retry.add_recent_message(client, to, req.id, message, None)
 
         if message.message_context_info is not None and message.message_context_info.message_secret is not None:
             err = await client.store.msg_secrets.put_message_secret(to, own_id, req.id,
@@ -499,7 +501,7 @@ async def send_message(
     return resp, err
 
 
-@deprecated
+@deprecated("This method is deprecated in favor of build_revoke")
 async def revoke_message(client: "Client", chat: JID, id: MessageID) -> SendResponse:
     """
     Delete the given message from everyone in the chat.
@@ -1949,7 +1951,7 @@ async def encrypt_message_for_device_and_wrap(
     plaintext: bytes,
     wire_identity: JID,
     encryption_identity: JID,
-    bundle: Optional[prekey.Bundle],
+    bundle: Optional[prekeys.PreKeyBundle],
     enc_attrs: Attrs
 ) -> Tuple[Optional[Node], bool, Optional[Exception]]:
     """
@@ -2010,7 +2012,7 @@ async def encrypt_message_for_device(
     client: 'Client',
     plaintext: bytes,
     to: JID,
-    bundle: Optional[prekey.Bundle],
+    bundle: Optional[prekeys.PreKeyBundle],
     extra_attrs: Attrs
 ) -> Tuple[Optional[Node], bool, Optional[Exception]]:
     """

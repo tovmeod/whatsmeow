@@ -12,7 +12,6 @@ from .binary.node import Node
 from .exceptions import ElementMissingError, IQError, ErrInvalidImageFormat, ErrGroupInviteLinkUnauthorized, \
     ErrGroupNotFound, ErrNotInGroup
 from .request import InfoQuery, InfoQueryType
-from .send import generate_message_id
 from .types.group import GroupParticipantRequest, GroupLinkTarget, GroupMemberAddMode, GroupParticipantAddRequest, \
     GroupName
 from .types.jid import GROUP_SERVER_JID, SERVER_JID, GROUP_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER
@@ -98,6 +97,7 @@ async def create_group(client: "Client", req: ReqCreateGroup) -> types.GroupInfo
     Raises:
         Exception: If there's an error creating the group
     """
+    from .send import generate_message_id
     participant_nodes = []
     for participant in req.participants:
         participant_nodes.append(Node(
@@ -368,6 +368,7 @@ async def set_group_topic(
     automatically fetch the current group info to find the previous topic ID. If the new ID is not
     specified, one will be generated with Client.generate_message_id().
     """
+    from .send import generate_message_id
     if not previous_id:
         old_info = await get_group_info(client, jid)
         previous_id = old_info.group_topic.topic_id
@@ -631,6 +632,7 @@ async def get_group_info(client: "Client", jid: types.JID) -> types.GroupInfo:
 
 async def get_group_info_internal(client: "Client", jid: types.JID, lock_participant_cache: bool = True) -> types.GroupInfo:
     """Internal method to get group information and populate cache."""
+    from .client import GroupMetaCache
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -697,7 +699,7 @@ async def get_group_info_internal(client: "Client", jid: types.JID, lock_partici
     return group_info
 
 
-async def get_cached_group_data(client: "Client", jid: types.JID) -> Optional[GroupMetaCache]:
+async def get_cached_group_data(client: "Client", jid: types.JID) -> Optional['GroupMetaCache']:
     """Gets cached group data if available, fetches it if not."""
     async with client.group_cache_lock:
         if jid in client.group_cache:

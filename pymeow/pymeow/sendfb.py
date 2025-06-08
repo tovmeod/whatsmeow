@@ -13,20 +13,17 @@ import os
 import time
 import uuid
 from datetime import timedelta
-from typing import Union, Optional, List, Tuple, Any, TYPE_CHECKING
+from typing import Union, Optional, List, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
-from Crypto.Random import get_random_bytes
 
-from . import request, group, send, retry
+from . import request, group, send, retry, user
 from .binary.attrs import Attrs
 from .binary.node import Node
 from .exceptions import ErrClientIsNil, ErrRecipientADJID, ErrNotLoggedIn, ErrUnknownServer, ErrMessageTimedOut, \
     ErrServerReturnedError
 from .generated import waCommon, waConsumerApplication, waArmadilloApplication, waMsgApplication, waMsgTransport
 from .generated.waCommon import WACommon_pb2
-from .generated.waCommon.WACommon_pb2 import SubProtocol
 from .generated.waMsgApplication import WAMsgApplication_pb2
-from .generated.waMsgApplication.WAMsgApplication_pb2 import MessageApplication
 
 from .send import SendRequestExtra, MessageDebugTimings, SendResponse
 
@@ -34,8 +31,8 @@ if TYPE_CHECKING:
     from .client import Client
     from .generated.waConsumerApplication.WAConsumerApplication_pb2 import ConsumerApplication
     from .generated.waArmadilloApplication.WAArmadilloApplication_pb2 import Armadillo
-    from .generated.waMsgApplication.WAMsgApplication_pb2 import MessageApplication_Metadata
-    from .generated.waMsgTransport.WAMsgTransport_pb2 import MessageTransport_Payload, MessageTransport_Protocol_Ancillary_SenderKeyDistributionMessage
+    from .generated.waMsgApplication.WAMsgApplication_pb2 import MessageApplication
+    from .generated.waMsgTransport.WAMsgTransport_pb2 import MessageTransport
     from .types.message import MessageID, EditAttribute, MessageServerID
     from .types.jid import JID, GROUP_SERVER, DEFAULT_USER_SERVER, MESSENGER_SERVER
     from .types.events import DecryptFailMode
@@ -62,9 +59,9 @@ class MessageAttrs:
 
 async def send_fb_message(
     client: 'Client',
-    to: JID,
+    to: 'JID',
     message: RealMessageApplicationSub,
-    metadata: Optional[MessageApplication_Metadata] = None,
+    metadata: Optional['MessageApplication.Metadata'] = None,
     *extra: SendRequestExtra
 ) -> Tuple[SendResponse, Optional[Exception]]:
     """
@@ -267,9 +264,9 @@ async def send_fb_message(
 
 def send_group_v3(
     client: 'Client',
-    to: JID,
-    own_id: JID,
-    id: MessageID,
+    to: 'JID',
+    own_id: 'JID',
+    id: 'MessageID',
     message_app: bytes,
     msg_attrs: MessageAttrs,
     franking_tag: bytes,
@@ -409,9 +406,9 @@ def send_group_v3(
 
 def send_dm_v3(
     client: 'Client',
-    to: JID,
-    own_id: JID,
-    id: MessageID,
+    to: 'JID',
+    own_id: 'JID',
+    id: 'MessageID',
     message_app: bytes,
     msg_attrs: MessageAttrs,
     franking_tag: bytes,
@@ -424,7 +421,6 @@ def send_dm_v3(
 
     Args:
         client: The WhatsApp client instance
-        ctx: Context for cancellation
         to: Target user JID
         own_id: Own user JID
         id: Message ID
@@ -594,8 +590,8 @@ def prepare_message_node_v3(
     to: 'JID',
     own_id: 'JID',
     message_id: 'MessageID',
-    payload: Optional['MessageTransport_Payload'],
-    skdm: Optional['MessageTransport_Protocol_Ancillary_SenderKeyDistributionMessage'],
+    payload: Optional['MessageTransport.Payload'],
+    skdm: Optional['MessageTransport.Protocol.Ancillary.SenderKeyDistributionMessage'],
     msg_attrs: MessageAttrs,
     franking_tag: bytes,
     participants: List['JID'],
@@ -603,7 +599,7 @@ def prepare_message_node_v3(
 ) -> Tuple['BinaryNode', List['JID'], Optional[Exception]]:
     """Prepare a message node for v3 protocol - matches Go Client.prepareMessageNodeV3 method."""
     start = time.time()
-    all_devices = client.get_user_devices_context(ctx, participants)
+    all_devices = user.get_user_devices_context(client, participants)
     timings.get_devices = time.time() - start
 
     # Build attributes - matches Go implementation exactly
@@ -625,14 +621,14 @@ def prepare_message_node_v3(
         enc_attrs["decrypt-fail"] = str(msg_attrs.decrypt_fail)
 
     # Create DSM - matches Go structure
-    dsm = MessageTransport_Protocol_Integral_DeviceSentMessage(
-        destination_jid=str(to),
+    dsm = MessageTransport.Protocol.Integral.DeviceSentMessage(
+        destinationJID=str(to),
         phash=""
     )
 
     start = time.time()
-    participant_nodes = client.encrypt_message_for_devices_v3(
-        ctx, all_devices, own_id, message_id, payload, skdm, dsm, enc_attrs
+    participant_nodes = encrypt_message_for_devices_v3(
+        all_devices, own_id, message_id, payload, skdm, dsm, enc_attrs
     )
     timings.peer_encrypt = time.time() - start
 

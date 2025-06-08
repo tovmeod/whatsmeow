@@ -7,6 +7,7 @@ import hashlib
 import struct
 import threading
 from typing import Optional, Tuple, Callable, Awaitable, Any
+from typing_extensions import Buffer
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -89,6 +90,7 @@ class NoiseHandshake:
         Args:
             data: The data to authenticate
         """
+        data: Buffer
         self.hash = self._sha256_slice(self.hash + data)
 
     def _post_increment_counter(self) -> int:

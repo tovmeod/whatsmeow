@@ -3,7 +3,6 @@ Message handling for PyMeow.
 
 Port of whatsmeow/message.go - handles encrypted and plaintext messages.
 """
-import asyncio
 import hashlib
 import logging
 import os
@@ -27,7 +26,6 @@ from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .msgsecret import decrypt_bot_message
 from .receipt import send_message_receipt
-from .retry import delayed_request_message_from_phone, send_retry_receipt, cancel_delayed_request_from_phone
 from .store import store
 from .types import JID, ReceiptType
 from .types import events
@@ -504,12 +502,12 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
     # TODO: Review send_message_receipt implementation
     # TODO: Review EventAlreadyProcessed exception
     # TODO: Review signalerror.ErrNoSenderKeyForUser exception
-
+    from . import retry
     unavailable_node, ok = node.get_optional_child_by_tag("unavailable")
     if ok and len(node.get_children_by_tag("enc")) == 0:
         u_type = events.UnavailableType(unavailable_node.attr_getter().string("type"))
         logger.warning("Unavailable message %s from %s (type: %q)", info.id, info.source_string(), u_type)
-        delayed_request_message_from_phone(client, info)
+        retry.delayed_request_message_from_phone(client, info)
         await client.dispatch_event(events.UndecryptableMessage(
             info=info,  # Go uses *info, Python uses info directly
             is_unavailable=True,
@@ -607,7 +605,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
                               isinstance(err, signalerror.ErrNoSenderKeyForUser)) # todo: check the correct type from signal_protocol
             if enc_type != "msmsg":
                 # Go's context.WithoutCancel becomes a new context
-                await send_retry_receipt(client, node, info, is_unavailable)
+                await retry.send_retry_receipt(client, node, info, is_unavailable)
             await client.dispatch_event(events.UndecryptableMessage(
                 info=info,
                 is_unavailable=is_unavailable,
@@ -616,7 +614,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
             return
 
         retry_count = ag.optional_int("count")
-        cancel_delayed_request_from_phone(client, info.id)
+        retry.cancel_delayed_request_from_phone(client, info.id)
 
         msg = waE2E_pb2.Message()
         version = ag.int("v")
@@ -1447,7 +1445,7 @@ async def store_message_secret(
 
 async def store_historical_message_secrets(
     client: 'Client',
-    conversations: List[waHistorySync_pb2.Conversation]
+    conversations: List[WAWebProtobufsHistorySync_pb2.Conversation]
 ) -> None:
     """
     Port of Go method storeHistoricalMessageSecrets from client.go.

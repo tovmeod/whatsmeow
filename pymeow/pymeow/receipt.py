@@ -10,7 +10,7 @@ import logging
 from datetime import datetime
 from typing import Callable, List, Optional, Union, Tuple, TYPE_CHECKING
 
-from . import retry, PrivacySetting, privacysettings, message
+from . import retry, privacysettings, message
 from .binary.node import Node, Attrs
 from .types import ReceiptType
 from .types.events.events import ReceiptTypeRead
@@ -298,7 +298,7 @@ async def mark_read(
     )
 
     if (chat.server == NEWSLETTER_SERVER or
-        (await privacysettings.get_privacy_settings(client)).read_receipts == PrivacySetting.NONE):
+        (await privacysettings.get_privacy_settings(client)).read_receipts == privacysettings.PrivacySetting.NONE):
         if receipt_type == ReceiptTypeRead:
             node.attrs["type"] = str(ReceiptType.READ_SELF)
             # TODO change played to played-self?
