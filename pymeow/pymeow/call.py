@@ -6,6 +6,7 @@ Port of whatsmeow/call.go
 
 import logging
 
+from . import receipt
 from .binary.node import Node, Attrs
 from .types.jid import JID
 from .types.call import BasicCallMeta, CallRemoteMeta
@@ -15,7 +16,6 @@ from .types.events.call import (
     UnknownCallEvent
 )
 from .exceptions import ErrNotLoggedIn
-from .receipt import maybe_deferred_ack
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,6 @@ async def handle_call_event(client, node: Node) -> None:
         client: The WhatsApp client instance
         node: The call event node to handle
     """
-    defer_ack = maybe_deferred_ack(client, node)
     try:
         children = node.get_children()
         if len(children) != 1:
@@ -111,7 +110,7 @@ async def handle_call_event(client, node: Node) -> None:
     except Exception as e:
         logger.warning(f"Failed to handle call event: {e}")
     finally:
-        defer_ack()
+        client.create_task(receipt.send_ack(client, node))
 
 
 async def reject_call(client, call_from: JID, call_id: str) -> None:

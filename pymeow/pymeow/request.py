@@ -10,6 +10,7 @@ Port of whatsmeow/request.go
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
 from typing import Any, Optional, Tuple, TYPE_CHECKING
 
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
     from .client import Client
 
 # Constants
-DEFAULT_REQUEST_TIMEOUT = 75.0  # seconds
+DEFAULT_REQUEST_TIMEOUT = timedelta(seconds=75)
 
 # XML stream end node used to detect disconnections
 XML_STREAM_END_NODE = Node(tag="xmlstreamend")
@@ -57,7 +58,6 @@ class InfoQuery:
     content: Any = None
     timeout: float = 0.0
     no_retry: bool = False
-    context: Optional[asyncio.Task] = None
 
 
 def generate_request_id(client: 'Client') -> str:

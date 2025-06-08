@@ -4,15 +4,11 @@ Frame-based WebSocket implementation for WhatsApp.
 Port of whatsmeow/socket/framesocket.go
 """
 import asyncio
-import contextlib
 import logging
-import struct
-from typing import Optional, Callable, Awaitable, Dict, List, Any, Coroutine
+from typing import Optional, Callable, Dict, Any, Coroutine, Set, Awaitable
 
-from aiohttp import ClientSession, ClientWebSocketResponse, WSMessage, WSMsgType
+from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType
 
-from .noisesocket import NoiseSocket
-from ..binary.token import DICT_VERSION
 from .constants import (
     URL, ORIGIN, WA_CONN_HEADER, FRAME_MAX_SIZE, FRAME_LENGTH_SIZE,
     FrameTooLargeError, SocketClosedError, SocketAlreadyOpenError
@@ -54,6 +50,8 @@ class FrameSocket:
         self.received_length: int = 0
         self.incoming: Optional[bytearray] = None
         self.partial_header: Optional[bytes] = None
+
+        self.read_task: Optional[asyncio.Task] = None
 
     def is_connected(self) -> bool:
         """
@@ -98,14 +96,12 @@ class FrameSocket:
             except Exception as err:
                 logger.error(f"Error closing websocket: {err}")
 
-            # Go: fs.conn = nil
+            if self.read_task and not self.read_task.done():
+                self.read_task.cancel()
+
             self.conn = None
-
-            # Go: if fs.OnDisconnect != nil { go fs.OnDisconnect(code == 0) }
-            if self.on_disconnect is not None:
-                # Go goroutine equivalent - run in background
-                asyncio.create_task(self.on_disconnect(code == 0))
-
+            if self.on_disconnect:
+                await self.on_disconnect(code == 0)
 
     async def connect(self) -> Optional[Exception]:
         """
@@ -131,7 +127,7 @@ class FrameSocket:
                 )
 
                 # Start read pump
-                asyncio.create_task(self.read_pump(self.conn))
+                self.read_task = asyncio.create_task(self.read_pump(self.conn))
 
                 return None
 
@@ -194,16 +190,16 @@ class FrameSocket:
             except Exception as e:
                 return e
 
-    def _frame_complete(self) -> None:
+    async def _frame_complete(self) -> None:
         """Handle a complete frame."""
         data = self.incoming
         self.incoming = None
         self.partial_header = None
         self.incoming_length = 0
         self.received_length = 0
-        asyncio.create_task(self.frames.put(data)) # todo store task so it is not gc'ed
+        await self.frames.put(data)
 
-    def _process_data(self, msg: bytes) -> None:
+    async def _process_data(self, msg: bytes) -> None:
         """
         Port of Go method processData from FrameSocket.
 
@@ -232,7 +228,7 @@ class FrameSocket:
                     if len(msg) >= length:
                         self.incoming = msg[:length]
                         msg = msg[length:]
-                        self._frame_complete()
+                        await self._frame_complete()
                     else:
                         self.incoming = bytearray(length)
                         self.incoming[:len(msg)] = msg
@@ -246,7 +242,7 @@ class FrameSocket:
                     bytes_needed = self.incoming_length - self.received_length
                     self.incoming[self.received_length:self.received_length + bytes_needed] = msg[:bytes_needed]
                     msg = msg[bytes_needed:]
-                    self._frame_complete()
+                    await self._frame_complete()
                 else:
                     self.incoming[self.received_length:self.received_length + len(msg)] = msg
                     self.received_length += len(msg)
@@ -269,7 +265,7 @@ class FrameSocket:
         try:
             async for msg in conn:
                 if msg.type == WSMsgType.BINARY:
-                    self._process_data(msg.data)
+                    await self._process_data(msg.data)
                 elif msg.type == WSMsgType.ERROR:
                     logger.error(f"Error reading from websocket: {conn.exception()}")
                     break
@@ -287,4 +283,4 @@ class FrameSocket:
         finally:
             logger.debug(f"Frame websocket read pump exiting {id(self)}")
             # Schedule close in background (equivalent to go fs.Close(0))
-            asyncio.create_task(self.close(0))  # todo store task so it is not gc'ed
+            await self.close(0)

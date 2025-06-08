@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Any, TYPE_CHECKING, Callable, Awaitable, List
 from typing import Tuple, Optional
 
+from . import receipt
 from .armadillomessage import handle_decrypted_armadillo
 from .types import MessageInfo
 from .appstate.keys import ALL_PATCH_NAMES
@@ -25,7 +26,7 @@ from .generated import waE2E
 from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .msgsecret import decrypt_bot_message
-from .receipt import maybe_deferred_ack, send_message_receipt
+from .receipt import send_message_receipt
 from .retry import delayed_request_message_from_phone, send_retry_receipt, cancel_delayed_request_from_phone
 from .store import store
 from .types import JID, ReceiptType
@@ -106,28 +107,21 @@ async def handle_encrypted_message(client: 'Client', node: Node) -> None:
         if (info.verified_name is not None and
             len(info.verified_name.details.get_verified_name()) > 0):
             # Go goroutine equivalent - async task
-            def update_business_name_async():
-                update_business_name(client, info.sender, info,
-                                     info.verified_name.details.get_verified_name())
 
-            asyncio.create_task(asyncio.to_thread(update_business_name_async))
+            await update_business_name(client, info.sender, info,
+                                     info.verified_name.details.get_verified_name())
 
         if len(info.push_name) > 0 and info.push_name != "-":
             # Go goroutine equivalent - async task
-            def update_push_name_async():
-                update_push_name(client, info.sender, info, info.push_name)
+            await update_push_name(client, info.sender, info, info.push_name)
 
-            asyncio.create_task(asyncio.to_thread(update_push_name_async))
-
-        # Defer the ack (Go's defer equivalent)
-        ack_func = maybe_deferred_ack(client, node)
         try:
             if info.sender.server == NEWSLETTER_SERVER:
                 await handle_plaintext_message(client, info, node)
             else:
-                decrypt_messages(client, info, node)
+                await decrypt_messages(client, info, node)
         finally:
-            ack_func()
+            client.create_task(receipt.send_ack(client, node))
 
 
 async def parse_message_source(client: 'Client', node: Node, require_participant: bool) -> Tuple[
@@ -515,8 +509,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
     if ok and len(node.get_children_by_tag("enc")) == 0:
         u_type = events.UnavailableType(unavailable_node.attr_getter().string("type"))
         logger.warning("Unavailable message %s from %s (type: %q)", info.id, info.source_string(), u_type)
-        # Go's `go` keyword becomes asyncio.create_task or similar
-        asyncio.create_task(delayed_request_message_from_phone(client, info))  # todo store the returned task so it is not gc'ed
+        delayed_request_message_from_phone(client, info)
         await client.dispatch_event(events.UndecryptableMessage(
             info=info,  # Go uses *info, Python uses info directly
             is_unavailable=True,
@@ -614,7 +607,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
                               isinstance(err, signalerror.ErrNoSenderKeyForUser)) # todo: check the correct type from signal_protocol
             if enc_type != "msmsg":
                 # Go's context.WithoutCancel becomes a new context
-                asyncio.create_task(send_retry_receipt(client, node, info, is_unavailable))
+                await send_retry_receipt(client, node, info, is_unavailable)
             await client.dispatch_event(events.UndecryptableMessage(
                 info=info,
                 is_unavailable=is_unavailable,
@@ -658,16 +651,15 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
             if time.time() - client.last_decrypted_buffer_clear > 12 * 3600:  # 12 hours
                 client.last_decrypted_buffer_clear = time.time()
 
-                def cleanup_task():
-                    # Go's context.WithoutCancel becomes a new context
-                    err = client.store.event_buffer.delete_old_buffered_hashes()
-                    if err is not None:
-                        logger.error("Failed to delete old buffered hashes", exc_info=err if isinstance(err, Exception) else None)
+                # Go's context.WithoutCancel becomes a new context
+                # cleanup
+                err = client.store.event_buffer.delete_old_buffered_hashes()
+                if err is not None:
+                    logger.error("Failed to delete old buffered hashes", exc_info=err if isinstance(err, Exception) else None)
 
-                asyncio.create_task(asyncio.to_thread(cleanup_task)) # todo save task object so it is not gc'ed
 
     if handled:
-        asyncio.create_task(send_message_receipt(client, info))
+        await send_message_receipt(client, info)
 
 
 async def clear_untrusted_identity(
@@ -681,7 +673,7 @@ async def clear_untrusted_identity(
     then dispatches an IdentityChange event.
 
     Args:
-        ctx: Context for the operation
+        client: Context for the operation
         target: The target JID whose identity should be cleared
 
     Returns:
@@ -700,11 +692,11 @@ async def clear_untrusted_identity(
     if err is not None:
         return Exception(f"failed to delete session: {err}")
 
-    asyncio.create_task(client.dispatch_event(events.IdentityChange(
+    await client.dispatch_event(events.IdentityChange(
         jid=target,
         timestamp=datetime.now(),
         implicit=True
-    )))  # todo maybe just await instead of creating task
+    ))
 
     return None
 
@@ -722,7 +714,7 @@ async def buffered_decrypt(
     If buffering is disabled, directly calls the decrypt function.
 
     Args:
-        ctx: Context for the operation
+        client: Context for the operation
         ciphertext: The encrypted message bytes
         server_timestamp: Timestamp from the server
         decrypt: Function that performs the actual decryption
@@ -1069,14 +1061,14 @@ async def handle_history_sync_notification_loop(client: 'Client') -> None:
     try:
         # Process notifications from the async iterator/queue
         async for notif in client.history_sync_notifications:
-            await handle_history_sync_notification(notif)
+            await handle_history_sync_notification(client, notif)
 
     except Exception as err:
         logger.error("History sync handler panicked: %v\n%s", err, traceback.format_exc())
 
     finally:
         # Mark handler as stopped
-        client.history_sync_handler_started.store(False)
+        client.history_sync_handler_started = False
 
         # Check if new notifications appeared while stopping
         if (len(client.history_sync_notifications) > 0 and
@@ -1084,7 +1076,7 @@ async def handle_history_sync_notification_loop(client: 'Client') -> None:
             logger.warning("New history sync notifications appeared after loop stopped, restarting loop...")
 
             # Start new async task for the loop
-            asyncio.create_task(handle_history_sync_notification_loop(client))
+            client.create_task(handle_history_sync_notification_loop(client))
 
 
 async def handle_history_sync_notification(
@@ -1146,12 +1138,12 @@ async def handle_history_sync_notification(
     # Handle different sync types
     if history_sync.syncType == WAWebProtobufsHistorySync_pb2.HistorySync.PUSH_NAME:
         # Start async task for handling push names
-        asyncio.create_task(
+        client.create_task(
             handle_historical_push_names(client, history_sync.pushnames)
         )
     elif len(history_sync.conversations) > 0:
         # Start async task for storing message secrets
-        asyncio.create_task(
+        client.create_task(
             store_historical_message_secrets(client, history_sync.conversations)
         )
 
@@ -1170,7 +1162,7 @@ async def handle_app_state_sync_key_share(
     and triggering fetches for all app state patch types.
 
     Args:
-        ctx: Context for the operation
+        client: Context for the operation
         keys: The app state sync key share containing new keys
 
     Returns:
@@ -1316,7 +1308,7 @@ async def handle_protocol_message(
     including history sync notifications, placeholder resend responses, and app state sync.
 
     Args:
-        ctx: Context for the operation
+        client: Context for the operation
         info: Message information
         msg: The protocol message to handle
 
@@ -1341,34 +1333,26 @@ async def handle_protocol_message(
         # Start handler loop if not already started (atomic compare and swap equivalent)
         if not client.history_sync_handler_started:
             client.history_sync_handler_started = True
-            asyncio.create_task(handle_history_sync_notification_loop(client))  # todo get the task object so is not gc'ed
+            client.create_task(handle_history_sync_notification_loop(client))
 
-        # Send receipt asynchronously
-        asyncio.create_task(
-            send_protocol_message_receipt(client, info.id, RECEIPT_TYPE_HISTORY_SYNC) # todo get the task object so is not gc'ed
-        )
+        # Send receipt asynchronously?
+        await send_protocol_message_receipt(client, info.id, RECEIPT_TYPE_HISTORY_SYNC)
 
     # Handle placeholder message resend response
     peer_data_msg = proto_msg.get_peer_data_operation_request_response_message()
     if (peer_data_msg.get_peer_data_operation_request_type() ==
         waE2E_pb2.PeerDataOperationRequestType.PLACEHOLDER_MESSAGE_RESEND):
-        asyncio.create_task(
-            handle_placeholder_resend_response(client, peer_data_msg)
-        )
+        await handle_placeholder_resend_response(client, peer_data_msg)
 
     # Handle app state sync key share
     if proto_msg.get_app_state_sync_key_share() is not None and info.is_from_me:
         # Note: Go's context.WithoutCancel creates a context that won't be cancelled
         # In Python, we'll pass the original context since cancellation is handled differently
-        asyncio.create_task(
-            handle_app_state_sync_key_share(client, proto_msg.app_state_sync_key_share)
-        )
+        await handle_app_state_sync_key_share(client, proto_msg.app_state_sync_key_share)
 
     # Handle peer category messages
     if info.category == "peer":
-        asyncio.create_task(
-            send_protocol_message_receipt(client, info.id, RECEIPT_TYPE_PEER_MSG) # todo get the task object so is not gc'ed
-        )
+        await send_protocol_message_receipt(client, info.id, RECEIPT_TYPE_PEER_MSG)
 
 
 async def process_protocol_parts(
@@ -1383,7 +1367,7 @@ async def process_protocol_parts(
     handling device-sent messages, sender key distribution, and protocol messages.
 
     Args:
-        ctx: Context for the operation
+        client: Context for the operation
         info: Message information
         msg: The message to process
 
@@ -1616,7 +1600,7 @@ async def send_protocol_message_receipt(
         return
 
     try:
-        await client._send_node(Node(
+        await client.send_node(Node(
             tag="receipt",
             attrs=Attrs({
                 "id": str(id),

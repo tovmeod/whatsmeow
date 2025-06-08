@@ -10,7 +10,6 @@ import asyncio
 import logging
 import signal
 import sys
-import os
 from pathlib import Path
 from typing import Any
 
@@ -177,7 +176,7 @@ async def main():
         client = Client(device_store)
 
         # Add event handler
-        client.add_event_handler(event_handler)
+        await client.add_event_handler(event_handler)
 
         # Set up signal handling for graceful shutdown
         shutdown_event = asyncio.Event()
@@ -190,7 +189,7 @@ async def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
         # Check if already logged in
-        if not hasattr(device_store, 'id') or device_store.id is None:
+        if device_store.id is None:
             print("No existing session found, starting new login...")
 
             # Get QR channel for authentication

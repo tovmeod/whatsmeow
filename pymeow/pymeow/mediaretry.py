@@ -133,16 +133,16 @@ async def send_media_retry_receipt(client: "Client", message: MessageInfo, media
         Node(tag="enc_iv", content=iv),
     ]
 
-    await client._send_node(Node(
+    await client.send_node(Node(
         tag="receipt",
-        attributes=Attrs({
+        attrs=Attrs({
             "id": str(message.id),
             "to": str(own_id),
             "type": "server-error",
         }),
         content=[
             Node(tag="encrypt", content=encrypted_request),
-            Node(tag="rmr", attributes=rmr_attrs),
+            Node(tag="rmr", attrs=rmr_attrs),
         ]
     ))
 

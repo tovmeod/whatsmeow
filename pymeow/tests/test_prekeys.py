@@ -420,8 +420,8 @@ async def test_client_integration_methods():
     mock_client.store.pre_keys = PreKeyStore()
     mock_client.send_log = MagicMock()
 
-    # Mock successful response for get_server_prekey_count
-    from ..pymeow.prekeys import get_server_prekey_count
+    # Mock successful response for get_server_pre_key_count
+    from ..pymeow.prekeys import get_server_pre_key_count
 
     mock_response = MagicMock()
     mock_count_node = MagicMock()
@@ -429,14 +429,14 @@ async def test_client_integration_methods():
     mock_response.get_child_by_tag.return_value = mock_count_node
     mock_client.send_iq.return_value = (mock_response, None)
 
-    # Test get_server_prekey_count
-    count = await get_server_prekey_count(mock_client)
+    # Test get_server_pre_key_count
+    count = await get_server_pre_key_count(mock_client)
     assert count == 25
 
     # Test with missing value
     mock_count_node.attrs = {}
     with pytest.raises(PreKeyError, match="server response missing prekey count value"):
-        await get_server_prekey_count(mock_client)
+        await get_server_pre_key_count(mock_client)
 
 def test_jid_parsing():
     """Test JID parsing in fetch_pre_keys response."""

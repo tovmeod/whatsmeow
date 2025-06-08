@@ -29,31 +29,8 @@ from .types.presence import (
     ChatPresenceEvent,
 )
 
-from .client import Client as BaseClient
+from .client import Client
 from .types import Message, GroupInfo, PrivacySetting
-
-
-# Create enhanced Client class with message handling capabilities
-class Client(BaseClient):
-    """
-    Client for WhatsApp Web API with message handling and newsletter capabilities.
-
-    This combines the base Client class with message handling and newsletter mixins,
-    similar to how the Device class is enhanced with SignalProtocolMixin.
-
-    The message handling now uses composition via MessageHandler and MessageProcessingHandler
-    classes, while maintaining backward compatibility through the mixins.
-    """
-
-    # Helper method stubs that should be implemented in the base client or one of the mixins
-
-    def generate_message_id(self):
-        """Generate a unique message ID.
-
-        This method should be implemented in the base client.
-        """
-        raise NotImplementedError("generate_message_id method must be implemented in the base client")
-
 
 __all__ = [
     'Client',

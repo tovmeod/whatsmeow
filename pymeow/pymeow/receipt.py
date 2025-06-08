@@ -40,8 +40,6 @@ async def handle_receipt(client, node: Node) -> None:
     # TODO: Review handle_retry_receipt implementation
     # TODO: Review dispatch_event implementation
 
-    defer_ack = maybe_deferred_ack(client, node)
-
     try:
         receipt, err = await parse_receipt(client, node)
         if err is not None:
@@ -68,10 +66,10 @@ async def handle_receipt(client, node: Node) -> None:
 
             client.dispatch_event(receipt)
     finally:
-        defer_ack()
+        client.create_task(send_ack(client, node))
 
 
-def handle_grouped_receipt(client: 'Client', partial_receipt: Receipt, participants: Node) -> None:
+async def handle_grouped_receipt(client: 'Client', partial_receipt: Receipt, participants: Node) -> None:
     """
     Port of Go method handleGroupedReceipt from receipt.go.
 
@@ -105,10 +103,7 @@ def handle_grouped_receipt(client: 'Client', partial_receipt: Receipt, participa
             continue
 
         # Create async task equivalent to Go's goroutine
-        async def dispatch_task(r=receipt):
-            await client.dispatch_event(r)
-
-        asyncio.create_task(dispatch_task())
+        await client.dispatch_event(receipt)
 
 
 async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt], Optional[Exception]]:
@@ -149,7 +144,7 @@ async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt]
             return None, ElementMissingError(tag="participants", in_location="grouped receipt")
 
         for pcp in participant_tags:
-            handle_grouped_receipt(client, receipt, pcp)
+            await handle_grouped_receipt(client, receipt, pcp)
 
         return None, None
 
@@ -367,7 +362,7 @@ def set_force_active_delivery_receipts(
         client.send_active_receipts.store(0)
 
 
-def send_message_receipt(
+async def send_message_receipt(
     client: 'Client',
     info: MessageInfo
 ) -> None:
@@ -409,7 +404,7 @@ def send_message_receipt(
         # Override the to attribute with the JID version with a device number
         attrs["to"] = info.sender
 
-    err = client.send_node(Node(
+    err = await client.send_node(Node(
         tag="receipt",
         attrs=attrs
     ))

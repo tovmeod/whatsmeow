@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 import datetime
 from os import urandom
-from typing import Any, Callable, List, Optional, Tuple, Awaitable, TYPE_CHECKING, Dict
+from typing import Any, Callable, List, Optional, Tuple, Awaitable, TYPE_CHECKING, Dict, Set, Coroutine
 from urllib.parse import urlparse
 
 import aiohttp
@@ -269,6 +269,8 @@ class Client:
         self._keepalive_task: Optional[asyncio.Task] = None
         self._handler_task: Optional[asyncio.Task] = None
 
+        self._background_tasks: Set[asyncio.Task] = set()
+
     def _init_node_handlers(self):
         """Initialize the node handlers dictionary."""
         self.node_handlers = {
@@ -285,6 +287,23 @@ class Client:
             "iq": handle_iq,
             "ib": handle_ib,
         }
+
+    def create_task(self, coro: Awaitable[Any]) -> asyncio.Task:
+        """
+        Create a background task and track it to prevent garbage collection.
+
+        Args:
+            coro: The coroutine to run
+
+        Returns:
+            The created task
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        task.add_done_callback(self._background_tasks.discard)
+
+        return task
 
     async def _ensure_http_session(self):
         """Ensures the aiohttp ClientSession is initialized."""
@@ -423,8 +442,7 @@ class Client:
                 while True:  # Loop until connected or timed out by the context manager
                     async with self.socket_lock:  # Acquire lock to check state
                         # Go: cli.socket == nil || !cli.socket.IsConnected() || !cli.IsLoggedIn()
-                        if (self.socket is not None and
-                            hasattr(self.socket, 'is_connected') and self.socket.is_connected() and
+                        if (self.socket is not None and self.socket.is_connected() and
                             self.is_logged_in()):
                             # Condition met, successfully connected and logged in
                             return True
@@ -470,11 +488,6 @@ class Client:
         """
         err = await self._connect()
 
-        # Go: if exhttp.IsNetworkError(err) && cli.InitialAutoReconnect && cli.EnableAutoReconnect
-        # Python: try...except Exception as err: ... if is_network_error and self.initial_auto_reconnect and self.enable_auto_reconnect:
-        # The Python try/except catches the error, so `err` inside the except block is guaranteed to be an Exception.
-        # The Go code checks `err != nil` implicitly before calling IsNetworkError.
-        # We need to check if err is not None *before* calling is_network_error in Python.
         if (err is not None and isinstance(err, (aiohttp.ClientConnectionError,
                                                 aiohttp.ClientError,
                                                 ConnectionError,
@@ -484,18 +497,12 @@ class Client:
                                                 aiohttp.ServerTimeoutError,
                                                 aiohttp.ClientTimeout))
             and self.initial_auto_reconnect and self.enable_auto_reconnect):
-            # Go: cli.Log.Errorf("Initial connection failed but reconnecting in background")
-            # Python: logger.error(...) -> Should use logger
             logger.error("Initial connection failed but reconnecting in background")
 
-            # Go: go cli.dispatchEvent(&events.Disconnected{})
-            # Go: go cli.autoReconnect()
-            # Launching as background tasks in Python using asyncio.create_task
-            asyncio.create_task(self.dispatch_event(Disconnected())) # todo store created tasks so it is not gc'ed
-            asyncio.create_task(self._auto_reconnect()) # todo store created tasks so it is not gc'ed
+            self.create_task(self.dispatch_event(Disconnected()))
+            self.create_task(self.auto_reconnect())
 
             # Go: return nil (meaning the public Connect() call doesn't propagate this specific error)
-            # Python: return (implicitly None)
             return None  # Explicitly return None for clarity
 
         # Go: return err
@@ -519,7 +526,7 @@ class Client:
         async with self.socket_lock:  # Go: cli.socketLock.Lock(); defer cli.socketLock.Unlock()
             if self.socket is not None:
                 # Go: if !cli.socket.IsConnected() { cli.unlockedDisconnect() }
-                if hasattr(self.socket, 'is_connected') and not self.socket.is_connected():
+                if not self.socket.is_connected():
                     await self._unlocked_disconnect()
                 else:
                     # Go: return ErrAlreadyConnected
@@ -548,7 +555,7 @@ class Client:
 
             # Go: fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), wsDialer)
             # Python: Pass logger and dialer config to FrameSocket constructor
-            fs = FrameSocket(dialer=self.ws_dialer)
+            fs = FrameSocket(dialer=self.ws_dialer)  # todo: check if this is saved, socket needs to be closed
 
             if self.messenger_config is not None:
                 fs.url = self.messenger_config.websocket_url
@@ -590,7 +597,7 @@ class Client:
             # FrameSocket (or the actual NoiseSocket assigned to self.socket after handshake) exposes its context.
             if self.socket:  # self.socket should be the actual (e.g., NoiseSocket) after handshake
                 socket_ctx = self.socket.context()  # Assuming a .context() method
-                self._keepalive_task = asyncio.create_task(keepalive.keepalive_loop(self))
+                self._keepalive_task = asyncio.create_task(keepalive.keep_alive_loop(self))
                 self._handler_task = asyncio.create_task(self._handler_queue_loop(socket_ctx))
             else:
                 # This case should ideally not be reached if handshake was successful
@@ -638,9 +645,9 @@ class Client:
                     # Go: cli.Log.Debugf("Emitting Disconnected event")
                     logger.debug("Emitting Disconnected event")
                     # Go: go cli.dispatchEvent(&events.Disconnected{})
-                    asyncio.create_task(self.dispatch_event(Disconnected()))
+                    self.create_task(self.dispatch_event(Disconnected()))
                     # Go: go cli.autoReconnect()
-                    asyncio.create_task(self._auto_reconnect())
+                    self.create_task(self.auto_reconnect())
                 # Go: else if remote
                 elif remote:
                     logger.debug("OnDisconnect() called, but it was expected, so not emitting event")
@@ -668,7 +675,7 @@ class Client:
         """
         return self._expected_disconnect
 
-    async def _auto_reconnect(self) -> None:
+    async def auto_reconnect(self) -> None:
         """Automatically reconnect to the server after a disconnection."""
         # Go: if !cli.EnableAutoReconnect || cli.Store.ID == nil
         if not self.enable_auto_reconnect or self.store.id is None:
@@ -791,6 +798,12 @@ class Client:
             # Python: await self._clear_response_waiters("xmlstreamend")
             # Ensure the argument matches the Go `xmlStreamEndNode`
             await request.clear_response_waiters(self, request.XML_STREAM_END_NODE)
+
+        await self.close()
+
+    async def close(self):
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
     async def logout(self) -> Optional[Exception]:
         """Log out from WhatsApp and delete the local device store.
@@ -975,7 +988,7 @@ class Client:
             except asyncio.QueueFull:
                 logger.warning("Handler queue is full, message ordering is no longer guaranteed. Scheduling put.")
                 # Go: go func() { cli.handlerQueue <- node }()
-                asyncio.create_task(self.handler_queue.put(node))  # todo: add created somewhere so it is not gc'ed
+                await self.handler_queue.put(node)
 
         # Go: else if node.Tag != "ack"
         elif node.tag != "ack":
@@ -1087,7 +1100,7 @@ class Client:
 
             return payload, None
 
-    async def _send_node(self, node: Node) -> Optional[Exception]:
+    async def send_node(self, node: Node) -> Optional[Exception]:
         """Send a node to the server.
 
         Args:
@@ -1103,7 +1116,7 @@ class Client:
         # Go: return err
         return err
 
-    async def dispatch_event(self, evt: Any) -> None:
+    async def dispatch_event(self, evt: events.BaseEvent) -> None:
         """Dispatch an event to all registered event handlers.
 
         Args:
@@ -1250,7 +1263,7 @@ class Client:
 
         return evt, None
 
-    async def store_lid_pn_mapping(self, first: JID, second: JID, ctx: Optional[Any] = None) -> None:
+    async def store_lid_pn_mapping(self, first: JID, second: JID) -> None:
         """Store a mapping between a LID (Local ID) and a PN (Phone Number JID).
 
         Args:

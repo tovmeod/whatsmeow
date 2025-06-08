@@ -76,7 +76,7 @@ async def handle_pair_device(client: "Client", node: Node) -> None:
     """Handle a pair-device request from the server."""
     pair_device = node.get_child_by_tag("pair-device")
     try:
-        await client._send_node(Node(
+        await client.send_node(Node(
             tag="iq",
             attributes={
                 "to": node.attrs.get("from"),
@@ -127,8 +127,8 @@ async def handle_pair_success(client: "Client", node: Node) -> None:
     platform = pair_success.get_child_by_tag("platform").attrs.get("name", "")
 
     # Handle pairing in a separate task (equivalent to Go's goroutine)
-    asyncio.create_task(_handle_pair_task(client, device_identity_bytes, req_id,
-                                         business_name, platform, device_jid, device_lid))
+    await _handle_pair_task(client, device_identity_bytes, req_id,
+                                         business_name, platform, device_jid, device_lid)
 
 async def _handle_pair_task(client: "Client", device_identity_bytes: bytes, req_id: str,
                            business_name: str, platform: str, device_jid: jid.JID, device_lid: jid.JID):
@@ -249,7 +249,7 @@ async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_i
 
     # Send pairing confirmation
     try:
-        await client._send_node(Node(
+        await client.send_node(Node(
             tag="iq",
             attributes={
                 "to": jid.SERVER_JID,
@@ -310,16 +310,16 @@ def generate_device_signature(device_identity: WAAdv_pb2.ADVSignedDeviceIdentity
 async def send_pair_error(client: "Client", req_id: str, code: int, text: str) -> None:
     """Send a pairing error response."""
     try:
-        await client._send_node(Node(
+        await client.send_node(Node(
             tag="iq",
-            attributes={
+            attrs={
                 "to": jid.SERVER_JID,
                 "type": "error",
                 "id": req_id,
             },
             content=[Node(
                 tag="error",
-                attributes={
+                attrs={
                     "code": code,
                     "text": text,
                 },

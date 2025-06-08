@@ -37,7 +37,7 @@ class PreKeyResp:
     bundle: Optional[PreKeyBundle]
     error: Optional[Exception]
 
-async def get_server_prekey_count(client: "Client") -> Tuple[int, Optional[Exception]]:
+async def get_server_pre_key_count(client: "Client") -> Tuple[int, Optional[Exception]]:
     """Port of Go's (*Client).getServerPreKeyCount method.
 
     Get the number of pre-keys stored on the WhatsApp server.
@@ -97,7 +97,7 @@ async def upload_prekeys(client: "Client") -> None:
             # Go: sc, _ := cli.getServerPreKeyCount(ctx)
             # Call the Python equivalent, which should return (count, error)
             # ctx is not used in Python, so we don't pass it here.
-            server_count, err_get_count = await get_server_prekey_count(client)
+            server_count, err_get_count = await get_server_pre_key_count(client)
 
             # Go ignores the error from getServerPreKeyCount in this specific check
             if err_get_count is None:

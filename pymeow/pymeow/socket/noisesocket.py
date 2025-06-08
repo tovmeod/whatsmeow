@@ -11,6 +11,8 @@ from typing import Optional, Callable, Awaitable, Any
 # TODO: Verify import when cipher is ported
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from pymeow.pymeow.socket.framesocket import FrameSocket
+
 logger = logging.getLogger(__name__)
 
 class NoiseSocket:
@@ -21,7 +23,7 @@ class NoiseSocket:
     using AEAD ciphers.
     """
 
-    def __init__(self, fs: Any, write_key: AESGCM, read_key: AESGCM,
+    def __init__(self, fs: FrameSocket, write_key: AESGCM, read_key: AESGCM,
                  on_frame: Callable[[bytes], None]):
         """
         Initialize a new NoiseSocket.
@@ -104,15 +106,6 @@ class NoiseSocket:
         struct.pack_into('>I', iv, 8, count)
         return bytes(iv)
 
-    def context(self) -> Any:
-        """
-        Get the context from the underlying FrameSocket.
-
-        Returns:
-            The context object from the FrameSocket
-        """
-        return self.fs.context()
-
     async def stop(self, disconnect: bool = True) -> None:
         """
         Stop the NoiseSocket.
@@ -125,7 +118,7 @@ class NoiseSocket:
             self.stop_consumer.set()
 
             # Cancel the consumer task
-            if self.consumer_task and not self.consumer_task.done():
+            if not self.consumer_task.done():
                 self.consumer_task.cancel()
                 try:
                     await self.consumer_task
@@ -187,7 +180,7 @@ class NoiseSocket:
         return self.fs.is_connected()
 
 
-async def new_noise_socket(fs: Any, write_key: AESGCM, read_key: AESGCM,
+async def new_noise_socket(fs: FrameSocket, write_key: AESGCM, read_key: AESGCM,
                           frame_handler: Callable[[bytes], Awaitable[None]],
                           disconnect_handler: Callable[["NoiseSocket", bool], Awaitable[None]]) -> NoiseSocket:
     """

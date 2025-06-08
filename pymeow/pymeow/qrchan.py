@@ -122,6 +122,10 @@ class QRChannel:
         self.stop_qrs = asyncio.Event()
         self._emit_task = None
 
+    async def ainit(self) -> 'QRChannel':
+        self.handler_id = await self.client.add_event_handler(self.handle_event)
+        return self
+
     async def __aenter__(self) -> 'QRChannel':
         """
         Async context manager entry.
@@ -382,10 +386,9 @@ async def get_qr_channel(client: Client, max_size: int = 8) -> QRChannel:
         raise QRStoreContainsIDError("Store already contains ID")
 
     output = asyncio.Queue(maxsize=max_size)
-    qrc = QRChannel(
+    qrc = await QRChannel(
         client=client,
         output_channel=output,
-    )
-    qrc.handler_id = client.add_event_handler(qrc.handle_event)
+    ).ainit()
 
     return qrc

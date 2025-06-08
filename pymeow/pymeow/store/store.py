@@ -106,7 +106,7 @@ class PreKeyStore(ABC):
         pass
 
     @abstractmethod
-    async def uploaded_prekey_count(self, ctx: Any) -> int:
+    async def uploaded_prekey_count(self) -> int:
         """Get the count of uploaded pre-keys."""
         pass
 
@@ -223,7 +223,7 @@ class ContactStore(ABC):
         pass
 
     @abstractmethod
-    async def put_all_contact_names(self, ctx: Any, contacts: List[ContactEntry]) -> None:
+    async def put_all_contact_names(self, contacts: List[ContactEntry]) -> None:
         """Store contact names for multiple users."""
         pass
 
@@ -233,7 +233,7 @@ class ContactStore(ABC):
         pass
 
     @abstractmethod
-    async def get_all_contacts(self) -> Tuple[Dict[JID, Any], Optional[Exception]]:
+    async def get_all_contacts(self) -> Dict[str, 'ContactInfo']:
         """Get contact info for all users."""
         pass
 
@@ -242,22 +242,22 @@ class ChatSettingsStore(ABC):
     """Interface for storing chat settings."""
 
     @abstractmethod
-    async def put_muted_until(self, ctx: Any, chat: JID, muted_until: datetime) -> None:
+    async def put_muted_until(self, chat: JID, muted_until: datetime) -> None:
         """Store the muted until time for a chat."""
         pass
 
     @abstractmethod
-    async def put_pinned(self, ctx: Any, chat: JID, pinned: bool) -> None:
+    async def put_pinned(self, chat: JID, pinned: bool) -> None:
         """Store the pinned status for a chat."""
         pass
 
     @abstractmethod
-    async def put_archived(self, ctx: Any, chat: JID, archived: bool) -> None:
+    async def put_archived(self, chat: JID, archived: bool) -> None:
         """Store the archived status for a chat."""
         pass
 
     @abstractmethod
-    async def get_chat_settings(self, ctx: Any, chat: JID) -> Tuple[Any, Optional[Exception]]:
+    async def get_chat_settings(self, chat: JID) -> Tuple[Any, Optional[Exception]]:
         """Get settings for a chat."""
         pass
 
@@ -266,12 +266,12 @@ class DeviceContainer(ABC):
     """Interface for storing devices."""
 
     @abstractmethod
-    async def put_device(self, ctx: Any, device: 'Device') -> None:
+    async def put_device(self, device: 'Device') -> None:
         """Store a device."""
         pass
 
     @abstractmethod
-    async def delete_device(self, ctx: Any, device: 'Device') -> None:
+    async def delete_device(self, device: 'Device') -> None:
         """Delete a device."""
         pass
 
@@ -290,17 +290,17 @@ class MsgSecretStore(ABC):
     """Interface for storing message secrets."""
 
     @abstractmethod
-    async def put_message_secrets(self, ctx: Any, inserts: List[MessageSecretInsert]) -> None:
+    async def put_message_secrets(self, inserts: List[MessageSecretInsert]) -> None:
         """Store multiple message secrets."""
-        pass
+        raise NotImplementedError
 
     @abstractmethod
-    async def put_message_secret(self, ctx: Any, chat: JID, sender: JID, id: str, secret: bytes) -> None:
+    async def put_message_secret(self, chat: JID, sender: JID, id: str, secret: bytes) -> None:
         """Store a message secret."""
-        pass
+        raise NotImplementedError
 
     @abstractmethod
-    async def get_message_secret(self, ctx: Any, chat: JID, sender: JID, id: str) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_message_secret(self, chat: JID, sender: JID, id: str) -> Tuple[Optional[bytes], Optional[Exception]]:
         """Get a message secret."""
         pass
 
@@ -318,12 +318,12 @@ class PrivacyTokenStore(ABC):
     """Interface for storing privacy tokens."""
 
     @abstractmethod
-    async def put_privacy_tokens(self, ctx: Any, tokens: List[PrivacyToken]) -> None:
+    async def put_privacy_tokens(self, tokens: List[PrivacyToken]) -> None:
         """Store multiple privacy tokens."""
-        pass
+        raise NotImplementedError  # todo implement this in sqlstore
 
     @abstractmethod
-    async def get_privacy_token(self, ctx: Any, user: JID) -> Tuple[Optional[PrivacyToken], Optional[Exception]]:
+    async def get_privacy_token(self, user: JID) -> Tuple[Optional[PrivacyToken], Optional[Exception]]:
         """Get a privacy token for a user."""
         pass
 
@@ -341,29 +341,29 @@ class EventBuffer(ABC):
     """Interface for buffering events."""
 
     @abstractmethod
-    async def get_buffered_event(self, ctx: Any, ciphertext_hash: bytes) -> Tuple[Optional[BufferedEvent], Optional[Exception]]:
+    async def get_buffered_event(self, ciphertext_hash: bytes) -> Tuple[Optional[BufferedEvent], Optional[Exception]]:
         """Get a buffered event by ciphertext hash."""
         pass
 
     @abstractmethod
-    async def put_buffered_event(self, ctx: Any, ciphertext_hash: bytes, plaintext: bytes, server_timestamp: datetime) -> None:
+    async def put_buffered_event(self, ciphertext_hash: bytes, plaintext: bytes, server_timestamp: datetime) -> None:
         """Store a buffered event."""
         pass
 
     @abstractmethod
-    async def do_decryption_txn(self, ctx: Any, fn: Callable[[Any], Any]) -> None:
+    async def do_decryption_txn(self, fn: Callable[[Any], Any]) -> None:
         """Execute a function within a decryption transaction."""
-        pass
+        raise NotImplementedError # todo implement in sqlstore
 
     @abstractmethod
-    async def clear_buffered_event_plaintext(self, ctx: Any, ciphertext_hash: bytes) -> None:
+    async def clear_buffered_event_plaintext(self, ciphertext_hash: bytes) -> None:
         """Clear the plaintext of a buffered event."""
-        pass
+        raise NotImplementedError # todo implement this in sqlstore
 
     @abstractmethod
-    async def delete_old_buffered_hashes(self, ctx: Any) -> None:
+    async def delete_old_buffered_hashes(self) -> None:
         """Delete old buffered event hashes."""
-        pass
+        raise NotImplementedError
 
 
 @dataclass
@@ -378,22 +378,22 @@ class LIDStore(ABC):
     """Interface for storing LID mappings."""
 
     @abstractmethod
-    async def put_many_lid_mappings(self, ctx: Any, mappings: List[LIDMapping]) -> None:
+    async def put_many_lid_mappings(self, mappings: List[LIDMapping]) -> None:
         """Store multiple LID mappings."""
         pass
 
     @abstractmethod
-    async def put_lid_mapping(self, ctx: Any, lid: JID, jid: JID) -> None:
+    async def put_lid_mapping(self, lid: JID, jid: JID) -> None:
         """Store a LID mapping."""
         pass
 
     @abstractmethod
-    async def get_pn_for_lid(self, ctx: Any, lid: JID) -> Tuple[Optional[JID], Optional[Exception]]:
+    async def get_pn_for_lid(self, lid: JID) -> Tuple[Optional[JID], Optional[Exception]]:
         """Get a phone number for a LID."""
         pass
 
     @abstractmethod
-    async def get_lid_for_pn(self, ctx: Any, pn: JID) -> Tuple[Optional[JID], Optional[Exception]]:
+    async def get_lid_for_pn(self, pn: JID) -> Tuple[Optional[JID], Optional[Exception]]:
         """Get a LID for a phone number."""
         pass
 
@@ -464,16 +464,16 @@ class Device:
             return EMPTY_JID
         return self.lid
 
-    async def save(self, ctx: Any) -> Optional[Exception]:
+    async def save(self) -> Optional[Exception]:
         """Save this device to its container."""
         if self.container:
-            return await self.container.put_device(ctx, self)
+            return await self.container.put_device(self)
         return None
 
-    async def delete(self, ctx: Any) -> Optional[Exception]:
+    async def delete(self) -> Optional[Exception]:
         """Delete this device from its container."""
         if self.container:
-            err = await self.container.delete_device(ctx, self)
+            err = await self.container.delete_device(self)
             if err:
                 return err
             self.id = None
