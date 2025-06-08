@@ -1,302 +1,284 @@
 """
+SQL-backed store implementation using Tortoise ORM.
+
 Port of whatsmeow/store/sqlstore/store.go
 """
 import asyncio
-from typing import Optional, List, Dict, Set, Tuple, TYPE_CHECKING
-import logging
-from typing import Any
-import time
+from typing import Dict, List, Optional, Tuple, Set
+from tortoise.transactions import in_transaction
 
-from .container import Container
-from .models.session import IdentityKey, Session, PreKeyModel, SenderKey
-from .models.contacts import Contact
-from .models.appstate import AppStateSyncKey, AppStateVersion, AppStateMutationMACModel
-from .. import store
-from ..store import (
-    IdentityStore, SessionStore, PreKeyStore, SenderKeyStore,
-    ContactStore, AppStateStore, AllSessionSpecificStores
-)
-from ...util.keys import keypair
+from ...types import JID, ContactInfo
 from ...util.keys.keypair import PreKey, KeyPair
+from ..store import ContactEntry, AppStateMutationMAC, AppStateSyncKey
+from .container import Container
+from .models.session import IdentityKeyModel, SessionModel, PreKeyModel, SenderKeyModel
+from .models.appstate import AppStateSyncKeyModel, AppStateVersionModel, AppStateMutationMACModel
+from .models.contacts import ContactModel
 
-if TYPE_CHECKING:
-    from ...types.user import ContactInfo
 
-class SQLStore(AllSessionSpecificStores):
-    """Tortoise ORM-based WhatsApp store implementation"""
+class SQLStore:
+    """
+    SQL-backed store implementation for WhatsApp client data.
+
+    Port of SQLStore from Go whatsmeow/store/sqlstore/store.go
+    """
 
     def __init__(self, container: Container, jid: str):
+        """
+        Args:
+            container: Database container
+            jid: User JID string
+        """
         self.container = container
         self.jid = jid
 
-        # Async locks for thread safety
+        # Thread safety for pre-key operations
         self.pre_key_lock = asyncio.Lock()
+
+        # Contact cache
+        self.contact_cache: Dict[JID, ContactInfo] = {}
         self.contact_cache_lock = asyncio.Lock()
 
-        # In-memory caches
-        self.contact_cache: Dict[str, Contact] = {}
+        # Cache for migrated PN sessions
         self.migrated_pn_sessions_cache: Set[str] = set()
 
-    # === Identity Store Implementation ===
-
+    # Identity Key methods
     async def put_identity(self, address: str, key: bytes) -> None:
-        """Store identity key for an address"""
-        await IdentityKey.update_or_create(
+        """Put an identity key in the store."""
+        await IdentityKeyModel.update_or_create(
             our_jid=self.jid,
             their_id=address,
-            defaults={"identity": key}
+            defaults={'identity': key}
         )
 
     async def delete_all_identities(self, phone: str) -> None:
-        """Delete all identity keys for a phone number"""
-        await IdentityKey.filter(
+        """Delete all identity keys for a phone number."""
+        await IdentityKeyModel.filter(
             our_jid=self.jid,
             their_id__startswith=f"{phone}:"
         ).delete()
 
     async def delete_identity(self, address: str) -> None:
-        """Delete identity key for an address"""
-        await IdentityKey.filter(
+        """Delete a specific identity key."""
+        await IdentityKeyModel.filter(
             our_jid=self.jid,
             their_id=address
         ).delete()
 
     async def is_trusted_identity(self, address: str, key: bytes) -> bool:
-        """Check if identity key is trusted"""
+        """Check if an identity key is trusted."""
         try:
-            identity = await IdentityKey.get(
-                our_jid=self.jid,
-                their_id=address
-            )
+            identity = await IdentityKeyModel.get(our_jid=self.jid, their_id=address)
             return identity.identity == key
         except:
             # Trust if not known, it'll be saved automatically later
             return True
 
-    # === Session Store Implementation ===
-
+    # Session methods
     async def get_session(self, address: str) -> Optional[bytes]:
-        """Get session data for an address"""
+        """Get a session for an address."""
         try:
-            session = await Session.get(
-                our_jid=self.jid,
-                their_id=address
-            )
+            session = await SessionModel.get(our_jid=self.jid, their_id=address)
             return session.session
         except:
             return None
 
     async def has_session(self, address: str) -> bool:
-        """Check if session exists for an address"""
-        return await Session.filter(
-            our_jid=self.jid,
-            their_id=address
-        ).exists()
+        """Check if a session exists for an address."""
+        return await SessionModel.filter(our_jid=self.jid, their_id=address).exists()
 
-    async def put_session(self, address: str, session_data: bytes) -> None:
-        """Store session data for an address"""
-        await Session.update_or_create(
+    async def put_session(self, address: str, session: bytes) -> None:
+        """Put a session in the store."""
+        await SessionModel.update_or_create(
             our_jid=self.jid,
             their_id=address,
-            defaults={"session": session_data}
+            defaults={'session': session}
         )
 
     async def delete_session(self, address: str) -> None:
-        """Delete session for an address"""
-        await Session.filter(
-            our_jid=self.jid,
-            their_id=address
-        ).delete()
+        """Delete a specific session."""
+        await SessionModel.filter(our_jid=self.jid, their_id=address).delete()
 
     async def delete_all_sessions(self, phone: str) -> None:
-        """Delete all sessions for a phone number"""
-        await Session.filter(
+        """Delete all sessions for a phone number."""
+        await SessionModel.filter(
             our_jid=self.jid,
             their_id__startswith=f"{phone}:"
         ).delete()
 
-    async def migrate_pn_to_lid(self, pn_signal: str, lid_signal: str) -> None:
-        """Migrate sessions, identity keys, and sender keys from phone number to LID"""
+    async def migrate_pn_to_lid(self, pn: JID, lid: JID) -> None:
+        """
+        Migrate sessions, identity keys, and sender keys from phone number to LID.
+
+        Args:
+            pn: Phone number JID
+            lid: LID JID
+        """
+        pn_signal = pn.signal_address_user()
+
+        # Skip if already migrated
         if pn_signal in self.migrated_pn_sessions_cache:
             return
 
         self.migrated_pn_sessions_cache.add(pn_signal)
 
-        # Migrate sessions
-        sessions = await Session.filter(
-            our_jid=self.jid,
-            their_id__startswith=f"{pn_signal}:"
-        )
+        lid_signal = lid.signal_address_user()
 
-        sessions_updated = 0
-        for session in sessions:
-            new_id = session.their_id.replace(pn_signal, lid_signal, 1)
-            await Session.update_or_create(
+        async with in_transaction() as connection:
+            # Migrate sessions
+            sessions_updated = 0
+            sessions = await SessionModel.filter(
                 our_jid=self.jid,
-                their_id=new_id,
-                defaults={"session": session.session}
-            )
-            sessions_updated += 1
+                their_id__startswith=f"{pn_signal}:"
+            ).using_db(connection).all()
+            for session in sessions:
+                new_id = session.their_id.replace(pn_signal, lid_signal, 1)
+                await SessionModel.update_or_create(
+                    our_jid=self.jid,
+                    their_id=new_id,
+                    defaults={'session': session.session},
+                    using_db=connection
+                )
+                sessions_updated += 1
 
-        await Session.filter(
-            our_jid=self.jid,
-            their_id__startswith=f"{pn_signal}:"
-        ).delete()
-
-        # Migrate identity keys
-        identity_keys = await IdentityKey.filter(
-            our_jid=self.jid,
-            their_id__startswith=f"{pn_signal}:"
-        )
-
-        identity_keys_updated = 0
-        for identity in identity_keys:
-            new_id = identity.their_id.replace(pn_signal, lid_signal, 1)
-            await IdentityKey.update_or_create(
+            # Delete old sessions
+            await SessionModel.filter(
                 our_jid=self.jid,
-                their_id=new_id,
-                defaults={"identity": identity.identity}
-            )
-            identity_keys_updated += 1
+                their_id__startswith=f"{pn_signal}:"
+            ).using_db(connection).delete()
 
-        await IdentityKey.filter(
-            our_jid=self.jid,
-            their_id__startswith=f"{pn_signal}:"
-        ).delete()
-
-        # Migrate sender keys
-        sender_keys = await SenderKey.filter(
-            our_jid=self.jid,
-            sender_id__startswith=f"{pn_signal}:"
-        )
-
-        sender_keys_updated = 0
-        for sender_key in sender_keys:
-            new_id = sender_key.sender_id.replace(pn_signal, lid_signal, 1)
-            await SenderKey.update_or_create(
+            # Migrate identity keys
+            identity_keys_updated = 0
+            identities = await IdentityKeyModel.filter(
                 our_jid=self.jid,
-                chat_id=sender_key.chat_id,
-                sender_id=new_id,
-                defaults={"sender_key": sender_key.sender_key}
-            )
-            sender_keys_updated += 1
+                their_id__startswith=f"{pn_signal}:"
+            ).using_db(connection)
+            for identity in identities:
+                new_id = identity.their_id.replace(pn_signal, lid_signal, 1)
+                await IdentityKeyModel.update_or_create(
+                    our_jid=self.jid,
+                    their_id=new_id,
+                    defaults={'identity': identity.identity},
+                    using_db=connection
+                )
+                identity_keys_updated += 1
 
-        await SenderKey.filter(
-            our_jid=self.jid,
-            sender_id__startswith=f"{pn_signal}:"
-        ).delete()
+            # Delete old identity keys
+            await IdentityKeyModel.filter(
+                our_jid=self.jid,
+                their_id__startswith=f"{pn_signal}:"
+            ).using_db(connection).delete()
+
+            # Migrate sender keys
+            sender_keys_updated = 0
+            sender_keys = await SenderKeyModel.filter(
+                our_jid=self.jid,
+                sender_id__startswith=f"{pn_signal}:"
+            ).using_db(connection)
+            for sender_key in sender_keys:
+                new_id = sender_key.sender_id.replace(pn_signal, lid_signal, 1)
+                await SenderKeyModel.update_or_create(
+                    our_jid=self.jid,
+                    chat_id=sender_key.chat_id,
+                    sender_id=new_id,
+                    defaults={'sender_key': sender_key.sender_key},
+                    using_db=connection
+                )
+                sender_keys_updated += 1
+
+            # Delete old sender keys
+            await SenderKeyModel.filter(
+                our_jid=self.jid,
+                sender_id__startswith=f"{pn_signal}:"
+            ).using_db(connection).delete()
 
         if sessions_updated > 0 or sender_keys_updated > 0 or identity_keys_updated > 0:
-            logging.info(f"Migrated {sessions_updated} sessions, {identity_keys_updated} identity keys and {sender_keys_updated} sender keys from {pn_signal} to {lid_signal}")
+            print(f"Migrated {sessions_updated} sessions, {identity_keys_updated} identity keys and {sender_keys_updated} sender keys from {pn_signal} to {lid_signal}")
 
-    # === PreKey Store Implementation ===
-
+    # Pre-key methods
     async def _get_next_pre_key_id(self) -> int:
-        """Get the next available pre-key ID"""
-        last_key = await PreKeyModel.filter(jid=self.jid).order_by('-key_id').first()
-        return (last_key.key_id + 1) if last_key else 1
+        """Get the next available pre-key ID."""
+        max_key = await PreKeyModel.filter(jid=self.jid).only('key_id').order_by('-key_id').first()
+        return (max_key.key_id + 1) if max_key else 1
 
-    async def _gen_one_pre_key(self, key_id: int, mark_uploaded: bool = False) -> 'PreKey':
-        """Generate a single pre-key"""
-        # Generate a new PreKey directly (matches Go's keys.NewPreKey(id))
-        key_data = PreKey.generate(key_id)
-
+    async def _gen_one_pre_key(self, key_id: int, mark_uploaded: bool = False) -> PreKey:
+        """Generate and store one pre-key."""
+        key = PreKey.generate(key_id)
         await PreKeyModel.create(
             jid=self.jid,
-            key_id=key_id,
-            key=key_data.priv,  # Store the private key bytes
+            key_id=key.key_id,
+            key=key.priv,
             uploaded=mark_uploaded
         )
+        return key
 
-        return key_data
-
-    async def gen_one_pre_key(self) -> 'PreKey':
-        """Generate a single pre-key (public method)"""
+    async def gen_one_pre_key(self) -> PreKey:
+        """Generate one pre-key marked as uploaded."""
         async with self.pre_key_lock:
-            next_id = await self._get_next_pre_key_id()
-            return await self._gen_one_pre_key(next_id, True)
+            next_key_id = await self._get_next_pre_key_id()
+            return await self._gen_one_pre_key(next_key_id, True)
 
-    async def get_or_gen_pre_keys(self, count: int) -> List['PreKey']:
-        """Get existing unuploaded pre-keys or generate new ones"""
+    async def get_or_gen_pre_keys(self, count: int) -> List[PreKey]:
+        """Get or generate the requested number of pre-keys."""
         async with self.pre_key_lock:
             # Get existing unuploaded keys
-            existing = await PreKeyModel.filter(
+            existing_keys = []
+            prekeys = await PreKeyModel.filter(
                 jid=self.jid,
                 uploaded=False
             ).order_by('key_id').limit(count)
+            for pre_key_model in prekeys:
+                key_pair = KeyPair.from_private_key(pre_key_model.key)
+                pre_key = PreKey(key_pair, pre_key_model.key_id)
+                existing_keys.append(pre_key)
 
-            keys = []
-            for pre_key in existing:
-                # Convert to PreKey object by reconstructing from private key
-                from ...util.keys.keypair import PreKey as PreKeyObj, KeyPair
+            # Generate additional keys if needed
+            if len(existing_keys) < count:
+                next_key_id = await self._get_next_pre_key_id()
+                for i in range(len(existing_keys), count):
+                    new_key = await self._gen_one_pre_key(next_key_id + i - len(existing_keys), False)
+                    existing_keys.append(new_key)
 
-                # Create KeyPair from private key (like Go's NewKeyPairFromPrivateKey)
-                key_pair = KeyPair.from_private_key(pre_key.key)
+            return existing_keys
 
-                # Create PreKey with the reconstructed KeyPair
-                key_obj = PreKeyObj(key_pair=key_pair, key_id=pre_key.key_id)
-                keys.append(key_obj)
-
-        # Generate additional keys if needed
-        if len(keys) < count:
-            needed = count - len(keys)
-            next_id = await self._get_next_pre_key_id()
-
-            for i in range(needed):
-                key_data = await self._gen_one_pre_key(next_id + i, False)
-                keys.append(key_data)
-
-        return keys
-
-    async def get_pre_key(self, key_id: int) -> Optional['PreKey']:
-        """Get a specific pre-key by ID"""
+    async def get_pre_key(self, key_id: int) -> Optional[PreKey]:
+        """Get a specific pre-key by ID."""
         try:
-            pre_key = await PreKeyModel.get(jid=self.jid, key_id=key_id)
-
-            # Create KeyPair from private key (like Go's NewKeyPairFromPrivateKey)
-            key_pair = KeyPair.from_private_key(pre_key.key)
-
-            # Create PreKey with the reconstructed KeyPair
-            return PreKey(key_pair=key_pair, key_id=pre_key.key_id)
+            pre_key_model = await PreKeyModel.get(jid=self.jid, key_id=key_id)
+            key_pair = KeyPair.from_private_key(pre_key_model.key)
+            return PreKey(key_pair, pre_key_model.key_id)
         except:
             return None
 
     async def remove_pre_key(self, key_id: int) -> None:
-        """Remove a pre-key by ID"""
+        """Remove a pre-key."""
         await PreKeyModel.filter(jid=self.jid, key_id=key_id).delete()
 
     async def mark_pre_keys_as_uploaded(self, up_to_id: int) -> None:
-        """Mark pre-keys as uploaded up to a certain ID"""
-        await PreKeyModel.filter(jid=self.jid, key_id__lte=up_to_id).update(uploaded=True)
+        """Mark pre-keys as uploaded up to the given ID."""
+        await PreKeyModel.filter(
+            jid=self.jid,
+            key_id__lte=up_to_id
+        ).update(uploaded=True)
 
-    async def uploaded_prekey_count(self, ctx: Any = None) -> int:
+    async def uploaded_prekey_count(self) -> int:
         """Get the count of uploaded pre-keys."""
-        try:
-            count = await PreKeyModel.filter(
-                jid=self.jid,
-                uploaded=True
-            ).count()
-            return count
-        except Exception as e:
-            # Log the error and return 0 as fallback
-            logging.error(f"Failed to get uploaded pre-key count: {e}")
-            return 0
+        return await PreKeyModel.filter(jid=self.jid, uploaded=True).count()
 
-    # === Sender Key Store Implementation ===
-
+    # Sender key methods
     async def put_sender_key(self, group: str, user: str, session: bytes) -> None:
-        """Store sender key for a group chat user"""
-        await SenderKey.update_or_create(
+        """Put a sender key in the store."""
+        await SenderKeyModel.update_or_create(
             our_jid=self.jid,
             chat_id=group,
             sender_id=user,
-            defaults={"sender_key": session}
+            defaults={'sender_key': session}
         )
 
     async def get_sender_key(self, group: str, user: str) -> Optional[bytes]:
-        """Get sender key for a group chat user"""
+        """Get a sender key from the store."""
         try:
-            sender_key = await SenderKey.get(
+            sender_key = await SenderKeyModel.get(
                 our_jid=self.jid,
                 chat_id=group,
                 sender_id=user
@@ -305,83 +287,87 @@ class SQLStore(AllSessionSpecificStores):
         except:
             return None
 
-    # === App State Store Implementation ===
-
-    async def put_app_state_sync_key(self, key_id: bytes, key_data: 'store.AppStateSyncKey') -> None:
-        """Store app state sync key"""
-        await AppStateSyncKey.update_or_create(
+    # App state sync key methods
+    async def put_app_state_sync_key(self, key_id: bytes, key: AppStateSyncKey) -> None:
+        """Put an app state sync key."""
+        await AppStateSyncKeyModel.update_or_create(
             jid=self.jid,
             key_id=key_id,
             defaults={
-                "key_data": key_data.data,
-                "timestamp": key_data.timestamp,
-                "fingerprint": key_data.fingerprint
+                'key_data': key.data,
+                'timestamp': key.timestamp,
+                'fingerprint': key.fingerprint
             }
         )
 
-    async def get_app_state_sync_key(self, key_id: bytes) -> Optional['AppStateSyncKey']:
-        """Get app state sync key by ID"""
+    async def get_app_state_sync_key(self, key_id: bytes) -> Optional[AppStateSyncKeyModel]:
+        """Get an app state sync key."""
         try:
-            key = await AppStateSyncKey.get(jid=self.jid, key_id=key_id)
-            from ...store import AppStateSyncKey as AppStateSyncKeyObj
-            return AppStateSyncKeyObj(
-                data=key.key_data,
-                timestamp=key.timestamp,
-                fingerprint=key.fingerprint
+            key_model = await AppStateSyncKeyModel.get(jid=self.jid, key_id=key_id)
+            return AppStateSyncKeyModel(
+                data=key_model.key_data,
+                timestamp=key_model.timestamp,
+                fingerprint=key_model.fingerprint
             )
         except:
             return None
 
     async def get_latest_app_state_sync_key_id(self) -> Optional[bytes]:
-        """Get the latest app state sync key ID"""
-        try:
-            key = await AppStateSyncKey.filter(jid=self.jid).order_by('-timestamp').first()
-            return key.key_id if key else None
-        except:
-            return None
+        """Get the latest app state sync key ID."""
+        latest = await AppStateSyncKeyModel.filter(
+            jid=self.jid
+        ).order_by('-timestamp').first()
+        return latest.key_id if latest else None
 
-    async def put_app_state_version(self, name: str, version: int, hash_bytes: bytes) -> None:
-        """Store app state version"""
-        await AppStateVersion.update_or_create(
+    # App state version methods
+    async def put_app_state_version(self, name: str, version: int, hash_value: bytes) -> None:
+        """Put an app state version."""
+        await AppStateVersionModel.update_or_create(
             jid=self.jid,
             name=name,
-            defaults={"version": version, "hash": hash_bytes}
+            defaults={
+                'version': version,
+                'hash': hash_value
+            }
         )
 
     async def get_app_state_version(self, name: str) -> Tuple[int, bytes]:
-        """Get app state version and hash"""
+        """Get an app state version."""
         try:
-            state = await AppStateVersion.get(jid=self.jid, name=name)
-            return state.version, state.hash
+            version_model = await AppStateVersionModel.get(jid=self.jid, name=name)
+            return version_model.version, version_model.hash
         except:
             return 0, b'\x00' * 128
 
     async def delete_app_state_version(self, name: str) -> None:
-        """Delete app state version"""
-        await AppStateVersion.filter(jid=self.jid, name=name).delete()
+        """Delete an app state version."""
+        await AppStateVersionModel.filter(jid=self.jid, name=name).delete()
 
-    async def put_app_state_mutation_macs(self, name: str, version: int, mutations: List['AppStateMutationMACModel']) -> None:
-        """Store app state mutation MACs"""
+    # App state mutation MAC methods
+    async def put_app_state_mutation_macs(
+        self,
+        name: str,
+        version: int,
+        mutations: List[AppStateMutationMAC]
+    ) -> None:
+        """Put app state mutation MACs."""
         if not mutations:
             return
 
-        # Process in batches to avoid too many parameters
-        batch_size = 400
-        for i in range(0, len(mutations), batch_size):
-            batch = mutations[i:i + batch_size]
-            mac_objects = []
-            for mutation in batch:
-                mac_objects.append(AppStateMutationMACModel(
+        # Use transaction for batch insert
+        async with in_transaction() as connection:
+            for mutation in mutations:
+                await AppStateMutationMACModel.create(
                     jid=self.jid,
                     name=name,
                     version=version,
                     index_mac=mutation.index_mac,
-                    value_mac=mutation.value_mac
-                ))
-            await AppStateMutationMACModel.bulk_create(mac_objects)
+                    value_mac=mutation.value_mac,
+                    using_db=connection
+                )
 
     async def delete_app_state_mutation_macs(self, name: str, index_macs: List[bytes]) -> None:
-        """Delete app state mutation MACs by index MAC"""
+        """Delete app state mutation MACs."""
         if not index_macs:
             return
 
@@ -392,159 +378,131 @@ class SQLStore(AllSessionSpecificStores):
         ).delete()
 
     async def get_app_state_mutation_mac(self, name: str, index_mac: bytes) -> Optional[bytes]:
-        """Get app state mutation MAC by index MAC"""
+        """Get an app state mutation MAC."""
+        mac_model = await AppStateMutationMACModel.filter(
+            jid=self.jid,
+            name=name,
+            index_mac=index_mac
+        ).order_by('-version').first()
+
+        return mac_model.value_mac if mac_model else None
+
+    # Contact methods
+    async def _get_contact(self, jid: JID) -> ContactInfo:
+        """Get contact from cache or database."""
+        if jid in self.contact_cache:
+            return self.contact_cache[jid]
+
         try:
-            mac = await AppStateMutationMACModel.filter(
-                jid=self.jid,
-                name=name,
-                index_mac=index_mac
-            ).order_by('-version').first()
-            return mac.value_mac if mac else None
-        except:
-            return None
-
-    # === Contact Store Implementation ===
-
-    async def put_contact_name(self, jid: str, first_name: str, full_name: str) -> None:
-        """Store contact name"""
-        async with self.contact_cache_lock:
-            await Contact.update_or_create(
-                our_jid=self.jid,
-                their_jid=jid,
-                defaults={
-                    "first_name": first_name,
-                    "full_name": full_name
-                }
+            contact = await ContactModel.get(our_jid=self.jid, their_jid=str(jid))
+            contact_info = ContactInfo(
+                first_name=contact.first_name or "",
+                full_name=contact.full_name or "",
+                push_name=contact.push_name or "",
+                business_name=contact.business_name or "",
+                found=True
             )
-            # Update cache
-            await self.contact_cache.pop(jid, None)
+        except:
+            contact_info = ContactInfo(found=False)
 
-    async def put_many_contact_names(self, contacts: List[Tuple[str, str, str]]) -> None:
-        """Store multiple contact names efficiently"""
+        self.contact_cache[jid] = contact_info
+        return contact_info
+
+    async def put_contact_name(self, user: JID, first_name: str, full_name: str) -> None:
+        """Put contact name."""
+        async with self.contact_cache_lock:
+            cached = await self._get_contact(user)
+            if cached.first_name != first_name or cached.full_name != full_name:
+                await ContactModel.update_or_create(
+                    our_jid=self.jid,
+                    their_jid=str(user),
+                    defaults={
+                        'first_name': first_name,
+                        'full_name': full_name
+                    }
+                )
+                cached.first_name = first_name
+                cached.full_name = full_name
+                cached.found = True
+
+    async def put_many_contact_names(self, contacts: List[ContactEntry]) -> None:
+        """Put many contact names in batch."""
         if not contacts:
             return
 
-        async with self.contact_cache_lock:
-            contact_objects = []
-            for jid, first_name, full_name in contacts:
-                contact_objects.append(Contact(
+        # Remove duplicates and filter empty JIDs
+        seen = set()
+        unique_contacts = []
+        for contact in contacts:
+            if contact.jid and contact.jid not in seen:
+                seen.add(contact.jid)
+                unique_contacts.append(contact)
+
+        async with in_transaction() as connection:
+            for contact in unique_contacts:
+                await ContactModel.update_or_create(
                     our_jid=self.jid,
-                    their_jid=jid,
-                    first_name=first_name,
-                    full_name=full_name
-                ))
-
-            # Clear cache for all updated contacts
-            for jid, _, _ in contacts:
-                await self.contact_cache.pop(jid, None)
-
-            for contact in contact_objects:
-                await Contact.update_or_create(
+                    their_jid=str(contact.jid),
                     defaults={
                         'first_name': contact.first_name,
-                        'full_name': contact.full_name,
+                        'full_name': contact.full_name
                     },
-                    our_jid=contact.our_jid,
-                    their_jid=contact.their_jid
+                    using_db=connection
                 )
 
-    async def put_push_name(self, user_jid: str, push_name: str) -> Tuple[bool, str]:
-        """Store push name and return if changed and previous name"""
+    async def put_push_name(self, user: JID, push_name: str) -> Tuple[bool, str]:
+        """Put push name, returns (changed, previous_name)."""
         async with self.contact_cache_lock:
-            try:
-                contact = await Contact.get(our_jid=self.jid, their_jid=user_jid)
-                previous_name = contact.push_name or ""
-                if contact.push_name != push_name:
-                    contact.push_name = push_name
-                    await contact.save()
-                    # Clear cache
-                    await self.contact_cache.pop(user_jid, None)
-                    return True, previous_name
-                return False, ""
-            except:
-                # Create new contact
-                await Contact.create(
+            cached = await self._get_contact(user)
+            if cached.push_name != push_name:
+                await ContactModel.update_or_create(
                     our_jid=self.jid,
-                    their_jid=user_jid,
-                    push_name=push_name
+                    their_jid=str(user),
+                    defaults={'push_name': push_name}
                 )
-                return True, ""
+                previous_name = cached.push_name
+                cached.push_name = push_name
+                cached.found = True
+                return True, previous_name
+            return False, ""
 
-    async def put_business_name(self, user_jid: str, business_name: str) -> Tuple[bool, str]:
-        """Store business name and return if changed and previous name"""
+    async def put_business_name(self, user: JID, business_name: str) -> Tuple[bool, str]:
+        """Put business name, returns (changed, previous_name)."""
         async with self.contact_cache_lock:
-            try:
-                contact = await Contact.get(our_jid=self.jid, their_jid=user_jid)
-                previous_name = contact.business_name or ""
-                if contact.business_name != business_name:
-                    contact.business_name = business_name
-                    await contact.save()
-                    # Clear cache
-                    await self.contact_cache.pop(user_jid, None)
-                    return True, previous_name
-                return False, ""
-            except:
-                # Create new contact
-                await Contact.create(
+            cached = await self._get_contact(user)
+            if cached.business_name != business_name:
+                await ContactModel.update_or_create(
                     our_jid=self.jid,
-                    their_jid=user_jid,
-                    business_name=business_name
+                    their_jid=str(user),
+                    defaults={'business_name': business_name}
                 )
-                return True, ""
+                previous_name = cached.business_name
+                cached.business_name = business_name
+                cached.found = True
+                return True, previous_name
+            return False, ""
 
-    async def get_contact(self, jid: str) -> Optional['ContactInfo']:
-        """Get contact information"""
-        from ...types.user import ContactInfo
+    async def get_contact(self, jid: JID) -> ContactInfo:
+        """Get contact info."""
         async with self.contact_cache_lock:
-            # Check cache first
-            if jid in self.contact_cache:
-                contact = self.contact_cache[jid]
+            return await self._get_contact(jid)
 
-                return ContactInfo(
-                    first_name=contact.first_name,
-                    full_name=contact.full_name,
-                    push_name=contact.push_name,
-                    business_name=contact.business_name,
-                    found=True
-                )
-
-            try:
-                contact = await Contact.get(
-                    our_jid=self.jid,
-                    their_jid=jid
-                )
-                # Cache the contact
-                self.contact_cache[jid] = contact
-
-                # Convert to ContactInfo
-                info = ContactInfo(
-                    first_name=contact.first_name,
-                    full_name=contact.full_name,
-                    push_name=contact.push_name,
-                    business_name=contact.business_name,
-                    found=True
-                )
-                return info
-            except:
-                # Return empty contact info
-                return ContactInfo(found=False)
-
-    async def get_all_contacts(self) -> Dict[str, 'ContactInfo']:
-        """Get all contacts"""
-        contacts = await Contact.filter(our_jid=self.jid)
-        result = {}
-
-        from ...types.user import ContactInfo
+    async def get_all_contacts(self) -> Dict[JID, ContactInfo]:
+        """Get all contacts."""
+        contacts_result = {}
+        contacts = await ContactModel.filter(our_jid=self.jid).all()
         for contact in contacts:
-            info = ContactInfo(
-                first_name=contact.first_name,
-                full_name=contact.full_name,
-                push_name=contact.push_name,
-                business_name=contact.business_name,
+            jid = JID.from_string(contact.their_jid)
+            contacts_result[jid] = ContactInfo(
+                first_name=contact.first_name or "",
+                full_name=contact.full_name or "",
+                push_name=contact.push_name or "",
+                business_name=contact.business_name or "",
                 found=True
             )
-            result[contact.their_jid] = info
-            # Update cache
-            self.contact_cache[contact.their_jid] = contact
+        return contacts_result
 
-        return result
+    # Compatibility methods for the missing methods from the summary
+    async def put_all_contact_names(self, contacts: List[ContactEntry]) -> None:
+        """Alias for put_many_contact_names for compatibility."""
+        await self.put_many_contact_names(contacts)

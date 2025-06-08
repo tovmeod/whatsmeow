@@ -2,7 +2,7 @@ from tortoise.models import Model
 from tortoise import fields
 from typing import Optional
 
-class Contact(Model):
+class ContactModel(Model):
     """Contact information"""
     our_jid = fields.CharField(max_length=255)
     their_jid = fields.CharField(max_length=255)

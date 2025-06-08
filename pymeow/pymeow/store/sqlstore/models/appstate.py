@@ -2,8 +2,7 @@ from tortoise.models import Model
 from tortoise import fields
 
 
-# todo rename to AppStateSyncKeyModel
-class AppStateSyncKey(Model):
+class AppStateSyncKeyModel(Model):
     """App state sync keys"""
     jid = fields.CharField(max_length=255)
     key_id = fields.BinaryField()
@@ -15,8 +14,7 @@ class AppStateSyncKey(Model):
         table = "pymeow_app_state_sync_keys"
         unique_together = (("jid", "key_id"),)
 
-# todo rename to AppStateVersionModel
-class AppStateVersion(Model):
+class AppStateVersionModel(Model):
     """App state versions"""
     jid = fields.CharField(max_length=255)
     name = fields.CharField(max_length=255)

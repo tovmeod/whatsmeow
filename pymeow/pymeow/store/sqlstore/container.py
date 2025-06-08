@@ -22,16 +22,17 @@ class Container:
         self.db_url = db_url
         self._initialized = False
 
-    async def initialize(self) -> None:
+    async def ainit(self) -> 'Container':
         """Initialize Tortoise ORM connection"""
         if self._initialized:
-            return
+            return self
 
         config = get_tortoise_config(self.db_url)
         await Tortoise.init(config)
         await Tortoise.generate_schemas()
         self._initialized = True
         logger.info("Database initialized successfully")
+        return self
 
     async def close(self) -> None:
         """Close database connections"""
@@ -113,17 +114,17 @@ class Container:
             # Delete device and cascade to related tables
             await DeviceModel.filter(id=jid).delete()
             # Additional cleanup for related tables
-            from .models.session import IdentityKey, Session, PreKeyModel, SenderKey
-            from .models.contacts import Contact
-            from .models.appstate import AppStateSyncKey, AppStateVersion
+            from .models.session import IdentityKeyModel, SessionModel, PreKeyModel, SenderKeyModel
+            from .models.contacts import ContactModel
+            from .models.appstate import AppStateSyncKeyModel, AppStateVersionModel
 
-            await IdentityKey.filter(our_jid=jid).delete()
-            await Session.filter(our_jid=jid).delete()
+            await IdentityKeyModel.filter(our_jid=jid).delete()
+            await SessionModel.filter(our_jid=jid).delete()
             await PreKeyModel.filter(jid=jid).delete()
-            await SenderKey.filter(our_jid=jid).delete()
-            await Contact.filter(our_jid=jid).delete()
-            await AppStateSyncKey.filter(jid=jid).delete()
-            await AppStateVersion.filter(jid=jid).delete()
+            await SenderKeyModel.filter(our_jid=jid).delete()
+            await ContactModel.filter(our_jid=jid).delete()
+            await AppStateSyncKeyModel.filter(jid=jid).delete()
+            await AppStateVersionModel.filter(jid=jid).delete()
 
     def _device_to_store(self, device: DeviceModel) -> Device:
         """Convert Device model to DeviceStore"""

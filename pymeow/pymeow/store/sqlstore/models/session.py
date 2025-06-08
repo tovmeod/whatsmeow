@@ -2,7 +2,7 @@ from tortoise.models import Model
 from tortoise import fields
 
 
-class IdentityKey(Model):
+class IdentityKeyModel(Model):
     """Identity key storage for Signal protocol"""
     our_jid = fields.CharField(max_length=255)
     their_id = fields.CharField(max_length=255)
@@ -12,7 +12,7 @@ class IdentityKey(Model):
         table = "pymeow_identity_keys"
         unique_together = (("our_jid", "their_id"),)
 
-class Session(Model):
+class SessionModel(Model):
     """Signal protocol sessions"""
     our_jid = fields.CharField(max_length=255)
     their_id = fields.CharField(max_length=255)
@@ -33,7 +33,7 @@ class PreKeyModel(Model):
         table = "pymeow_pre_keys"
         unique_together = (("jid", "key_id"),)
 
-class SenderKey(Model):
+class SenderKeyModel(Model):
     """Sender keys for group encryption"""
     our_jid = fields.CharField(max_length=255)
     chat_id = fields.CharField(max_length=255)
