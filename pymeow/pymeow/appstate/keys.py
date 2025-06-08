@@ -72,7 +72,7 @@ class ExpandedAppStateKeys:
 class Processor:
     """Processor for app state patches."""
 
-    def __init__(self, store: Device, log: Optional[logging.Logger] = None):
+    def __init__(self, store: Device):
         """
         Initialize a new app state processor.
 

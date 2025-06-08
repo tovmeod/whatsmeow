@@ -9,7 +9,7 @@ import struct
 from dataclasses import dataclass
 from typing import List, Callable, Tuple, Optional
 
-from ..appstate.lthash import LTHash, WAPatchIntegrity
+from .lthash import WAPatchIntegrity
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
 from .errors import ErrMissingPreviousSetValueOperation

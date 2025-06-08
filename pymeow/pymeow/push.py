@@ -81,3 +81,51 @@ class WebPushConfig(PushConfig):
             "p256dh": base64.b64encode(self.p256dh).decode(),
         }
 
+
+async def get_server_push_notification_config(self) -> Optional[Node]:
+    """Retrieves server push notification settings."""
+    if not self:
+        return None
+
+    from .request import InfoQuery, InfoQueryType
+
+    resp, err = await self.send_iq(InfoQuery(
+        namespace="urn:xmpp:whatsapp:push",
+        type=InfoQueryType.GET,
+        to=self.server_jid,
+        content=[Node(tag="settings")]
+    ))
+
+    if err:
+        logger.error(f"Failed to get server push notification config: {err}")
+        return None
+
+    return resp
+
+async def register_for_push_notifications(self, pc: PushConfig) -> None:
+    """
+    Registers a device for push notifications.
+
+    This is generally not necessary for anything. Don't use this if you don't know what you're doing.
+
+    Args:
+        pc: The push configuration to register
+
+    Raises:
+        ElementMissingError: If the client is nil
+        Exception: If there's an error registering for push notifications
+    """
+    if not self:
+        raise ElementMissingError(tag="client", location="register_for_push_notifications")
+
+    from .request import InfoQuery, InfoQueryType
+
+    _, err = await self.send_iq(InfoQuery(
+        namespace="urn:xmpp:whatsapp:push",
+        type=InfoQueryType.SET,
+        to=self.server_jid,
+        content=[Node(tag="config", attributes=pc.get_push_config_attrs())]
+    ))
+
+    if err:
+        raise Exception(f"Failed to register for push notifications: {err}")

@@ -1,6 +1,6 @@
 """Test application state error classes."""
 import pytest
-from ..pymeow.appstate.errors import (
+from pymeow.pymeow.appstate import (
     AppStateError,
     MissingPreviousSetValueOperationError,
     MismatchingLTHashError,
