@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Any
-import json
 
 from .jid import JID
 from .message import MessageServerID, MessageID
@@ -268,12 +267,17 @@ class GraphQLError:
         return f"{self.extensions.error_code} {self.message} ({self.extensions.severity})"
 
 
-class GraphQLErrors(Exception, List[GraphQLError]):
+class GraphQLErrors(Exception):
     """
     A list of GraphQL errors that can be raised as an exception.
 
     Port of GraphQLErrors in Go.
     """
+
+    def __init__(self, errors: List[GraphQLError]):
+        """Initialize with a list of GraphQL errors."""
+        self.errors = errors
+        super().__init__(str(self))
 
     def unwrap(self) -> List[Exception]:
         """
@@ -281,7 +285,7 @@ class GraphQLErrors(Exception, List[GraphQLError]):
 
         Port of Unwrap() method in Go.
         """
-        return [err for err in self]
+        return [Exception(str(err)) for err in self.errors]
 
     def __str__(self) -> str:
         """
@@ -289,12 +293,24 @@ class GraphQLErrors(Exception, List[GraphQLError]):
 
         Port of Error() method in Go.
         """
-        if not self:
+        if not self.errors:
             return ""
-        elif len(self) == 1:
-            return str(self[0])
+        elif len(self.errors) == 1:
+            return str(self.errors[0])
         else:
-            return f"{self[0]} (and {len(self)-1} other errors)"
+            return f"{self.errors[0]} (and {len(self.errors)-1} other errors)"
+
+    def __len__(self) -> int:
+        """Return the number of errors."""
+        return len(self.errors)
+
+    def __getitem__(self, index: int) -> GraphQLError:
+        """Allow indexing into the errors."""
+        return self.errors[index]
+
+    def __iter__(self):
+        """Allow iteration over the errors."""
+        return iter(self.errors)
 
 
 @dataclass
