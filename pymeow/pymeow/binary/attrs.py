@@ -4,9 +4,10 @@ Port of whatsmeow/binary/attrs.go
 """
 
 from datetime import datetime
-from typing import List, Optional, Tuple, Any, Dict
+from typing import List, Optional, Tuple, Any, Dict, TYPE_CHECKING
 
-from pymeow.pymeow.types import JID
+if TYPE_CHECKING:
+    from ....pymeow.pymeow.types import JID
 
 # Type alias for attributes (equivalent to Go's Attrs = map[string]any)
 Attrs = Dict[str, Any]
@@ -25,8 +26,9 @@ class AttrUtility:
         self.attrs = attrs
         self.errors: List[Exception] = []
 
-    def get_jid(self, key: str, require: bool) -> Tuple[JID, bool]:
+    def get_jid(self, key: str, require: bool) -> Tuple['JID', bool]:
         """Get JID attribute with error handling."""
+        from ....pymeow.pymeow.types import JID
         if key not in self.attrs:
             if require:
                 self.errors.append(ValueError(f"didn't find required JID attribute '{key}'"))
@@ -48,7 +50,7 @@ class AttrUtility:
         self.errors.append(TypeError(f"expected attribute '{key}' to be JID, but was {type(val).__name__}"))
         return JID(), False
 
-    def optional_jid(self, key: str) -> Optional[JID]:
+    def optional_jid(self, key: str) -> Optional['JID']:
         """
         OptionalJID returns the JID under the given key. If there's no valid JID under the given key, this will return None.
         However, if the attribute is completely missing, this will not store an error.
@@ -58,7 +60,7 @@ class AttrUtility:
             return jid
         return None
 
-    def optional_jid_or_empty(self, key: str) -> JID:
+    def optional_jid_or_empty(self, key: str) -> 'JID':
         """
         OptionalJIDOrEmpty returns the JID under the given key. If there's no valid JID under the given key, this will return an empty JID.
         However, if the attribute is completely missing, this will not store an error.
@@ -68,7 +70,7 @@ class AttrUtility:
             return jid
         return JID()
 
-    def jid(self, key: str) -> JID:
+    def jid(self, key: str) -> 'JID':
         """
         JID returns the JID under the given key.
         If there's no valid JID under the given key, an error will be stored and a blank JID struct will be returned.
