@@ -3,14 +3,14 @@ import os
 import struct
 from datetime import datetime
 from typing import Optional, List
+from typing_extensions import Buffer
+
 from tortoise import Tortoise, transactions
 from tortoise.exceptions import DoesNotExist
-from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives import serialization
 
 from .config import get_tortoise_config
-from .models.device import Device
-from ...store.store import Device as DeviceStore
+from .models.device import DeviceModel
+from ...store.store import Device
 from ...util.keys.keypair import KeyPair, PreKey
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class Container:
     """Database container managing WhatsApp store operations"""
 
-    def __init__(self, db_url: str, logger: Optional[logging.Logger] = None):
+    def __init__(self, db_url: str):
         self.db_url = db_url
         self._initialized = False
 
@@ -40,29 +40,29 @@ class Container:
             self._initialized = False
             logger.info("Database connections closed")
 
-    async def get_all_devices(self) -> List[DeviceStore]:
+    async def get_all_devices(self) -> List[Device]:
         """Get all registered devices"""
-        devices = await Device.all()
+        devices = await DeviceModel.all()
         return [self._device_to_store(device) for device in devices]
 
-    async def get_first_device(self) -> Optional[DeviceStore]:
+    async def get_first_device(self) -> Optional[Device]:
         """Get the first available device, create one if none exist"""
         try:
-            device = await Device.first()
+            device = await DeviceModel.first()
             return self._device_to_store(device) if device else await self.new_device("new_device@temp.com")
         except DoesNotExist:
             # Create a new device if none exist (like Go implementation)
             return await self.new_device("new_device@temp.com")
 
-    async def get_device(self, jid: str) -> Optional[DeviceStore]:
+    async def get_device(self, jid: str) -> Optional[Device]:
         """Get device by JID"""
         try:
-            device = await Device.get(id=jid)
+            device = await DeviceModel.get(id=jid)
             return self._device_to_store(device)
         except DoesNotExist:
             return None
 
-    async def new_device(self, jid: str) -> DeviceStore:
+    async def new_device(self, jid: str) -> Device:
         """Create a new device with proper default values"""
         # Generate noise key
         noise_key = KeyPair.generate()
@@ -74,9 +74,12 @@ class Container:
         signed_pre_key = identity_key.create_signed_pre_key(1)
 
         # Generate registration ID (random 32-bit integer)
-        registration_id = struct.unpack(">I", os.urandom(4))[0]
+        the_random_bytes: bytes
+        the_random_bytes = os.urandom(4)
+        the_random_bytes: 'Buffer'
+        registration_id = struct.unpack(">I", the_random_bytes)[0]
 
-        device = await Device.create(
+        device = await DeviceModel.create(
             id=jid,
             registration_id=registration_id,
             noise_key_private=noise_key.priv,
@@ -97,10 +100,10 @@ class Container:
 
         return store
 
-    async def put_device(self, store: DeviceStore) -> None:
+    async def put_device(self, store: Device) -> None:
         """Save device to database"""
-        await Device.update_or_create(
-            id=store.jid,
+        await DeviceModel.update_or_create(
+            id=store.id,
             defaults=self._store_to_device_dict(store)
         )
 
@@ -108,7 +111,7 @@ class Container:
         """Delete device and all associated data"""
         async with transactions.in_transaction():
             # Delete device and cascade to related tables
-            await Device.filter(id=jid).delete()
+            await DeviceModel.filter(id=jid).delete()
             # Additional cleanup for related tables
             from .models.session import IdentityKey, Session, PreKeyModel, SenderKey
             from .models.contacts import Contact
@@ -122,9 +125,9 @@ class Container:
             await AppStateSyncKey.filter(jid=jid).delete()
             await AppStateVersion.filter(jid=jid).delete()
 
-    def _device_to_store(self, device: Device) -> DeviceStore:
+    def _device_to_store(self, device: DeviceModel) -> Device:
         """Convert Device model to DeviceStore"""
-        store = DeviceStore()
+        store = Device()
         store.jid = device.id
         store.registration_id = device.registration_id
 
@@ -148,19 +151,17 @@ class Container:
                 signature=device.signed_pre_key_signature
             )
 
-        store.phone_id = device.phone_id
-        store.device_id = device.device_id
+        # Only set fields that exist in the Go version
         store.platform = device.platform
         store.business_name = device.business_name
         store.push_name = device.push_name
+
         return store
 
-    def _store_to_device_dict(self, store: DeviceStore) -> dict:
+    def _store_to_device_dict(self, store: Device) -> dict:
         """Convert DeviceStore to Device model dict"""
         data = {
             "registration_id": store.registration_id,
-            "phone_id": store.phone_id,
-            "device_id": store.device_id,
             "platform": store.platform or "android",
             "business_name": store.business_name,
             "push_name": store.push_name,
