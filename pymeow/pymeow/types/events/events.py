@@ -28,6 +28,9 @@ ReceiptTypeRead = ReceiptType.READ
 ReceiptTypeReadSelf = ReceiptType.READ_SELF
 ReceiptTypePlayed = ReceiptType.PLAYED
 
+class BaseEvent:
+    pass
+
 # QR is emitted after connecting when there's no session data in the device store.
 @dataclass
 class QR:
@@ -95,7 +98,7 @@ class Connected:
 
 # KeepAliveTimeout is emitted when the keepalive ping request to WhatsApp web servers times out.
 @dataclass
-class KeepAliveTimeout:
+class KeepAliveTimeout(BaseEvent):
     """
     Emitted when the keepalive ping request to WhatsApp web servers times out.
 
@@ -108,7 +111,7 @@ class KeepAliveTimeout:
 
 # KeepAliveRestored is emitted if the keepalive pings start working again after some KeepAliveTimeout events.
 @dataclass
-class KeepAliveRestored:
+class KeepAliveRestored(BaseEvent):
     """
     Emitted if the keepalive pings start working again after some KeepAliveTimeout events.
 
@@ -301,7 +304,7 @@ class StreamError:
 
 # Disconnected is emitted when the websocket is closed by the server.
 @dataclass
-class Disconnected:
+class Disconnected(BaseEvent):
     """
     Emitted when the websocket is closed by the server.
     """
@@ -327,7 +330,7 @@ class UnavailableType(Enum):
 
 # UndecryptableMessage is emitted when receiving a new message that failed to decrypt.
 @dataclass
-class UndecryptableMessage:
+class UndecryptableMessage(BaseEvent):
     """
     Emitted when receiving a new message that failed to decrypt.
 
@@ -469,7 +472,7 @@ class FBMessage:
 
 # Receipt is emitted when an outgoing message is delivered to or read by another user, or when another device reads an incoming message.
 @dataclass
-class Receipt:
+class Receipt(BaseEvent):
     """
     Emitted when an outgoing message is delivered to or read by another user, or when another device reads an incoming message.
 
@@ -607,7 +610,7 @@ class UserAbout:
 
 # IdentityChange is emitted when another user changes their primary device.
 @dataclass
-class IdentityChange:
+class IdentityChange(BaseEvent):
     """
     Emitted when another user changes their primary device.
     """

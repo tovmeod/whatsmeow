@@ -2,7 +2,7 @@ from tortoise.models import Model
 from tortoise import fields
 from typing import Optional
 
-class Device(Model):
+class DeviceModel(Model):
     """Device information storage"""
     id = fields.CharField(max_length=255, pk=True)
     registration_id = fields.IntField()
