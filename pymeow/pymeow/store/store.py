@@ -6,10 +6,11 @@ Port of whatsmeow/store/store.go
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Callable, Any, Protocol, TypeVar, ByteString
+from typing import List, Dict, Optional, Tuple, Callable, Any, Protocol, TypeVar, ByteString, TYPE_CHECKING
 import uuid
 import asyncio
 
+from .sqlstore.container import Container
 # Protobuf imports
 from ..generated.waAdv import WAAdv_pb2
 
@@ -257,7 +258,7 @@ class ChatSettingsStore(ABC):
         pass
 
     @abstractmethod
-    async def get_chat_settings(self, chat: JID) -> Tuple[Any, Optional[Exception]]:
+    async def get_chat_settings(self, chat: JID) -> Any:
         """Get settings for a chat."""
         pass
 
@@ -323,7 +324,7 @@ class PrivacyTokenStore(ABC):
         raise NotImplementedError  # todo implement this in sqlstore
 
     @abstractmethod
-    async def get_privacy_token(self, user: JID) -> Tuple[Optional[PrivacyToken], Optional[Exception]]:
+    async def get_privacy_token(self, user: JID) -> Optional[PrivacyToken]:
         """Get a privacy token for a user."""
         pass
 
@@ -341,7 +342,7 @@ class EventBuffer(ABC):
     """Interface for buffering events."""
 
     @abstractmethod
-    async def get_buffered_event(self, ciphertext_hash: bytes) -> Tuple[Optional[BufferedEvent], Optional[Exception]]:
+    async def get_buffered_event(self, ciphertext_hash: bytes) -> Optional[BufferedEvent]:
         """Get a buffered event by ciphertext hash."""
         pass
 
@@ -401,19 +402,19 @@ class LIDStore(ABC):
 class AllSessionSpecificStores(IdentityStore, SessionStore, PreKeyStore, SenderKeyStore,
                               AppStateSyncKeyStore, AppStateStore, ContactStore,
                               ChatSettingsStore, MsgSecretStore, PrivacyTokenStore,
-                              EventBuffer):
+                              EventBuffer, LIDStore, DeviceContainer):
     """Interface combining all session-specific stores."""
     pass
 
 
-class AllGlobalStores(LIDStore):
-    """Interface combining all global stores."""
-    pass
+# class AllGlobalStores(LIDStore):
+#     """Interface combining all global stores."""
+#     pass
 
 
-class AllStores(AllSessionSpecificStores, AllGlobalStores):
-    """Interface combining all stores."""
-    pass
+# class AllStores(AllSessionSpecificStores, AllGlobalStores):
+#     """Interface combining all stores."""
+#     pass
 
 
 @dataclass
@@ -450,7 +451,36 @@ class Device:
     privacy_tokens: Optional[PrivacyTokenStore] = None
     event_buffer: Optional[EventBuffer] = None
     lids: Optional[LIDStore] = None
-    container: Optional[DeviceContainer] = None
+    device_container: Optional[DeviceContainer] = None
+
+    # todo: check if and where these are used, maybe not here in this class
+    adv_details: bytes = field(default_factory=bytes)
+    adv_account_sig: bytes = field(default_factory=bytes)
+    adv_account_sig_key: bytes = field(default_factory=bytes)
+    adv_device_sig: bytes = field(default_factory=bytes)
+
+    def __init__(self, container: Container, jid: str):
+        from .sqlstore.store import SQLStore
+        # Create ONE SQLStore instance that implements ALL interfaces
+        sql_store = SQLStore(container, jid)
+
+        # All store attributes point to the SAME instance
+        self.identities: IdentityStore = sql_store
+        self.sessions: SessionStore = sql_store
+        self.pre_keys: PreKeyStore = sql_store
+        self.sender_keys: SenderKeyStore = sql_store
+        self.app_state_keys: AppStateSyncKeyStore = sql_store
+        self.app_state: AppStateStore = sql_store
+        self.contacts: ContactStore = sql_store
+        self.chat_settings: ChatSettingsStore = sql_store
+        self.msg_secrets: MsgSecretStore = sql_store
+        self.privacy_tokens: PrivacyTokenStore = sql_store
+        self.event_buffer: EventBuffer = sql_store
+        self.lids: LIDStore = sql_store
+
+        # Device-specific attributes
+        self.jid = jid
+        self.device_container = sql_store
 
     def get_jid(self) -> JID:
         """Get the JID of this device."""
@@ -466,14 +496,14 @@ class Device:
 
     async def save(self) -> Optional[Exception]:
         """Save this device to its container."""
-        if self.container:
-            return await self.container.put_device(self)
+        if self.device_container:
+            return await self.device_container.put_device(self)
         return None
 
     async def delete(self) -> Optional[Exception]:
         """Delete this device from its container."""
-        if self.container:
-            err = await self.container.delete_device(self)
+        if self.device_container:
+            err = await self.device_container.delete_device(self)
             if err:
                 return err
             self.id = None

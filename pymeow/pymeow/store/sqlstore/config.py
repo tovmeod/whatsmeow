@@ -12,7 +12,11 @@ def get_tortoise_config(db_url: str) -> Dict[str, Any]:
                     "pymeow.store.sqlstore.models.session",
                     "pymeow.store.sqlstore.models.contacts",
                     "pymeow.store.sqlstore.models.appstate",
+                    "pymeow.store.sqlstore.models.chatsettings",
                     "pymeow.store.sqlstore.models.messages",
+                    "pymeow.store.sqlstore.models.privacy",
+                    "pymeow.store.sqlstore.models.events",
+                    "pymeow.store.sqlstore.models.lids",
                 ],
                 "default_connection": "default",
             }

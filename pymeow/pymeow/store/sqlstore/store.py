@@ -4,19 +4,30 @@ SQL-backed store implementation using Tortoise ORM.
 Port of whatsmeow/store/sqlstore/store.go
 """
 import asyncio
-from typing import Dict, List, Optional, Tuple, Set
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Set, Any, Callable
 from tortoise.transactions import in_transaction
 
+from .models.chatsettings import ChatSettingsModel
+from .models.messages import MessageSecretModel
 from ...types import JID, ContactInfo
 from ...util.keys.keypair import PreKey, KeyPair
-from ..store import ContactEntry, AppStateMutationMAC, AppStateSyncKey
+from ..store import ContactEntry, AppStateMutationMAC, AppStateSyncKey, AllSessionSpecificStores, Device, \
+    MessageSecretInsert, PrivacyToken, BufferedEvent, LIDMapping
 from .container import Container
 from .models.session import IdentityKeyModel, SessionModel, PreKeyModel, SenderKeyModel
 from .models.appstate import AppStateSyncKeyModel, AppStateVersionModel, AppStateMutationMACModel
 from .models.contacts import ContactModel
 
 
-class SQLStore:
+class ChatSettings:
+    def __init__(self, muted_until: Optional[int] = None, pinned: bool = False, archived: bool = False):
+        self.muted_until = muted_until
+        self.pinned = pinned
+        self.archived = archived
+
+
+class SQLStore(AllSessionSpecificStores):
     """
     SQL-backed store implementation for WhatsApp client data.
 
@@ -41,6 +52,12 @@ class SQLStore:
 
         # Cache for migrated PN sessions
         self.migrated_pn_sessions_cache: Set[str] = set()
+
+        # Add these in-memory stores:
+        self.privacy_tokens_cache: Dict[str, PrivacyToken] = {}  # key: user_jid
+        self.buffered_events_cache: Dict[str, BufferedEvent] = {}  # key: event_id
+        self.lid_mappings_cache: Dict[str, str] = {}  # key: lid_jid, value: pn_jid
+        self.pn_to_lid_cache: Dict[str, str] = {}  # key: pn_jid, value: lid_jid
 
     # Identity Key methods
     async def put_identity(self, address: str, key: bytes) -> None:
@@ -506,3 +523,179 @@ class SQLStore:
     async def put_all_contact_names(self, contacts: List[ContactEntry]) -> None:
         """Alias for put_many_contact_names for compatibility."""
         await self.put_many_contact_names(contacts)
+
+    # Chat Settings Store methods
+    async def put_muted_until(self, chat: JID, muted_until: datetime) -> None:
+        """Set chat muted until timestamp in database."""
+        await ChatSettingsModel.update_or_create(
+            our_jid=self.jid,
+            chat_jid=str(chat),
+            defaults={'muted_until': muted_until}
+        )
+
+    async def put_pinned(self, chat: JID, pinned: bool) -> None:
+        """Set chat pinned status in database."""
+        await ChatSettingsModel.update_or_create(
+            our_jid=self.jid,
+            chat_jid=str(chat),
+            defaults={'pinned': pinned}
+        )
+
+    async def put_archived(self, chat: JID, archived: bool) -> None:
+        """Set chat archived status in database."""
+        await ChatSettingsModel.update_or_create(
+            our_jid=self.jid,
+            chat_jid=str(chat),
+            defaults={'archived': archived}
+        )
+
+    async def get_chat_settings(self, chat: JID) -> Any:
+        """Get chat settings from database."""
+        try:
+            settings = await ChatSettingsModel.get(our_jid=self.jid, chat_jid=str(chat))
+            return ChatSettings(
+                muted_until=settings.muted_until,
+                pinned=settings.pinned,
+                archived=settings.archived
+            )
+        except:
+            return None
+
+    # Device Container methods
+    async def put_device(self, device: 'Device') -> None:
+        """Save device to database."""
+        await self.container.put_device(device)
+
+    async def delete_device(self, device: 'Device') -> None:
+        """Delete device."""
+        if device.id:
+            await self.container.delete_device(str(device.id))
+
+    # Message Secret Store methods
+    async def put_message_secrets(self, inserts: List[MessageSecretInsert]) -> None:
+        """Put multiple message secrets in database."""
+        for insert in inserts:
+            await MessageSecretModel.update_or_create(
+                our_jid=self.jid,
+                chat_jid=str(insert.chat),
+                sender_jid=str(insert.sender),
+                message_id=insert.id,
+                defaults={'key': insert.secret}
+            )
+
+    async def put_message_secret(self, chat: JID, sender: JID, id: str, secret: bytes) -> None:
+        """Put a single message secret in database."""
+        await MessageSecretModel.update_or_create(
+            our_jid=self.jid,
+            chat_jid=str(chat),
+            sender_jid=str(sender),
+            message_id=id,
+            defaults={'key': secret}
+        )
+
+    async def get_message_secret(self, chat: JID, sender: JID, id: str) -> Tuple[Optional[bytes], Optional[Exception]]:
+        """Get message secret from database."""
+        try:
+            secret = await MessageSecretModel.get(
+                our_jid=self.jid,
+                chat_jid=str(chat),
+                sender_jid=str(sender),
+                message_id=id
+            )
+            return secret.key, None
+        except Exception as e:
+            return None, e
+
+    # Privacy Token Store methods
+    async def put_privacy_tokens(self, tokens: List[PrivacyToken]) -> None:
+        """Stub: Put multiple privacy tokens."""
+        for token in tokens:
+            self.privacy_tokens_cache[str(token.user)] = token
+
+    async def get_privacy_token(self, user: JID) -> Optional[PrivacyToken]:
+        """Stub: Get privacy token for user."""
+        return self.privacy_tokens_cache.get(str(user))
+
+    # Event Buffer methods
+    async def get_buffered_event(self, ciphertext_hash: bytes) -> Optional[BufferedEvent]:
+        """Stub: Get buffered event."""
+        # Use hex representation as key since bytes can't be dict keys
+        key = ciphertext_hash.hex()
+        return self.buffered_events_cache.get(key)
+
+    async def put_buffered_event(self, ciphertext_hash: bytes, plaintext: bytes, server_timestamp: datetime) -> None:
+        """Stub: Put buffered event."""
+        key = ciphertext_hash.hex()
+        event = BufferedEvent(
+            plaintext=plaintext,
+            insert_time=datetime.now(),
+            server_time=server_timestamp
+        )
+        self.buffered_events_cache[key] = event
+
+    async def do_decryption_txn(self, fn: Callable[[Any], Any]) -> None:
+        """Execute a function within a decryption transaction."""
+        # For in-memory implementation, just call the function
+        # In a real database implementation, this would be wrapped in a transaction
+        fn(None)
+
+    async def clear_buffered_event_plaintext(self, ciphertext_hash: bytes) -> None:
+        """Stub: Clear plaintext from buffered event."""
+        key = ciphertext_hash.hex()
+        if key in self.buffered_events_cache:
+            event = self.buffered_events_cache[key]
+            event.plaintext = b''
+
+    async def delete_old_buffered_hashes(self) -> None:
+        """Stub: Delete old buffered events."""
+        """Delete old buffered events from memory."""
+        # Delete events older than 1 hour (arbitrary threshold)
+        cutoff_time = datetime.now().timestamp() - 3600
+        to_delete = []
+
+        for key, event in self.buffered_events_cache.items():
+            if event.insert_time.timestamp() < cutoff_time:
+                to_delete.append(key)
+
+        for key in to_delete:
+            del self.buffered_events_cache[key]
+
+    # LID Store methods
+    async def put_many_lid_mappings(self, mappings: List[LIDMapping]) -> None:
+        """Stub: Put multiple LID mappings."""
+        for mapping in mappings:
+            lid_str = str(mapping.lid)
+            pn_str = str(mapping.pn)
+            self.lid_mappings_cache[lid_str] = pn_str
+            self.pn_to_lid_cache[pn_str] = lid_str
+
+    async def put_lid_mapping(self, lid: JID, jid: JID) -> None:
+        """Put single LID mapping in memory."""
+        lid_str = str(lid)
+        jid_str = str(jid)
+        self.lid_mappings_cache[lid_str] = jid_str
+        self.pn_to_lid_cache[jid_str] = lid_str
+
+    async def get_pn_for_lid(self, lid: JID) -> Tuple[Optional[JID], Optional[Exception]]:
+        """Get phone number for LID from memory."""
+        pn_str = self.lid_mappings_cache.get(str(lid))
+        if pn_str:
+            try:
+                from ...types.jid import JID
+                pn_jid = JID.from_string(pn_str)
+                return (pn_jid, None)
+            except Exception as e:
+                return (None, e)
+        return (None, None)
+
+    async def get_lid_for_pn(self, pn: JID) -> Tuple[Optional[JID], Optional[Exception]]:
+        """Get LID for phone number from memory."""
+        lid_str = self.pn_to_lid_cache.get(str(pn))
+        if lid_str:
+            try:
+                from ...types.jid import JID
+                lid_jid = JID.from_string(lid_str)
+                return lid_jid, None
+            except Exception as e:
+                return None, e
+        return None, None
