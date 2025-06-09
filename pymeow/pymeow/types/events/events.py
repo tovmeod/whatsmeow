@@ -5,8 +5,8 @@ Port of whatsmeow/types/events/events.go
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from enum import Enum, auto
-from typing import List, Optional, Protocol, Dict, Any, Union
+from enum import Enum
+from typing import List, Optional, Protocol, Dict, Any
 
 from ...binary.node import Node
 from ...generated.waArmadilloApplication import WAArmadilloApplication_pb2 as WAArm_pb2

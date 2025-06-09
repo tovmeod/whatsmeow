@@ -122,7 +122,7 @@ async def register_for_push_notifications(self, pc: PushConfig) -> None:
         Exception: If there's an error registering for push notifications
     """
     if not self:
-        raise ElementMissingError(tag="client", location="register_for_push_notifications")
+        raise Exception("Element missing")
 
     from .request import InfoQuery, InfoQueryType
 

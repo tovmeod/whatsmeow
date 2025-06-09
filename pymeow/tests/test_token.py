@@ -1,5 +1,5 @@
 """Test token handling for WhatsApp binary protocol."""
-import pytest
+
 from ..pymeow.binary.token import (
     get_double_token,
     index_of_single_token,

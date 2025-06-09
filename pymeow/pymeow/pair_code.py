@@ -3,11 +3,11 @@ WhatsApp Web pairing with phone number and code.
 
 Port of whatsmeow/pair-code.go
 """
+import os
 import re
 import base64
-import asyncio
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Tuple
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes
@@ -18,7 +18,6 @@ from .binary.node import Node, Attrs
 from .types.jid import JID
 from .util.hkdfutil.hkdf import sha256 as hkdf_sha256
 from .util.keys.keypair import KeyPair
-from .util.random import random_bytes
 
 
 class PairCodeError(Exception):
@@ -105,9 +104,9 @@ def generate_companion_ephemeral_key() -> Tuple[KeyPair, bytes, str]:
         - encoded_linking_code: The linking code for pairing
     """
     ephemeral_key_pair = KeyPair.generate()
-    salt = random_bytes(SALT_SIZE)
-    iv = random_bytes(IV_SIZE)
-    linking_code = random_bytes(LINKING_CODE_SIZE)
+    salt = os.urandom(SALT_SIZE)
+    iv = os.urandom(IV_SIZE)
+    linking_code = os.urandom(LINKING_CODE_SIZE)
     encoded_linking_code = base64.b32encode(linking_code).decode()
 
     # Generate link code key using PBKDF2
@@ -168,7 +167,7 @@ async def pair_phone(client, ctx, phone: str, show_push_notification: bool, clie
         to=JID.new_server(),
         content=Node(
             tag="link_code_companion_reg",
-            attributes=Attrs({
+            attrs=Attrs({
                 "jid": jid,
                 "stage": "companion_hello",
                 "should_show_push_notification": str(show_push_notification).lower(),
@@ -255,9 +254,9 @@ async def _handle_code_pair_notification(client, ctx, parent_node: Node) -> None
         raise ValueError("Missing primary_identity_pub in notification")
 
     # Generate random values
-    adv_secret_random = random_bytes(ADV_SECRET_SIZE)
-    key_bundle_salt = random_bytes(SALT_SIZE)
-    key_bundle_nonce = random_bytes(KEY_BUNDLE_NONCE_SIZE)
+    adv_secret_random = os.urandom(ADV_SECRET_SIZE)
+    key_bundle_salt = os.urandom(SALT_SIZE)
+    key_bundle_nonce = os.urandom(KEY_BUNDLE_NONCE_SIZE)
 
     # Decrypt the primary device's ephemeral public key
     primary_salt = wrapped_primary_ephemeral_pub[0:SALT_SIZE]
@@ -337,7 +336,7 @@ async def _handle_code_pair_notification(client, ctx, parent_node: Node) -> None
         to=JID.new_server(),
         content=Node(
             tag="link_code_companion_reg",
-            attributes=Attrs({
+            attrs=Attrs({
                 "jid": link_cache.jid,
                 "stage": "companion_finish",
             }),

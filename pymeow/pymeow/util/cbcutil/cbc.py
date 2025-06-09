@@ -10,9 +10,7 @@ This package simplifies the usage of AES-256-CBC.
 Port of util/cbcutil/cbc.go
 """
 import os
-import io
 import hmac
-import typing
 from typing import Optional, Tuple, Protocol, BinaryIO
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -173,7 +171,7 @@ def encrypt_stream(
     has_writer_at = hasattr(ciphertext, "write_at")
 
     buf_size = 32 * 1024
-    buf = bytearray(buf_size)
+    # buf = bytearray(buf_size)
     size = 0
     extra_size = 0
     write_ptr = 0

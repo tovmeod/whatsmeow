@@ -5,7 +5,7 @@ Port of whatsmeow/store/sqlstore/lidmap.go
 """
 import asyncio
 import logging
-from typing import Dict, Optional, Any, Tuple, List
+from typing import Dict, Optional, Tuple, List
 
 # Internal imports
 from ...types.jid import JID

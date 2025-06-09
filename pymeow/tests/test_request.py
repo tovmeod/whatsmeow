@@ -3,20 +3,14 @@ Tests for the request handling implementation.
 """
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from datetime import timedelta
 
 from pymeow.pymeow.request import (
-    Request,
-    RequestManager,
-    RequestHandler,
     InfoQuery,
     InfoQueryType,
     IQError,
-    DisconnectedError,
     ErrIQTimedOut,
-    ErrNotConnected,
-    ErrClientIsNil,
 )
 from pymeow.pymeow.binary import node as binary_node
 
@@ -105,7 +99,7 @@ class TestRequestHandler(unittest.IsolatedAsyncioTestCase):
     async def test_wait_and_cancel_response(self):
         """Test setting up a waiter for a response and canceling it."""
         # Wait for a response
-        waiter = await self.handler.wait_response("test_id")
+        await self.handler.wait_response("test_id")
 
         # Check that the waiter was added
         self.assertIn("test_id", self.handler.response_waiters)

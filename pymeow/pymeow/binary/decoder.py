@@ -444,13 +444,13 @@ class BinaryDecoder:
             attrs = {}
 
         if list_size % 2 == 1:
-            return Node(tag=tag, attributes=attrs), None
+            return Node(tag=tag, attrs=attrs), None
 
         content, err = self.read(False)
         if err:
             return None, err
 
-        return Node(tag=tag, attributes=attrs, content=content), None
+        return Node(tag=tag, attrs=attrs, content=content), None
 
     def read_bytes_or_string(self, length: int, as_string: bool) -> Tuple[Any, Optional[Exception]]:
         """

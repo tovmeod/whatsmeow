@@ -95,7 +95,7 @@ def generate_protos():
             ]
 
             # Try to run base protoc command
-            result = subprocess.run(base_cmd, capture_output=True, text=True)
+            result = subprocess.run(base_cmd, capture_output=True, text=True, check=False)
 
             if result.returncode != 0:
                 print(f"✗ Error generating {rel_path}:")
@@ -110,7 +110,7 @@ def generate_protos():
                 # Insert mypy_out after python_out
                 mypy_cmd.insert(3, f'--mypy_out={output_dir}')
                 mypy_cmd.insert(3, '--mypy_opt=readable_stubs')
-                mypy_result = subprocess.run(mypy_cmd, capture_output=True, text=True)
+                mypy_result = subprocess.run(mypy_cmd, capture_output=True, text=True, check=False)
                 if mypy_result.returncode == 0:
                     print(f"✓ Generated mypy stubs for {rel_path}")
                 else:

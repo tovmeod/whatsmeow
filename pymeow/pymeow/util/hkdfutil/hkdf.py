@@ -3,7 +3,6 @@ HKDF utility module.
 
 Port of whatsmeow/util/hkdfutil/hkdf.go
 """
-import hashlib
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 

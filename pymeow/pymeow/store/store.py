@@ -6,13 +6,13 @@ Port of whatsmeow/store/store.go
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Callable, Any, Protocol, TypeVar, ByteString, TYPE_CHECKING
+from typing import List, Dict, Optional, Tuple, Callable, Any
 import uuid
-import asyncio
 
 from .sqlstore.container import Container
 # Protobuf imports
 from ..generated.waAdv import WAAdv_pb2
+from ..types import ContactInfo
 
 # Internal imports
 from ..types.jid import JID, EMPTY_JID

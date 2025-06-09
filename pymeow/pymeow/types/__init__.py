@@ -3,9 +3,6 @@ Types used throughout the PyMeow library.
 
 This module exports various types used for type hints and data validation.
 """
-from __future__ import annotations
-from typing import TYPE_CHECKING
-
 # Import and expose presence-related types
 from .presence import (
     Presence,
@@ -68,62 +65,45 @@ from .user import (
 )
 
 __all__ = [
-    # JID
     'JID',
-
-    # Presence
-    'Presence',
-    'ChatPresence',
-    'ChatPresenceMedia',
-    'PresenceEvent',
-    'ChatPresenceEvent',
-
-    # Message
-    'Message',
-    'MessageInfo',
-
-    # Receipts
-    'ReceiptType',
-
-    # Groups
-    'GroupLinkChangeType',
-    'GroupUnlinkReason',
-    'GroupParticipant',
-    'GroupInfo',
-
-    # Privacy
-    'PrivacySetting',
-    'PrivacySettings',
-
-    # Status (Stories)
-    'StatusPrivacy',
-
-    # Newsletter
-    'NewsletterState',
-    'NewsletterRole',
-    'NewsletterMuteState',
-    'NewsletterReactionsMode',
-    'NewsletterSettings',
-
-    # User types
-    'VerifiedName',
-    'UserInfo',
+    'Blocklist',
     'BotListInfo',
     'BotProfileCommand',
     'BotProfileInfo',
-    'ProfilePictureInfo',
-    'ContactInfo',
-    'LocalChatSettings',
-    'IsOnWhatsAppResponse',
+    'BusinessHoursConfig',
     'BusinessMessageLinkTarget',
+    'BusinessProfile',
+    'Category',
+    'ChatPresence',
+    'ChatPresenceEvent',
+    'ChatPresenceMedia',
+    'ContactInfo',
     'ContactQRLinkTarget',
+    'GroupInfo',
+    'GroupLinkChangeType',
+    'GroupParticipant',
+    'GroupUnlinkReason',
+    'IsOnWhatsAppResponse',
+    'LocalChatSettings',
+    'Message',
+    'MessageInfo',
+    'NewsletterMuteState',
+    'NewsletterReactionsMode',
+    'NewsletterRole',
+    'NewsletterSettings',
+    'NewsletterState',
+    'Presence',
+    'PresenceEvent',
+    'PrivacySetting',
     'PrivacySetting',
     'PrivacySettingType',
     'PrivacySettings',
-    'StatusPrivacyType',
+    'PrivacySettings',
+    'ProfilePictureInfo',
+    'ReceiptType',
     'StatusPrivacy',
-    'Blocklist',
-    'BusinessHoursConfig',
-    'Category',
-    'BusinessProfile',
+    'StatusPrivacy',
+    'StatusPrivacyType',
+    'UserInfo',
+    'VerifiedName',
 ]

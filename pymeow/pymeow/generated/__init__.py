@@ -20,9 +20,9 @@ from .waMsgTransport.WAMsgTransport_pb2 import MessageTransport
 Message = MessageTransport
 
 __all__ = [
-    'waMsgTransport',
-    'WAMsgTransport_pb2',
-    'WACommon_pb2',
-    'MessageTransport',
     'Message',  # Backward compatibility alias
+    'MessageTransport',
+    'WACommon_pb2',
+    'WAMsgTransport_pb2',
+    'waMsgTransport',
 ]

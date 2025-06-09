@@ -3,19 +3,16 @@ Media upload handling for WhatsApp.
 
 Port of whatsmeow/upload.go
 """
-import asyncio
 import base64
 import hashlib
 import hmac
 import os
 import io
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, BinaryIO, List, Tuple, Union, Protocol
+from typing import Optional, BinaryIO, Tuple
 from urllib.parse import urlencode
 import aiohttp
 
-from .generated.waE2E import waE2E_pb2
-from .mediaconn import MediaConn, MediaConnHost
 from .download import MediaType, MEDIA_TYPE_TO_MMS_TYPE
 from .util.cbcutil import encrypt, encrypt_stream
 from .exceptions import PymeowError
@@ -173,7 +170,6 @@ class Uploader:
         finally:
             if temp_file_created:
                 temp_file.close()
-                import os
                 os.unlink(temp_file.name)
 
     async def upload_newsletter(self, ctx, data: bytes, app_info: MediaType) -> UploadResponse:

@@ -8,11 +8,12 @@ Each function receives the client as the first argument.
 import asyncio
 import logging
 from datetime import datetime
-from typing import Callable, List, Optional, Union, Tuple, TYPE_CHECKING
+from typing import Callable, List, Optional, Tuple, TYPE_CHECKING
 
 from . import retry, privacysettings, message
 from .binary.node import Node, Attrs
 from .types import ReceiptType
+from .types.botmap import BOT_JID_MAP
 from .types.events.events import ReceiptTypeRead
 from .types.jid import JID, BOT_SERVER, NEWSLETTER_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, MESSENGER_SERVER
 from .types.message import MessageID, MessageInfo

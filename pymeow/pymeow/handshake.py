@@ -14,7 +14,6 @@ from .socket.noisehandshake import NoiseHandshake
 from .store import clientpayload
 from .store.clientpayload import get_client_payload
 from .util.keys.keypair import KeyPair
-from .exceptions import ProtocolError
 
 if TYPE_CHECKING:
     from .client import Client

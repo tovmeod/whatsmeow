@@ -4,9 +4,10 @@ Noise protocol socket implementation for WhatsApp Web.
 Port of whatsmeow/socket/noisesocket.go
 """
 import asyncio
+import contextlib
 import logging
 import struct
-from typing import Optional, Callable, Awaitable, Any, TYPE_CHECKING
+from typing import Callable, Awaitable, TYPE_CHECKING
 
 # TODO: Verify import when cipher is ported
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -119,12 +120,9 @@ class NoiseSocket:
             self.stop_consumer.set()
 
             # Cancel the consumer task
-            if not self.consumer_task.done():
-                self.consumer_task.cancel()
-                try:
-                    await self.consumer_task
-                except asyncio.CancelledError:
-                    pass
+            self.consumer_task.cancel()
+            async with contextlib.suppress(asyncio.CancelledError):
+                await self.consumer_task
 
             # Clear the disconnect handler
             self.fs.on_disconnect = None

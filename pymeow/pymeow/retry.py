@@ -4,12 +4,15 @@ Retry logic for WhatsApp operations.
 Port of whatsmeow/retry.go
 """
 import asyncio
+import hashlib
 import hmac
 import logging
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, TYPE_CHECKING
+
+from signal_protocol.ecc import Curve
 
 from . import prekeys, sendfb, message, send
 from .binary.node import Node
@@ -294,33 +297,31 @@ async def handle_retry_receipt(
 
     fb_skdm = None
     fb_dsm = None
-    if receipt.is_group:
+    if receipt.message_source.is_group:
         try:
             from signal_protocol import GroupSessionBuilder, SenderKeyName  # TODO: Review signal_protocol imports
 
-            builder = GroupSessionBuilder(client.store, pb_serializer)  # TODO: Review pb_serializer
-            sender_key_name = SenderKeyName(receipt.message_source.chat.string(), client.get_own_lid().signal_address())
-            signal_skd_message, err = builder.create(ctx, sender_key_name)
-            if err is not None:
-                logger.warning(
-                    "Failed to create sender key distribution message to include in retry of %s in %s to %s: %v",
-                    message_id, receipt.message_source.chat, receipt.message_source.sender, err)
+            builder = GroupSessionBuilder()
+            sender_key_name = SenderKeyName(
+                str(receipt.message_source.chat),
+                client.get_own_lid().signal_address()
+            )
+            signal_skd_message = builder.create(sender_key_name)
+            if msg.wa is not None:
+                msg.wa.sender_key_distribution_message = WAE2E_pb2.SenderKeyDistributionMessage(
+                    groupID=str(receipt.message_source.chat),
+                    axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
+                )
             else:
-                if msg.wa is not None:
-                    msg.wa.sender_key_distribution_message = WAE2E_pb2.SenderKeyDistributionMessage(
-                        groupID=str(receipt.message_source.chat),
-                        axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
-                    )
-                else:
-                    fb_skdm = WAMsgTransport_pb2.MessageTransport.Protocol.Ancillary.SenderKeyDistributionMessage(
-                        groupID=str(receipt.message_source.chat),
-                        axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
-                    )
+                fb_skdm = WAMsgTransport_pb2.MessageTransport.Protocol.Ancillary.SenderKeyDistributionMessage(
+                    groupID=str(receipt.message_source.chat),
+                    axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
+                )
         except Exception as e:
             logger.warning(
                 "Failed to create sender key distribution message to include in retry of %s in %s to %s: %v",
                 message_id, receipt.message_source.chat, receipt.message_source.sender, e)
-    elif receipt.is_from_me:
+    elif receipt.message_source.is_from_me:
         if msg.wa is not None:
             msg.wa = WAE2E_pb2.Message(
                 deviceSentMessage=WAE2E_pb2.DeviceSentMessage(
@@ -373,7 +374,7 @@ async def handle_retry_receipt(
                 if err is not None:
                     return Exception(f"failed to fetch prekeys: {err}")
                 elif bundle is None:
-                    return Exception(f"didn't get prekey bundle for %s (response size: %d)", receipt.sender, len(keys))
+                    return Exception(f"didn't get prekey bundle for {receipt.sender} (response size: {len(keys)})")
             except Exception as e:
                 return e
 
@@ -494,7 +495,7 @@ def cancel_delayed_request_from_phone(client: "Client", msg_id: MessageID) -> No
         client.pending_phone_rerequests_lock.release_read()
 
 
-def delayed_request_message_from_phone(client: "Client", info: "MessageInfo") -> None:
+async def delayed_request_message_from_phone(client: "Client", info: "MessageInfo") -> None:
     """
     Port of Go method delayedRequestMessageFromPhone from retry.go.
 
@@ -599,7 +600,6 @@ async def send_retry_receipt(
 
     Args:
         client: The WhatsApp client instance
-        ctx: The context for the operation
         node: The binary node containing the message
         info: The message info containing message details
         force_include_identity: Whether to force including identity information
@@ -615,28 +615,21 @@ async def send_retry_receipt(
     if len(children) == 1 and children[0].tag == "enc":
         retry_count_in_msg = children[0].attr_getter().optional_int("count")
 
-    client.message_retries_lock.acquire()
-    try:
+    async with client.message_retries_lock:  # todo: check if we really need a lock
         client.message_retries[id_str] = client.message_retries.get(id_str, 0) + 1
         retry_count = client.message_retries[id_str]
         # In case the message is a retry response, and we restarted in between, find the count from the message
         if retry_count == 1 and retry_count_in_msg > 0:
             retry_count = retry_count_in_msg + 1
             client.message_retries[id_str] = retry_count
-    finally:
-        client.message_retries_lock.release()
 
-    if retry_count >= 5:
-        logger.warning("Not sending any more retry receipts for %s", id_str)
+    if retry_count > 5:
+        logger.warning(f"Not sending any more retry receipts for {id_str}")
         return
 
     if retry_count == 1:
         # Go uses goroutine: go cli.delayedRequestMessageFromPhone(info)
-        threading.Thread(
-            target=client.delayed_request_message_from_phone,
-            args=(info,),
-            daemon=True
-        ).start()
+        client.create_task(delayed_request_message_from_phone(client, info))
 
     # Prepare registration ID bytes (4 bytes, big endian)
     registration_id_bytes = struct.pack(">I", client.store.registration_id)
@@ -668,30 +661,29 @@ async def send_retry_receipt(
 
     if retry_count > 1 or force_include_identity:
         try:
-            key, err = client.store.pre_keys.gen_one_pre_key(ctx)
+            key, err = client.store.pre_keys.gen_one_pre_key()
             if err is not None:
-                client.log.errorf("Failed to get prekey for retry receipt: %v", err)
+                logger.error("Failed to get prekey for retry receipt: %v", err)
             else:
                 try:
-                    import google.protobuf.message
                     device_identity = client.store.account.SerializeToString()
                 except Exception as e:
-                    client.log.errorf("Failed to marshal account info: %v", e)
+                    logger.error("Failed to marshal account info: %v", e)
                     return
 
                 payload.content.append(Node(
                     tag="keys",
                     content=[
-                        Node(tag="type", content=bytes([ECC_DJB_TYPE])),  # TODO: Review ECC_DJB_TYPE constant
+                        Node(tag="type", content=bytes([Curve.ECC_DJB_TYPE])),
                         Node(tag="identity", content=client.store.identity_key.pub[:]),
-                        pre_key_to_node(key),  # TODO: Review pre_key_to_node implementation
-                        pre_key_to_node(client.store.signed_pre_key),
+                        prekeys.pre_key_to_node(key),  # TODO: Review pre_key_to_node implementation
+                        prekeys.pre_key_to_node(client.store.signed_pre_key),
                         Node(tag="device-identity", content=device_identity)
                     ]
                 ))
         except Exception as e:
-            client.log.errorf("Failed to get prekey for retry receipt: %v", e)
+            logger.error("Failed to get prekey for retry receipt: %v", e)
 
     err = client.send_node(payload)
     if err is not None:
-        client.log.errorf("Failed to send retry receipt for %s: %v", id_str, err)
+        logger.error("Failed to send retry receipt for %s: %v", id_str, err)

@@ -175,33 +175,34 @@ def deprecated_generate_message_id() -> MessageID:
     """
 
 
-def marshal_zerolog_object(client: "Client", evt: 'zerolog.Event') -> None:
-    """
-    Port of Go method MarshalZerologObject from MessageDebugTimings.
-
-    Marshals MessageDebugTimings data into a zerolog Event for structured logging.
-
-    Args:
-        evt: Zerolog event to add timing data to
-
-    Returns:
-        None
-    """
-    # TODO: Review zerolog.Event implementation
-    # TODO: Review Event.dur method implementation
-
-    evt.dur("queue", self.queue)
-    evt.dur("marshal", self.marshal)
-    if self.get_participants != 0:
-        evt.dur("get_participants", self.get_participants)
-    evt.dur("get_devices", self.get_devices)
-    if self.group_encrypt != 0:
-        evt.dur("group_encrypt", self.group_encrypt)
-    evt.dur("peer_encrypt", self.peer_encrypt)
-    evt.dur("send", self.send)
-    evt.dur("resp", self.resp)
-    if self.retry != 0:
-        evt.dur("retry", self.retry)
+# todo: I don't think I need this, schedule to delete
+# def marshal_zerolog_object(client: "Client", evt: 'zerolog.Event') -> None:
+#     """
+#     Port of Go method MarshalZerologObject from MessageDebugTimings.
+#
+#     Marshals MessageDebugTimings data into a zerolog Event for structured logging.
+#
+#     Args:
+#         evt: Zerolog event to add timing data to
+#
+#     Returns:
+#         None
+#     """
+#     # TODO: Review zerolog.Event implementation
+#     # TODO: Review Event.dur method implementation
+#
+#     evt.dur("queue", self.queue)
+#     evt.dur("marshal", self.marshal)
+#     if self.get_participants != 0:
+#         evt.dur("get_participants", self.get_participants)
+#     evt.dur("get_devices", self.get_devices)
+#     if self.group_encrypt != 0:
+#         evt.dur("group_encrypt", self.group_encrypt)
+#     evt.dur("peer_encrypt", self.peer_encrypt)
+#     evt.dur("send", self.send)
+#     evt.dur("resp", self.resp)
+#     if self.retry != 0:
+#         evt.dur("retry", self.retry)
 
 
 
@@ -1038,7 +1039,7 @@ async def send_group(
     builder = GroupSessionBuilder(client.store, pb_serializer)
     sender_key_name = SenderKeyName(str(to), client.get_own_lid().signal_address())
     try:
-        signal_skd_message = await builder.create(ctx, sender_key_name)
+        signal_skd_message = await builder.create(sender_key_name)
     except Exception as err:
         return "", None, Exception(f"failed to create sender key distribution message to send {id} to {to}: {err}")
 
@@ -1053,7 +1054,7 @@ async def send_group(
 
     cipher = GroupCipher(builder, sender_key_name, client.store)
     try:
-        encrypted = await cipher.encrypt(ctx, pad_message(plaintext))
+        encrypted = await cipher.encrypt(pad_message(plaintext))
     except Exception as err:
         return "", None, Exception(f"failed to encrypt group message to send {id} to {to}: {err}")
 
@@ -2048,7 +2049,7 @@ async def encrypt_message_for_device(
 
         if bundle is not None:
             logger.debug(f"Processing prekey bundle for {to}")
-            err = builder.process_bundle(ctx, bundle)
+            err = builder.process_bundle(bundle)
 
             if client.auto_trust_identity and isinstance(err, UntrustedIdentityError):
                 logger.warning(
@@ -2058,7 +2059,7 @@ async def encrypt_message_for_device(
                 err = clear_untrusted_identity(client, to)
                 if err is not None:
                     return None, False, Exception(f"failed to clear untrusted identity: {err}")
-                err = builder.process_bundle(ctx, bundle)
+                err = builder.process_bundle(bundle)
 
             if err is not None:
                 return None, False, Exception(f"failed to process prekey bundle: {err}")
@@ -2070,7 +2071,7 @@ async def encrypt_message_for_device(
                 return None, False, ErrNoSession
 
         cipher = session.new_cipher(builder, to.signal_address())
-        ciphertext, err = cipher.encrypt(ctx, pad_message(plaintext))
+        ciphertext, err = cipher.encrypt(pad_message(plaintext))
         if err is not None:
             return None, False, Exception(f"cipher encryption failed: {err}")
 

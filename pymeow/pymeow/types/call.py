@@ -6,7 +6,6 @@ Port of whatsmeow/types/call.go
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 from .jid import JID
 

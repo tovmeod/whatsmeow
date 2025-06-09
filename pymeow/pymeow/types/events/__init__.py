@@ -3,9 +3,6 @@ WhatsApp events interface.
 
 Port of whatsmeow/types/events/
 """
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional, Dict, Any, List
 
 from .events import (
     QR, PairSuccess, PairError, QRScannedWithoutMultidevice, Connected,
@@ -25,3 +22,73 @@ from .appstate import (
     UnarchiveChatsSetting, UserStatusMute, LabelEdit, LabelAssociationChat,
     LabelAssociationMessage, AppState, AppStateSyncComplete
 )
+
+__all__ = [
+    "QR",
+    "AppState",
+    "AppStateSyncComplete",
+    "Archive",
+    "Blocklist",
+    "BlocklistAction",
+    "BlocklistChange",
+    "BlocklistChangeAction",
+    "BusinessName",
+    "CATRefreshError",
+    "ChatPresenceEvent",
+    "ClearChat",
+    "ClientOutdated",
+    "ConnectFailure",
+    "ConnectFailureReason",
+    "Connected",
+    "Contact",
+    "DecryptFailMode",
+    "DeleteChat",
+    "DeleteForMe",
+    "Disconnected",
+    "FBMessage",
+    "GroupInfo",
+    "HistorySync",
+    "IdentityChange",
+    "JoinedGroup",
+    "KeepAliveRestored",
+    "KeepAliveTimeout",
+    "LabelAssociationChat",
+    "LabelAssociationMessage",
+    "LabelEdit",
+    "LoggedOut",
+    "ManualLoginReconnect",
+    "MarkChatAsRead",
+    "MediaRetry",
+    "MediaRetryError",
+    "Message",
+    "Mute",
+    "NewsletterJoin",
+    "NewsletterLeave",
+    "NewsletterLiveUpdate",
+    "NewsletterMessageMeta",
+    "NewsletterMuteChange",
+    "OfflineSyncCompleted",
+    "OfflineSyncPreview",
+    "PairError",
+    "PairSuccess",
+    "PermanentDisconnect",
+    "Picture",
+    "Pin",
+    "PresenceEvent",
+    "PrivacySettingsEvent",
+    "PushName",
+    "PushNameSetting",
+    "QRScannedWithoutMultidevice",
+    "Receipt",
+    "Star",
+    "StreamError",
+    "StreamReplaced",
+    "TempBanReason",
+    "TemporaryBan",
+    "UnarchiveChatsSetting",
+    "UnavailableType",
+    "UndecryptableMessage",
+    "UserAbout",
+    "UserStatusMute",
+    "WAPatchName"
+]

@@ -1,6 +1,5 @@
 from tortoise.models import Model
 from tortoise import fields
-from typing import Optional
 
 class ContactModel(Model):
     """Contact information"""

@@ -6,13 +6,11 @@ Port of whatsmeow/socket/noisehandshake.go
 import hashlib
 import struct
 import threading
-from typing import Optional, Tuple, Callable, Awaitable, Any
+from typing import Optional, Tuple, Callable, Awaitable
 from typing_extensions import Buffer
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from ..util.gcmutil import prepare
 
@@ -279,7 +277,6 @@ class NoiseHandshake:
             # Then it reads 32 bytes twice from the same HKDF reader
 
             # Create a raw HKDF implementation
-            import io
             import hmac
 
             # Step 1: Extract

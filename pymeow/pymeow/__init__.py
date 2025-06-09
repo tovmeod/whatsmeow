@@ -34,7 +34,7 @@ from .types import Message, GroupInfo, PrivacySetting
 
 __all__ = [
     'Client',
-    'Message',
     'GroupInfo',
+    'Message',
     'PrivacySetting',
 ]

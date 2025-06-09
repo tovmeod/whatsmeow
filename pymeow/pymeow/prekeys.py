@@ -3,12 +3,12 @@ WhatsApp prekeys handling.
 
 Port of whatsmeow/prekeys.go
 """
+import logging
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, TYPE_CHECKING, Tuple
+from typing import List, Optional, Dict, TYPE_CHECKING, Tuple
 import struct
 from datetime import datetime, timedelta
 
-from .exceptions import PreKeyError
 from .binary.node import Node
 from .request import InfoQuery, InfoQueryType
 from .types import JID
@@ -21,6 +21,9 @@ DJB_TYPE = 5             # ecc.DjbType - curve25519 key type
 
 if TYPE_CHECKING:
     from .client import Client
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class PreKeyBundle:
@@ -270,7 +273,7 @@ async def fetch_pre_keys(
             # TODO: Confirm JID.from_string exists and works as expected.
             jid = JID.from_string(jid_str)
         except Exception as e_jid_parse:
-            # client.send_log.warning(f"Failed to parse JID '{jid_str}' from prekey response: {e_jid_parse}")
+            logger.warning(f"Failed to parse JID '{jid_str}' from prekey response: {e_jid_parse}")
             continue
 
 

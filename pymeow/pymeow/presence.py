@@ -4,8 +4,6 @@ Presence handling for WhatsApp.
 Port of whatsmeow/presence.go
 """
 import logging
-from datetime import datetime
-from typing import Optional
 
 from .binary.node import Node, Attrs
 from .exceptions import NoPushNameError, ErrNotLoggedIn, NoPrivacyTokenError

@@ -845,7 +845,6 @@ async def usync(client, jids: List[JID], mode: str, context: str, query: List[No
     if extras is None:
         extras = UsyncQueryExtras()
 
-    user_list = []
     for jid in jids:
         user_node = Node(tag="user")
         jid = jid.to_non_ad()
@@ -868,6 +867,6 @@ async def usync(client, jids: List[JID], mode: str, context: str, query: List[No
                     tag="bot",
                     content=[Node(
                         tag="profile",
-                        attributes=Attrs({"persona_id": persona_id})
+                        attrs=Attrs({"persona_id": persona_id})
                     )]
                 )]

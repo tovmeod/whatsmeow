@@ -5,7 +5,6 @@ Port of whatsmeow/util/keys/keypair.go
 """
 from dataclasses import dataclass
 from typing import Optional
-import os
 
 from signal_protocol import curve
 
@@ -75,7 +74,6 @@ class KeyPair:
         except Exception:
             # Fallback: generate from raw bytes using curve25519 math
             # This matches the Go implementation more closely
-            import hashlib
             from cryptography.hazmat.primitives.asymmetric import x25519
             from cryptography.hazmat.primitives import serialization
 
@@ -153,7 +151,7 @@ class KeyPair:
         except Exception:
             # Fallback: use cryptography library
             from cryptography.hazmat.primitives.asymmetric import ed25519
-            from cryptography.hazmat.primitives import serialization
+            # from cryptography.hazmat.primitives import serialization
 
             # Convert X25519 to Ed25519 for signing (this is a simplification)
             # In a real implementation, you'd need proper key conversion

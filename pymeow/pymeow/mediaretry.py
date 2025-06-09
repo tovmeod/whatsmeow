@@ -18,7 +18,6 @@ from .exceptions import (
 )
 from .generated.waMmsRetry import WAMmsRetry_pb2
 from .types import events
-from .types.jid import JID
 from .types.message import MessageID, MessageInfo
 from .util import gcmutil, hkdfutil
 

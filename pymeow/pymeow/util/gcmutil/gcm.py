@@ -3,8 +3,7 @@ GCM (Galois/Counter Mode) encryption and decryption utilities.
 
 Port of util/gcmutil/gcm.go
 """
-from typing import Tuple, Optional
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from typing import Optional
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 

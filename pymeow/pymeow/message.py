@@ -507,7 +507,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
     if ok and len(node.get_children_by_tag("enc")) == 0:
         u_type = events.UnavailableType(unavailable_node.attr_getter().string("type"))
         logger.warning("Unavailable message %s from %s (type: %q)", info.id, info.source_string(), u_type)
-        retry.delayed_request_message_from_phone(client, info)
+        await retry.delayed_request_message_from_phone(client, info)
         await client.dispatch_event(events.UndecryptableMessage(
             info=info,  # Go uses *info, Python uses info directly
             is_unavailable=True,
@@ -1000,7 +1000,7 @@ async def handle_sender_key_distribution_message(
     Parses the message and updates the group session builder with the new key.
 
     Args:
-        ctx: Context for the operation
+        client: Context for the operation
         chat: The group chat JID
         from_jid: The sender's JID
         axolotl_skdm: The sender key distribution message bytes
@@ -1012,20 +1012,13 @@ async def handle_sender_key_distribution_message(
     # TODO: Review protocol.NewSenderKeyName implementation
     # TODO: Review protocol.NewSenderKeyDistributionMessageFromBytes implementation
     # TODO: Review pbSerializer implementation
+    from signal_protocol import GroupSessionBuilder, SenderKeyName, SenderKeyDistributionMessage
+    builder = GroupSessionBuilder()
+    sender_key_name = SenderKeyName(str(chat), from_jid.signal_address())
 
-    builder = groups.new_group_session_builder(client.store, pb_serializer)
-    sender_key_name = protocol.new_sender_key_name(chat.string(), from_jid.signal_address())
-
-    sdk_msg, err = protocol.new_sender_key_distribution_message_from_bytes(
-        axolotl_skdm,
-        pb_serializer.sender_key_distribution_message
-    )
-    if err is not None:
-        logger.error(
-            "Failed to parse sender key distribution message from %s for %s: %v",
-            from_jid, chat, err
-        )
-        return
+    # Go: NewSenderKeyDistributionMessageFromBytes(skdmBytes)
+    # Python equivalent:
+    sdk_msg = SenderKeyDistributionMessage.deserialize(axolotl_skdm)
 
     err = builder.process(sender_key_name, sdk_msg)
     if err is not None:
@@ -1180,10 +1173,10 @@ async def handle_app_state_sync_key_share(
             try:
                 # Marshal fingerprint using protobuf's built-in method
                 marshaled_fingerprint = key.get_key_data().get_fingerprint().SerializeToString()
-            except Exception as err:
+            except Exception as e:
                 logger.error(
-                    "Failed to marshal fingerprint of app state sync key %s",
-                    key.get_key_id().get_key_id().hex().upper()
+                    f"Failed to marshal fingerprint of app state sync key {key.get_key_id().get_key_id().hex().upper()}: {e}",
+
                 )
                 continue
 
@@ -1334,7 +1327,7 @@ async def handle_protocol_message(
             client.create_task(handle_history_sync_notification_loop(client))
 
         # Send receipt asynchronously?
-        await send_protocol_message_receipt(client, info.id, RECEIPT_TYPE_HISTORY_SYNC)
+        await send_protocol_message_receipt(client, info.id, ReceiptType.HISTORY_SYNC)
 
     # Handle placeholder message resend response
     peer_data_msg = proto_msg.get_peer_data_operation_request_response_message()
@@ -1350,7 +1343,7 @@ async def handle_protocol_message(
 
     # Handle peer category messages
     if info.category == "peer":
-        await send_protocol_message_receipt(client, info.id, RECEIPT_TYPE_PEER_MSG)
+        await send_protocol_message_receipt(client, info.id, ReceiptType.PEER_MSG)
 
 
 async def process_protocol_parts(

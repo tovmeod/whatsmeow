@@ -7,9 +7,7 @@ import base64
 import hmac
 import hashlib
 import logging
-from typing import Optional, TYPE_CHECKING
-import asyncio
-import copy
+from typing import TYPE_CHECKING
 
 from .binary.node import Node
 from .types import jid, events

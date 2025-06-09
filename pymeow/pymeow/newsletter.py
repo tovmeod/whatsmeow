@@ -6,10 +6,9 @@ Each function receives the client as the first argument.
 """
 
 import json
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any
 
 from .types.jid import JID, SERVER_JID
 from .types.message import MessageServerID, MessageID

@@ -5,7 +5,7 @@ Port of whatsmeow/socket/framesocket.go
 """
 import asyncio
 import logging
-from typing import Optional, Callable, Dict, Any, Coroutine, Set, Awaitable
+from typing import Optional, Callable, Dict, Any, Coroutine
 
 from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType
 

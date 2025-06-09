@@ -5,17 +5,15 @@ Port of whatsmeow/update.go
 """
 import re
 import aiohttp
-from typing import Optional, Dict, Any
-import asyncio
+from typing import Optional
 
 from .socket import noisesocket
-from .store import WAVersionContainer
+from .store.clientpayload import WAVersionContainer
 
 # Regex to extract client revision from web.whatsapp.com
 client_version_regex = re.compile(r'"client_revision":(\d+),')
 
 async def get_latest_version(
-    ctx: Optional[asyncio.AbstractEventLoop] = None,
     http_client: Optional[aiohttp.ClientSession] = None
 ) -> Optional[WAVersionContainer]:
     """
@@ -30,7 +28,6 @@ async def get_latest_version(
     ```
 
     Args:
-        ctx: Optional event loop context
         http_client: Optional aiohttp client session to use for the request
 
     Returns:
@@ -69,7 +66,7 @@ async def get_latest_version(
             return WAVersionContainer(2, 3000, parsed_ver)
 
     except Exception as e:
-        raise Exception(f"Failed to get latest version: {str(e)}")
+        raise Exception(f"Failed to get latest version: {e}")
 
     finally:
         if should_close_client:

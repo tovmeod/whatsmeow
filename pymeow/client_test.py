@@ -13,9 +13,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from pymeow import Client
+from pymeow.client import Client
+from pymeow.store.sqlstore.container import Container
 from pymeow.qrchan import get_qr_channel
-from pymeow.store.sqlstore import Container, SQLStore
 from pymeow.types.events import Message
 from pymeow.types.events import QR
 from pymeow.types.events import Connected, Disconnected
@@ -152,19 +152,17 @@ async def main():
         data_dir.mkdir(exist_ok=True)
 
         # Create database path
-        db_path = data_dir / "whatsapp_session.db"
+        db_path = data_dir / "device_storage.db"
         db_url = f"sqlite:///{db_path}"
 
         print(f"Using database: {db_path}")
 
         # Create database container
-        container = Container(db_url)
-        await container.initialize()
+        container = await Container(db_url).ainit()
 
         # Create database store with a test JID
         # In a real application, you'd use the actual user's JID
         test_jid = "test@example.com"
-        store = SQLStore(container, test_jid)
 
         # Get or create device store
         device_store = await container.get_first_device()
