@@ -256,8 +256,8 @@ class ErrMediaNotAvailableOnPhone(PymeowError):
 class ErrUnknownMediaRetryError(PymeowError):
     """Raised when there's an unknown media retry error."""
 
-    def __init__(self):
-        super().__init__("unknown media retry error")
+    def __init__(self, msg: str):
+        super().__init__(msg)
 
 
 class ErrInvalidDisappearingTimer(PymeowError):

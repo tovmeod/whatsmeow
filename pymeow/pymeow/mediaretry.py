@@ -36,7 +36,7 @@ def get_media_retry_key(media_key: bytes) -> bytes:
     Returns:
         The cipher key for encryption/decryption
     """
-    return hkdfutil.sha256(media_key, None, b"WhatsApp Media Retry Notification", 32)
+    return hkdfutil.sha256(media_key, b"", b"WhatsApp Media Retry Notification", 32)
 
 
 def encrypt_media_retry_receipt(message_id: MessageID, media_key: bytes) -> Tuple[bytes, bytes]:
@@ -53,7 +53,7 @@ def encrypt_media_retry_receipt(message_id: MessageID, media_key: bytes) -> Tupl
         Exception: If marshaling or encryption fails
     """
     receipt = WAMmsRetry_pb2.ServerErrorReceipt()
-    receipt.stanza_id = str(message_id)
+    receipt.stanzaID = str(message_id)
 
     try:
         plaintext = receipt.SerializeToString()
@@ -208,7 +208,7 @@ def parse_media_retry_notification(node: Node) -> events.MediaRetry:
     if not ag.ok():
         raise Exception(f"failed to parse attributes: {ag.error()}")
 
-    rmr = node.get_optional_child_by_tag("rmr")
+    rmr, found = node.get_optional_child_by_tag("rmr")
     if not rmr:
         raise ElementMissingError(tag="rmr", in_location="retry notification")
 
@@ -220,7 +220,7 @@ def parse_media_retry_notification(node: Node) -> events.MediaRetry:
     if not rmr_ag.ok():
         raise Exception(f"missing attributes in <rmr> tag: {rmr_ag.error()}")
 
-    error_node = node.get_optional_child_by_tag("error")
+    error_node, found = node.get_optional_child_by_tag("error")
     if error_node:
         evt.error = events.MediaRetryError(
             code=error_node.attr_getter().int("code")
@@ -240,12 +240,11 @@ def parse_media_retry_notification(node: Node) -> events.MediaRetry:
     return evt
 
 
-async def handle_media_retry_notification(client: "Client", ctx: any, node: Node) -> None:
+async def handle_media_retry_notification(client: "Client", node: Node) -> None:
     """Handle a media retry notification.
 
     Args:
         client: The client instance
-        ctx: The context (unused but kept for consistency)
         node: The binary node containing the notification
     """
     try:

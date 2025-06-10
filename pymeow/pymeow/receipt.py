@@ -63,7 +63,7 @@ async def handle_receipt(client, node: Node) -> None:
                         )
 
                 # Execute in background (equivalent to Go's goroutine)
-                asyncio.create_task(retry_task())
+                client.create_task(retry_task())
 
             client.dispatch_event(receipt)
     finally:

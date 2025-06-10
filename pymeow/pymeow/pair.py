@@ -76,7 +76,7 @@ async def handle_pair_device(client: "Client", node: Node) -> None:
     try:
         await client.send_node(Node(
             tag="iq",
-            attributes={
+            attrs={
                 "to": node.attrs.get("from"),
                 "id": node.attrs.get("id"),
                 "type": "result",

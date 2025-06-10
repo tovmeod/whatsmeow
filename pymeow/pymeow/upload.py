@@ -357,7 +357,7 @@ class Uploader:
         # Import here to avoid circular imports
         from .util.hkdfutil import sha256 as hkdf_sha256
 
-        media_key_expanded = hkdf_sha256(media_key, None, str(app_info).encode(), 112)
+        media_key_expanded = hkdf_sha256(media_key, b"", str(app_info).encode(), 112)
         return (
             media_key_expanded[:16],
             media_key_expanded[16:48],

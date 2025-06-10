@@ -51,7 +51,7 @@ async def fetch_app_state(
         elif only_if_not_synced:
             return
 
-        from .__init__.hash import HashState
+        from .hash import HashState
         state = HashState(version=version, hash=hash_value)
 
         has_more = True
@@ -448,7 +448,7 @@ async def send_app_state(client: "Client", ctx: Any, patch: Any) -> None:
     if latest_key_id is None:
         raise Exception("no app state keys found, creating app state keys is not yet supported")
 
-    from .__init__.hash import HashState
+    from .hash import HashState
     state = HashState(version=version, hash=hash_value)
 
     encoded_patch = await client.app_state_proc.encode_patch(ctx, latest_key_id, state, patch)

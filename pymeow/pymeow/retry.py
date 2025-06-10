@@ -546,7 +546,7 @@ async def delayed_request_message_from_phone(client: "Client", info: "MessageInf
                 if cancel_event.is_set():
                     logger.debug("Cancelled delayed request for message %s from phone", info.id)
                     return
-                time.sleep(0.1)  # Small sleep to prevent busy waiting
+                await asyncio.sleep(0.1)  # Small sleep to prevent busy waiting
         except Exception:
             return
 

@@ -33,7 +33,7 @@ class BaseEvent:
 
 # QR is emitted after connecting when there's no session data in the device store.
 @dataclass
-class QR:
+class QR(BaseEvent):
     """
     Emitted after connecting when there's no session data in the device store.
 
@@ -50,7 +50,7 @@ class QR:
 # PairSuccess is emitted after the QR code has been scanned with the phone and the handshake has
 # been completed.
 @dataclass
-class PairSuccess:
+class PairSuccess(BaseEvent):
     """
     Emitted after the QR code has been scanned with the phone and the handshake has been completed.
 
@@ -64,7 +64,7 @@ class PairSuccess:
 
 # PairError is emitted when a pair-success event is received from the server, but finishing the pairing locally fails.
 @dataclass
-class PairError:
+class PairError(BaseEvent):
     """
     Emitted when a pair-success event is received from the server, but finishing the pairing locally fails.
     """
@@ -76,7 +76,7 @@ class PairError:
 
 # QRScannedWithoutMultidevice is emitted when the pairing QR code is scanned, but the phone didn't have multidevice enabled.
 @dataclass
-class QRScannedWithoutMultidevice:
+class QRScannedWithoutMultidevice(BaseEvent):
     """
     Emitted when the pairing QR code is scanned, but the phone didn't have multidevice enabled.
 
@@ -639,7 +639,7 @@ class PrivacySettingsEvent:
 
 # OfflineSyncPreview is emitted right after connecting if the server is going to send events that the client missed during downtime.
 @dataclass
-class OfflineSyncPreview:
+class OfflineSyncPreview(BaseEvent):
     """
     Emitted right after connecting if the server is going to send events that the client missed during downtime.
     """
@@ -651,7 +651,7 @@ class OfflineSyncPreview:
 
 # OfflineSyncCompleted is emitted after the server has finished sending missed events.
 @dataclass
-class OfflineSyncCompleted:
+class OfflineSyncCompleted(BaseEvent):
     """
     Emitted after the server has finished sending missed events.
     """
@@ -667,7 +667,7 @@ class MediaRetryError:
 
 # MediaRetry is emitted when the phone sends a response to a media retry request.
 @dataclass
-class MediaRetry:
+class MediaRetry(BaseEvent):
     """
     Emitted when the phone sends a response to a media retry request.
     """

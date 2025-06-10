@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import List, Optional, Tuple, Any, Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ....pymeow.pymeow.types import JID
+    from ..types import JID
 
 # Type alias for attributes (equivalent to Go's Attrs = map[string]any)
 Attrs = Dict[str, Any]
@@ -28,7 +28,7 @@ class AttrUtility:
 
     def get_jid(self, key: str, require: bool) -> Tuple['JID', bool]:
         """Get JID attribute with error handling."""
-        from ....pymeow.pymeow.types import JID
+        from ..types import JID
         if key not in self.attrs:
             if require:
                 self.errors.append(ValueError(f"didn't find required JID attribute '{key}'"))

@@ -115,8 +115,6 @@ class BinaryEncoder:
             self.write_string(str(data).lower())
         elif isinstance(data, int):
             self.write_string(str(data))
-        elif isinstance(data, float):
-            self.write_string(str(data))
         elif isinstance(data, (bytes, bytearray)):
             self.write_bytes(data)
         elif isinstance(data, list) and all(isinstance(item, Node) for item in data):
@@ -124,15 +122,6 @@ class BinaryEncoder:
             for n in data:
                 self.write_node(n)
         else:
-            # Check for numpy types if numpy is available
-            try:
-                import numpy as np
-                if isinstance(data, (np.int32, np.int64, np.uint32, np.uint64)):
-                    self.write_string(str(data))
-                    return
-            except ImportError:
-                pass
-
             raise InvalidTypeError(f"Unsupported type: {type(data)}")
 
     def write_string(self, data: str):
