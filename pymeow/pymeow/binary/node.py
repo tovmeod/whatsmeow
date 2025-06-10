@@ -204,7 +204,7 @@ def marshal(n: Node) -> bytes:
     return w.get_data()
 
 
-def unmarshal(data: bytes) -> tuple[Optional[Node], Optional[Exception]]:
+def unmarshal(data: bytes) -> Node:
     """
     Decodes WhatsApp's binary XML representation into a Node.
 

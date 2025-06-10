@@ -3,12 +3,10 @@ Decoder for WhatsApp binary protocol.
 
 Port of whatsmeow/binary/decoder.go
 """
-import io
-import struct
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List
 
-from ..types.jid import JID, DEFAULT_USER_SERVER, MESSENGER_SERVER, INTEROP_SERVER
+from ..types.jid import JID, MESSENGER_SERVER, INTEROP_SERVER
 from .errors import (
     InvalidTypeError, InvalidJIDTypeError, InvalidNodeError,
     InvalidTokenError, NonStringKeyError
@@ -40,37 +38,34 @@ class BinaryDecoder:
         """
         return cls(data=data, index=0)
 
-    def check_eos(self, length: int) -> Optional[Exception]:
+    def check_eos(self, length: int) -> None:
         """
         Check if reading the specified length would go beyond the end of the data.
 
         Args:
             length: The number of bytes to check
 
-        Returns:
-            io.EOF if reading would go beyond the end of the data, None otherwise
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
         if self.index + length > len(self.data):
-            return io.EOF
-        return None
+            raise EOFError("unexpected end of data")
 
-    def read_byte(self) -> Tuple[int, Optional[Exception]]:
+    def read_byte(self) -> int:
         """
         Read a single byte from the data.
 
         Returns:
             A tuple containing the byte read and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
-        err = self.check_eos(1)
-        if err:
-            return 0, err
-
+        self.check_eos(1)
         b = self.data[self.index]
         self.index += 1
+        return b
 
-        return b, None
-
-    def read_int_n(self, n: int, little_endian: bool) -> Tuple[int, Optional[Exception]]:
+    def read_int_n(self, n: int, little_endian: bool) -> int:
         """
         Read an n-byte integer from the data.
 
@@ -80,11 +75,10 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the integer read and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
-        err = self.check_eos(n)
-        if err:
-            return 0, err
-
+        self.check_eos(n)
         ret = 0
         for i in range(n):
             if little_endian:
@@ -94,9 +88,9 @@ class BinaryDecoder:
             ret |= self.data[self.index + i] << (cur_shift * 8)
 
         self.index += n
-        return ret, None
+        return ret
 
-    def read_int8(self, little_endian: bool) -> Tuple[int, Optional[Exception]]:
+    def read_int8(self, little_endian: bool) -> int:
         """
         Read a 1-byte integer from the data.
 
@@ -105,10 +99,12 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the integer read and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
         return self.read_int_n(1, little_endian)
 
-    def read_int16(self, little_endian: bool) -> Tuple[int, Optional[Exception]]:
+    def read_int16(self, little_endian: bool) -> int:
         """
         Read a 2-byte integer from the data.
 
@@ -117,25 +113,26 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the integer read and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
         return self.read_int_n(2, little_endian)
 
-    def read_int20(self) -> Tuple[int, Optional[Exception]]:
+    def read_int20(self) -> int:
         """
         Read a 3-byte integer from the data, where only the lower 20 bits are used.
 
         Returns:
             A tuple containing the integer read and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
-        err = self.check_eos(3)
-        if err:
-            return 0, err
-
+        self.check_eos(3)
         ret = ((self.data[self.index] & 15) << 16) + (self.data[self.index + 1] << 8) + self.data[self.index + 2]
         self.index += 3
-        return ret, None
+        return ret
 
-    def read_int32(self, little_endian: bool) -> Tuple[int, Optional[Exception]]:
+    def read_int32(self, little_endian: bool) -> int:
         """
         Read a 4-byte integer from the data.
 
@@ -144,10 +141,12 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the integer read and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
         return self.read_int_n(4, little_endian)
 
-    def read_packed8(self, tag: int) -> Tuple[str, Optional[Exception]]:
+    def read_packed8(self, tag: int) -> str:
         """
         Read a packed string from the data.
 
@@ -156,35 +155,31 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the string read and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
-        start_byte, err = self.read_byte()
-        if err:
-            return "", err
-
+        start_byte = self.read_byte()
         result = []
 
         for i in range(start_byte & 127):
             curr_byte, err = self.read_byte()
             if err:
-                return "", err
+                return ""
 
-            lower, err = unpack_byte(tag, (curr_byte & 0xF0) >> 4)
+            lower = unpack_byte(tag, (curr_byte & 0xF0) >> 4)
             if err:
-                return "", err
+                return ""
 
-            upper, err = unpack_byte(tag, curr_byte & 0x0F)
-            if err:
-                return "", err
-
+            upper = unpack_byte(tag, curr_byte & 0x0F)
             result.append(chr(lower))
             result.append(chr(upper))
 
         ret = "".join(result)
         if (start_byte >> 7) != 0:
             ret = ret[:-1]
-        return ret, None
+        return ret
 
-    def read_list_size(self, tag: int) -> Tuple[int, Optional[Exception]]:
+    def read_list_size(self, tag: int) -> int:
         """
         Read the size of a list from the data.
 
@@ -193,17 +188,20 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the list size and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
+            InvalidTokenError: If the tag is invalid
         """
         if tag == token.LIST_EMPTY:
-            return 0, None
+            return 0
         elif tag == token.LIST_8:
             return self.read_int8(False)
         elif tag == token.LIST_16:
             return self.read_int16(False)
         else:
-            return 0, InvalidTokenError(f"readListSize with unknown tag {tag} at position {self.index}")
+            raise InvalidTokenError(f"readListSize with unknown tag {tag} at position {self.index}")
 
-    def read(self, as_string: bool) -> Tuple[Any, Optional[Exception]]:
+    def read(self, as_string: bool) -> None | List[Node] | bytes | str | JID:
         """
         Read a value from the data.
 
@@ -212,36 +210,28 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the value read and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
+            InvalidTokenError:
         """
-        tag_byte, err = self.read_byte()
-        if err:
-            return None, err
-
+        tag_byte = self.read_byte()
         tag = tag_byte
 
         if tag == token.LIST_EMPTY:
-            return None, None
+            return None
         elif tag in (token.LIST_8, token.LIST_16):
             return self.read_list(tag)
         elif tag == token.BINARY_8:
-            size, err = self.read_int8(False)
-            if err:
-                return None, err
+            size = self.read_int8(False)
             return self.read_bytes_or_string(size, as_string)
         elif tag == token.BINARY_20:
-            size, err = self.read_int20()
-            if err:
-                return None, err
+            size = self.read_int20()
             return self.read_bytes_or_string(size, as_string)
         elif tag == token.BINARY_32:
-            size, err = self.read_int32(False)
-            if err:
-                return None, err
+            size = self.read_int32(False)
             return self.read_bytes_or_string(size, as_string)
         elif token.DICTIONARY_0 <= tag <= token.DICTIONARY_3:
-            i, err = self.read_int8(False)
-            if err:
-                return "", err
+            i = self.read_int8(False)
             return token.get_double_token(tag - token.DICTIONARY_0, i)
         elif tag == token.FB_JID:
             return self.read_fb_jid()
@@ -255,111 +245,90 @@ class BinaryDecoder:
             return self.read_packed8(tag)
         else:
             if 1 <= tag < len(token.SINGLE_BYTE_TOKENS):
-                return token.SINGLE_BYTE_TOKENS[tag], None
-            return "", InvalidTokenError(f"{tag} at position {self.index}")
+                return token.SINGLE_BYTE_TOKENS[tag]
+            raise InvalidTokenError(f"{tag} at position {self.index}")
 
-    def read_jid_pair(self) -> Tuple[Any, Optional[Exception]]:
+    def read_jid_pair(self) -> JID:
         """
         Read a JID pair from the data.
 
         Returns:
             A tuple containing the JID and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
+            InvalidJIDTypeError: If the JID type is invalid
         """
-        user, err = self.read(True)
-        if err:
-            return None, err
+        user = self.read(True)
 
-        server, err = self.read(True)
-        if err:
-            return None, err
-        elif server is None:
-            return None, InvalidJIDTypeError()
+        server = self.read(True)
+        if server is None:
+            raise InvalidJIDTypeError()
         elif user is None:
-            return JID.new_jid("", server), None
+            return JID.new_jid("", server)
 
-        return JID.new_jid(user, server), None
+        return JID.new_jid(user, server)
 
-    def read_interop_jid(self) -> Tuple[Any, Optional[Exception]]:
+    def read_interop_jid(self) -> JID:
         """
         Read an interop JID from the data.
 
         Returns:
             A tuple containing the JID and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
+            InvalidJIDTypeError: If the JID type is invalid
         """
-        user, err = self.read(True)
-        if err:
-            return None, err
-
-        device, err = self.read_int16(False)
-        if err:
-            return None, err
-
-        integrator, err = self.read_int16(False)
-        if err:
-            return None, err
-
-        server, err = self.read(True)
-        if err:
-            return None, err
-        elif server != INTEROP_SERVER:
-            return None, InvalidJIDTypeError(f"expected {INTEROP_SERVER}, got {server}")
+        user = self.read(True)
+        device = self.read_int16(False)
+        integrator = self.read_int16(False)
+        server = self.read(True)
+        if server != INTEROP_SERVER:
+            raise InvalidJIDTypeError(f"expected {INTEROP_SERVER}, got {server}")
 
         return JID(
             user=user,
             device=device,
             integrator=integrator,
             server=INTEROP_SERVER
-        ), None
+        )
 
-    def read_fb_jid(self) -> Tuple[Any, Optional[Exception]]:
+    def read_fb_jid(self) -> JID:
         """
         Read a Facebook JID from the data.
 
         Returns:
             A tuple containing the JID and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
+            InvalidJIDTypeError: If the JID type is invalid
         """
-        user, err = self.read(True)
-        if err:
-            return None, err
-
-        device, err = self.read_int16(False)
-        if err:
-            return None, err
-
-        server, err = self.read(True)
-        if err:
-            return None, err
-        elif server != MESSENGER_SERVER:
-            return None, InvalidJIDTypeError(f"expected {MESSENGER_SERVER}, got {server}")
+        user = self.read(True)
+        device= self.read_int16(False)
+        server = self.read(True)
+        if server != MESSENGER_SERVER:
+            raise InvalidJIDTypeError(f"expected {MESSENGER_SERVER}, got {server}")
 
         return JID(
             user=user,
             device=device,
             server=server
-        ), None
+        )
 
-    def read_ad_jid(self) -> Tuple[Any, Optional[Exception]]:
+    def read_ad_jid(self) -> JID:
         """
         Read an AD JID from the data.
 
         Returns:
             A tuple containing the JID and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
-        agent, err = self.read_byte()
-        if err:
-            return None, err
+        agent = self.read_byte()
+        device = self.read_byte()
+        user = self.read(True)
+        return JID.new_ad_jid(user, agent, device)
 
-        device, err = self.read_byte()
-        if err:
-            return None, err
-
-        user, err = self.read(True)
-        if err:
-            return None, err
-
-        return JID.new_ad_jid(user, agent, device), None
-
-    def read_attributes(self, n: int) -> Tuple[Dict[str, Any], Optional[Exception]]:
+    def read_attributes(self, n: int) -> Dict[str, Any]:
         """
         Read attributes from the data.
 
@@ -368,28 +337,22 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the attributes and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
+            NonStringKeyError: If a key is not a string
         """
         if n == 0:
-            return None, None
-
+            return {}
         ret = {}
         for i in range(n):
-            key_ifc, err = self.read(True)
-            if err:
-                return None, err
-
+            key_ifc = self.read(True)
             if not isinstance(key_ifc, str):
-                return None, NonStringKeyError(f"at position {self.index} ({type(key_ifc)}): {key_ifc}")
-
+                raise NonStringKeyError(f"at position {self.index} ({type(key_ifc)}): {key_ifc}")
             key = key_ifc
+            ret[key] = self.read(True)
+        return ret
 
-            ret[key], err = self.read(True)
-            if err:
-                return None, err
-
-        return ret, None
-
-    def read_list(self, tag: int) -> Tuple[List[Node], Optional[Exception]]:
+    def read_list(self, tag: int) -> List[Node]:
         """
         Read a list of nodes from the data.
 
@@ -398,61 +361,41 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the list of nodes and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
+            InvalidTokenError
         """
-        size, err = self.read_list_size(tag)
-        if err:
-            return None, err
-
+        size = self.read_list_size(tag)
         ret = []
         for i in range(size):
-            n, err = self.read_node()
-            if err:
-                return None, err
-
+            n = self.read_node()
             ret.append(n)
+        return ret
 
-        return ret, None
-
-    def read_node(self) -> Tuple[Node, Optional[Exception]]:
+    def read_node(self) -> Node:
         """
         Read a node from the data.
 
         Returns:
             A tuple containing the node and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
+            InvalidNodeError
         """
-        size, err = self.read_int8(False)
-        if err:
-            return None, err
-
-        list_size, err = self.read_list_size(size)
-        if err:
-            return None, err
-
-        raw_desc, err = self.read(True)
-        if err:
-            return None, err
-
+        size = self.read_int8(False)
+        list_size = self.read_list_size(size)
+        raw_desc = self.read(True)
         tag = raw_desc
         if list_size == 0 or not tag:
-            return None, InvalidNodeError()
+            raise InvalidNodeError()
 
-        attrs, err = self.read_attributes((list_size - 1) >> 1)
-        if err:
-            return None, err
-
-        if attrs is None:
-            attrs = {}
-
+        attrs = self.read_attributes((list_size - 1) >> 1)
         if list_size % 2 == 1:
-            return Node(tag=tag, attrs=attrs), None
+            return Node(tag=tag, attrs=attrs)
+        content = self.read(False)
+        return Node(tag=tag, attrs=attrs, content=content)
 
-        content, err = self.read(False)
-        if err:
-            return None, err
-
-        return Node(tag=tag, attrs=attrs, content=content), None
-
-    def read_bytes_or_string(self, length: int, as_string: bool) -> Tuple[Any, Optional[Exception]]:
+    def read_bytes_or_string(self, length: int, as_string: bool) -> bytes | str:
         """
         Read bytes or a string from the data.
 
@@ -462,16 +405,15 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the data and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
-        data, err = self.read_raw(length)
-        if err:
-            return None, err
-
+        data = self.read_raw(length)
         if as_string:
-            return data.decode('utf-8', errors='replace'), None
-        return data, None
+            return data.decode('utf-8', errors='replace')
+        return data
 
-    def read_raw(self, length: int) -> Tuple[bytes, Optional[Exception]]:
+    def read_raw(self, length: int) -> bytes:
         """
         Read raw bytes from the data.
 
@@ -480,18 +422,16 @@ class BinaryDecoder:
 
         Returns:
             A tuple containing the bytes and an optional error
+        Raises:
+            EOFError: If reading would go beyond the end of the data
         """
-        err = self.check_eos(length)
-        if err:
-            return None, err
-
+        self.check_eos(length)
         ret = self.data[self.index:self.index + length]
         self.index += length
+        return ret
 
-        return ret, None
 
-
-def unpack_byte(tag: int, value: int) -> Tuple[int, Optional[Exception]]:
+def unpack_byte(tag: int, value: int) -> int:
     """
     Unpack a byte based on the tag.
 
@@ -501,16 +441,18 @@ def unpack_byte(tag: int, value: int) -> Tuple[int, Optional[Exception]]:
 
     Returns:
         A tuple containing the unpacked byte and an optional error
+    Raises:
+        InvalidTypeError: If the tag is invalid
     """
     if tag == token.NIBBLE_8:
         return unpack_nibble(value)
     elif tag == token.HEX_8:
         return unpack_hex(value)
     else:
-        return 0, InvalidTypeError(f"unpackByte with unknown tag {tag}")
+        raise InvalidTypeError(f"unpackByte with unknown tag {tag}")
 
 
-def unpack_nibble(value: int) -> Tuple[int, Optional[Exception]]:
+def unpack_nibble(value: int) -> int:
     """
     Unpack a nibble.
 
@@ -519,20 +461,22 @@ def unpack_nibble(value: int) -> Tuple[int, Optional[Exception]]:
 
     Returns:
         A tuple containing the unpacked nibble and an optional error
+    Raises:
+        InvalidTypeError: If the value is invalid
     """
     if value < 10:
-        return ord('0') + value, None
+        return ord('0') + value
     elif value == 10:
-        return ord('-'), None
+        return ord('-')
     elif value == 11:
-        return ord('.'), None
+        return ord('.')
     elif value == 15:
-        return 0, None
+        return 0
     else:
-        return 0, InvalidTypeError(f"unpackNibble with value {value}")
+        raise InvalidTypeError(f"unpackNibble with value {value}")
 
 
-def unpack_hex(value: int) -> Tuple[int, Optional[Exception]]:
+def unpack_hex(value: int) -> int:
     """
     Unpack a hex value.
 
@@ -541,16 +485,18 @@ def unpack_hex(value: int) -> Tuple[int, Optional[Exception]]:
 
     Returns:
         A tuple containing the unpacked hex value and an optional error
+    Raises:
+        InvalidTypeError:
     """
     if value < 10:
-        return ord('0') + value, None
+        return ord('0') + value
     elif value < 16:
-        return ord('A') + value - 10, None
+        return ord('A') + value - 10
     else:
-        return 0, InvalidTypeError(f"unpackHex with value {value}")
+        raise InvalidTypeError(f"unpackHex with value {value}")
 
 
-def unmarshal(data: bytes) -> Tuple[Node, Optional[Exception]]:
+def unmarshal(data: bytes) -> Node:
     """
     Unmarshal binary data into a Node.
 
@@ -559,11 +505,11 @@ def unmarshal(data: bytes) -> Tuple[Node, Optional[Exception]]:
 
     Returns:
         A tuple containing the Node and an optional error
+    Raises:
+        Exception: if r.index != len(r.data): leftover bytes after decoding
     """
     r = BinaryDecoder.new_decoder(data)
-    n, err = r.read_node()
-    if err:
-        return None, err
-    elif r.index != len(r.data):
-        return n, Exception(f"{len(r.data) - r.index} leftover bytes after decoding")
-    return n, None
+    n = r.read_node()
+    if r.index != len(r.data):
+        raise Exception(f"{len(r.data) - r.index} leftover bytes after decoding")
+    return n
