@@ -13,11 +13,14 @@ functionality as the Go implementation where DecodePatches is a method on the Pr
 import json
 import logging
 from dataclasses import dataclass
-from typing import List, Callable, Tuple, Optional, Dict, Awaitable
+from typing import List, Callable, Tuple, Optional, Awaitable
+
+from typing_extensions import Sequence
 
 from ..binary.node import Node
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
+from ..store.store import AppStateMutationMAC
 from ..util.cbcutil import decrypt
 from .errors import (
     ErrMismatchingContentMAC,
@@ -168,7 +171,8 @@ async def parse_patch_list(node: Node, download_external: DownloadExternalFunc) 
 class PatchOutput:
     """Internal class for processing patch outputs."""
     removed_macs: List[bytes] = None
-    added_macs: List[Dict[str, bytes]] = None
+    # added_macs: List[Dict[str, bytes]] = None
+    added_macs: List[AppStateMutationMAC] = None
     mutations: List[Mutation] = None
 
     def __post_init__(self):
@@ -183,242 +187,236 @@ class PatchOutput:
 class Decoder(Processor):
     """Decoder for app state patches."""
 
-    async def decode_mutations(self, mutations: List[WAServerSync_pb2.SyncdMutation],
-                              out: PatchOutput, validate_macs: bool) -> None:
-        """
-        Decode mutations from encrypted format.
+async def decode_mutations(processor: Processor, mutations: Sequence[WAServerSync_pb2.SyncdMutation],
+                           out: PatchOutput, validate_macs: bool) -> None:
+    """
+    Decode mutations from encrypted format.
 
-        Args:
-            mutations: The mutations to decode
-            out: Output container for decoded mutations
-            validate_macs: Whether to validate MACs
+    Args:
+        processor
+        mutations: The mutations to decode
+        out: Output container for decoded mutations
+        validate_macs: Whether to validate MACs
 
-        Raises:
-            ValueError: If decoding fails
-        """
-        for i, mutation in enumerate(mutations):
-            key_id = mutation.record.key_id.id
-            keys, err = await self.get_app_state_key(key_id)
-            if err:
-                raise ValueError(f"Failed to get key {key_id.hex().upper()} to decode mutation: {err}")
-
-            content = mutation.record.value.blob
-            content, value_mac = content[:-32], content[-32:]
-
-            if validate_macs:
-                expected_value_mac = generate_content_mac(mutation.operation, content, key_id, keys.value_mac)
-                if expected_value_mac != value_mac:
-                    raise ErrMismatchingContentMAC(f"Failed to verify mutation #{i+1}")
-
-            iv, content = content[:16], content[16:]
-            try:
-                plaintext = decrypt(keys.value_encryption, iv, content)
-            except Exception as err:
-                raise ValueError(f"Failed to decrypt mutation #{i+1}: {err}")
-
-            sync_action = WASyncAction_pb2.SyncActionData()
-            try:
-                sync_action.ParseFromString(plaintext)
-            except Exception as err:
-                raise ValueError(f"Failed to unmarshal mutation #{i+1}: {err}")
-
-            index_mac = mutation.record.index.blob
-            if validate_macs:
-                expected_index_mac = concat_and_hmac(lambda: __import__('hashlib').sha256(),
-                                                   keys.index,
-                                                   [sync_action.index])
-                if expected_index_mac != index_mac:
-                    raise ErrMismatchingIndexMAC(f"Failed to verify mutation #{i+1}")
-
-            try:
-                index = json.loads(sync_action.index)
-            except Exception as err:
-                raise ValueError(f"Failed to unmarshal index of mutation #{i+1}: {err}")
-
-            if mutation.operation == WAServerSync_pb2.SyncdMutation.SyncdOperation.REMOVE:
-                out.removed_macs.append(index_mac)
-            elif mutation.operation == WAServerSync_pb2.SyncdMutation.SyncdOperation.SET:
-                out.added_macs.append({
-                    "index_mac": index_mac,
-                    "value_mac": value_mac
-                })
-
-            out.mutations.append(Mutation(
-                operation=mutation.operation,
-                action=sync_action.value,
-                index=index,
-                index_mac=index_mac,
-                value_mac=value_mac
-            ))
-
-    async def store_macs(self, name: WAPatchName, current_state: HashState, out: PatchOutput) -> None:
-        """
-        Store MACs in the database.
-
-        Args:
-            name: The patch name
-            current_state: The current hash state
-            out: The patch output containing MACs to store
-        """
-        try:
-            await self.store.app_state.put_app_state_version(str(name), current_state.version, current_state.hash)
-        except Exception as err:
-            logger.error(f"Failed to update app state version in the database: {err}")
-
-        try:
-            await self.store.app_state.delete_app_state_mutation_macs(str(name), out.removed_macs)
-        except Exception as err:
-            logger.error(f"Failed to remove deleted mutation MACs from the database: {err}")
-
-        try:
-            await self.store.app_state.put_app_state_mutation_macs(str(name), current_state.version, out.added_macs)
-        except Exception as err:
-            logger.error(f"Failed to insert added mutation MACs to the database: {err}")
-
-    async def validate_snapshot_mac(self, name: WAPatchName, current_state: HashState,
-                                  key_id: bytes, expected_snapshot_mac: bytes) -> Tuple[ExpandedAppStateKeys, Optional[Exception]]:
-        """
-        Validate a snapshot MAC.
-
-        Args:
-            name: The patch name
-            current_state: The current hash state
-            key_id: The key ID
-            expected_snapshot_mac: The expected snapshot MAC
-
-        Returns:
-            A tuple of (expanded keys, error)
-        """
-        keys, err = await self.get_app_state_key(key_id)
+    Raises:
+        ValueError: If decoding fails
+    """
+    for i, mutation in enumerate(mutations):
+        key_id = mutation.record.keyID.ID
+        keys, err = await processor.get_app_state_key(key_id)
         if err:
-            return None, ValueError(f"Failed to get key {key_id.hex().upper()} to verify patch v{current_state.version} MACs: {err}")
+            raise ValueError(f"Failed to get key {key_id.hex().upper()} to decode mutation: {err}")
 
-        snapshot_mac = current_state.generate_snapshot_mac(name, keys.snapshot_mac)
-        if snapshot_mac != expected_snapshot_mac:
-            return None, ErrMismatchingLTHash(f"Failed to verify patch v{current_state.version}")
-
-        return keys, None
-
-    async def decode_snapshot(self, name: WAPatchName, ss: WAServerSync_pb2.SyncdSnapshot,
-                            initial_state: HashState, validate_macs: bool,
-                            new_mutations_input: List[Mutation]) -> Tuple[List[Mutation], HashState, Optional[Exception]]:
-        """
-        Decode a snapshot.
-
-        Args:
-            name: The patch name
-            ss: The snapshot to decode
-            initial_state: The initial hash state
-            validate_macs: Whether to validate MACs
-            new_mutations_input: Input list of mutations
-
-        Returns:
-            A tuple of (new mutations, current state, error)
-        """
-        current_state = HashState(version=initial_state.version, hash=initial_state.hash)
-        current_state.version = ss.version.version
-
-        encrypted_mutations = []
-        for record in ss.records:
-            encrypted_mutations.append(WAServerSync_pb2.SyncdMutation(
-                operation=WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
-                record=record
-            ))
-
-        def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> Tuple[Optional[bytes], Optional[Exception]]:
-            return None, None
-
-        warnings, err = current_state.update_hash(encrypted_mutations, get_prev_set_value_mac)
-        if warnings:
-            logger.warning(f"Warnings while updating hash for {name}: {warnings}")
-        if err:
-            return None, None, ValueError(f"Failed to update state hash: {err}")
+        content = mutation.record.value.blob
+        content, value_mac = content[:-32], content[-32:]
 
         if validate_macs:
-            _, err = await self.validate_snapshot_mac(name, current_state, ss.key_id.id, ss.mac)
-            if err:
-                return None, None, err
+            expected_value_mac = generate_content_mac(mutation.operation, content, key_id, keys.value_mac)
+            if expected_value_mac != value_mac:
+                raise ErrMismatchingContentMAC(f"Failed to verify mutation #{i+1}")
 
-        out = PatchOutput(mutations=new_mutations_input)
+        iv, content = content[:16], content[16:]
         try:
-            await self.decode_mutations(encrypted_mutations, out, validate_macs)
+            plaintext = decrypt(keys.value_encryption, iv, content)
         except Exception as err:
-            return None, None, ValueError(f"Failed to decode snapshot of v{current_state.version}: {err}")
+            raise ValueError(f"Failed to decrypt mutation #{i+1}: {err}")
 
-        await self.store_macs(name, current_state, out)
-        return out.mutations, current_state, None
+        sync_action = WASyncAction_pb2.SyncActionData()
+        try:
+            sync_action.ParseFromString(plaintext)
+        except Exception as err:
+            raise ValueError(f"Failed to unmarshal mutation #{i+1}: {err}")
 
-    async def decode_patches(self, patch_list: PatchList, initial_state: HashState,
-                           validate_macs: bool) -> Tuple[List[Mutation], HashState, Optional[Exception]]:
-        """
-        Decode all the patches in a PatchList into a list of app state mutations.
+        index_mac = mutation.record.index.blob
+        if validate_macs:
+            expected_index_mac = concat_and_hmac(lambda: __import__('hashlib').sha256(),
+                                               keys.index,
+                                               [sync_action.index])
+            if expected_index_mac != index_mac:
+                raise ErrMismatchingIndexMAC(f"Failed to verify mutation #{i+1}")
 
-        Args:
-            patch_list: The patch list to decode
-            initial_state: The initial hash state
-            validate_macs: Whether to validate MACs
+        try:
+            index = json.loads(sync_action.index)
+        except Exception as err:
+            raise ValueError(f"Failed to unmarshal index of mutation #{i+1}: {err}")
 
-        Returns:
-            A tuple of (new mutations, current state, error)
-        """
-        current_state = HashState(version=initial_state.version, hash=initial_state.hash)
-        expected_length = 0
+        if mutation.operation == WAServerSync_pb2.SyncdMutation.SyncdOperation.REMOVE:
+            out.removed_macs.append(index_mac)
+        elif mutation.operation == WAServerSync_pb2.SyncdMutation.SyncdOperation.SET:
+            out.added_macs.append(AppStateMutationMAC(index_mac=index_mac, value_mac=value_mac))
 
-        if patch_list.snapshot:
-            expected_length += len(patch_list.snapshot.records)
+        out.mutations.append(Mutation(
+            operation=mutation.operation,
+            action=sync_action.value,
+            index=index,
+            index_mac=index_mac,
+            value_mac=value_mac
+        ))
 
-        for patch in patch_list.patches:
-            expected_length += len(patch.mutations)
+async def store_macs(processor: Processor, name: WAPatchName, current_state: HashState, out: PatchOutput) -> None:
+    """
+    Store MACs in the database.
 
-        new_mutations = []
+    Args:
+        processor
+        name: The patch name
+        current_state: The current hash state
+        out: The patch output containing MACs to store
+    """
+    try:
+        await processor.store.app_state.put_app_state_version(str(name), current_state.version, current_state.hash)
+    except Exception as e:
+        logger.exception(f"Failed to update app state version in the database: {e}")
 
-        if patch_list.snapshot:
-            new_mutations, current_state, err = await self.decode_snapshot(
-                patch_list.name, patch_list.snapshot, current_state, validate_macs, new_mutations
+    try:
+        await processor.store.app_state.delete_app_state_mutation_macs(str(name), out.removed_macs)
+    except Exception as e:
+        logger.exception(f"Failed to remove deleted mutation MACs from the database: {e}")
+
+    try:
+        await processor.store.app_state.put_app_state_mutation_macs(str(name), current_state.version, out.added_macs)
+    except Exception as e:
+        logger.exception(f"Failed to insert added mutation MACs to the database: {e}")
+
+async def validate_snapshot_mac(processor: Processor, name: WAPatchName, current_state: HashState,
+                                key_id: bytes, expected_snapshot_mac: bytes) -> ExpandedAppStateKeys:
+    """
+    Validate a snapshot MAC.
+
+    Args:
+        processor
+        name: The patch name
+        current_state: The current hash state
+        key_id: The key ID
+        expected_snapshot_mac: The expected snapshot MAC
+
+    Returns:
+        expanded keys
+    Raises:
+        ValueError
+        ErrMismatchingLTHash
+    """
+    keys, err = await processor.get_app_state_key(key_id)
+    if err:
+        raise ValueError(f"Failed to get key {key_id.hex().upper()} to verify patch v{current_state.version} MACs: {err}")
+
+    snapshot_mac = current_state.generate_snapshot_mac(name, keys.snapshot_mac)
+    if snapshot_mac != expected_snapshot_mac:
+        raise ErrMismatchingLTHash(f"Failed to verify patch v{current_state.version}")
+
+    return keys
+
+async def decode_snapshot(processor: Processor, name: WAPatchName, ss: WAServerSync_pb2.SyncdSnapshot,
+                          initial_state: HashState, validate_macs: bool,
+                          new_mutations_input: List[Mutation]) -> Tuple[List[Mutation], HashState]:
+    """
+    Decode a snapshot.
+
+    Args:
+        processor
+        name: The patch name
+        ss: The snapshot to decode
+        initial_state: The initial hash state
+        validate_macs: Whether to validate MACs
+        new_mutations_input: Input list of mutations
+
+    Returns:
+        A tuple of (new mutations, current state)
+    Raises:
+        ValueError
+    """
+    current_state = HashState(version=initial_state.version, hash=initial_state.hash)
+    current_state.version = ss.version.version
+
+    encrypted_mutations = []
+    for record in ss.records:
+        encrypted_mutations.append(WAServerSync_pb2.SyncdMutation(
+            operation=WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
+            record=record
+        ))
+
+    async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> Optional[bytes]:
+        return None
+
+    warnings, err = current_state.update_hash(encrypted_mutations, get_prev_set_value_mac)
+    if warnings:
+        logger.warning(f"Warnings while updating hash for {name}: {warnings}")
+    if err:
+        raise ValueError(f"Failed to update state hash: {err}")
+
+    if validate_macs:
+        _ = await validate_snapshot_mac(processor, name, current_state, ss.keyID.ID, ss.mac)
+
+    out = PatchOutput(mutations=new_mutations_input)
+    try:
+        await decode_mutations(processor, encrypted_mutations, out, validate_macs)
+    except Exception as err:
+        raise ValueError(f"Failed to decode snapshot of v{current_state.version}: {err}")
+
+    await store_macs(processor, name, current_state, out)
+    return out.mutations, current_state
+
+async def decode_patches(processor: Processor, patch_list: PatchList, initial_state: HashState,
+                         validate_macs: bool) -> Tuple[List[Mutation], HashState]:
+    """
+    Decode all the patches in a PatchList into a list of app state mutations.
+
+    Args:
+        processor:
+        patch_list: The patch list to decode
+        initial_state: The initial hash state
+        validate_macs: Whether to validate MACs
+
+    Returns:
+        A tuple of (new mutations, current state)
+    Raises:
+        ErrMismatchingPatchMAC
+    """
+    current_state = HashState(version=initial_state.version, hash=initial_state.hash)
+    expected_length = 0
+
+    if patch_list.snapshot:
+        expected_length += len(patch_list.snapshot.records)
+
+    for patch in patch_list.patches:
+        expected_length += len(patch.mutations)
+
+    new_mutations = []
+
+    if patch_list.snapshot:
+        new_mutations, current_state = await decode_snapshot(
+            processor, patch_list.name, patch_list.snapshot, current_state, validate_macs, new_mutations
+        )
+
+    for patch in patch_list.patches:
+        version = patch.version.version
+        current_state.version = version
+
+        async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> Optional[bytes]:
+            for i in range(max_index - 1, -1, -1):
+                if patch.mutations[i].record.index.blob == index_mac:
+                    value = patch.mutations[i].record.value.blob
+                    return value[-32:]
+
+            # Previous value not found in current patch, look in the database
+            return await processor.store.app_state.get_app_state_mutation_mac(str(patch_list.name), index_mac)
+
+        warnings = current_state.update_hash(patch.mutations, get_prev_set_value_mac)
+        if warnings:
+            logger.warning(f"Warnings while updating hash for {patch_list.name}: {warnings}")
+
+        if validate_macs:
+            keys = await validate_snapshot_mac(
+                processor, patch_list.name, current_state, patch.keyID.ID, patch.snapshotMAC
             )
-            if err:
-                return None, None, err
 
-        for patch in patch_list.patches:
-            version = patch.version.version
-            current_state.version = version
+            patch_mac = generate_patch_mac(patch, patch_list.name, keys.patch_mac, patch.version.version)
+            if patch_mac != patch.patchMAC:
+                raise ErrMismatchingPatchMAC(f"Failed to verify patch v{version}")
 
-            async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> Tuple[Optional[bytes], Optional[Exception]]:
-                for i in range(max_index - 1, -1, -1):
-                    if patch.mutations[i].record.index.blob == index_mac:
-                        value = patch.mutations[i].record.value.blob
-                        return value[-32:], None
+        out = PatchOutput(mutations=new_mutations)
+        await decode_mutations(processor, patch.mutations, out, validate_macs)
+        await store_macs(processor, patch_list.name, current_state, out)
+        new_mutations = out.mutations
 
-                # Previous value not found in current patch, look in the database
-                try:
-                    return await self.store.app_state.get_app_state_mutation_mac(str(patch_list.name), index_mac), None
-                except Exception as err:
-                    return None, err
-
-            warnings, err = current_state.update_hash(patch.mutations, get_prev_set_value_mac)
-            if warnings:
-                logger.warning(f"Warnings while updating hash for {patch_list.name}: {warnings}")
-            if err:
-                return None, None, ValueError(f"Failed to update state hash: {err}")
-
-            if validate_macs:
-                keys, err = await self.validate_snapshot_mac(
-                    patch_list.name, current_state, patch.key_id.id, patch.snapshot_mac
-                )
-                if err:
-                    return None, None, err
-
-                patch_mac = generate_patch_mac(patch, patch_list.name, keys.patch_mac, patch.version.version)
-                if patch_mac != patch.patch_mac:
-                    return None, None, ErrMismatchingPatchMAC(f"Failed to verify patch v{version}")
-
-            out = PatchOutput(mutations=new_mutations)
-            try:
-                await self.decode_mutations(patch.mutations, out, validate_macs)
-            except Exception as err:
-                return None, None, err
-
-            await self.store_macs(patch_list.name, current_state, out)
-            new_mutations = out.mutations
-
-        return new_mutations, current_state, None
+    return new_mutations, current_state
