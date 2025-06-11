@@ -164,15 +164,27 @@ class Client:
         self.response_waiters_lock = asyncio.Lock()
 
         # Event handling
-        # TODO: Type hint for node_handlers values (should be Callable[[Node], Awaitable[None]] or similar)
-        self.node_handlers: Dict[str, Callable[[Any], Awaitable[None]]] = {}
+        self.node_handlers: Dict[str, Callable[[Client, Node], Awaitable[None]]] = {
+            "message": handle_encrypted_message,
+            "appdata": handle_encrypted_message,
+            "receipt": handle_receipt,
+            "call": handle_call_event,
+            "chatstate": handle_chat_state,
+            "presence": handle_presence,
+            "notification": handle_notification,
+            "success": connectionevents.handle_connect_success,
+            "failure": connectionevents.handle_connect_failure,
+            "stream:error": connectionevents.handle_stream_error,
+            "iq": handle_iq,
+            "ib": handle_ib,
+        }
+
         # Go: chan *waBinary.Node (unbuffered or default size) -> Python: asyncio.Queue(HANDLER_QUEUE_SIZE)
         # The buffer size (HANDLER_QUEUE_SIZE=2048) is a behavioral difference from an unbuffered Go channel.
         # Consider asyncio.Queue() for an unbounded queue or asyncio.Queue(1) for closer to unbuffered semantics if backpressure is important.
         # TODO: Type hint for handler_queue queue items
         self.handler_queue: asyncio.Queue[Any] = asyncio.Queue(HANDLER_QUEUE_SIZE)
-        self.event_handlers: List[WrappedEventHandler] = []
-        self.event_handlers_lock = asyncio.Lock()
+        self.event_handlers: Set[EventHandler] = set()
 
         # Message handling
         self.message_retries: Dict[str, int] = {}
@@ -247,31 +259,33 @@ class Client:
         # Go: RefreshCAT func() error -> Python: Callable[[], Optional[Exception]] (OK)
         self.refresh_cat: Optional[Callable[[], Optional[Exception]]] = None
 
-        # Initialize node handlers
-        self._init_node_handlers()
-
         # These are extra attributes in Python, likely for managing async tasks.
         self._keepalive_task: Optional[asyncio.Task] = None
         self._handler_task: Optional[asyncio.Task] = None
 
         self._background_tasks: Set[asyncio.Task] = set()
 
-    def _init_node_handlers(self):
-        """Initialize the node handlers dictionary."""
-        self.node_handlers = {
-            "message": handle_encrypted_message,
-            "appdata": handle_encrypted_message,
-            "receipt": handle_receipt,
-            "call": handle_call_event,
-            "chatstate": handle_chat_state,
-            "presence": handle_presence,
-            "notification": handle_notification,
-            "success": connectionevents.handle_connect_success,
-            "failure": connectionevents.handle_connect_failure,
-            "stream:error": connectionevents.handle_stream_error,
-            "iq": handle_iq,
-            "ib": handle_ib,
-        }
+
+
+        # used by the signal_protocol lib
+        self.signal_store = None
+        # self.session_ciphers = {}  # Cache for session ciphers
+        # self.group_ciphers = {}  # Cache for group ciphers
+
+    # async def initialize_signal_protocol(self):
+    #     """Initialize Signal Protocol on startup."""
+    #
+    #     # 1. Generate or load identity keys
+    #     identity_keys = generate_identity_keys()
+    #     registration_id = 12345  # Should be randomly generated and stored
+    #
+    #     # 2. Create your persistent store
+    #     self.signal_store = TortoiseSignalStore(identity_keys, registration_id)
+    #
+    #     # 3. Generate and store prekeys if this is first run
+    #     await self._setup_prekeys()
+    #
+    #     print("Signal Protocol initialized with persistent storage")
 
     def create_task(self, coro: Awaitable[Any]) -> asyncio.Task:
         """
@@ -750,7 +764,7 @@ class Client:
         # Go: return nil
         return None
 
-    async def add_event_handler(self, handler: EventHandler) -> int:
+    def add_event_handler(self, handler: EventHandler) -> EventHandler:
         """Register a new async function to receive all events emitted by this client.
 
         Args:
@@ -759,64 +773,30 @@ class Client:
         Returns:
             The event handler ID, which can be passed to remove_event_handler to remove it.
         """
-        # Go: nextID := atomic.AddUint32(&nextHandlerID, 1)
-        # Go uses a global atomic counter for unique IDs across all clients.
-        # Python uses a per-client counter (self.id_counter) protected by a lock.
-        # This is a difference in the scope of ID uniqueness (global vs per-client).
-        # Using a lock around a simple integer counter is a common Python equivalent for thread/async safety.
+        self.event_handlers.add(handler)
+        return handler  # Return for lambda users who want to remove later
 
-        # Go: cli.eventHandlersLock.Lock()
-        # Go: defer cli.eventHandlersLock.Unlock()
-        async with self.event_handlers_lock:  # Use async with for asyncio Lock
-
-            # Increment the counter *before* using it, matching Go's atomic.AddUint32 behavior
-            self.id_counter += 1
-            handler_id = self.id_counter  # Use the new value as the ID
-
-            # Go: cli.eventHandlers = append(cli.eventHandlers, wrappedEventHandler{handler, nextID})
-            # Python: self.event_handlers.append(WrappedEventHandler(handler, handler_id))
-            self.event_handlers.append(WrappedEventHandler(handler, handler_id))
-
-        # Go: return nextID
-        return handler_id
-
-    async def remove_event_handler(self, handler_id: int) -> bool:
+    def remove_event_handler(self, handler: EventHandler) -> bool:
         """Remove a previously registered event handler function.
 
         N.B. Do not run this directly from an event handler. That would cause a deadlock.
         Instead run it in a separate task (e.g., using asyncio.create_task).
 
         Args:
-            handler_id: The ID of the handler to remove.
+            handler: The same async event handler function used to add but now to remove.
 
         Returns:
             True if the handler was found and removed, False otherwise.
         """
-        # Go: cli.eventHandlersLock.Lock(); defer cli.eventHandlersLock.Unlock()
-        async with self.event_handlers_lock:  # Use async with for asyncio.Lock
-            # Go: for index := range cli.eventHandlers
-            for i, wrapped_handler in enumerate(self.event_handlers):
-                # Go: if cli.eventHandlers[index].id == id
-                if wrapped_handler.id == handler_id:
-                    # To mirror Go's behavior of nil-ing out the function reference
-                    # before removing the element from the list, which can help with GC.
-                    wrapped_handler.fn = None
-
-                    # Pythonic way to remove an element by index
-                    self.event_handlers.pop(i)
-                    return True
-        return False
+        try:
+            self.event_handlers.remove(handler)
+            return True
+        except KeyError:
+            return False
 
     async def remove_event_handlers(self) -> None:
         """Remove all event handlers that have been registered with add_event_handler."""
-        # Go: cli.eventHandlersLock.Lock()
-        # Go: defer cli.eventHandlersLock.Unlock()
-        async with self.event_handlers_lock:  # Use async with for asyncio.Lock
-            # Go: cli.eventHandlers = make([]wrappedEventHandler, 0, 1)
-            # Python: self.event_handlers = []
-            # Re-assigning to a new empty list is the Python equivalent of Go's make([]type, 0, capacity)
-            # for the purpose of clearing the list.
-            self.event_handlers = []
+        self.event_handlers.clear()
 
     async def handle_frame(self, data: bytes):
         """
@@ -996,48 +976,12 @@ class Client:
         Args:
             evt: The event to dispatch
         """
-        # Go: cli.eventHandlersLock.RLock()
-        # Python: Acquire lock to safely iterate over self.event_handlers.
-        # asyncio.Lock is exclusive. If RLock semantics are critical and handlers
-        # can be added/removed *during* dispatch by another task (which is generally
-        # a bad idea and can lead to issues even with RLock if not careful),
-        # a more complex lock or a copy of the list might be needed.
-        # For now, assuming exclusive lock is acceptable for iteration.
-        async with self.event_handlers_lock:
-            # Create a copy of the handlers list before iterating.
-            # This prevents issues if a handler tries to modify the list
-            # (e.g., remove itself) during iteration, which would be problematic
-            # even with a read lock in Go if not handled carefully.
-            # The Go version's RLock prevents modification of the slice header,
-            # but not concurrent modification of the underlying array if a handler
-            # somehow got a reference to it and modified it (highly unlikely for Add/Remove).
-            # A copy is safer in Python for this pattern.
-            handlers_to_dispatch = list(self.event_handlers)
-
-        # Go: defer func() { ... recover() ... }()
-        # Python: The try/except block outside the loop aims to mimic the
-        # single recover() for the entire dispatch operation. However, Python's
-        # exceptions don't quite work like Go's panics + recover in a defer.
-        # A panic in one Go handler would be caught by the single defer.
-        # In Python, an unhandled exception in one `await handler.fn(evt)`
-        # would stop the loop unless caught individually.
-        # The provided Python code catches exceptions per handler, which is often
-        # a more robust approach in Python event systems (one bad handler doesn't
-        # stop others). We'll keep that per-handler try-except.
-        # If a single catch for the whole loop is desired, it would be more complex
-        # to also get the Go behavior of continuing to other handlers after a panic.
-
-        for handler_wrapper in handlers_to_dispatch:
-            if handler_wrapper.fn is None:  # Handler might have been removed (fn set to None)
-                continue
+        # maybe we could use gather if we have many handlers
+        for handler in list(self.event_handlers):
             try:
-                # Go: handler.fn(evt)
-                # Python: await handler.fn(evt)
-                await handler_wrapper.fn(evt)
-            except Exception as err:
-                # Go: cli.Log.Errorf("Event handler panicked while handling a %T: %v\n%s", evt, err, debug.Stack())
-                # Python: logger.exception(...)
-                logger.exception(f"Event handler panicked while handling a {type(evt).__name__}")
+                await handler(evt)
+            except Exception as e:
+                logger.exception(f"Event handler raised while handling a {type(evt).__name__}: {e}")
 
     # The method can be synchronous if all its internal calls are synchronous.
     # If get_own_id or JID.parse were async, this would need to be async.
