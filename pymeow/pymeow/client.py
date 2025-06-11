@@ -81,14 +81,8 @@ class MessengerConfig:
     base_url: str
     websocket_url: str
 
-
-@dataclass
-class SetProxyOptions:
-    """Options for setting a proxy."""
-    no_websocket: bool = False
-    no_media: bool = False
-
 logger = logging.getLogger(__name__)
+
 # todo: port sendNodeAndGetData in client.go to send_node_and_get_data
 class Client:
     """Client for WhatsApp Web API.
@@ -109,12 +103,8 @@ class Client:
 
         Args:
             device_store: The device store to use for storing session data
-            logger: Optional logger to use for logging. If None, a no-op logger will be used.
         """
         super().__init__()
-        # Generate a unique ID prefix
-        unique_id_prefix = urandom(2)
-
         self.store: 'Device' = device_store
         self.recv_log = logging.getLogger(f"{logger.name}.Recv")
         self.send_log = logging.getLogger(f"{logger.name}.Send")
@@ -244,17 +234,12 @@ class Client:
 
         self.phone_linking_cache = None # TODO: Type hint for phone_linking_cache
 
+        # Generate a unique ID prefix
+        unique_id_prefix = urandom(2)
         self.unique_id = f"{unique_id_prefix[0]}.{unique_id_prefix[1]}-"
         self.id_counter = 0
 
-        # HTTP and proxy settings
-        # This is handled by aiohttp.ClientSession(trust_env=True) if you want environment proxies.
-        # If you want to set an explicit proxy programmatically, you'd pass it to ClientSession.
-        # The `self.proxy` attribute could store an explicit proxy URL if needed.
-        self.proxy: Optional[str] = None  # To store an explicitly set proxy URL
-        self.socks_proxy: Optional['proxy.Dialer'] = None
-        self.proxy_only_login = False
-        self.http: Optional[aiohttp.ClientSession] = None
+        self.http: aiohttp.ClientSession = aiohttp.ClientSession(trust_env=True)
 
         # Messenger config (for non-WhatsApp clients)
         self.messenger_config: Optional[
@@ -305,91 +290,7 @@ class Client:
 
         return task
 
-    async def _ensure_http_session(self):
-        """Ensures the aiohttp ClientSession is initialized."""
-        if self.http is None:
-            # trust_env=True makes aiohttp respect HTTP_PROXY/HTTPS_PROXY environment variables
-            # which is similar to Go's http.ProxyFromEnvironment
-            # If you have an explicit self.proxy URL, you'd pass it here:
-            # proxy_url = self.proxy if self.proxy else None
-            # self.http = aiohttp.ClientSession(proxy=proxy_url, trust_env=True if not proxy_url else False)
-            self.http = aiohttp.ClientSession(trust_env=True)
-
-    async def close_http_session(self):
-        """Closes the aiohttp ClientSession if it exists."""
-        if self.http:
-            await self.http.close()
-            self.http = None
-
-    async def set_proxy_address(self, addr: str, opts: Optional[SetProxyOptions] = None) -> None:
-        """Set a proxy address for the client.
-
-        Args:
-            addr: The proxy address to use (e.g., "http://proxy.example.com:8080" or "socks5://proxy.example.com:1080")
-            opts: Optional proxy options
-
-        Raises:
-            ValueError: If the proxy scheme is unsupported
-        """
-        if not addr:
-            self.set_proxy(None, opts)
-            return
-
-        parsed = urlparse(addr)
-        if parsed.scheme in ("http", "https"):
-            # TODO: Implement HTTP proxy support
-            self.set_proxy(parsed, opts)
-        elif parsed.scheme == "socks5":
-            # TODO: Implement SOCKS5 proxy support
-            self.set_socks_proxy(parsed, opts)
-        else:
-            raise ValueError(f"Unsupported proxy scheme {parsed.scheme!r}")
-
-    def set_proxy(self, proxy, opts: Optional[SetProxyOptions] = None):
-        """Set an HTTP proxy for the client.
-
-        Args:
-            proxy: The proxy to use
-            opts: Optional proxy options
-        """
-        if opts is None:
-            opts = SetProxyOptions()
-
-        if not opts.no_websocket:
-            self.proxy = proxy
-            self.socks_proxy = None
-
-        if not opts.no_media:
-            # TODO: Implement HTTP client proxy settings
-            pass
-
-    def set_socks_proxy(self, proxy, opts: Optional[SetProxyOptions] = None):
-        """Set a SOCKS5 proxy for the client.
-
-        Args:
-            proxy: The proxy to use
-            opts: Optional proxy options
-        """
-        if opts is None:
-            opts = SetProxyOptions()
-
-        if not opts.no_websocket:
-            self.socks_proxy = proxy
-            self.proxy = None
-
-        if not opts.no_media:
-            # TODO: Implement HTTP client SOCKS proxy settings
-            pass
-
-    def toggle_proxy_only_for_login(self, only: bool):
-        """Toggle whether the proxy is only used for login.
-
-        Args:
-            only: If True, the proxy will only be used for login
-        """
-        self.proxy_only_login = only
-
-    async def get_socket_wait_chan(self):
+    async def get_socket_wait_chan(self) -> asyncio.Event:
         """Get the socket wait event.
 
         Returns:
@@ -465,15 +366,7 @@ class Client:
             # Timeout occurred either during `await wait_event.wait()` or elsewhere within the `async with asyncio.timeout` block.
             return False
 
-    def set_ws_dialer(self, dialer: aiohttp.ClientSession):
-        """Set a custom WebSocket dialer.
-
-        Args:
-            dialer: The WebSocket dialer to use
-        """
-        self.ws_dialer = dialer
-
-    async def connect(self) -> None:
+    async def connect(self) -> Exception | None:
         """Connect to the WhatsApp web websocket.
 
         After connection, it will either authenticate if there's data in the device store,
@@ -533,25 +426,6 @@ class Client:
                     return ErrAlreadyConnected()
 
             self._reset_expected_disconnect()
-
-            # Go: if cli.wsDialer != nil { wsDialer = *cli.wsDialer }
-            if self.ws_dialer is None:
-                self.ws_dialer = await self._ensure_http_session()
-            # Go: else if !cli.proxyOnlyLogin || cli.Store.ID == nil { ... }
-            elif not self.proxy_only_login or (self.store and self.store.id is None):
-                if self.proxy is not None:
-                    # Go: wsDialer.Proxy = cli.proxy
-                    # TODO: How self.proxy (Callable) translates to ws_dialer_config needs to be defined
-                    # For aiohttp, this might mean setting proxy on ClientSession or Connector
-                    print(f"Using HTTP proxy function: {self.proxy}")
-                    # ws_dialer_config = {"proxy_func": self.proxy} # Example
-                elif self.socks_proxy is not None:
-                    # Go: wsDialer.NetDial = cli.socksProxy.Dial
-                    # Go: contextDialer, ok := cli.socksProxy.(proxy.ContextDialer); if ok { wsDialer.NetDialContext = contextDialer.DialContext }
-                    # TODO: How self.socks_proxy translates to ws_dialer_config needs to be defined
-                    # For aiohttp, this would involve a custom connector using the SOCKS proxy.
-                    print(f"Using SOCKS proxy: {self.socks_proxy}")
-                    # ws_dialer_config = {"socks_proxy": self.socks_proxy} # Example
 
             # Go: fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), wsDialer)
             # Python: Pass logger and dialer config to FrameSocket constructor
