@@ -1,0 +1,36 @@
+from typing import Any, Union, Optional, List, Dict, Tuple
+from signal_protocol.curve import PublicKey, PrivateKey
+from signal_protocol.address import ProtocolAddress
+
+class SenderKeyName:
+	def __init__(self, group_id: str, sender: ProtocolAddress) -> None: ...
+	def group_id(self) -> str: ...
+	def sender_name(self) -> str: ...
+	def sender_device_id(self) -> int: ...
+	def sender(self) -> ProtocolAddress: ...
+
+class SenderKeyRecord:
+	@staticmethod
+	def new_empty() -> "SenderKeyRecord": ...
+
+	@staticmethod
+	def deserialize(buf: bytes) -> "SenderKeyRecord": ...
+
+	def is_empty(self) -> bool: ...
+	def add_sender_key_state(
+		self,
+		id: int,
+		iteration: int,
+		chain_key: bytes,
+		signature_key: PublicKey,
+		signature_private_key: Optional[PrivateKey],
+	) -> None: ...
+	def set_sender_key_state(
+		self,
+		id: int,
+		iteration: int,
+		chain_key: bytes,
+		signature_key: PublicKey,
+		signature_private_key: Optional[PrivateKey],
+	) -> None: ...
+	def serialize(self) -> bytes: ...
