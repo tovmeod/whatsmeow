@@ -7,7 +7,7 @@ from typing import Optional, List, Any, Tuple
 import logging
 
 # Signal protocol imports
-from signal_protocol import curve, identity_key, state, storage, protocol, sender_keys, address
+from signal_protocol import curve, identity_key, state, storage, address
 from signal_protocol.state import PreKeyRecord, SessionRecord, SignedPreKeyRecord
 from signal_protocol.sender_keys import SenderKeyRecord, SenderKeyName
 
@@ -285,27 +285,26 @@ async def store_session(
 async def contains_session(
     device: 'Device',
     remote_address: address.ProtocolAddress
-) -> Tuple[bool, Optional[Exception]]:
+) -> bool:
     """
     Port of Go method ContainsSession from Device.
 
     Checks if a session exists for the given remote address.
 
     Args:
-        ctx: Context for the operation
+        device:
         remote_address: The remote protocol address to check
 
     Returns:
-        Tuple containing (has_session: bool, error: Optional[Exception])
+        has_session: bool
+    Raises:
+        Exception
     """
     # TODO: Review ProtocolAddress.string method implementation
     # TODO: Review Sessions.has_session implementation
 
-    addr_string = remote_address.string()
-    has_session, err = await device.sessions.has_session(addr_string)
-    if err is not None:
-        return False, Exception(f"failed to check if store has session for {addr_string}: {err}")
-    return has_session, None
+    has_session = await device.sessions.has_session(str(remote_address))
+    return has_session
 
 
 async def delete_session(device: 'Device', ctx: Any, remote_address: address.ProtocolAddress) -> None:

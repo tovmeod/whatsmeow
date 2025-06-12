@@ -8,11 +8,13 @@ import logging
 from typing import Any, List, TYPE_CHECKING
 
 from . import appstate
+from .appstate import WAPatchName
 from .binary.node import Node
 from .prekeys import upload_prekeys
 from .types import events
 from .types.jid import JID
-from .generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
+from .generated.waE2E import WAWebProtobufsE2E_pb2
+from .types.message import MessageID, MessageServerID
 
 if TYPE_CHECKING:
     from .client import Client
@@ -58,7 +60,7 @@ async def handle_app_state_notification(client: "Client", node: Node) -> None:
     """Handle app state synchronization notifications."""
     for collection in node.get_children_by_tag("collection"):
         ag = collection.attr_getter()
-        name = ag.string("name")
+        name = WAPatchName(ag.string("name"))
         version = ag.uint64("version")
         logger.debug(f"Got server sync notification that app state {name} has updated to version {version}")
 
@@ -308,19 +310,19 @@ def parse_newsletter_messages(client: "Client", node: Node) -> List[Any]:
         ag = child.attr_getter()
         from .types.newsletter import NewsletterMessage
         msg = NewsletterMessage(
-            message_server_id=ag.int("server_id"),
-            message_id=ag.string("id"),
+            message_server_id=MessageServerID(ag.int("server_id")),
+            message_id=MessageID(ag.string("id")),
             type=ag.string("type"),
             timestamp=ag.unix_time("t"),
             views_count=0,
-            reaction_counts=None
+            reaction_counts={}
         )
 
         for subchild in child.get_children():
             if subchild.tag == "plaintext":
                 if isinstance(subchild.content, bytes):
                     try:
-                        msg.message = WAE2E_pb2.Message()
+                        msg.message = WAWebProtobufsE2E_pb2.Message() # type: ignore[attr-defined]
                         msg.message.ParseFromString(subchild.content)
                     except Exception as err:
                         logger.warning(f"Failed to unmarshal newsletter message: {err}")

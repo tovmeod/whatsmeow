@@ -5,25 +5,30 @@ Port of whatsmeow/appstate.go
 """
 import logging
 import time
+from datetime import datetime
 from typing import Any, List, TYPE_CHECKING
 
-from .. import download
+from . import encode
+from .hash import Mutation
+from .keys import WAPatchName
+from .. import download, request, send
 from ..generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from ..binary import node as binary_node
 from ..exceptions import ErrAppStateUpdate
 from ..request import InfoQuery, InfoQueryType
 from ..store.store import ContactEntry
 from ..types import events, JID
+from ..types.events.events import BaseEvent
 
 if TYPE_CHECKING:
-    from pymeow.pymeow.client import Client
+    from ..client import Client
 
 logger = logging.getLogger(__name__)
 
 
 async def fetch_app_state(
     client: "Client",
-    name: str,
+    name: WAPatchName,
     full_sync: bool,
     only_if_not_synced: bool
 ) -> None:
@@ -36,15 +41,8 @@ async def fetch_app_state(
 
     async with client.app_state_sync_lock:
         if full_sync:
-            try:
-                await client.store.app_state.delete_app_state_version(name)
-            except Exception as err:
-                raise Exception(f"failed to reset app state {name} version: {err}")
-
-        try:
-            version, hash_value = await client.store.app_state.get_app_state_version(name)
-        except Exception as err:
-            raise Exception(f"failed to get app state {name} version: {err}")
+            await client.store.app_state.delete_app_state_version(name)
+        version, hash_value = await client.store.app_state.get_app_state_version(name)
 
         if version == 0:
             full_sync = True
@@ -73,7 +71,7 @@ async def fetch_app_state(
             was_full_sync = state.version == 0 and patches.snapshot is not None
             state = new_state
 
-            if name == "critical_unblock_low" and was_full_sync and not client.emit_app_state_events_on_full_sync:
+            if name == WAPatchName.CRITICAL_UNBLOCK_LOW and was_full_sync and not client.emit_app_state_events_on_full_sync:
                 mutations, contacts = filter_contacts(mutations)
                 logger.debug(f"Mass inserting app state snapshot with {len(contacts)} contacts into the store")
                 try:
@@ -98,7 +96,7 @@ def filter_contacts(mutations: List[Any]) -> tuple[List[Any], List[Any]]:
 
     for mutation in mutations:
         if len(mutation.index) > 1 and mutation.index[0] == "contact":
-            jid = JID.parse(mutation.index[1]) if len(mutation.index) > 1 else None
+            jid = JID.parse_jid(mutation.index[1]) if len(mutation.index) > 1 else None
             if jid and mutation.action and hasattr(mutation.action, 'contact_action'):
                 act = mutation.action.contact_action
                 contacts.append(ContactEntry(
@@ -114,7 +112,7 @@ def filter_contacts(mutations: List[Any]) -> tuple[List[Any], List[Any]]:
 
 async def dispatch_app_state(
     client: "Client",
-    mutation: Any,
+    mutation: Mutation,
     full_sync: bool,
     emit_on_full_sync: bool
 ) -> None:
@@ -122,7 +120,7 @@ async def dispatch_app_state(
     dispatch_evts = not full_sync or emit_on_full_sync
 
     # Only handle SET operations
-    if not hasattr(mutation, 'operation') or mutation.operation != 'SET':
+    if mutation.operation != 'SET':
         return
 
     if dispatch_evts:
@@ -131,17 +129,14 @@ async def dispatch_app_state(
             sync_action_value=mutation.action
         ))
 
-    jid = None
     if len(mutation.index) > 1:
-        jid = JID.parse(mutation.index[1])
+        jid = JID.parse_jid(mutation.index[1])
+    else:
+        jid = JID()
 
-    timestamp = time.time()
-    if hasattr(mutation.action, 'timestamp'):
-        timestamp = mutation.action.timestamp / 1000  # Convert from milliseconds
-
+    timestamp = datetime.fromtimestamp(mutation.action.timestamp / 1000)
     store_update_error = None
-    event_to_dispatch = None
-
+    event_to_dispatch: BaseEvent
     index_type = mutation.index[0] if mutation.index else ""
 
     if index_type == "mute":
@@ -238,7 +233,7 @@ async def dispatch_app_state(
 
     elif index_type == "star":
         if len(mutation.index) >= 5:
-            evt = events.Star(
+            event_to_dispatch = events.Star(
                 chat_jid=jid,
                 message_id=mutation.index[2],
                 timestamp=timestamp,
@@ -247,9 +242,7 @@ async def dispatch_app_state(
                 from_full_sync=full_sync
             )
             if mutation.index[4] != "0":
-                evt.sender_jid = JID.parse(mutation.index[4])
-            event_to_dispatch = evt
-
+                event_to_dispatch.sender_jid = JID.parse_jid(mutation.index[4])
     elif index_type == "deleteMessageForMe":
         if len(mutation.index) >= 5:
             evt = events.DeleteForMe(
@@ -311,7 +304,7 @@ async def dispatch_app_state(
 
     elif index_type == "labelAssociationChat":
         if len(mutation.index) >= 3:
-            jid = JID.parse(mutation.index[2])
+            jid = JID.parse_jid(mutation.index[2])
             event_to_dispatch = events.LabelAssociationChat(
                 jid=jid,
                 timestamp=timestamp,
@@ -322,7 +315,7 @@ async def dispatch_app_state(
 
     elif index_type == "labelAssociationMessage":
         if len(mutation.index) >= 6:
-            jid = JID.parse(mutation.index[2])
+            jid = JID.parse_jid(mutation.index[2])
             event_to_dispatch = events.LabelAssociationMessage(
                 jid=jid,
                 timestamp=timestamp,
@@ -358,10 +351,10 @@ async def fetch_app_state_patches(
     if not snapshot:
         attrs["version"] = from_version
 
-    resp = await client.send_iq(InfoQuery(
+    resp = await request.send_iq(client, InfoQuery(
         namespace="w:sync:app:state",
-        type="set",
-        to=client.store.server_jid,
+        type=InfoQueryType.SET,
+        to=JID.server_jid(),
         content=[binary_node.Node(
             tag="sync",
             content=[binary_node.Node(
@@ -421,12 +414,12 @@ async def request_app_state_keys(client: "Client", raw_key_ids: List[bytes]) -> 
 
     logger.info(f"Sending key request for app state keys {debug_key_ids}")
     try:
-        await client.send_message(own_id, msg, SendRequestExtra(peer=True))
+        await send.send_message(client, own_id, msg, SendRequestExtra(peer=True))
     except Exception as err:
         logger.warning(f"Failed to send app state key request: {err}")
 
 
-async def send_app_state(client: "Client", ctx: Any, patch: Any) -> None:
+async def send_app_state(client: "Client", patch: Any) -> None:
     """
     Send the given app state patch, then resyncs that app state type from the server
     to update local caches and send events for the updates.
@@ -435,13 +428,13 @@ async def send_app_state(client: "Client", ctx: Any, patch: Any) -> None:
         raise ValueError("Client is None")
 
     try:
-        version, hash_value = await client.store.app_state.get_app_state_version(ctx, patch.type)
+        version, hash_value = await client.store.app_state.get_app_state_version(patch.type)
     except Exception as err:
         raise err
 
     # TODO: create new key instead of reusing the primary client's keys
     try:
-        latest_key_id = await client.store.app_state_keys.get_latest_app_state_sync_key_id(ctx)
+        latest_key_id = await client.store.app_state_keys.get_latest_app_state_sync_key_id()
     except Exception as err:
         raise Exception(f"failed to get latest app state key ID: {err}")
 
@@ -451,12 +444,12 @@ async def send_app_state(client: "Client", ctx: Any, patch: Any) -> None:
     from .hash import HashState
     state = HashState(version=version, hash=hash_value)
 
-    encoded_patch = await client.app_state_proc.encode_patch(ctx, latest_key_id, state, patch)
+    encoded_patch = await encode.encode_patch(client.app_state_proc, latest_key_id, state, patch)
 
-    resp = await client.send_iq(InfoQuery(
+    resp = await request.send_iq(client, InfoQuery(
         namespace="w:sync:app:state",
         type=InfoQueryType.SET,
-        to=client.store.server_jid,
+        to=JID.server_jid(),
         content=[binary_node.Node(
             tag="sync",
             content=[binary_node.Node(
@@ -480,4 +473,4 @@ async def send_app_state(client: "Client", ctx: Any, patch: Any) -> None:
     if resp_collection_attr.optional_string("type") == "error":
         raise ErrAppStateUpdate(f"App state update failed: {resp_collection.xml_string()}")
 
-    await fetch_app_state(client, ctx, patch.type, False, False)
+    await fetch_app_state(client, patch.type, False, False)

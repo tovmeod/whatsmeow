@@ -8,30 +8,15 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 
+from .events import BaseEvent
+from ...appstate import WAPatchName
 from ...generated.waSyncAction import WASyncAction_pb2
 from ..jid import JID
 from ..message import MessageInfo
 
-# TODO: Verify import when appstate is ported
-# In Go: "go.mau.fi/whatsmeow/appstate"
-
-
-# WAPatchName represents a type of app state patch.
-class WAPatchName(str, Enum):
-    """
-    Types of app state patches.
-
-    Port of WAPatchName in Go.
-    """
-    CRITICAL_BLOCK = "critical_block"  # Contains the user's settings like push name and locale
-    CRITICAL_UNBLOCK_LOW = "critical_unblock_low"  # Contains the user's contact list
-    REGULAR_LOW = "regular_low"  # Contains some local chat settings like pin, archive status
-    REGULAR_HIGH = "regular_high"  # Contains more local chat settings like mute status and starred messages
-    REGULAR = "regular"  # Contains protocol info about app state patches like key expiration
-
 
 @dataclass
-class Contact:
+class Contact(BaseEvent):
     """
     Emitted when an entry in the user's contact list is modified from another device.
 
@@ -71,7 +56,7 @@ class BusinessName:
 
 
 @dataclass
-class Pin:
+class Pin(BaseEvent):
     """
     Emitted when a chat is pinned or unpinned from another device.
 
@@ -85,7 +70,7 @@ class Pin:
 
 
 @dataclass
-class Star:
+class Star(BaseEvent):
     """
     Emitted when a message is starred or unstarred from another device.
 
@@ -102,7 +87,7 @@ class Star:
 
 
 @dataclass
-class DeleteForMe:
+class DeleteForMe(BaseEvent):
     """
     Emitted when a message is deleted (for the current user only) from another device.
 
@@ -119,7 +104,7 @@ class DeleteForMe:
 
 
 @dataclass
-class Mute:
+class Mute(BaseEvent):
     """
     Emitted when a chat is muted or unmuted from another device.
 
@@ -133,7 +118,7 @@ class Mute:
 
 
 @dataclass
-class Archive:
+class Archive(BaseEvent):
     """
     Emitted when a chat is archived or unarchived from another device.
 
@@ -147,7 +132,7 @@ class Archive:
 
 
 @dataclass
-class MarkChatAsRead:
+class MarkChatAsRead(BaseEvent):
     """
     Emitted when a whole chat is marked as read or unread from another device.
 
@@ -161,7 +146,7 @@ class MarkChatAsRead:
 
 
 @dataclass
-class ClearChat:
+class ClearChat(BaseEvent):
     """
     Emitted when a chat is cleared on another device. This is different from DeleteChat.
 
@@ -175,7 +160,7 @@ class ClearChat:
 
 
 @dataclass
-class DeleteChat:
+class DeleteChat(BaseEvent):
     """
     Emitted when a chat is deleted on another device.
 
@@ -189,7 +174,7 @@ class DeleteChat:
 
 
 @dataclass
-class PushNameSetting:
+class PushNameSetting(BaseEvent):
     """
     Emitted when the user's push name is changed from another device.
 
@@ -202,7 +187,7 @@ class PushNameSetting:
 
 
 @dataclass
-class UnarchiveChatsSetting:
+class UnarchiveChatsSetting(BaseEvent):
     """
     Emitted when the user changes the "Keep chats archived" setting from another device.
 
@@ -215,7 +200,7 @@ class UnarchiveChatsSetting:
 
 
 @dataclass
-class UserStatusMute:
+class UserStatusMute(BaseEvent):
     """
     Emitted when the user mutes or unmutes another user's status updates.
 
@@ -229,7 +214,7 @@ class UserStatusMute:
 
 
 @dataclass
-class LabelEdit:
+class LabelEdit(BaseEvent):
     """
     Emitted when a label is edited from any device.
 
@@ -243,7 +228,7 @@ class LabelEdit:
 
 
 @dataclass
-class LabelAssociationChat:
+class LabelAssociationChat(BaseEvent):
     """
     Emitted when a chat is labeled or unlabeled from any device.
 
@@ -258,7 +243,7 @@ class LabelAssociationChat:
 
 
 @dataclass
-class LabelAssociationMessage:
+class LabelAssociationMessage(BaseEvent):
     """
     Emitted when a message is labeled or unlabeled from any device.
 
@@ -274,7 +259,7 @@ class LabelAssociationMessage:
 
 
 @dataclass
-class AppState:
+class AppState(BaseEvent):
     """
     Emitted directly for new data received from app state syncing.
     You should generally use the higher-level events like events.Contact and events.Mute.
@@ -286,7 +271,7 @@ class AppState:
 
 
 @dataclass
-class AppStateSyncComplete:
+class AppStateSyncComplete(BaseEvent):
     """
     Emitted when app state is resynced.
 

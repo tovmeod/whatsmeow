@@ -406,92 +406,85 @@ def build_star(target: jid.JID, sender: jid.JID, message_id: str, from_me: bool,
     )
 
 
-class Encoder(Processor):
-    """Encoder for app state patches."""
+async def encode_patch(processor: Processor, key_id: bytes, state: HashState, patch_info: PatchInfo) -> bytes:
+    """
+    Encode a patch for sending to the WhatsApp server.
 
-    async def encode_patch(self, ctx: any, key_id: bytes, state: HashState, patch_info: PatchInfo) -> bytes:
-        """
-        Encode a patch for sending to the WhatsApp server.
+    Args:
+        processor:
+        key_id: The key ID to use for encryption
+        state: The current hash state
+        patch_info: The patch information
 
-        Args:
-            ctx: Context for the operation
-            key_id: The key ID to use for encryption
-            state: The current hash state
-            patch_info: The patch information
+    Returns:
+        The encoded patch
 
-        Returns:
-            The encoded patch
+    Raises:
+        ValueError: If encoding fails
+    """
+    keys = await processor.get_app_state_key(key_id)
 
-        Raises:
-            ValueError: If encoding fails
-        """
-        keys, err = await self.get_app_state_key(key_id)
-        if err:
-            raise ValueError(f"Failed to get app state key details with key ID {key_id.hex().upper()}: {err}")
+    if patch_info.timestamp is None:
+        patch_info.timestamp = time.time()
 
-        if patch_info.timestamp is None:
-            patch_info.timestamp = time.time()
+    mutations = []
+    for mutation_info in patch_info.mutations:
+        mutation_info.value.timestamp = int(patch_info.timestamp * 1000)
 
-        mutations = []
-        for mutation_info in patch_info.mutations:
-            mutation_info.value.timestamp = int(patch_info.timestamp * 1000)
+        index_bytes = json.dumps(mutation_info.index).encode('utf-8')
 
-            index_bytes = json.dumps(mutation_info.index).encode('utf-8')
-
-            pb_obj = WASyncAction_pb2.SyncActionData(
-                index=index_bytes,
-                value=mutation_info.value,
-                padding=b'',
-                version=mutation_info.version
-            )
-
-            content = pb_obj.SerializeToString()
-
-            # Generate a random IV (16 bytes)
-            iv = bytes([x & 0xFF for x in range(16)])
-            encrypted_content = encrypt_cbc(keys.value_encryption, iv, content)
-            encrypted_content = iv + encrypted_content
-
-            value_mac = generate_content_mac(
-                WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
-                encrypted_content,
-                key_id,
-                keys.value_mac
-            )
-
-            index_mac = concat_and_hmac(hashlib.sha256, keys.index, [index_bytes])
-
-            mutations.append(WAServerSync_pb2.SyncdMutation(
-                operation=WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
-                record=WAServerSync_pb2.SyncdRecord(
-                    index=WAServerSync_pb2.SyncdIndex(blob=index_mac),
-                    value=WAServerSync_pb2.SyncdValue(blob=encrypted_content + value_mac),
-                    key_id=WAServerSync_pb2.KeyId(id=key_id)
-                )
-            ))
-
-        async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> tuple[Optional[bytes], Optional[Exception]]:
-            try:
-                return await self.store.app_state.get_app_state_mutation_mac(str(patch_info.type), index_mac), None
-            except Exception as e:
-                return None, e
-
-        warnings, err = state.update_hash(mutations, get_prev_set_value_mac)
-        if warnings:
-            logger.warning(f"Warnings while updating hash for {patch_info.type} (sending new app state): {warnings}")
-        if err:
-            raise ValueError(f"Failed to update state hash: {err}")
-
-        state.version += 1
-
-        syncd_patch = WAServerSync_pb2.SyncdPatch(
-            snapshot_mac=state.generate_snapshot_mac(patch_info.type, keys.snapshot_mac),
-            key_id=WAServerSync_pb2.KeyId(id=key_id),
-            mutations=mutations
+        pb_obj = WASyncAction_pb2.SyncActionData(
+            index=index_bytes,
+            value=mutation_info.value,
+            padding=b'',
+            version=mutation_info.version
         )
 
-        syncd_patch.patch_mac = generate_patch_mac(syncd_patch, patch_info.type, keys.patch_mac, state.version)
+        content = pb_obj.SerializeToString()
 
-        result = syncd_patch.SerializeToString()
+        # Generate a random IV (16 bytes)
+        iv = bytes([x & 0xFF for x in range(16)])
+        encrypted_content = encrypt_cbc(keys.value_encryption, iv, content)
+        encrypted_content = iv + encrypted_content
 
-        return result
+        value_mac = generate_content_mac(
+            WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
+            encrypted_content,
+            key_id,
+            keys.value_mac
+        )
+
+        index_mac = concat_and_hmac(hashlib.sha256, keys.index, [index_bytes])
+
+        mutations.append(WAServerSync_pb2.SyncdMutation(
+            operation=WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
+            record=WAServerSync_pb2.SyncdRecord(
+                index=WAServerSync_pb2.SyncdIndex(blob=index_mac),
+                value=WAServerSync_pb2.SyncdValue(blob=encrypted_content + value_mac),
+                key_id=WAServerSync_pb2.KeyId(id=key_id)
+            )
+        ))
+
+    async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> Optional[bytes]:
+        return await processor.store.app_state.get_app_state_mutation_mac(str(patch_info.type), index_mac)
+
+
+    warnings, err = state.update_hash(mutations, get_prev_set_value_mac)
+    if warnings:
+        logger.warning(f"Warnings while updating hash for {patch_info.type} (sending new app state): {warnings}")
+    if err:
+        raise ValueError(f"Failed to update state hash: {err}")
+
+    state.version += 1
+
+    syncd_patch = WAServerSync_pb2.SyncdPatch(
+        snapshot_mac=state.generate_snapshot_mac(patch_info.type, keys.snapshot_mac),
+        key_id=WAServerSync_pb2.KeyId(id=key_id),
+        mutations=mutations
+    )
+
+    syncd_patch.patch_mac = generate_patch_mac(syncd_patch, patch_info.type, keys.patch_mac, state.version)
+
+    result = syncd_patch.SerializeToString()
+
+    return result

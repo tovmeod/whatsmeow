@@ -5,8 +5,9 @@ Port of whatsmeow/call.go
 """
 
 import logging
+from typing import TYPE_CHECKING
 
-from . import receipt
+from . import receipt, send
 from .binary.node import Node, Attrs
 from .types.jid import JID
 from .types.call import BasicCallMeta, CallRemoteMeta
@@ -17,10 +18,13 @@ from .types.events.call import (
 )
 from .exceptions import ErrNotLoggedIn
 
+if TYPE_CHECKING:
+    from .client import Client
+
 logger = logging.getLogger(__name__)
 
 
-async def handle_call_event(client, node: Node) -> None:
+async def handle_call_event(client: 'Client', node: Node) -> None:
     """
     Handle a call event node from the WhatsApp server.
 
@@ -113,7 +117,7 @@ async def handle_call_event(client, node: Node) -> None:
         client.create_task(receipt.send_ack(client, node))
 
 
-async def reject_call(client, call_from: JID, call_id: str) -> None:
+async def reject_call(client: 'Client', call_from: JID, call_id: str) -> None:
     """
     Reject an incoming call.
 
@@ -134,14 +138,14 @@ async def reject_call(client, call_from: JID, call_id: str) -> None:
 
     await client.send_node(Node(
         tag="call",
-        attributes=Attrs({
-            "id": client.generate_message_id(),
+        attrs=Attrs({
+            "id": send.generate_message_id(client),
             "from": own_id,
             "to": call_from
         }),
         content=[Node(
             tag="reject",
-            attributes=Attrs({
+            attrs=Attrs({
                 "call-id": call_id,
                 "call-creator": call_from,
                 "count": "0"

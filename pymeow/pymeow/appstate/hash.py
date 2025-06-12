@@ -7,21 +7,18 @@ import hmac
 import hashlib
 import struct
 from dataclasses import dataclass
-from typing import List, Callable, Tuple, Optional
+from typing import List, Callable, Optional, Awaitable, Sequence
 
+from . import WAPatchName
 from .lthash import WAPatchIntegrity
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
 from .errors import ErrMissingPreviousSetValueOperation
 
-# Type alias for WAPatchName
-WAPatchName = str
-
-
 @dataclass
 class Mutation:
     """Represents a mutation in the app state."""
-    operation: WAServerSync_pb2.SyncdMutation.SyncdOperation
+    operation: WAServerSync_pb2.SyncdMutation.SyncdOperation.ValueType
     action: WASyncAction_pb2.SyncActionValue
     index: List[str]
     index_mac: bytes
@@ -34,8 +31,8 @@ class HashState:
     version: int
     hash: bytes  # 128 bytes
 
-    def update_hash(self, mutations: List[WAServerSync_pb2.SyncdMutation],
-                   get_prev_set_value_mac: Callable[[bytes, int], Tuple[Optional[bytes], Optional[Exception]]]) -> Tuple[List[Exception], Optional[Exception]]:
+    async def update_hash(self, mutations: Sequence[WAServerSync_pb2.SyncdMutation],
+                   get_prev_set_value_mac: Callable[[bytes, int], Awaitable[Optional[bytes]]]) -> List[Exception]:
         """
         Update the hash state with the given mutations.
 
@@ -45,6 +42,8 @@ class HashState:
 
         Returns:
             A tuple containing (warnings, error)
+        Raises:
+            Exception
         """
         added = []
         removed = []
@@ -56,11 +55,9 @@ class HashState:
                 added.append(value[-32:])
 
             index_mac = mutation.record.index.blob
-            removal, err = get_prev_set_value_mac(index_mac, i)
+            removal = await get_prev_set_value_mac(index_mac, i)
 
-            if err:
-                return warnings, Exception(f"failed to get value MAC of previous SET operation: {err}")
-            elif removal:
+            if removal:
                 removed.append(removal)
             elif mutation.operation == WAServerSync_pb2.SyncdMutation.SyncdOperation.REMOVE:
                 # TODO figure out if there are certain cases that are safe to ignore and others that aren't
@@ -70,7 +67,7 @@ class HashState:
                 # return ErrMissingPreviousSetValueOperation
 
         WAPatchIntegrity.subtract_then_add_in_place(self.hash, removed, added)
-        return warnings, None
+        return warnings
 
     def generate_snapshot_mac(self, name: WAPatchName, key: bytes) -> bytes:
         """
@@ -146,7 +143,7 @@ def generate_patch_mac(patch: WAServerSync_pb2.SyncdPatch, name: WAPatchName, ke
     return concat_and_hmac(hashlib.sha256, key, data_to_hash)
 
 
-def generate_content_mac(operation: WAServerSync_pb2.SyncdMutation.SyncdOperation, data: bytes, key_id: bytes, key: bytes) -> bytes:
+def generate_content_mac(operation: WAServerSync_pb2.SyncdMutation.SyncdOperation.ValueType, data: bytes, key_id: bytes, key: bytes) -> bytes:
     """
     Generate a content MAC.
 

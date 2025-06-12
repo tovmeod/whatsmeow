@@ -6,6 +6,7 @@ Port of whatsmeow/appstate/keys.go
 import base64
 import asyncio
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Any
 
 from ..store.store import Device
@@ -13,23 +14,17 @@ from ..util.hkdfutil import expand_hmac
 import logging
 
 # WAPatchName represents a type of app state patch.
-class WAPatchName(str):
-    """Types of app state patches."""
+class WAPatchName(str, Enum):
+    """
+    Types of app state patches.
 
-    # WAPatchCriticalBlock contains the user's settings like push name and locale.
-    CRITICAL_BLOCK = "critical_block"
-
-    # WAPatchCriticalUnblockLow contains the user's contact list.
-    CRITICAL_UNBLOCK_LOW = "critical_unblock_low"
-
-    # WAPatchRegularLow contains some local chat settings like pin, archive status, and the setting of whether to unarchive chats when messages come in.
-    REGULAR_LOW = "regular_low"
-
-    # WAPatchRegularHigh contains more local chat settings like mute status and starred messages.
-    REGULAR_HIGH = "regular_high"
-
-    # WAPatchRegular contains protocol info about app state patches like key expiration.
-    REGULAR = "regular"
+    Port of WAPatchName in Go.
+    """
+    CRITICAL_BLOCK = "critical_block"  # Contains the user's settings like push name and locale
+    CRITICAL_UNBLOCK_LOW = "critical_unblock_low"  # Contains the user's contact list
+    REGULAR_LOW = "regular_low"  # Contains some local chat settings like pin, archive status
+    REGULAR_HIGH = "regular_high"  # Contains more local chat settings like mute status and starred messages
+    REGULAR = "regular"  # Contains protocol info about app state patches like key expiration
 
 # AllPatchNames contains all currently known patch state names.
 ALL_PATCH_NAMES = [
@@ -78,7 +73,6 @@ class Processor:
 
         Args:
             store: The device to use for retrieving keys
-            log: Logger for debug messages
         """
         self.key_cache: Dict[str, ExpandedAppStateKeys] = {}
         self.key_cache_lock = asyncio.Lock()
@@ -104,7 +98,7 @@ class Processor:
             patch_mac=app_state_key_expanded[128:160]
         )
 
-    async def get_app_state_key(self, key_id: bytes) -> tuple[ExpandedAppStateKeys, Optional[Exception]]:
+    async def get_app_state_key(self, key_id: bytes) -> ExpandedAppStateKeys:
         """
         Get the expanded app state keys for the given key ID.
 
@@ -112,25 +106,24 @@ class Processor:
             key_id: The key ID to look up
 
         Returns:
-            A tuple of (expanded keys, error)
+            expanded keys
+        Raises:
+            ErrKeyNotFound
         """
         key_cache_id = base64.b64encode(key_id).decode('ascii')
 
         async with self.key_cache_lock:
             keys = self.key_cache.get(key_cache_id)
             if keys is None:
-                try:
-                    key_data = await self.store.get_app_state_sync_key(key_id)
-                    if key_data is not None:
-                        keys = self.expand_app_state_keys(key_data.data)
-                        self.key_cache[key_cache_id] = keys
-                        return keys, None
-                    else:
-                        from .errors import ErrKeyNotFound
-                        return None, ErrKeyNotFound()
-                except Exception as err:
-                    return None, err
-            return keys, None
+                key_data = await self.store.app_state_keys.get_app_state_sync_key(key_id)
+                if key_data is not None:
+                    keys = self.expand_app_state_keys(key_data.data)
+                    self.key_cache[key_cache_id] = keys
+                    return keys
+                else:
+                    from .errors import ErrKeyNotFound
+                    raise ErrKeyNotFound()
+            return keys
 
     async def get_missing_key_ids(self, patch_list: Any) -> List[bytes]:
         """
@@ -154,7 +147,7 @@ class Processor:
                 return
 
             try:
-                key_data = await self.store.get_app_state_sync_key(key_id)
+                key_data = await self.store.app_state_keys.get_app_state_sync_key(key_id)
                 missing = key_data is None
                 cache[string_key_id] = missing
                 if missing:

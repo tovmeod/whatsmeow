@@ -11,7 +11,7 @@ Port of util/cbcutil/cbc.go
 """
 import os
 import hmac
-from typing import Optional, Tuple, Protocol, BinaryIO
+from typing import Optional, Tuple, Protocol, BinaryIO, IO
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from Crypto.Random import get_random_bytes
@@ -142,8 +142,8 @@ def encrypt_stream(
     key: bytes,
     iv: bytes,
     mac_key: bytes,
-    plaintext: BinaryIO,
-    ciphertext: BinaryIO
+    plaintext: IO[bytes],
+    ciphertext: IO[bytes]
 ) -> Tuple[bytes, bytes, int, int]:
     """
     Encrypt a stream with key, IV, and MAC key.

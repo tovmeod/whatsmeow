@@ -13,8 +13,14 @@ import struct
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import IntEnum
 from typing import Any, Optional, TYPE_CHECKING, List, Tuple
 from warnings import deprecated
+
+from signal_protocol import session, session_cipher, protocol
+from signal_protocol.state import PreKeyBundle
+from signal_protocol.protocol import CiphertextMessage
+from signal_protocol.error import SignalProtocolException
 
 from . import prekeys
 from .broadcast import get_broadcast_list_participants
@@ -28,7 +34,6 @@ from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from .generated.waCommon import WACommon_pb2
 from .prekeys import fetch_pre_keys
 from .request import wait_response, cancel_response, retry_frame, is_disconnect_node, InfoQueryType
-from .store.signal import contains_session
 from .types import events
 from .types.jid import JID, DEFAULT_USER_SERVER, GROUP_SERVER, BROADCAST_SERVER, HIDDEN_USER_SERVER, BOT_SERVER, \
     NEWSLETTER_SERVER, MESSENGER_SERVER
@@ -39,6 +44,14 @@ if TYPE_CHECKING:
     from .client import Client
 
 logger = logging.getLogger(__name__)
+
+class SignalMessageType(IntEnum):
+    """Signal Protocol message type constants."""
+    WHISPER_TYPE = 2  # Regular encrypted message (SignalMessage)
+    PREKEY_TYPE = 3   # Initial message with prekey bundle (PreKeySignalMessage)
+    SENDERKEY_TYPE = 4  # Group message (SenderKeyMessage)
+    SENDERKEY_DISTRIBUTION_TYPE = 5  # Group key distribution (SenderKeyDistributionMessage)
+
 
 # Constants
 WEB_MESSAGE_ID_PREFIX = "3EB0"
@@ -77,7 +90,7 @@ class SendResponse:
     debug_timings: MessageDebugTimings = None
     sender: JID = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.debug_timings is None:
             self.debug_timings = MessageDebugTimings()
         if self.sender is None:
@@ -97,7 +110,7 @@ class SendRequestExtra:
     media_handle: str = ""
     meta: Optional[MsgMetaInfo] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.inline_bot_jid is None:
             self.inline_bot_jid = JID()
 
@@ -211,7 +224,7 @@ async def send_message(
     to: JID,
     message: waE2E_pb2.Message,
     *extra: SendRequestExtra
-) -> Tuple[Optional[SendResponse], Optional[Exception]]:
+) -> SendResponse:
     """
     Port of Go method SendMessage from client.go.
 
@@ -241,13 +254,19 @@ async def send_message(
     send the same kind of message.
 
     Args:
-        ctx: Context for the operation
+        client:
         to: Target JID to send message to
         message: Message protobuf to send
         extra: Optional SendRequestExtra parameters
 
     Returns:
-        Tuple containing (SendResponse, error) - matches Go's multiple return pattern
+        SendResponse
+    Raises:
+        Exception
+        ErrRecipientADJID
+        ErrNotLoggedIn
+        ErrInvalidInlineBotID
+        ErrMessageTimedOut
     """
     # TODO: Review ErrClientIsNil implementation
     # TODO: Review SendRequestExtra implementation
@@ -286,16 +305,16 @@ async def send_message(
 
     req = SendRequestExtra()
     if len(extra) > 1:
-        return None, Exception("only one extra parameter may be provided to SendMessage")
+        raise Exception("only one extra parameter may be provided to SendMessage")
     elif len(extra) == 1:
         req = extra[0]
 
     if to.device > 0 and not req.peer:
-        return None, ErrRecipientADJID
+        raise ErrRecipientADJID
 
     own_id = client.get_own_id()
     if own_id.is_empty():
-        return None, ErrNotLoggedIn
+        raise ErrNotLoggedIn
 
     if req.timeout == timedelta():
         req.timeout = DEFAULT_REQUEST_TIMEOUT
@@ -315,7 +334,7 @@ async def send_message(
 
     if not req.inline_bot_jid.is_empty():
         if not req.inline_bot_jid.is_bot():
-            return None, ErrInvalidInlineBotID
+            raise ErrInvalidInlineBotID
         is_inline_bot_mode = True
 
     is_bot_mode = is_inline_bot_mode or to.is_bot()
@@ -356,9 +375,7 @@ async def send_message(
                 ),
             )
 
-            message_plaintext, _, marshal_err = marshal_message(req.inline_bot_jid, bot_message)
-            if marshal_err is not None:
-                return None, marshal_err
+            message_plaintext, _ = marshal_message(req.inline_bot_jid, bot_message)
 
             participant_nodes, _ = await encrypt_message_for_devices(client, [req.inline_bot_jid], resp.id,
                                                                      message_plaintext, None, Attrs())
@@ -371,9 +388,7 @@ async def send_message(
     if to.server == GROUP_SERVER or to.server == BROADCAST_SERVER:
         start = time.time()
         if to.server == GROUP_SERVER:
-            cached_data, err = await get_cached_group_data(client, to)
-            if err is not None:
-                return None, Exception(f"failed to get group members: {err}")
+            cached_data = await get_cached_group_data(client, to)
             group_participants = cached_data.members
             # TODO this is fairly hacky, is there a proper way to determine which identity the message is sent with?
             if cached_data.addressing_mode == AddressingMode.LID:
@@ -387,9 +402,7 @@ async def send_message(
                 # Why is this set to PN?
                 extra_params.addressing_mode = AddressingMode.PN
         else:
-            group_participants, err = await get_broadcast_list_participants(client, to)
-            if err is not None:
-                return None, Exception(f"failed to get broadcast list members: {err}")
+            group_participants = await get_broadcast_list_participants(client, to)
         resp.debug_timings.get_participants = timedelta(seconds=time.time() - start)
     elif to.server == HIDDEN_USER_SERVER:
         own_id = client.get_own_lid()
@@ -419,7 +432,7 @@ async def send_message(
         resp_chan = wait_response(client, req.id)
         # Peer message retries aren't implemented yet
         if not req.peer:
-            retry.add_recent_message(client, to, req.id, message, None)
+            await retry.add_recent_message(client, to, req.id, message, None)
 
         if message.message_context_info is not None and message.message_context_info.message_secret is not None:
             err = await client.store.msg_secrets.put_message_secret(to, own_id, req.id,
@@ -442,13 +455,10 @@ async def send_message(
         elif to.server == NEWSLETTER_SERVER:
             data, err = await send_newsletter(client, to, req.id, message, req.media_handle, resp.debug_timings)
         else:
-            err = Exception(f"{ErrUnknownServer} {to.server}")
+            await cancel_response(client, req.id, resp_chan)
+            raise Exception(f"{ErrUnknownServer} {to.server}")
 
         start = time.time()
-        if err is not None:
-            await cancel_response(client, req.id, resp_chan)
-            return None, err
-
         resp_node = None
         timeout_chan = None
         if req.timeout > timedelta():
@@ -466,21 +476,19 @@ async def send_message(
 
             if timeout_chan in done:
                 await cancel_response(client, req.id, resp_chan)
-                return None, ErrMessageTimedOut
+                raise ErrMessageTimedOut
             else:
                 resp_node = await resp_chan
         except asyncio.CancelledError as e:
             await cancel_response(client, req.id, resp_chan)
-            return None, e
+            raise
 
         resp.debug_timings.resp = timedelta(seconds=time.time() - start)
 
         if is_disconnect_node(resp_node):
             start = time.time()
-            resp_node, err = await retry_frame(client, "message send", req.id, data, resp_node, 0)
+            resp_node = await retry_frame(client, "message send", req.id, data, resp_node, 0)
             resp.debug_timings.retry = timedelta(seconds=time.time() - start)
-            if err is not None:
-                return None, err
 
         ag = resp_node.attr_getter()
         resp.server_id = MessageServerID(ag.optional_int("server_id"))
@@ -499,7 +507,7 @@ async def send_message(
                 if to in client.group_cache:
                     del client.group_cache[to]
 
-    return resp, err
+    return resp
 
 
 @deprecated("This method is deprecated in favor of build_revoke")
@@ -513,7 +521,7 @@ async def revoke_message(client: "Client", chat: JID, id: MessageID) -> SendResp
     Deprecated: This method is deprecated in favor of build_revoke
     """
     revoke_msg = build_revoke(client, chat, JID(), id)
-    send_response, error = await send_message(client, None, chat, revoke_msg)
+    send_response = await send_message(client, chat, revoke_msg)
     return send_response
 
 
@@ -544,7 +552,7 @@ def build_message_key(
     # TODO: Review types.DefaultUserServer, HiddenUserServer, MessengerServer constants
 
     key = WACommon_pb2.MessageKey()
-    key.from_me = True
+    key.fromMe = True
     key.id = str(id)
     key.remote_jid = str(chat)
 
@@ -663,10 +671,10 @@ def build_unavailable_message_request(
     # TODO: Review SendRequestExtra implementation
 
     message = waE2E_pb2.Message()
-    message.protocol_message.type = waE2E_pb2.ProtocolMessage.PEER_DATA_OPERATION_REQUEST_MESSAGE
+    message.protocolMessage.type = waE2E_pb2.ProtocolMessage.PEER_DATA_OPERATION_REQUEST_MESSAGE
 
     # Create the peer data operation request message
-    peer_request = message.protocol_message.peer_data_operation_request_message
+    peer_request = message.protocolMessage.peer_data_operation_request_message
     peer_request.peer_data_operation_request_type = waE2E_pb2.PeerDataOperationRequestType.PLACEHOLDER_MESSAGE_RESEND
 
     # Create placeholder message resend request
@@ -803,11 +811,11 @@ def parse_disappearing_timer_string(val: str) -> Tuple[timedelta, bool]:
         return timedelta(), False
 
 
-def set_disappearing_timer(
+async def set_disappearing_timer(
     client: 'Client',
     chat: JID,
     timer: timedelta
-) -> Optional[Exception]:
+) -> None:
     """
     Port of Go method SetDisappearingTimer from client.go.
 
@@ -824,8 +832,9 @@ def set_disappearing_timer(
         chat: JID of the chat to set disappearing timer in
         timer: Duration for disappearing messages (use timedelta(0) to disable)
 
-    Returns:
-        Optional[Exception]: None if successful, Exception if error occurred
+    Returns: None
+    Raises:
+        Exception:
     """
     # TODO: Review send_message implementation
     # TODO: Review send_group_iq implementation
@@ -836,36 +845,23 @@ def set_disappearing_timer(
     # TODO: Review types.DEFAULT_USER_SERVER implementation
     # TODO: Review types.GROUP_SERVER implementation
 
-    try:
-        if chat.server == DEFAULT_USER_SERVER:
-            message = waE2E_pb2.Message()
-            message.protocol_message.type = waE2E_pb2.ProtocolMessage.EPHEMERAL_SETTING
-            message.protocol_message.ephemeral_expiration = int(timer.total_seconds())
-
-            _, err = send_message(client, chat, message)
-            return err
-
-        elif chat.server == GROUP_SERVER:
-            if timer == timedelta(0):
-                node = Node(tag="not_ephemeral")
-                _, err = send_group_iq(client, InfoQueryType.SET, chat, node)
-            else:
-                node = Node(
-                    tag="ephemeral",
-                    attrs=Attrs(expiration=str(int(timer.total_seconds())))
-                )
-                _, err = send_group_iq(client, None, InfoQueryType.SET, chat, node)  # context.TODO() -> None
-
-                # TODO: Review error comparison and wrapping
-                if err is not None:  # Simplified error handling - needs proper error type checking
-                    pass  # Add proper error wrapping when error types are implemented
-
-            return err
+    if chat.server == DEFAULT_USER_SERVER:
+        message = waE2E_pb2.Message()
+        message.protocol_message.type = waE2E_pb2.ProtocolMessage.EPHEMERAL_SETTING
+        message.protocol_message.ephemeral_expiration = int(timer.total_seconds())
+        _ = await send_message(client, chat, message)
+    elif chat.server == GROUP_SERVER:
+        if timer == timedelta(0):
+            node = Node(tag="not_ephemeral")
+            _ = await send_group_iq(client, InfoQueryType.SET, chat, node)
         else:
-            return Exception(f"can't set disappearing time in a {chat.server} chat")
-    except Exception as e:
-        return e
-
+            node = Node(
+                tag="ephemeral",
+                attrs=Attrs(expiration=str(int(timer.total_seconds())))
+            )
+            _ = await send_group_iq(client, InfoQueryType.SET, chat, node)
+    else:
+        raise Exception(f"can't set disappearing time in a {chat.server} chat")
 
 def participant_list_hash_v2(participants: List[JID]) -> str:
     """
@@ -903,14 +899,14 @@ def participant_list_hash_v2(participants: List[JID]) -> str:
     return f"2:{encoded_hash}"
 
 
-def send_newsletter(
+async def send_newsletter(
     client: 'Client',
     to: JID,
     id: MessageID,
     message: Optional[waE2E_pb2.Message],
     media_id: str,
     timings: MessageDebugTimings
-) -> Tuple[Optional[bytes], Optional[Exception]]:
+) -> Optional[bytes]:
     """
     Port of Go method sendNewsletter from client.go.
 
@@ -925,7 +921,9 @@ def send_newsletter(
         timings: Debug timing information
 
     Returns:
-        Tuple containing (response_data, error)
+        response_data
+    Raises:
+
     """
     # TODO: Review get_type_from_message implementation
     # TODO: Review types.EditAttributeAdminEdit implementation
@@ -933,61 +931,48 @@ def send_newsletter(
     # TODO: Review marshal_message implementation
     # TODO: Review get_media_type_from_message implementation
     # TODO: Review send_node_and_get_data implementation
+    attrs = Attrs({
+        "to": str(to),
+        "id": str(id),
+        "type": get_type_from_message(message),
+    })
 
-    try:
-        attrs = Attrs({
-            "to": str(to),
-            "id": str(id),
-            "type": get_type_from_message(message),
-        })
+    if media_id != "":
+        attrs["media_id"] = media_id
 
-        if media_id != "":
-            attrs["media_id"] = media_id
+    if message and message.edited_message is not None:
+        attrs["edit"] = str(EditAttribute.ADMIN_EDIT)
+        message = message.edited_message.message.protocol_message.edited_message
+    elif (message and message.protocol_message is not None and
+          message.protocol_message.type == waE2E_pb2.ProtocolMessage.REVOKE):
+        attrs["edit"] = str(EditAttribute.ADMIN_REVOKE)
+        message = None
 
-        if message and message.edited_message is not None:
-            attrs["edit"] = str(EditAttribute.ADMIN_EDIT)
-            message = message.edited_message.message.protocol_message.edited_message
-        elif (message and message.protocol_message is not None and
-              message.protocol_message.type == waE2E_pb2.ProtocolMessage.REVOKE):
-            attrs["edit"] = str(EditAttribute.ADMIN_REVOKE)
-            message = None
+    start = time.time()
+    plaintext, _ = marshal_message(to, message)
+    timings.marshal = time.time() - start
 
-        start = time.time()
-        plaintext, _, err = marshal_message(to, message)
-        timings.marshal = time.time() - start
+    plaintext_node = Node(
+        tag="plaintext",
+        content=plaintext,
+        attrs=Attrs({})
+    )
 
-        if err is not None:
-            return None, err
+    if message is not None:
+        media_type = get_media_type_from_message(message)
+        if media_type != "":
+            plaintext_node.attrs["mediatype"] = media_type
 
-        plaintext_node = Node(
-            tag="plaintext",
-            content=plaintext,
-            attrs=Attrs({})
-        )
+    node = Node(
+        tag="message",
+        attrs=attrs,
+        content=[plaintext_node]
+    )
 
-        if message is not None:
-            media_type = get_media_type_from_message(message)
-            if media_type != "":
-                plaintext_node.attrs["mediatype"] = media_type
-
-        node = Node(
-            tag="message",
-            attrs=attrs,
-            content=[plaintext_node]
-        )
-
-        start = time.time()
-        data, err = client.send_node_and_get_data(node)
-        timings.send = time.time() - start
-
-        if err is not None:
-            return None, Exception(f"failed to send message node: {err}")
-
-        return data, None
-
-    except Exception as e:
-        return None, e
-
+    start = time.time()
+    data = await client.send_node_and_get_data(node)
+    timings.send = time.time() - start
+    return data
 
 async def send_group(
     client: "Client",
@@ -997,7 +982,7 @@ async def send_group(
     message: waE2E_pb2.Message,
     timings: MessageDebugTimings,
     extra_params: NodeExtraParams
-) -> Tuple[str, Optional[bytes], Optional[Exception]]:
+) -> Tuple[str, Optional[bytes]]:
     """
     Port of Go method sendGroup from client.go.
 
@@ -1012,7 +997,9 @@ async def send_group(
         extra_params: Extra parameters for node construction
 
     Returns:
-        Tuple containing (participant_hash, message_data, error)
+        Tuple containing (participant_hash, message_data)
+    Raises:
+
     """
     # TODO: Review marshalMessage implementation
     # TODO: Review groups.NewGroupSessionBuilder implementation
@@ -1027,45 +1014,40 @@ async def send_group(
     # TODO: Review waBinary.Attrs implementation
 
     start = time.time()
-    plaintext, _, err = marshal_message(to, message)
+    plaintext, _ = marshal_message(to, message)
     timings.marshal = time.time() - start
-    if err is not None:
-        return "", None, err
-
     start = time.time()
 
-    from signal_protocol import GroupSessionBuilder, GroupCipher, SenderKeyName
-
-    builder = GroupSessionBuilder(client.store, pb_serializer)
-    sender_key_name = SenderKeyName(str(to), client.get_own_lid().signal_address())
-    try:
-        signal_skd_message = await builder.create(sender_key_name)
-    except Exception as err:
-        return "", None, Exception(f"failed to create sender key distribution message to send {id} to {to}: {err}")
+    from signal_protocol.sender_keys import SenderKeyName
+    from signal_protocol.group_cipher import (
+        create_sender_key_distribution_message,
+        group_encrypt
+    )
+    from signal_protocol.address import ProtocolAddress
+    sender_address = client.get_own_lid().signal_address()
+    sender_key_name = SenderKeyName(str(to), sender_address)
+    signal_skd_message = create_sender_key_distribution_message(
+        sender_key_name,
+        client.signal_store
+    )
 
     skd_message = waE2E_pb2.Message()
     skd_message.sender_key_distribution_message.group_id = str(to)
     skd_message.sender_key_distribution_message.axolotl_sender_key_distribution_message = signal_skd_message.serialize()
 
-    try:
-        skd_plaintext = skd_message.SerializeToString()
-    except Exception as err:
-        return "", None, Exception(f"failed to marshal sender key distribution message to send {id} to {to}: {err}")
+    skd_plaintext = skd_message.SerializeToString()
 
-    cipher = GroupCipher(builder, sender_key_name, client.store)
-    try:
-        encrypted = await cipher.encrypt(pad_message(plaintext))
-    except Exception as err:
-        return "", None, Exception(f"failed to encrypt group message to send {id} to {to}: {err}")
+    ciphertext = group_encrypt(
+        client.signal_store,
+        sender_key_name,
+        pad_message(plaintext)
+    )
 
-    ciphertext = encrypted.signed_serialize()
     timings.group_encrypt = time.time() - start
 
-    node, all_devices, err = await prepare_message_node(
-        to, id, message, participants, skd_plaintext, None, timings, extra_params,
+    node, all_devices = await prepare_message_node(
+        client, to, id, message, participants, skd_plaintext, None, timings, extra_params,
     )
-    if err is not None:
-        return "", None, err
 
     phash = participant_list_hash_v2(all_devices)
     node.attrs["phash"] = phash
@@ -1075,17 +1057,14 @@ async def send_group(
         attrs=Attrs({"v": "2", "type": "skmsg"}),
     )
     media_type = get_media_type_from_message(message)
-    if media_type != "":
+    if media_type:
         sk_msg.attrs["mediatype"] = media_type
     node.content = node.get_children() + [sk_msg]
 
     start = time.time()
-    data, err = await client.send_node_and_get_data(node)
+    data = await client.send_node_and_get_data(node)
     timings.send = time.time() - start
-    if err is not None:
-        return "", None, Exception(f"failed to send message node: {err}")
-
-    return phash, data, None
+    return phash, data
 
 async def send_peer_message(
     client: "Client",
@@ -1178,7 +1157,7 @@ async def send_dm(
     message: Optional[waE2E_pb2.Message],
     timings: MessageDebugTimings,
     extra_params: NodeExtraParams
-) -> Tuple[Optional[bytes], Optional[Exception]]:
+) -> Optional[bytes]:
     """
     Port of Go method sendDM from client.go.
 
@@ -1186,7 +1165,6 @@ async def send_dm(
 
     Args:
         client: The WhatsApp client instance
-        ctx: Context (asyncio context in Python)
         own_id: Own JID (sender)
         to: Target JID (recipient)
         id: Message ID
@@ -1195,36 +1173,23 @@ async def send_dm(
         extra_params: Additional node parameters
 
     Returns:
-        Tuple containing (response_data, error)
+        response_data
     """
     # TODO: Review marshal_message implementation
     # TODO: Review prepare_message_node implementation
     # TODO: Review send_node_and_get_data implementation
+    start = time.time()
+    message_plaintext, device_sent_message_plaintext = marshal_message(to, message)
+    timings.marshal = time.time() - start
 
-    try:
-        start = time.time()
-        message_plaintext, device_sent_message_plaintext, err = marshal_message(to, message)
-        timings.marshal = time.time() - start
-        if err is not None:
-            return None, err
-
-        node, _, err = prepare_message_node(
-            client, to, id, message, [to, own_id.to_non_ad()],
-            message_plaintext, device_sent_message_plaintext, timings, extra_params
-        )
-        if err is not None:
-            return None, err
-
-        start = time.time()
-        data, err = client.send_node_and_get_data(node)
-        timings.send = time.time() - start
-        if err is not None:
-            return None, Exception(f"failed to send message node: {err}")
-
-        return data, None
-
-    except Exception as e:
-        return None, e
+    node, _ = await prepare_message_node(
+        client, to, id, message, [to, own_id.to_non_ad()],
+        message_plaintext, device_sent_message_plaintext, timings, extra_params
+    )
+    start = time.time()
+    data = await client.send_node_and_get_data(node)
+    timings.send = time.time() - start
+    return data
 
 
 def get_type_from_message(msg: waE2E_pb2.Message) -> str:
@@ -1684,7 +1649,7 @@ async def prepare_message_node(
     dsm_plaintext: Optional[bytes],
     timings: MessageDebugTimings,
     extra_params: NodeExtraParams,
-) -> Tuple[Optional[Node], Optional[List[JID]], Optional[Exception]]:
+) -> Tuple[Optional[Node], Optional[List[JID]]]:
     """
     Port of Go method prepareMessageNode from client.go.
 
@@ -1703,7 +1668,9 @@ async def prepare_message_node(
         extra_params: Extra parameters for node construction
 
     Returns:
-        Tuple containing (message_node, all_devices, error)
+        Tuple containing (message_node, all_devices)
+    Raises:
+        Exception
     """
     # TODO: Review GetUserDevicesContext implementation
     # TODO: Review get_type_from_message implementation
@@ -1716,10 +1683,8 @@ async def prepare_message_node(
     # TODO: Review events.DecryptFailHide implementation
 
     start = time.time()
-    all_devices, err = await get_user_devices_context(client, participants)
+    all_devices = await get_user_devices_context(client, participants)
     timings.get_devices = time.time() - start
-    if err is not None:
-        return None, None, Exception(f"failed to get device list: {err}")
 
     msg_type = get_type_from_message(message)
     enc_attrs = Attrs({})
@@ -1766,10 +1731,10 @@ async def prepare_message_node(
         ),
     )
 
-    return message_node, all_devices, None
+    return message_node, all_devices
 
 
-def marshal_message(to_jid: JID, message: waE2E_pb2.Message):
+def marshal_message(to_jid: JID, message: waE2E_pb2.Message) -> Tuple[bytes, Optional[bytes]]:
     """
     Marshal a message for sending over WhatsApp.
 
@@ -1783,32 +1748,25 @@ def marshal_message(to_jid: JID, message: waE2E_pb2.Message):
     Returns:
         tuple: (message_plaintext_bytes, dsm_plaintext_bytes, error)
                dsm_plaintext_bytes will be None if not needed
+    Raises:
+        Exception
     """
-    try:
-        # Handle None message (e.g., for revoke operations)
-        if message is None:
-            return b"", None, None
+    # Handle None message (e.g., for revoke operations)
+    if message is None:
+        return b"", None
 
-        # Serialize the protobuf message to bytes
-        try:
-            message_bytes = message.SerializeToString()
-        except Exception as e:
-            return None, None, f"Failed to serialize message: {e}"
+    # Serialize the protobuf message to bytes
+    message_bytes = message.SerializeToString()
 
-        # DSM (Device Specific Message) is only needed for certain scenarios
-        # For now, we'll return None for DSM as it's not always required
-        dsm_plaintext = None
+    # DSM (Device Specific Message) is only needed for certain scenarios
+    # For now, we'll return None for DSM as it's not always required
+    dsm_plaintext = None
 
-        # In the Go implementation, DSM handling depends on various factors:
-        # - Group messages may need DSM for sender key distribution
-        # - Bot messages have special handling
-        # - For most regular messages, DSM is not needed
-
-        return message_bytes, dsm_plaintext, None
-
-    except Exception as e:
-        return None, None, f"Marshal message error: {e}"
-
+    # In the Go implementation, DSM handling depends on various factors:
+    # - Group messages may need DSM for sender key distribution
+    # - Bot messages have special handling
+    # - For most regular messages, DSM is not needed
+    return message_bytes, dsm_plaintext
 
 def make_device_identity_node(client: 'Client') -> Node:
     """
@@ -1825,15 +1783,7 @@ def make_device_identity_node(client: 'Client') -> Node:
     Raises:
         Exception: If device identity marshaling fails
     """
-    # TODO: Review Node implementation
-
-    from google.protobuf import message as proto_message
-
-    try:
-        device_identity = proto_message.MessageToBytes(client.store.account)
-    except Exception as e:
-        raise Exception(f"failed to marshal device identity: {e}")
-
+    device_identity = client.store.account.SerializeToString()
     return Node(
         tag="device-identity",
         content=device_identity
@@ -1888,10 +1838,8 @@ async def encrypt_message_for_devices(
         if jid.server == DEFAULT_USER_SERVER:
             # TODO: Review Store.LIDs.get_lid_for_pn implementation
             try:
-                lid_for_pn, err = client.store.lids.get_lid_for_pn(jid)
-                if err:
-                    logger.warning(f"Failed to get LID for {jid}: {err}")
-                elif not lid_for_pn.is_empty():
+                lid_for_pn = await client.store.lids.get_lid_for_pn(jid)
+                if not lid_for_pn.is_empty():
                     # TODO: Review message.migrate_session_store implementation
                     await migrate_session_store(client, jid, lid_for_pn)
                     encryption_identity = lid_for_pn
@@ -1899,17 +1847,16 @@ async def encrypt_message_for_devices(
                 logger.warning(f"Failed to get LID for {jid}: {e}")
 
         # TODO: Review Client.encrypt_message_for_device_and_wrap implementation
-        encrypted, is_pre_key, err = await encrypt_message_for_device_and_wrap(
-            client, plaintext, jid, encryption_identity, None, enc_attrs
-        )
-
-        if err and hasattr(err, '__class__') and 'NoSession' in err.__class__.__name__:
+        try:
+            encrypted, is_pre_key = await encrypt_message_for_device_and_wrap(
+                client, plaintext, jid, encryption_identity, None, enc_attrs
+            )
+        except ErrNoSession:
             retry_devices.append(jid)
             retry_encryption_identities.append(encryption_identity)
             continue
-        elif err:
-            # TODO return these errors if it's a fatal one (like context cancellation or database)
-            logger.warning(f"Failed to encrypt {id} for {jid}: {err}")
+        except Exception as e:
+            logger.exception(f"Failed to encrypt {id} for {jid}: {e}")
             continue
 
         participant_nodes.append(encrypted)
@@ -1917,27 +1864,28 @@ async def encrypt_message_for_devices(
             include_identity = True
 
     if len(retry_devices) > 0:
-        # TODO: Review prekeys.fetch_pre_keys implementation
-        bundles, err = fetch_pre_keys(client, retry_devices)
-        if err:
-            logger.warning(f"Failed to fetch prekeys for {retry_devices} to retry encryption: {err}")
+        try:
+            bundles = await fetch_pre_keys(client, retry_devices)
+        except Exception as e:
+            logger.warning(f"Failed to fetch prekeys for {retry_devices} to retry encryption: {e}")
         else:
             for i, jid in enumerate(retry_devices):
                 resp = bundles.get(jid)
-                if resp is None or resp.err:
-                    logger.warning(f"Failed to fetch prekey for {jid}: {resp.err if resp else 'no response'}")
+                if resp is None or resp.error:
+                    logger.warning(f"Failed to fetch prekey for {jid}: {resp.error if resp else 'no response'}")
                     continue
 
                 plaintext = msg_plaintext
                 if (jid.user == own_jid.user or jid.user == own_lid.user) and dsm_plaintext is not None:
                     plaintext = dsm_plaintext
 
-                encrypted, is_pre_key, err = await encrypt_message_for_device_and_wrap(
-                    client, plaintext, jid, retry_encryption_identities[i], resp.bundle, enc_attrs
-                )
-                if err:
+                try:
+                    encrypted, is_pre_key = await encrypt_message_for_device_and_wrap(
+                        client, plaintext, jid, retry_encryption_identities[i], resp.bundle, enc_attrs
+                    )
+                except Exception as e:
                     # TODO return these errors if it's a fatal one (like context cancellation or database)
-                    logger.warning(f"Failed to encrypt {id} for {jid} (retry): {err}")
+                    logger.exception(f"Failed to encrypt {id} for {jid} (retry): {e}")
                     continue
 
                 participant_nodes.append(encrypted)
@@ -1954,7 +1902,7 @@ async def encrypt_message_for_device_and_wrap(
     encryption_identity: JID,
     bundle: Optional[prekeys.PreKeyBundle],
     enc_attrs: Attrs
-) -> Tuple[Optional[Node], bool, Optional[Exception]]:
+) -> Tuple[Optional[Node], bool]:
     """
     Port of Go method encryptMessageForDeviceAndWrap from send.go.
 
@@ -1974,15 +1922,13 @@ async def encrypt_message_for_device_and_wrap(
         Tuple containing:
         - Optional[waBinary.Node]: The wrapped encrypted node (None on error)
         - bool: Whether device identity should be included
-        - Optional[Exception]: Any error that occurred
+    Raises:
+
     """
     # TODO: Review Client.encrypt_message_for_device implementation
-    node, include_device_identity, err = await encrypt_message_for_device(
+    node, include_device_identity = await encrypt_message_for_device(
         client ,plaintext, encryption_identity, bundle, enc_attrs
     )
-
-    if err is not None:
-        return None, False, err
 
     wrapped_node = Node(
         tag="to",
@@ -1990,7 +1936,7 @@ async def encrypt_message_for_device_and_wrap(
         content=[node]
     )
 
-    return wrapped_node, include_device_identity, None
+    return wrapped_node, include_device_identity
 
 
 def copy_attrs(from_: Attrs, to: Attrs) -> None:
@@ -2015,7 +1961,7 @@ async def encrypt_message_for_device(
     to: JID,
     bundle: Optional[prekeys.PreKeyBundle],
     extra_attrs: Attrs
-) -> Tuple[Optional[Node], bool, Optional[Exception]]:
+) -> Tuple[Node, bool]:
     """
     Port of Go method encryptMessageForDevice from send.go.
 
@@ -2033,71 +1979,89 @@ async def encrypt_message_for_device(
         Tuple containing:
         - Optional[waBinary.Node]: The encrypted message node (None on error)
         - bool: Whether device identity should be included
-        - Optional[Exception]: Any error that occurred
+    Raises:
+        ErrNoSession: When no session exists and no bundle provided
+        Exception: Various encryption/session errors
     """
-    # TODO: Review session implementation
-    # TODO: Review prekey.Bundle implementation
-    # TODO: Review pb_serializer implementation
-    # TODO: Review UntrustedIdentityError implementation
-    # TODO: Review ErrNoSession implementation
-    # TODO: Review protocol.PREKEY_TYPE implementation
-
-    from signal_protocol import session, UntrustedIdentityError, protocol
-
-    try:
-        builder = session.new_builder_from_signal(client.store, to.signal_address(), pb_serializer)
-
-        if bundle is not None:
-            logger.debug(f"Processing prekey bundle for {to}")
-            err = builder.process_bundle(bundle)
-
-            if client.auto_trust_identity and isinstance(err, UntrustedIdentityError):
+    remote_address = to.signal_address()
+    if bundle is not None:
+        logger.debug(f"Processing prekey bundle for {to}")
+        try:
+            session.process_prekey_bundle(
+                remote_address=remote_address,
+                protocol_store=client.signal_store,
+                bundle=bundle
+            )
+        except SignalProtocolException as e:
+            if client.auto_trust_identity:
                 logger.warning(
-                    f"Got {err} error while trying to process prekey bundle for {to}, "
+                    f"Got {e} error while trying to process prekey bundle for {to}, "
                     f"clearing stored identity and retrying"
                 )
-                err = clear_untrusted_identity(client, to)
-                if err is not None:
-                    return None, False, Exception(f"failed to clear untrusted identity: {err}")
-                err = builder.process_bundle(bundle)
+                try:
+                    await clear_untrusted_identity(client, to)
+                    session.process_prekey_bundle(
+                        remote_address=remote_address,
+                        protocol_store=client.signal_store,
+                        bundle=bundle
+                    )
+                except Exception as clear_err:
+                    raise Exception(f"failed to clear untrusted identity") from clear_err
+            else:
+                raise Exception(f"failed to process prekey bundle") from e
+        except Exception as e:
+            raise Exception(f"failed to process prekey bundle") from e
+    else:
+        # Check if session exists
+        try:
+            has_session = await client.signal_store.contains_session(remote_address)
+            if not has_session:
+                raise ErrNoSession
+        except Exception as e:
+            raise Exception(f"failed to check session existence") from e
 
-            if err is not None:
-                return None, False, Exception(f"failed to process prekey bundle: {err}")
-        else:
-            contains, err = contains_session(client.store, to.signal_address())
-            if err is not None:
-                return None, False, err
-            elif not contains:
-                return None, False, ErrNoSession
-
-        cipher = session.new_cipher(builder, to.signal_address())
-        ciphertext, err = cipher.encrypt(pad_message(plaintext))
-        if err is not None:
-            return None, False, Exception(f"cipher encryption failed: {err}")
-
-        enc_attrs = {
-            "v": "2",
-            "type": "msg"
-        }
-
-        if ciphertext.type() == protocol.PREKEY_TYPE:
-            enc_attrs["type"] = "pkmsg"
-
-        copy_attrs(extra_attrs, enc_attrs)
-
-        include_device_identity = (enc_attrs["type"] == "pkmsg" and
-                                   client.messenger_config is None)
-
-        encrypted_node = Node(
-            tag="enc",
-            attrs=enc_attrs,
-            content=ciphertext.serialize()
+    # Encrypt the message
+    try:
+        padded_message = pad_message(plaintext)
+        # You'll need to find the correct encryption function in your signal_protocol library
+        # This might be something like:
+        ciphertext = session_cipher.message_encrypt(
+            protocol_store=client.signal_store,
+            remote_address=remote_address,
+            msg=padded_message
         )
-
-        return encrypted_node, include_device_identity, None
-
+        # OR it might be a different function - check your stubs
     except Exception as e:
-        return None, False, e
+        raise Exception(f"cipher encryption failed") from e
+
+    # Set up encryption attributes
+    enc_attrs = {
+        "v": "2",
+        "type": "msg"
+    }
+
+    # Check if this is a prekey message
+    # Based on the Go code: if ciphertext.Type() == protocol.PREKEY_TYPE
+    if ciphertext.message_type == SignalMessageType.PREKEY_TYPE:
+        enc_attrs["type"] = "pkmsg"
+
+    # Copy extra attributes
+    copy_attrs(extra_attrs, enc_attrs)
+
+    # Determine if device identity should be included
+    include_device_identity = (
+        enc_attrs["type"] == "pkmsg" and
+        client.messenger_config is None
+    )
+
+    # Create encrypted node
+    encrypted_node = Node(
+        tag="enc",
+        attrs=enc_attrs,
+        content=ciphertext.serialize()
+    )
+
+    return encrypted_node, include_device_identity
 
 
 # EditWindow specifies how long a message can be edited for after it was sent.

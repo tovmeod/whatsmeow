@@ -128,7 +128,7 @@ async def clear_response_waiters(client: 'Client', node: Node) -> None:
         client.response_waiters.clear()
 
 
-async def wait_response(client: 'Client', req_id: str) -> asyncio.Queue:
+async def wait_response(client: 'Client', req_id: str) -> asyncio.Queue[Node]:
     """
     Create a queue to wait for a response with the given request ID.
 
@@ -188,7 +188,7 @@ async def receive_response(client: 'Client', data: Node) -> bool:
     return True
 
 
-async def send_iq_async_and_get_data(client: 'Client', query: InfoQuery) -> Tuple[Optional[asyncio.Queue], Optional[bytes], Optional[Exception]]:
+async def send_iq_async_and_get_data(client: 'Client', query: InfoQuery) -> Tuple[Optional[asyncio.Queue[Node]], Optional[bytes]]:
     """
     Send an info query asynchronously and return the response queue and raw data.
 
@@ -198,9 +198,11 @@ async def send_iq_async_and_get_data(client: 'Client', query: InfoQuery) -> Tupl
 
     Returns:
         Tuple of (response_queue, raw_data, error)
+    Raises:
+        ErrClientIsNil
     """
     if client is None:
-        return None, None, ErrClientIsNil()
+        raise ErrClientIsNil()
 
     if not query.id:
         query.id = generate_request_id(client)
@@ -221,19 +223,19 @@ async def send_iq_async_and_get_data(client: 'Client', query: InfoQuery) -> Tupl
 
     node = Node(
         tag="iq",
-        attributes=attrs,
+        attrs=attrs,
         content=query.content
     )
 
     try:
         data = await client.send_node_and_get_data(node)
-        return waiter, data, None
-    except Exception as e:
+        return waiter, data
+    except Exception:
         await cancel_response(client, query.id, waiter)
-        return None, None, e
+        raise
 
 
-async def send_iq_async(client: 'Client', query: InfoQuery) -> Tuple[Optional[asyncio.Queue], Optional[Exception]]:
+async def send_iq_async(client: 'Client', query: InfoQuery) -> asyncio.Queue:
     """
     Send an info query asynchronously.
 
@@ -244,8 +246,8 @@ async def send_iq_async(client: 'Client', query: InfoQuery) -> Tuple[Optional[as
     Returns:
         Tuple of (response_queue, error)
     """
-    queue, _, error = await send_iq_async_and_get_data(client, query)
-    return queue, error
+    queue, _ = await send_iq_async_and_get_data(client, query)
+    return queue
 
 
 async def send_iq(client: 'Client', query: InfoQuery) -> Node:
@@ -260,11 +262,11 @@ async def send_iq(client: 'Client', query: InfoQuery) -> Node:
         The response node
 
     Raises:
-        Various exceptions depending on the error type
+        IQError
+        ErrIQTimedOut
+        asyncio.CancelledError
     """
-    res_queue, data, error = await send_iq_async_and_get_data(client, query)
-    if error:
-        raise error
+    res_queue, data = await send_iq_async_and_get_data(client, query)
 
     if query.timeout == 0:
         query.timeout = DEFAULT_REQUEST_TIMEOUT
@@ -275,7 +277,7 @@ async def send_iq(client: 'Client', query: InfoQuery) -> Node:
 
         if is_disconnect_node(res):
             if query.no_retry:
-                raise DisconnectedError("info query", res)
+                raise DisconnectedError(res, "info query")
 
             res = await retry_frame(client, "info query", query.id, data, res, query.timeout)
 

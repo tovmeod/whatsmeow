@@ -87,7 +87,7 @@ class PreKeyStore(ABC):
         pass
 
     @abstractmethod
-    async def gen_one_pre_key(self) -> Tuple[Optional[PreKey], Optional[Exception]]:
+    async def gen_one_pre_key(self) -> PreKey:
         """Generate a single pre-key."""
         pass
 
@@ -149,7 +149,7 @@ class AppStateSyncKeyStore(ABC):
         pass
 
     @abstractmethod
-    async def get_latest_app_state_sync_key_id(self) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_latest_app_state_sync_key_id(self) -> Optional[bytes]:
         """Get the latest app state sync key ID."""
         pass
 
@@ -171,7 +171,7 @@ class AppStateStore(ABC):
         pass
 
     @abstractmethod
-    async def get_app_state_version(self, name: str) -> Tuple[int, bytes, Optional[Exception]]:
+    async def get_app_state_version(self, name: str) -> Tuple[int, bytes]:
         """Get an app state version by name."""
         pass
 
@@ -191,7 +191,7 @@ class AppStateStore(ABC):
         pass
 
     @abstractmethod
-    async def get_app_state_mutation_mac(self, name: str, index_mac: bytes) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_app_state_mutation_mac(self, name: str, index_mac: bytes) -> Optional[bytes]:
         """Get an app state mutation MAC by name and index MAC."""
         pass
 
@@ -394,7 +394,7 @@ class LIDStore(ABC):
         pass
 
     @abstractmethod
-    async def get_lid_for_pn(self, pn: JID) -> Tuple[Optional[JID], Optional[Exception]]:
+    async def get_lid_for_pn(self, pn: JID) -> Optional[JID]:
         """Get a LID for a phone number."""
         pass
 
@@ -420,12 +420,9 @@ class AllSessionSpecificStores(IdentityStore, SessionStore, PreKeyStore, SenderK
 @dataclass
 class Device:
     """Device data and associated stores."""
-
-    log: Optional[logging.Logger] = None
-
-    noise_key: Optional[KeyPair] = None
-    identity_key: Optional[KeyPair] = None
-    signed_pre_key: Optional[PreKey] = None
+    noise_key: KeyPair
+    identity_key: KeyPair
+    signed_pre_key: PreKey
     registration_id: int = 0
     adv_secret_key: bytes = field(default_factory=bytes)
 
@@ -439,18 +436,18 @@ class Device:
     facebook_uuid: uuid.UUID = field(default_factory=uuid.uuid4)
 
     initialized: bool = False
-    identities: Optional[IdentityStore] = None
-    sessions: Optional[SessionStore] = None
-    pre_keys: Optional[PreKeyStore] = None
+    identities: IdentityStore
+    sessions: SessionStore
+    pre_keys: PreKeyStore
     sender_keys: Optional[SenderKeyStore] = None
-    app_state_keys: Optional[AppStateSyncKeyStore] = None
-    app_state: Optional[AppStateStore] = None
+    app_state_keys: AppStateSyncKeyStore
+    app_state: AppStateStore
     contacts: Optional[ContactStore] = None
     chat_settings: Optional[ChatSettingsStore] = None
-    msg_secrets: Optional[MsgSecretStore] = None
-    privacy_tokens: Optional[PrivacyTokenStore] = None
+    msg_secrets: MsgSecretStore
+    privacy_tokens: PrivacyTokenStore
     event_buffer: Optional[EventBuffer] = None
-    lids: Optional[LIDStore] = None
+    lids: LIDStore
     device_container: Optional[DeviceContainer] = None
 
     # todo: check if and where these are used, maybe not here in this class

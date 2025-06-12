@@ -36,10 +36,14 @@ class DownloadHTTPError(DownloadError):
 
 # Error constants
 ErrNothingDownloadableFound = DownloadError("Nothing downloadable found in message")
-ErrUnknownMediaType = DownloadError("Unknown media type")
+class ErrUnknownMediaType(DownloadError):
+    def __init__(self, media_type: str):
+        super().__init__(f"Unknown media type '{media_type}'")
 ErrNoURLPresent = DownloadError("No URL present in message")
 ErrClientIsNil = DownloadError("Client is nil")
-ErrFileLengthMismatch = DownloadError("File length mismatch")
+class ErrFileLengthMismatch(DownloadError):
+    def __init__(self, file_length, len_data):
+        super().__init__(f"File length mismatch: {file_length=} != {len_data=}")
 ErrInvalidMediaSHA256 = DownloadError("Invalid media SHA256")
 ErrInvalidMediaEncSHA256 = DownloadError("Invalid media encrypted SHA256")
 ErrInvalidMediaHMAC = DownloadError("Invalid media HMAC")
@@ -278,7 +282,7 @@ def get_media_type(msg: DownloadableMessage) -> MediaType:
     return ""
 
 
-async def download(client: 'Client', msg: DownloadableMessage) -> Optional[bytes]:
+async def download(client: 'Client', msg: DownloadableMessage) -> bytes:
     """
     Port of Go method `Download` from client.go.
 
@@ -319,7 +323,7 @@ async def download(client: 'Client', msg: DownloadableMessage) -> Optional[bytes
         pass
 
     if url and not is_web_whatsapp_net_url:
-        data, err = await download_and_decrypt(
+        data = await download_and_decrypt(
             client,
             url,
             msg.GetMediaKey(),
@@ -383,7 +387,7 @@ async def download_media_with_path(
     file_length: int,
     media_type: "MediaType",  # TODO: Review MediaType enum/type
     mms_type: Optional[str]
-) -> bytes:
+) -> Optional[bytes]:
     """
     Port of Go method DownloadMediaWithPath from client.go.
 
@@ -424,7 +428,7 @@ async def download_media_with_path(
             f"&mms-type={mms_type}&__wa-mms="
         )
         try:
-            data, err = await download_and_decrypt(
+            data = await download_and_decrypt(
                 client,
                 media_url,
                 media_key,
@@ -440,8 +444,8 @@ async def download_media_with_path(
             ErrMediaDownloadFailedWith403,
             ErrMediaDownloadFailedWith404,
             ErrMediaDownloadFailedWith410
-        ) as err:
-            return data  # These are allowed partial errors
+        ):
+            return None  # These are allowed partial errors
 
         except Exception as err:
             if i >= len(media_conn.hosts) - 1:
@@ -458,7 +462,7 @@ async def download_and_decrypt(
     file_length: int,
     file_enc_sha256: Optional[bytes],
     file_sha256: Optional[bytes],
-) -> Tuple[Optional[bytes], Optional[Exception]]:
+) -> bytes:
     """
     Port of Go method downloadAndDecrypt from media.go.
 
@@ -475,6 +479,10 @@ async def download_and_decrypt(
 
     Returns:
         Tuple of (decrypted media bytes or None, error or None)
+    Raises:
+        DownloadError:
+        ErrFileLengthMismatch
+        ErrInvalidMediaSHA256
     """
     # TODO: Review get_media_keys implementation
     # TODO: Review client.download_possibly_encrypted_media_with_retries implementation
@@ -487,24 +495,24 @@ async def download_and_decrypt(
 
     if media_key is None and file_enc_sha256 is None and mac is None:
         # Unencrypted media, just return the downloaded data
-        return ciphertext, None
+        return ciphertext
 
     validate_media(iv, ciphertext, mac_key, mac)
 
     try:
         data = decrypt(cipher_key, iv, ciphertext)
     except Exception as e:
-        return None, Exception(f"failed to decrypt file: {e}")
+        raise DownloadError(f"failed to decrypt file") from e
 
     if file_length >= 0 and len(data) != file_length:
-        return None, ErrFileLengthMismatch(file_length, len(data))  # custom error assumed to exist
+        raise ErrFileLengthMismatch(file_length, len(data))  # custom error assumed to exist
 
     if file_sha256 is not None and len(file_sha256) == 32:
         calculated_sha256 = hashlib.sha256(data).digest()
         if calculated_sha256 != file_sha256:
-            return None, ErrInvalidMediaSHA256
+            raise ErrInvalidMediaSHA256
 
-    return data, None
+    return data
 
 def get_media_keys(media_key: bytes, app_info: MediaType) -> Tuple[bytes, bytes, bytes, bytes]:
     """Generate media keys from a media key and app info.

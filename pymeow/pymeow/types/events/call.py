@@ -7,12 +7,13 @@ Port of whatsmeow/types/events/call.go
 from dataclasses import dataclass
 from typing import Optional
 
+from .events import BaseEvent
 from ...binary.node import Node
 from ..call import BasicCallMeta, CallRemoteMeta
 
 
 @dataclass
-class CallOffer:
+class CallOffer(BaseEvent):
     """Emitted when the user receives a call on WhatsApp."""
     basic_call_meta: BasicCallMeta
     call_remote_meta: CallRemoteMeta
@@ -20,7 +21,7 @@ class CallOffer:
 
 
 @dataclass
-class CallOfferNotice:
+class CallOfferNotice(BaseEvent):
     """Emitted when the user receives a call offer notice."""
     basic_call_meta: BasicCallMeta
     media: str
@@ -29,14 +30,14 @@ class CallOfferNotice:
 
 
 @dataclass
-class CallRelayLatency:
+class CallRelayLatency(BaseEvent):
     """Emitted for call relay latency information."""
     basic_call_meta: BasicCallMeta
     data: Optional[Node] = None
 
 
 @dataclass
-class CallAccept:
+class CallAccept(BaseEvent):
     """Emitted when a call is accepted."""
     basic_call_meta: BasicCallMeta
     call_remote_meta: CallRemoteMeta
@@ -44,7 +45,7 @@ class CallAccept:
 
 
 @dataclass
-class CallPreAccept:
+class CallPreAccept(BaseEvent):
     """Emitted when a call is pre-accepted."""
     basic_call_meta: BasicCallMeta
     call_remote_meta: CallRemoteMeta
@@ -52,7 +53,7 @@ class CallPreAccept:
 
 
 @dataclass
-class CallTransport:
+class CallTransport(BaseEvent):
     """Emitted for call transport information."""
     basic_call_meta: BasicCallMeta
     call_remote_meta: CallRemoteMeta
@@ -60,7 +61,7 @@ class CallTransport:
 
 
 @dataclass
-class CallTerminate:
+class CallTerminate(BaseEvent):
     """Emitted when a call is terminated."""
     basic_call_meta: BasicCallMeta
     reason: str
@@ -68,13 +69,13 @@ class CallTerminate:
 
 
 @dataclass
-class CallReject:
+class CallReject(BaseEvent):
     """Emitted when a call is rejected."""
     basic_call_meta: BasicCallMeta
     data: Optional[Node] = None
 
 
 @dataclass
-class UnknownCallEvent:
+class UnknownCallEvent(BaseEvent):
     """Emitted when an unknown call event is received."""
     node: Node

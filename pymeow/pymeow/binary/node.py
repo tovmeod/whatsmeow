@@ -20,7 +20,7 @@ class Node:
     containing a tag, attributes, and optional content.
     """
     tag: str
-    attrs: Attrs = field(default_factory=dict)
+    attrs: Attrs = field(default_factory=dict) = None
     content: Optional[Union[List['Node'], bytes]] = None
 
     def attr_getter(self) -> AttrUtility:
@@ -213,6 +213,8 @@ def unmarshal(data: bytes) -> Node:
 
     Returns:
         Tuple of (node, error) where error is None if decoding was successful
+    Raises:
+        DecodingError: if r.index != len(r.data): leftover bytes after decoding
     """
     from .decoder import unmarshal as decoder_unmarshal
 

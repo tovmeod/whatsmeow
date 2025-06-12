@@ -115,14 +115,13 @@ class QRChannel:
             output_channel: The asyncio Queue to send QR codes and events to
         """
         self.client = client
-        self.handler_id = None
         self.closed = False
         self.output = output_channel
         self.stop_qrs = asyncio.Event()
         self._emit_task: Optional[asyncio.Task[None]]= None
 
     async def ainit(self) -> 'QRChannel':
-        self.handler_id = await self.client.add_event_handler(self.handle_event)
+        self.client.add_event_handler(self.handle_event)
         return self
 
     async def __aenter__(self) -> 'QRChannel':
@@ -189,9 +188,7 @@ class QRChannel:
         if not self.closed:
             logger.debug("Closing QR channel")
             self.stop_qrs.set()
-            if self.handler_id is not None:
-                self.client.remove_event_handler(self.handler_id)
-                self.handler_id = None
+            self.client.remove_event_handler(self.handle_event)
             self.closed = True
 
     async def emit_qrs(self, codes: List[str]) -> None:

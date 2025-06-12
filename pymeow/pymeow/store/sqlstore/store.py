@@ -688,14 +688,11 @@ class SQLStore(AllSessionSpecificStores):
                 return (None, e)
         return (None, None)
 
-    async def get_lid_for_pn(self, pn: JID) -> Tuple[Optional[JID], Optional[Exception]]:
+    async def get_lid_for_pn(self, pn: JID) -> Optional[JID]:
         """Get LID for phone number from memory."""
+        from ...types.jid import JID
         lid_str = self.pn_to_lid_cache.get(str(pn))
         if lid_str:
-            try:
-                from ...types.jid import JID
-                lid_jid = JID.from_string(lid_str)
-                return lid_jid, None
-            except Exception as e:
-                return None, e
-        return None, None
+            lid_jid = JID.from_string(lid_str)
+            return lid_jid
+        return None

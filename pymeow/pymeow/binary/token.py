@@ -66,7 +66,7 @@ for dict_index, tokens in enumerate(DOUBLE_BYTE_TOKENS):
     for index, token in enumerate(tokens):
         _md_double_byte_token_index[token] = (dict_index, index)
 
-def get_double_token(index1: int, index2: int) -> Tuple[str, Optional[Exception]]:
+def get_double_token(index1: int, index2: int) -> str:
     """
     Get the string value of the double-byte token at the given index.
 
@@ -76,13 +76,15 @@ def get_double_token(index1: int, index2: int) -> Tuple[str, Optional[Exception]
 
     Returns:
         A tuple containing the token string and an optional error
+    Raises:
+        ValueError: If the index is out of bounds
     """
     if index1 < 0 or index1 >= len(DOUBLE_BYTE_TOKENS):
-        return "", ValueError(f"index out of double byte token bounds {index1}-{index2}")
+        raise ValueError(f"index out of double byte token bounds {index1}-{index2}")
     elif index2 < 0 or index2 >= len(DOUBLE_BYTE_TOKENS[index1]):
-        return "", ValueError(f"index out of double byte token index {index1} bounds {index2}")
+        raise ValueError(f"index out of double byte token index {index1} bounds {index2}")
 
-    return DOUBLE_BYTE_TOKENS[index1][index2], None
+    return DOUBLE_BYTE_TOKENS[index1][index2]
 
 def index_of_single_token(token: str) -> Tuple[int, bool]:
     """

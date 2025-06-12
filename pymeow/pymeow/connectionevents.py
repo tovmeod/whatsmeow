@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, TYPE_CHECKING
 
+from . import request
 from .binary.node import Node
 from .prekeys import get_server_pre_key_count, upload_prekeys
 from .request import InfoQuery, InfoQueryType
@@ -31,9 +32,8 @@ async def handle_stream_error(client: "Client", node: Node) -> None:
         client: The WhatsApp client
         node: The stream error node from the server
     """
-    ctx = {}
     client._is_logged_in = False
-    await client._clear_response_waiters(node)
+    await request.clear_response_waiters(client, node)
 
     code = node.attrs.get("code", "")
     conflict, _ = node.get_optional_child_by_tag("conflict")
@@ -63,16 +63,6 @@ async def handle_stream_error(client: "Client", node: Node) -> None:
         # This seems to happen when the server wants to restart or something.
         # The disconnection will be emitted as an events.Disconnected and then the auto-reconnect will do its thing.
         logger.warning("Got 503 stream error, assuming automatic reconnect will handle it")
-    elif client.refresh_cat is not None and (code == events.ConnectFailureReason.CAT_INVALID.number_string() or
-                                             code == events.ConnectFailureReason.CAT_EXPIRED.number_string()):
-        logger.info(f"Got {code} stream error, refreshing CAT before reconnecting...")
-        async with client.socket_lock:
-            try:
-                await client.refresh_cat()
-            except Exception as e:
-                logger.error(f"Failed to refresh CAT: {e}")
-                client._expect_disconnect()
-                await client.dispatch_event(events.CATRefreshError(error=e))
     else:
         logger.error(f"Unknown stream error: {node.xml_string()}")
         await client.dispatch_event(events.StreamError(code=code, raw=node))
@@ -112,7 +102,6 @@ async def handle_connect_failure(client: "Client", node: Node) -> None:
         client: The WhatsApp client
         node: The connection failure node from the server
     """
-    ctx = {}
     reason = events.ConnectFailureReason(int(node.attrs.get("reason", 0)))
     message = node.attrs.get("message", "")
     will_auto_reconnect = True
@@ -155,12 +144,12 @@ async def handle_connect_failure(client: "Client", node: Node) -> None:
         await client.dispatch_event(events.ClientOutdated())
     elif reason == events.ConnectFailureReason.CAT_INVALID or reason == events.ConnectFailureReason.CAT_EXPIRED:
         logger.info(f"Got {reason.value}/{message} connect failure, refreshing CAT before reconnecting...")
-        try:
-            await client.refresh_cat()
-        except Exception as e:
-            logger.error(f"Failed to refresh CAT: {e}")
-            client._expect_disconnect()
-            await client.dispatch_event(events.CATRefreshError(error=e))
+        # try:
+        #     await client.refresh_cat()
+        # except Exception as e:
+        #     logger.error(f"Failed to refresh CAT: {e}")
+        #     client._expect_disconnect()
+        #     await client.dispatch_event(events.CATRefreshError(error=e))
     elif will_auto_reconnect:
         logger.warning(f"Got {reason.value}/{message} connect failure, assuming automatic reconnect will handle it")
     else:
@@ -176,19 +165,18 @@ async def handle_connect_success(cli: "Client", node: Node) -> None:
         cli: The WhatsApp client
         node: The connection success node from the server
     """
-    ctx = {}
     logger.info("Successfully authenticated")
     cli.last_successful_connect = datetime.now()
     cli.auto_reconnect_errors = 0
     cli._is_logged_in = True
 
     node_lid_str = node.attrs.get("lid", "")
-    node_lid = jid.JID.from_string(node_lid_str) if node_lid_str else jid.JID()
+    node_lid = jid.JID.parse_jid(node_lid_str) if node_lid_str else jid.JID()
 
     if cli.store.lid.is_empty() and not node_lid.is_empty():
         cli.store.lid = node_lid
         try:
-            await cli.store.save(ctx)
+            await cli.store.save()
         except Exception as e:
             logger.warning(f"Failed to save device after updating LID: {e}")
         else:
@@ -207,35 +195,34 @@ async def _post_connect_setup(cli: "Client") -> None:
     Args:
         cli: The WhatsApp client
     """
-    ctx = {}
 
     # Check and upload prekeys if needed
     db_count = None
     server_count = None
 
     try:
-        db_count = await cli.store.pre_keys.uploaded_prekey_count(ctx)
+        db_count = await cli.store.pre_keys.uploaded_prekey_count()
     except Exception as e:
         logger.error(f"Failed to get number of prekeys in database: {e}")
 
     if db_count is not None:
         try:
-            server_count = await get_server_pre_key_count(cli, ctx)
+            server_count = await get_server_pre_key_count(cli)
         except Exception as e:
             logger.warning(f"Failed to get number of prekeys on server: {e}")
         else:
             logger.debug(f"Database has {db_count} prekeys, server says we have {server_count}")
             if server_count < MIN_PREKEY_COUNT or db_count < MIN_PREKEY_COUNT:
-                await upload_prekeys(cli, ctx)
+                await upload_prekeys(cli)
                 try:
-                    sc = await get_server_pre_key_count(cli, ctx)
+                    sc = await get_server_pre_key_count(cli)
                     logger.debug(f"Prekey count after upload: {sc}")
                 except Exception:
                     pass
 
     # Set passive mode to false
     try:
-        await set_passive(cli, ctx, False)
+        await set_passive(cli,False)
     except Exception as e:
         logger.warning(f"Failed to send post-connect passive IQ: {e}")
 
@@ -258,7 +245,7 @@ async def _reconnect_after_515(cli: "Client") -> None:
         logger.error(f"Failed to reconnect after 515 code: {e}")
 
 
-async def set_passive(cli: "Client", ctx, passive: bool) -> None:
+async def set_passive(client: "Client", passive: bool) -> None:
     """
     Tell the WhatsApp server whether this device is passive or not.
 
@@ -266,8 +253,7 @@ async def set_passive(cli: "Client", ctx, passive: bool) -> None:
     By default, whatsmeow will automatically do set_passive(False) after connecting.
 
     Args:
-        cli: The WhatsApp client
-        ctx: The async context
+        client: The WhatsApp client
         passive: Whether to set the device as passive
 
     Returns:
@@ -278,13 +264,9 @@ async def set_passive(cli: "Client", ctx, passive: bool) -> None:
     """
     tag = "passive" if passive else "active"
 
-    _, err = await cli.send_iq(InfoQuery(
+    _ = await request.send_iq(client, InfoQuery(
         namespace="passive",
         type=InfoQueryType.SET,  # Fixed: Use enum value instead of string
         to=jid.SERVER_JID,
-        context=ctx,
         content=[Node(tag=tag)]
     ))
-
-    if err:
-        raise err

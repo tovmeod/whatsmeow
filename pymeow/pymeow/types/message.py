@@ -148,7 +148,7 @@ class MessageInfo:
         device_sent_meta: Metadata for direct messages sent from another one of the user's own devices.
     """
     message_source: MessageSource = field(default_factory=lambda: MessageSource())
-    id: Optional[MessageID] = None
+    id: MessageID = None
     server_id: Optional[MessageServerID] = None
     type: str = ""
     push_name: str = ""

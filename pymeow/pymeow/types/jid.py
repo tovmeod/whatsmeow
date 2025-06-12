@@ -180,18 +180,21 @@ class JID:
         return cls(user=user, server=server, raw_agent=raw_agent, device=device)
 
     @classmethod
-    def parse_jid(cls, jid_str: str) -> Tuple['JID', Optional[Exception]]:
-        """Parses a JID out of the given string. Supports both regular and AD JIDs."""
+    def parse_jid(cls, jid_str: str) -> 'JID':
+        """Parses a JID out of the given string. Supports both regular and AD JIDs.
+        Raises:
+            ValueError:
+        """
         parts = jid_str.split('@')
         if len(parts) == 1:
-            return cls.new_jid("", parts[0]), None
+            return cls.new_jid("", parts[0])
 
         parsed_jid = cls.new_jid(parts[0], parts[1])
 
         if '.' in parsed_jid.user:
             user_parts = parsed_jid.user.split('.')
             if len(user_parts) != 2:
-                return parsed_jid, ValueError("Unexpected number of dots in JID")
+                raise ValueError("Unexpected number of dots in JID")
 
             parsed_jid = cls(
                 user=user_parts[0],
@@ -203,7 +206,7 @@ class JID:
             ad_parts = ad.split(':')
 
             if len(ad_parts) > 2:
-                return parsed_jid, ValueError("Unexpected number of colons in JID")
+                raise ValueError("Unexpected number of colons in JID")
 
             try:
                 agent = int(ad_parts[0])
@@ -224,12 +227,12 @@ class JID:
                         integrator=parsed_jid.integrator
                     )
             except ValueError as e:
-                return parsed_jid, ValueError(f"Failed to parse device from JID: {e}")
+                raise ValueError(f"Failed to parse device from JID: {e}")
 
         elif ':' in parsed_jid.user:
             user_parts = parsed_jid.user.split(':')
             if len(user_parts) != 2:
-                return parsed_jid, ValueError("Unexpected number of colons in JID")
+                raise ValueError("Unexpected number of colons in JID")
 
             parsed_jid = cls(
                 user=user_parts[0],
@@ -247,9 +250,9 @@ class JID:
                     integrator=parsed_jid.integrator
                 )
             except ValueError as e:
-                return parsed_jid, ValueError(f"Failed to parse device from JID: {e}")
+                raise ValueError(f"Failed to parse device from JID: {e}")
 
-        return parsed_jid, None
+        return parsed_jid
 
     @classmethod
     def from_string(cls, jid: Optional[Union[str, 'JID']]) -> Optional['JID']:
@@ -258,11 +261,7 @@ class JID:
             return None
         if isinstance(jid, JID):
             return jid
-
-        parsed_jid, error = cls.parse_jid(jid)
-        if error:
-            return None
-        return parsed_jid
+        return cls.parse_jid(jid)
 
     @classmethod
     def from_user_id(cls, user_id: str, device: int = 0, agent: int = 0) -> 'JID':
@@ -338,7 +337,7 @@ class JID:
         Returns an Address object from the signal_protocol package, which is the Python
         equivalent of protocol.SignalAddress in the Go implementation.
         """
-        return address.Address(self.signal_address_user(), self.device)
+        return address.ProtocolAddress(self.signal_address_user(), self.device)
 
 
 # Initialize predefined JIDs

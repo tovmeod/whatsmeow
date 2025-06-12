@@ -109,7 +109,7 @@ def make_qr_data(client: "Client", ref: str) -> str:
 
 async def handle_pair_success(client: "Client", node: Node) -> None:
     """Handle a pair-success response from the server."""
-    req_id = node.attrs.get("id")
+    req_id = str(node.attrs.get("id"))
     pair_success = node.get_child_by_tag("pair-success")
 
     device_identity_bytes = pair_success.get_child_by_tag("device-identity").content
@@ -119,8 +119,8 @@ async def handle_pair_success(client: "Client", node: Node) -> None:
     device_jid_str = device_jid_node.attrs.get("jid")
     device_lid_str = device_jid_node.attrs.get("lid")
 
-    device_jid = jid.JID.from_string(device_jid_str) if device_jid_str else None
-    device_lid = jid.JID.from_string(device_lid_str) if device_lid_str else None
+    device_jid = jid.JID.parse_jid(device_jid_str) if device_jid_str else jid.EMPTY_JID
+    device_lid = jid.JID.parse_jid(device_lid_str) if device_lid_str else jid.EMPTY_JID
 
     platform = pair_success.get_child_by_tag("platform").attrs.get("name", "")
 
@@ -129,10 +129,10 @@ async def handle_pair_success(client: "Client", node: Node) -> None:
                                          business_name, platform, device_jid, device_lid)
 
 async def _handle_pair_task(client: "Client", device_identity_bytes: bytes, req_id: str,
-                           business_name: str, platform: str, device_jid: jid.JID, device_lid: jid.JID):
+                           business_name: str, platform: str, device_jid: jid.JID, device_lid: jid.JID) -> None:
     """Task to handle pairing after receiving pair-success."""
     try:
-        await handle_pair(client, None, device_identity_bytes, req_id, business_name, platform, device_jid, device_lid)
+        await handle_pair(client, device_identity_bytes, req_id, business_name, platform, device_jid, device_lid)
         logger.info(f"Successfully paired {client.store.id}")
         await client.dispatch_event(events.PairSuccess(
             id=device_jid, lid=device_lid, business_name=business_name, platform=platform
@@ -144,7 +144,7 @@ async def _handle_pair_task(client: "Client", device_identity_bytes: bytes, req_
             id=device_jid, lid=device_lid, business_name=business_name, platform=platform, error=e
         ))
 
-async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_id: str,
+async def handle_pair(client: "Client", device_identity_bytes: bytes, req_id: str,
                      business_name: str, platform: str, device_jid: jid.JID, device_lid: jid.JID) -> None:
     """Handle the main pairing process."""
     # Parse device identity container
@@ -228,7 +228,7 @@ async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_i
     client.store.platform = platform
 
     try:
-        await client.store.save(ctx)
+        await client.store.save()
     except Exception as e:
         await send_pair_error(client, req_id, 500, "internal-error")
         raise PairDatabaseError("failed to save device store", e)
@@ -236,9 +236,9 @@ async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_i
     await client.store_lid_pn_mapping(device_lid, device_jid)
 
     try:
-        await client.store.identities.put_identity(main_device_lid.signal_address(), main_device_identity)
+        await client.store.identities.put_identity(str(main_device_lid.signal_address()), main_device_identity)
     except Exception as e:
-        await client.store.delete(ctx)
+        await client.store.delete()
         await send_pair_error(client, req_id, 500, "internal-error")
         raise PairDatabaseError("failed to store main device identity", e)
 
@@ -249,7 +249,7 @@ async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_i
     try:
         await client.send_node(Node(
             tag="iq",
-            attributes={
+            attrs={
                 "to": jid.SERVER_JID,
                 "type": "result",
                 "id": req_id,
@@ -258,7 +258,7 @@ async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_i
                 tag="pair-device-sign",
                 content=[Node(
                     tag="device-identity",
-                    attributes={
+                    attrs={
                         "key-index": device_identity_details.keyIndex,
                     },
                     content=self_signed_device_identity,
@@ -266,8 +266,8 @@ async def handle_pair(client: "Client", ctx, device_identity_bytes: bytes, req_i
             )],
         ))
     except Exception as e:
-        await client.store.delete(ctx)
-        raise Exception(f"failed to send pairing confirmation: {e}")
+        await client.store.delete()
+        raise Exception(f"failed to send pairing confirmation") from e
 
 def verify_device_identity_account_signature(device_identity: WAAdv_pb2.ADVSignedDeviceIdentity,
                                            ikp: KeyPair, is_hosted_account: bool) -> bool:
@@ -276,7 +276,7 @@ def verify_device_identity_account_signature(device_identity: WAAdv_pb2.ADVSigne
         return False
 
     try:
-        signature_key = curve.PublicKey(device_identity.accountSignatureKey)
+        signature_key = curve.PublicKey.deserialize(device_identity.accountSignatureKey)
         signature = device_identity.accountSignature
 
         prefix = ADV_PREFIX_ACCOUNT_SIGNATURE
@@ -302,7 +302,7 @@ def generate_device_signature(device_identity: WAAdv_pb2.ADVSignedDeviceIdentity
         device_identity.accountSignatureKey
     )
 
-    private_key = curve.PrivateKey(ikp.priv)
+    private_key = curve.PrivateKey.deserialize(ikp.priv)
     return private_key.calculate_signature(message)
 
 async def send_pair_error(client: "Client", req_id: str, code: int, text: str) -> None:

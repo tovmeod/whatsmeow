@@ -533,7 +533,7 @@ async def get_user_devices_context(client, jids: List[JID]) -> List[JID]:
                 mode="query",
                 context="message",
                 query=[
-                    Node(tag="devices", attributes=Attrs({"version": "2"}))
+                    Node(tag="devices", attrs=Attrs({"version": "2"}))
                 ]
             )
 

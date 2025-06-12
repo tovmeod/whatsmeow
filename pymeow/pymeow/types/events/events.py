@@ -87,7 +87,7 @@ class QRScannedWithoutMultidevice(BaseEvent):
 # Connected is emitted when the client has successfully connected to the WhatsApp servers
 # and is authenticated.
 @dataclass
-class Connected:
+class Connected(BaseEvent):
     """
     Emitted when the client has successfully connected to the WhatsApp servers and is authenticated.
 
@@ -196,7 +196,7 @@ class ConnectFailureReason(Enum):
 
 # LoggedOut is emitted when the client has been unpaired from the phone.
 @dataclass
-class LoggedOut:
+class LoggedOut(BaseEvent):
     """
     Emitted when the client has been unpaired from the phone.
 
@@ -215,7 +215,7 @@ class LoggedOut:
 
 # StreamReplaced is emitted when the client is disconnected by another client connecting with the same keys.
 @dataclass
-class StreamReplaced:
+class StreamReplaced(BaseEvent):
     """
     Emitted when the client is disconnected by another client connecting with the same keys.
 
@@ -228,7 +228,7 @@ class StreamReplaced:
 
 # ManualLoginReconnect is emitted after login if DisableLoginAutoReconnect is set.
 @dataclass
-class ManualLoginReconnect:
+class ManualLoginReconnect(BaseEvent):
     """
     Emitted after login if DisableLoginAutoReconnect is set.
     """
@@ -236,7 +236,7 @@ class ManualLoginReconnect:
 
 # TemporaryBan is emitted when there's a connection failure with the ConnectFailureTempBanned reason code.
 @dataclass
-class TemporaryBan:
+class TemporaryBan(BaseEvent):
     """
     Emitted when there's a connection failure with the ConnectFailureTempBanned reason code.
     """
@@ -255,7 +255,7 @@ class TemporaryBan:
 
 # ConnectFailure is emitted when the WhatsApp server sends a <failure> node with an unknown reason.
 @dataclass
-class ConnectFailure:
+class ConnectFailure(BaseEvent):
     """
     Emitted when the WhatsApp server sends a <failure> node with an unknown reason.
 
@@ -271,7 +271,7 @@ class ConnectFailure:
 
 # ClientOutdated is emitted when the WhatsApp server rejects the connection with the ConnectFailureClientOutdated code.
 @dataclass
-class ClientOutdated:
+class ClientOutdated(BaseEvent):
     """
     Emitted when the WhatsApp server rejects the connection with the ConnectFailureClientOutdated code.
     """
@@ -293,7 +293,7 @@ class CATRefreshError:
 
 # StreamError is emitted when the WhatsApp server sends a <stream:error> node with an unknown code.
 @dataclass
-class StreamError:
+class StreamError(BaseEvent):
     """
     Emitted when the WhatsApp server sends a <stream:error> node with an unknown code.
 
@@ -586,7 +586,7 @@ class GroupInfo:
 
 # Picture is emitted when a user's profile picture or group's photo is changed.
 @dataclass
-class Picture:
+class Picture(BaseEvent):
     """
     Emitted when a user's profile picture or group's photo is changed.
 
@@ -600,7 +600,7 @@ class Picture:
 
 # UserAbout is emitted when a user's about status is changed.
 @dataclass
-class UserAbout:
+class UserAbout(BaseEvent):
     """
     Emitted when a user's about status is changed.
     """
@@ -671,8 +671,8 @@ class MediaRetry(BaseEvent):
     """
     Emitted when the phone sends a response to a media retry request.
     """
-    ciphertext: Optional[bytes] = None
-    iv: Optional[bytes] = None
+    ciphertext: bytes = None
+    iv: bytes = None
     error: Optional[MediaRetryError] = None  # Sometimes there's an unencrypted media retry error
     timestamp: Optional[datetime] = None  # The time of the response
     message_id: Optional[MessageID] = None  # The ID of the message
@@ -701,7 +701,7 @@ class BlocklistChange:
 
 # Blocklist is emitted when the user's blocked user list is changed.
 @dataclass
-class Blocklist:
+class Blocklist(BaseEvent):
     """
     Emitted when the user's blocked user list is changed.
     """
@@ -717,7 +717,7 @@ class Blocklist:
 
 # NewsletterJoin is emitted when the user joins a newsletter.
 @dataclass
-class NewsletterJoin:
+class NewsletterJoin(BaseEvent):
     """
     Emitted when the user joins a newsletter.
     """
@@ -731,7 +731,7 @@ class NewsletterJoin:
 
 # NewsletterLeave is emitted when the user leaves a newsletter.
 @dataclass
-class NewsletterLeave:
+class NewsletterLeave(BaseEvent):
     """
     Emitted when the user leaves a newsletter.
     """
@@ -740,7 +740,7 @@ class NewsletterLeave:
 
 # NewsletterMuteChange is emitted when the user changes the mute state of a newsletter.
 @dataclass
-class NewsletterMuteChange:
+class NewsletterMuteChange(BaseEvent):
     """
     Emitted when the user changes the mute state of a newsletter.
     """
@@ -749,7 +749,7 @@ class NewsletterMuteChange:
 
 # NewsletterLiveUpdate is emitted when there's a live update to a newsletter.
 @dataclass
-class NewsletterLiveUpdate:
+class NewsletterLiveUpdate(BaseEvent):
     """
     Emitted when there's a live update to a newsletter.
     """

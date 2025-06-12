@@ -6,6 +6,7 @@ Port of whatsmeow/binary/decoder.go
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
+from ..exceptions import PymeowError
 from ..types.jid import JID, MESSENGER_SERVER, INTEROP_SERVER
 from .errors import (
     InvalidTypeError, InvalidJIDTypeError, InvalidNodeError,
@@ -495,6 +496,9 @@ def unpack_hex(value: int) -> int:
     else:
         raise InvalidTypeError(f"unpackHex with value {value}")
 
+class DecodingError(PymeowError):
+    """Error that occurs during binary decoding operations."""
+    pass
 
 def unmarshal(data: bytes) -> Node:
     """
@@ -506,10 +510,10 @@ def unmarshal(data: bytes) -> Node:
     Returns:
         A tuple containing the Node and an optional error
     Raises:
-        Exception: if r.index != len(r.data): leftover bytes after decoding
+        DecodingError: if r.index != len(r.data): leftover bytes after decoding
     """
     r = BinaryDecoder.new_decoder(data)
     n = r.read_node()
     if r.index != len(r.data):
-        raise Exception(f"{len(r.data) - r.index} leftover bytes after decoding")
+        raise DecodingError(f"{len(r.data) - r.index} leftover bytes after decoding")
     return n

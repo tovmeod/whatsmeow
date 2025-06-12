@@ -6,7 +6,7 @@ Port of whatsmeow/group.go
 import logging
 from typing import List, Optional, TYPE_CHECKING
 
-from . import types
+from . import types, request
 from .binary.attrs import AttrUtility
 from .binary.node import Node
 from .exceptions import ElementMissingError, IQError, ErrInvalidImageFormat, ErrGroupInviteLinkUnauthorized, \
@@ -75,7 +75,7 @@ async def send_group_iq(
     content: Node
 ) -> Node:
     """Send a group IQ request."""
-    res, err = await client.send_iq(InfoQuery(
+    res = await request.send_iq(client, InfoQuery(
         namespace="w:g2",
         type=iq_type,
         to=jid,

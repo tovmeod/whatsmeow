@@ -175,7 +175,7 @@ async def send_fb_message(
         resp_chan = await request.wait_response(client, req.id)  # TODO: Review method implementation
 
         if not req.peer:
-            retry.add_recent_message(client, to, req.id, None, message_app_proto)  # TODO: Review method implementation
+            await retry.add_recent_message(client, to, req.id, None, message_app_proto)
 
         phash = ""
         data = b""
@@ -328,7 +328,7 @@ def send_group_v3(
     skdm.axolotl_sender_key_distribution_message = signal_skd_message.serialize()
 
     # Create group cipher and encrypt - matches Go cipher usage
-    cipher = GroupCipher(builder, sender_key_name, client.store)
+    cipher = GroupCipher(client.signal_store, sender_key_name)
 
     # Build message transport proto - matches Go structure exactly
     message_transport = waMsgTransport.WAMsgTransport_pb2.MessageTransport()
@@ -596,7 +596,7 @@ def prepare_message_node_v3(
     franking_tag: bytes,
     participants: List['JID'],
     timings: 'MessageDebugTimings'
-) -> Tuple['BinaryNode', List['JID'], Optional[Exception]]:
+) -> Tuple['Node', List['JID'], Optional[Exception]]:
     """Prepare a message node for v3 protocol - matches Go Client.prepareMessageNodeV3 method."""
     start = time.time()
     all_devices = user.get_user_devices_context(client, participants)
@@ -665,11 +665,11 @@ def prepare_message_node_v3(
 
     return node, all_devices, None
 
-def encrypt_message_for_devices_v3():
+def encrypt_message_for_devices_v3() -> None:
     raise NotImplementedError
 
-def encrypt_message_for_device_and_wrap_v3():
+def encrypt_message_for_device_and_wrap_v3() -> None:
     raise NotImplementedError
 
-def encrypt_message_for_device_v3():
+def encrypt_message_for_device_v3() -> None:
     raise NotImplementedError

@@ -10,13 +10,14 @@ import time
 from dataclasses import dataclass, field
 import datetime
 from os import urandom
-from typing import Any, Callable, List, Optional, Tuple, Awaitable, TYPE_CHECKING, Dict, Set, Coroutine
+from typing import Any, Callable, List, Optional, Tuple, Awaitable, TYPE_CHECKING, Dict, Set, Coroutine, Self
 from urllib.parse import urlparse
 
 import aiohttp
 
 from . import handshake, keepalive, request, retry, connectionevents
 from .appstate.keys import Processor
+from .binary.decoder import DecodingError
 from .binary.unpack import unpack
 from .call import handle_call_event
 from .connectionevents import handle_ib
@@ -32,10 +33,12 @@ from .socket.framesocket import FrameSocket
 from .binary.node import Node, unmarshal, marshal
 from .socket.noisesocket import NoiseSocket
 from .store.store import Device
+from .store.tortoise_signal_store_implementation import SignalPreKeyModel, TortoiseSignalStore, generate_identity_keys, \
+    generate_prekeys
 from .types import message
 from .types.events import Disconnected, PrivacySettingsEvent, events
 from .types.jid import JID, EMPTY_JID, HIDDEN_USER_SERVER, DEFAULT_USER_SERVER, NEWSLETTER_SERVER, GROUP_SERVER
-from .types.message import AddressingMode, MessageInfo, MessageSource
+from .types.message import AddressingMode, MessageInfo, MessageSource, MessageID
 from .types.presence import Presence, ChatPresence, ChatPresenceMedia
 from .exceptions import ElementMissingError, ErrNotLoggedIn, ErrNotConnected, ErrAlreadyConnected
 from .privacysettings import PrivacySettings, PrivacySettingType, PrivacySetting
@@ -113,19 +116,18 @@ class Client:
         self.socket: Optional[NoiseSocket] = None
         self.socket_lock = asyncio.Lock()
         self.socket_wait = asyncio.Event()
-        self.ws_dialer: Optional[aiohttp.ClientSession] = None
 
         # State flags
         self._is_logged_in = False
         self._expected_disconnect = False
         self.enable_auto_reconnect = True
         self.initial_auto_reconnect = False
-        self.last_successful_connect: Optional[datetime] = None
+        self.last_successful_connect: Optional[datetime.datetime] = None
         self.auto_reconnect_errors = 0
         self.auto_reconnect_hook: Optional[Callable[[Exception], bool]] = None
         self.synchronous_ack = False
         self.enable_decrypted_event_buffer = False
-        self.last_decrypted_buffer_clear: Optional[datetime] = None
+        self.last_decrypted_buffer_clear: Optional[datetime.datetime] = None
 
         self.disable_login_auto_reconnect = False
 
@@ -145,11 +147,11 @@ class Client:
         # The buffer size (32) is a behavioral difference from an unbuffered Go channel.
         # Consider asyncio.Queue() for an unbounded queue or asyncio.Queue(1) for closer to unbuffered semantics if backpressure is important.
         # TODO: Type hint for history_sync_notifications queue items
-        self.history_sync_notifications = asyncio.Queue(32)
+        self.history_sync_notifications: asyncio.Queue[waE2E_pb2.HistorySyncNotification] = asyncio.Queue(32)
         self.history_sync_handler_started = False
 
         self.upload_prekeys_lock = asyncio.Lock()
-        self.last_pre_key_upload: Optional[datetime] = None
+        self.last_pre_key_upload: Optional[datetime.datetime] = None
 
         # Import JID here to avoid circular imports
         from .types import JID
@@ -160,7 +162,7 @@ class Client:
 
         # Response handling
         # TODO: Type hint for response_waiters values (should be asyncio.Queue[Node])
-        self.response_waiters: Dict[str, asyncio.Queue[Any]] = {}
+        self.response_waiters: Dict[str, asyncio.Queue[Node]] = {}
         self.response_waiters_lock = asyncio.Lock()
 
         # Event handling
@@ -195,7 +197,7 @@ class Client:
         self.incoming_retry_request_counter_lock = asyncio.Lock()
 
         # Go: map[string]time.Time -> Python: Dict[str, datetime] (OK)
-        self.app_state_key_requests: Dict[str, datetime] = {}
+        self.app_state_key_requests: Dict[str, float] = {}
         self.app_state_key_requests_lock = asyncio.Lock()
 
         self.message_send_lock = asyncio.Lock()
@@ -220,7 +222,7 @@ class Client:
         self.recent_messages_ptr = 0  # Go: int -> Python: int (OK)
         self.recent_messages_lock = asyncio.Lock()
 
-        self.session_recreate_history: Dict[JID, datetime] = {}
+        self.session_recreate_history: Dict[JID, datetime.datetime] = {}
         self.session_recreate_history_lock = asyncio.Lock()
 
         # Callbacks
@@ -256,8 +258,6 @@ class Client:
         # Messenger config (for non-WhatsApp clients)
         self.messenger_config: Optional[
             MessengerConfig] = None  # Go: *MessengerConfig -> Python: Optional[MessengerConfig] (OK)
-        # Go: RefreshCAT func() error -> Python: Callable[[], Optional[Exception]] (OK)
-        self.refresh_cat: Optional[Callable[[], Optional[Exception]]] = None
 
         # These are extra attributes in Python, likely for managing async tasks.
         self._keepalive_task: Optional[asyncio.Task] = None
@@ -265,29 +265,42 @@ class Client:
 
         self._background_tasks: Set[asyncio.Task] = set()
 
-
-
         # used by the signal_protocol lib
-        self.signal_store = None
+        self.signal_store: TortoiseSignalStore
         # self.session_ciphers = {}  # Cache for session ciphers
         # self.group_ciphers = {}  # Cache for group ciphers
 
-    # async def initialize_signal_protocol(self):
-    #     """Initialize Signal Protocol on startup."""
-    #
-    #     # 1. Generate or load identity keys
-    #     identity_keys = generate_identity_keys()
-    #     registration_id = 12345  # Should be randomly generated and stored
-    #
-    #     # 2. Create your persistent store
-    #     self.signal_store = TortoiseSignalStore(identity_keys, registration_id)
-    #
-    #     # 3. Generate and store prekeys if this is first run
-    #     await self._setup_prekeys()
-    #
-    #     print("Signal Protocol initialized with persistent storage")
+    async def ainit(self) -> 'Client':
+        await self.initialize_signal_protocol()
+        return self
 
-    def create_task(self, coro: Awaitable[Any]) -> asyncio.Task:
+    async def initialize_signal_protocol(self) -> None:
+        """Initialize Signal Protocol on startup."""
+
+        # 1. Generate or load identity keys
+        identity_keys = generate_identity_keys()
+        registration_id = 12345  # Should be randomly generated and stored
+
+        # 2. Create your persistent store
+        self.signal_store = TortoiseSignalStore(identity_keys, registration_id)
+
+        # 3. Generate and store prekeys if this is first run
+        await self._setup_prekeys()
+
+        print("Signal Protocol initialized with persistent storage")
+
+    async def _setup_prekeys(self) -> None:
+        """Generate prekeys on first run."""
+        # Check if we already have prekeys
+        existing_prekeys = await SignalPreKeyModel.all().count()
+        if existing_prekeys == 0:
+            # Generate 100 prekeys
+            prekeys = generate_prekeys(1, 100)
+            for prekey in prekeys:
+                await self.signal_store.store_pre_key(prekey.id(), prekey)
+            print(f"Generated {len(prekeys)} prekeys")
+
+    def create_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """
         Create a background task and track it to prevent garbage collection.
 
@@ -313,7 +326,7 @@ class Client:
         async with self.socket_lock:
             return self.socket_wait
 
-    async def close_socket_wait_chan(self):
+    async def close_socket_wait_chan(self) -> None:
         """Close and recreate the socket wait event."""
         async with self.socket_lock:
             self.socket_wait.set()
@@ -443,7 +456,7 @@ class Client:
 
             # Go: fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), wsDialer)
             # Python: Pass logger and dialer config to FrameSocket constructor
-            fs = FrameSocket(dialer=self.ws_dialer)  # todo: check if this is saved, socket needs to be closed
+            fs = FrameSocket(dialer=self.http)  # todo: check if this is saved, socket needs to be closed?
 
             if self.messenger_config is not None:
                 fs.url = self.messenger_config.websocket_url
@@ -484,9 +497,8 @@ class Client:
             # The Go code passes cli.socket.Context(). The Python equivalent depends on how
             # FrameSocket (or the actual NoiseSocket assigned to self.socket after handshake) exposes its context.
             if self.socket:  # self.socket should be the actual (e.g., NoiseSocket) after handshake
-                socket_ctx = self.socket.context()  # Assuming a .context() method
                 self._keepalive_task = asyncio.create_task(keepalive.keep_alive_loop(self))
-                self._handler_task = asyncio.create_task(self._handler_queue_loop(socket_ctx))
+                self._handler_task = asyncio.create_task(self._handler_queue_loop())
             else:
                 # This case should ideally not be reached if handshake was successful
                 # and self.socket was assigned.
@@ -504,7 +516,7 @@ class Client:
         """
         return self is not None and self._is_logged_in
 
-    async def on_disconnect(self, ns: "NoiseSocket", remote: bool):
+    async def on_disconnect(self, ns: "NoiseSocket", remote: bool) -> None:
         """
         Handles the disconnection of a NoiseSocket.
 
@@ -639,7 +651,7 @@ class Client:
             await self._unlocked_disconnect()
 
         # Go: cli.clearDelayedMessageRequests()
-        retry.clear_delayed_message_requests(self)
+        await retry.clear_delayed_message_requests(self)
 
     async def _unlocked_disconnect(self) -> None:
         """
@@ -689,9 +701,10 @@ class Client:
 
         await self.close()
 
-    async def close(self):
+    async def close(self) -> None:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        await self.http.close()
 
     async def logout(self) -> Optional[Exception]:
         """Log out from WhatsApp and delete the local device store.
@@ -735,12 +748,7 @@ class Client:
             content=[iq_content_node]
         )
 
-        _, err_iq = await self.send_iq(logout_iq)
-
-        # Go: if err != nil { return fmt.Errorf("error sending logout request: %w", err) }
-        if err_iq is not None:
-            # Wrap the error to match Go's fmt.Errorf style
-            return ValueError(f"error sending logout request: {err_iq}")
+        _ = await request.send_iq(self, logout_iq)
 
         # Go: cli.Disconnect()
         await self.disconnect()
@@ -798,7 +806,7 @@ class Client:
         """Remove all event handlers that have been registered with add_event_handler."""
         self.event_handlers.clear()
 
-    async def handle_frame(self, data: bytes):
+    async def handle_frame(self, data: bytes) -> None:
         """
         Processes an incoming WebSocket frame.
 
@@ -807,17 +815,14 @@ class Client:
         """
         # Go: decompressed, err := waBinary.Unpack(data)
         # Python: Assuming wa_binary.unpack returns (Optional[bytes], Optional[Exception])
-        decompressed, err_unpack = unpack(data)
-        if err_unpack is not None:
-            logger.warning(f"Failed to decompress frame: {err_unpack}")
-            logger.debug(f"Errored frame hex: {data.hex()}")
-            return
-        decompressed: bytes
+        decompressed = unpack(data)
+
         # Go: node, err := waBinary.Unmarshal(decompressed)
         # Python: Assuming wa_binary.unmarshal returns (Optional[Node], Optional[Exception])
-        node, err_unmarshal = unmarshal(decompressed)
-        if err_unmarshal is not None:
-            logger.warning(f"Failed to decode node in frame: {err_unmarshal}")
+        try:
+            node = unmarshal(decompressed)
+        except DecodingError as e:
+            logger.warning(f"Failed to decode node in frame: {e}")
             logger.debug(f"Errored frame hex: {decompressed.hex()}")
             return
 
@@ -848,7 +853,7 @@ class Client:
         elif node.tag != "ack":
             logger.debug(f"Didn't handle WhatsApp node {node.tag}")
 
-    async def _handler_queue_loop(self, stop_event: Optional[asyncio.Event] = None) -> None:
+    async def _handler_queue_loop(self) -> None:
         """
         Process nodes from the handler queue.
         Accepts an optional asyncio.Event to signal shutdown.
@@ -865,9 +870,9 @@ class Client:
                 done_event = asyncio.Event()
 
                 # Go: go func() { start := time.Now(); cli.nodeHandlers[node.Tag](node); ... }()
-                async def process_node():
+                async def process_node() -> None:
                     start = time.time()
-                    await self.node_handlers[node.tag](node)
+                    await self.node_handlers[node.tag](self, node)
                     duration = time.time() - start
                     done_event.set()
                     if duration > 5.0:  # 5 seconds
@@ -902,7 +907,7 @@ class Client:
                 logger.error(f"Error in handler queue loop: {e}")
                 # Continue the loop on other errors
 
-    async def send_node_and_get_data(self, node: Node) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def send_node_and_get_data(self, node: Node) -> Optional[bytes]:
         """
         Send a node to the server and get the raw data.
         Mirrors Go's pattern of returning (data, error).
@@ -911,7 +916,9 @@ class Client:
             node: The node to send.
 
         Returns:
-            A tuple containing the raw data sent (bytes) and an optional Exception.
+            the raw data sent (bytes)
+        Raises:
+            ErrNotConnected
         """
         # Go: if cli == nil { return nil, ErrClientIsNil }
         # This check is unidiomatic for Python instance methods.
@@ -928,19 +935,12 @@ class Client:
 
             # Go: if sock == nil { return nil, ErrNotConnected }
             if self.socket is None:
-                return None, ErrNotConnected("Not connected")
+                raise ErrNotConnected("Not connected")
 
             # Go: payload, err := waBinary.Marshal(node)
             # Python: try...except for node.marshal()
             # To match Go's return pattern, node.marshal() should also return (data, error)
-            payload, err_marshal = marshal(node)  # Assuming node.marshal() returns (bytes, error)
-            payload: bytes
-            if err_marshal is not None:
-                # Go: return nil, fmt.Errorf("failed to marshal node: %w", err)
-                return None, ValueError(f"Failed to marshal node: {err_marshal}")
-
-            if payload is None:  # Should not happen if err_marshal is None, but good practice
-                return None, ValueError("Marshaling returned no data and no error")
+            payload = marshal(node)  # Assuming node.marshal() returns (bytes, error)
 
             # Go: cli.sendLog.Debugf("%s", node.XMLString())
             self.send_log.debug(f"{node.xml_string()}")
@@ -948,27 +948,20 @@ class Client:
             # Go: return payload, sock.SendFrame(payload)
             # Python: await sock.send_frame(payload)
             # To match Go, sock.send_frame should return an error or None
-            err_send = await self.socket.send_frame(payload)
-            if err_send is not None:
-                return payload, err_send  # Return payload even on send error, as Go does
+            await self.socket.send_frame(payload)
+            return payload
 
-            return payload, None
-
-    async def send_node(self, node: Node) -> Optional[Exception]:
+    async def send_node(self, node: Node) -> None:
         """Send a node to the server.
 
         Args:
             node: The node to send.
 
-        Returns:
-            Optional[Exception]: An exception object if an error occurred, otherwise None.
+        Returns: None
         """
         # Go: _, err := cli.sendNodeAndGetData(node)
         # Python: Assuming self.send_node_and_get_data returns (data, error_object)
-        _payload, err = await self.send_node_and_get_data(node)
-
-        # Go: return err
-        return err
+        _payload = await self.send_node_and_get_data(node)
 
     async def dispatch_event(self, evt: events.BaseEvent) -> None:
         """Dispatch an event to all registered event handlers.
@@ -1004,25 +997,21 @@ class Client:
         # Go: if chatJID.IsEmpty()
         if chat_jid.is_empty():
             # Go: chatJID, err = types.ParseJID(webMsg.GetKey().GetRemoteJID())
-            parsed_jid, err_parse = JID.parse_jid(web_msg.GetKey().remote_jid)
-            if err_parse:
-                return None, ValueError(f"no chat JID provided and failed to parse remote JID: {err_parse}")
-            if parsed_jid is None:  # Should not happen if err_parse is None
-                return None, ValueError("no chat JID provided and remote JID parsing yielded None without error")
+            parsed_jid = JID.parse_jid(web_msg.key.remoteJID)
             chat_jid = parsed_jid
 
         # Go: info := types.MessageInfo{...}
         message_source = MessageSource(
             chat=chat_jid,
-            is_from_me=web_msg.GetKey().from_me,
-            is_group=(chat_jid.server == GROUP_SERVER)  # Assuming GROUP_SERVER constant
+            is_from_me=web_msg.key.fromMe,
+            is_group=(chat_jid.server == GROUP_SERVER)
         )
         info = MessageInfo(
             message_source=message_source,
-            id=web_msg.GetKey().id,
-            push_name=web_msg.GetPushName(),
+            id=MessageID(web_msg.key.ID),
+            push_name=web_msg.pushName,
             # Go: time.Unix(int64(webMsg.GetMessageTimestamp()), 0)
-            timestamp=datetime.datetime.fromtimestamp(web_msg.GetMessageTimestamp(), tz=datetime.timezone.utc)
+            timestamp=datetime.datetime.fromtimestamp(web_msg.messageTimestamp, tz=datetime.timezone.utc)
         )
 
         # Determine sender
@@ -1036,48 +1025,44 @@ class Client:
         elif chat_jid.server in [DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, NEWSLETTER_SERVER]:
             info.message_source.sender = chat_jid
         # Go: else if webMsg.GetParticipant() != ""
-        elif web_msg.GetParticipant():
-            info.message_source.sender, err = JID.parse_jid(web_msg.GetParticipant())
+        elif web_msg.participant:
+            info.message_source.sender = JID.parse_jid(web_msg.participant)
         # Go: else if webMsg.GetKey().GetParticipant() != ""
-        elif web_msg.GetKey().participant:  # Assuming GetKey() returns object with .participant
-            info.message_source.sender, err = JID.parse_jid(web_msg.GetKey().participant)
+        elif web_msg.key.participant:
+            info.message_source.sender = JID.parse_jid(web_msg.key.participant)
         else:
             return None, ValueError(f"couldn't find sender of message {info.id}")
 
         if err:
             return None, ValueError(f"failed to parse sender of message {info.id}: {err}")
-        if info.sender is None and not info.message_source.is_from_me:  # Double check if sender was set
+        if info.sender is None and not info.message_source.is_from_me:
             return None, ValueError(f"sender could not be determined for message {info.id}")
 
         # Go: if pk := webMsg.GetCommentMetadata().GetCommentParentKey(); pk != nil
-        comment_meta = web_msg.GetCommentMetadata()
-        if comment_meta:
-            pk = comment_meta.GetCommentParentKey()
-            if pk:
-                info.msg_meta_info.thread_message_id = pk.GetID()
-                # Go: info.MsgMetaInfo.ThreadMessageSenderJID, _ = types.ParseJID(pk.GetParticipant())
-                # Error from this specific JID parse is ignored in Go
-                parsed_thread_sender_jid, _ = JID.parse_jid(pk.GetParticipant())
-                info.msg_meta_info.thread_message_sender_jid = parsed_thread_sender_jid
+        if web_msg.commentMetadata and web_msg.commentMetadata.commentParentKey:
+            pk = web_msg.commentMetadata.commentParentKey
+            info.msg_meta_info.thread_message_id = MessageID(pk.ID)
+            # Go: info.MsgMetaInfo.ThreadMessageSenderJID, _ = types.ParseJID(pk.GetParticipant())
+            parsed_thread_sender_jid = JID.parse_jid(pk.participant)
+            info.msg_meta_info.thread_message_sender_jid = parsed_thread_sender_jid
 
         # Go: evt := &events.Message{...}
         evt = events.Message(
-            raw_message=web_msg.GetMessage(),
+            raw_message=web_msg.message,
             source_web_msg=web_msg,
             info=info
         )
 
         # Go: evt.UnwrapRaw()
-        evt.unwrap_raw()  # Assuming this method exists and modifies evt.message
+        evt.unwrap_raw()
 
         # Go: if evt.Message.GetProtocolMessage().GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT
-        # Ensure evt.message and protocol_message are not None before accessing
-        if evt.message and evt.message.GetProtocolMessage():
-            protocol_msg = evt.message.GetProtocolMessage()
-            if protocol_msg.GetType() == waE2E_pb2.ProtocolMessage.MESSAGE_EDIT:
-                if protocol_msg.GetKey():
-                    info.id = protocol_msg.GetKey().id  # Update MessageInfo's ID
-                evt.message = protocol_msg.GetEditedMessage()  # Update the actual message content
+        if evt.message and evt.message.protocol_message:
+            protocol_msg = evt.message.protocol_message
+            if protocol_msg.type == waE2E_pb2.ProtocolMessage.MESSAGE_EDIT:
+                if protocol_msg.key:
+                    info.id = protocol_msg.key.id
+                evt.message = protocol_msg.edited_message
 
         return evt, None
 
@@ -1087,7 +1072,6 @@ class Client:
         Args:
             first: The first JID.
             second: The second JID.
-            ctx: Optional context, similar to Go's context.Context (usage depends on store implementation).
         """
         lid: Optional[JID] = None
         pn: Optional[JID] = None
@@ -1115,15 +1099,9 @@ class Client:
         # Python: Call the store method, passing the context if the Python store uses it.
         # The Python store method might raise an exception or return an error object.
         # Assuming it returns Optional[Exception] to match Go's error handling better.
-        err: Optional[Exception]
         try:
             # Pass ctx if your Python store's put_lid_mapping expects it.
             # If it doesn't, you can omit it: await self.store.lids.put_lid_mapping(lid, pn)
-            err = await self.store.lids.put_lid_mapping(lid, pn)
+            await self.store.lids.put_lid_mapping(lid, pn)
         except Exception as e:  # Catch if put_lid_mapping raises directly
-            err = e
-
-        # Go: if err != nil { cli.Log.Errorf("Failed to store LID-PN mapping for %s -> %s: %v", lid, pn, err) }
-        if err is not None:
-            # Use logger for consistency
-            logger.error(f"Failed to store LID-PN mapping for {lid} -> {pn}: {err}")
+            logger.exception(f"Failed to store LID-PN mapping for {lid} -> {pn}: {e}")

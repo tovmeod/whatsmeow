@@ -9,6 +9,8 @@ from typing import List, Optional, Dict, TYPE_CHECKING, Tuple
 import struct
 from datetime import datetime, timedelta
 
+from signal_protocol.state import PreKeyBundle
+from . import request
 from .binary.node import Node
 from .request import InfoQuery, InfoQueryType
 from .types import JID
@@ -25,14 +27,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class PreKeyBundle:
-    """Pre-key bundle for Signal protocol - matches Go's prekey.Bundle."""
-    registration_id: int
-    device_id: int
-    pre_key: Optional[PreKey]
-    signed_pre_key: PreKey
-    identity_key: bytes
+# @dataclass
+# class PreKeyBundle:
+#     """Pre-key bundle for Signal protocol - matches Go's prekey.Bundle."""
+#     registration_id: int
+#     device_id: int
+#     pre_key: Optional[PreKey]
+#     signed_pre_key: PreKey
+#     identity_key: bytes
 
 @dataclass
 class PreKeyResp:
@@ -40,7 +42,7 @@ class PreKeyResp:
     bundle: Optional[PreKeyBundle]
     error: Optional[Exception]
 
-async def get_server_pre_key_count(client: "Client") -> Tuple[int, Optional[Exception]]:
+async def get_server_pre_key_count(client: "Client") -> int:
     """Port of Go's (*Client).getServerPreKeyCount method.
 
     Get the number of pre-keys stored on the WhatsApp server.
@@ -49,39 +51,39 @@ async def get_server_pre_key_count(client: "Client") -> Tuple[int, Optional[Exce
         client: The client instance
 
     Returns:
-        Tuple[int, Optional[Exception]]: Number of pre-keys on server and an
-                                         Exception if an error occurred, otherwise None.
-                                         Returns (0, Exception) on error.
+        int: Number of pre-keys on server
+    Raises:
+        RuntimeError
+        ValueError
     """
     # TODO: Review client.send_iq to ensure its signature and behavior
     #       (especially error reporting) align with Go's sendIQ.
     # TODO: Review client.server_jid to ensure it's the correct equivalent of types.ServerJID.
     # TODO: Review Node class and its methods like get_child_by_tag and attribute access.
 
-    resp_node, err_send_iq = await client.send_iq(
+    resp_node, err_send_iq = await request.send_iq(
+        client,
         InfoQuery(namespace="encrypt", type=InfoQueryType.GET,
                   to=client.server_jid, content=[Node(tag="count")])
     )
 
     if err_send_iq is not None:
-        return 0, RuntimeError(f"failed to get prekey count on server: {err_send_iq}")
+        raise RuntimeError(f"failed to get prekey count on server: {err_send_iq}")
 
     if resp_node is None:  # Should ideally be covered by err_send_iq, but good for robustness
-        return 0, RuntimeError("failed to get prekey count on server: no response node received")
+        raise RuntimeError("failed to get prekey count on server: no response node received")
 
     count_node = resp_node.get_child_by_tag("count")
     if count_node is None:
-        return 0, ValueError("server response missing 'count' node")
+        raise ValueError("server response missing 'count' node")
 
     value_str = count_node.attrs.get("value")
     if value_str is None:
-        return 0, ValueError("server response 'count' node missing 'value' attribute")
+        raise ValueError("server response 'count' node missing 'value' attribute")
 
-    try:
-        val = int(value_str)
-        return val, None
-    except ValueError as e_parse:
-        return 0, ValueError(f"failed to parse prekey count value from '{value_str}': {e_parse}")
+    val = int(value_str)
+    return val
+
 
 async def upload_prekeys(client: "Client") -> None:
     """
@@ -100,16 +102,18 @@ async def upload_prekeys(client: "Client") -> None:
             # Go: sc, _ := cli.getServerPreKeyCount(ctx)
             # Call the Python equivalent, which should return (count, error)
             # ctx is not used in Python, so we don't pass it here.
-            server_count, err_get_count = await get_server_pre_key_count(client)
-
-            # Go ignores the error from getServerPreKeyCount in this specific check
-            if err_get_count is None:
+            try:
+                server_count = await get_server_pre_key_count(client)
+            except Exception as e:
+                # Go ignores the error from getServerPreKeyCount in this specific check
                 # Go: if sc >= WantedPreKeyCount { ... }
                 if server_count >= WANTED_PREKEY_COUNT:
                     # Go: cli.Log.Debugf(...)
                     client.send_log.debug("Canceling prekey upload request due to likely race condition")
                     # Go: return
+                    logger.exception(e)
                     return
+
             # If err_get_count is not None, Go ignores it and proceeds, so we do nothing here.
 
         # Go: var registrationIDBytes [4]byte; binary.BigEndian.PutUint32(registrationIDBytes[:], cli.Store.RegistrationID)
@@ -173,7 +177,7 @@ async def upload_prekeys(client: "Client") -> None:
 async def fetch_pre_keys(
     client: "Client",
     users: List[JID]
-) -> Tuple[Optional[Dict[JID, PreKeyResp]], Optional[Exception]]:
+) -> Optional[Dict[JID, PreKeyResp]]:
     """
     Port of Go's (*Client).fetchPreKeys method.
 
@@ -185,9 +189,11 @@ async def fetch_pre_keys(
         users: List of user JIDs to fetch pre-keys for.
 
     Returns:
-        Tuple[Optional[Dict[JID, PreKeyResp]], Optional[Exception]]:
-            Map of JID to pre-key response, and an Exception if an error
-            occurred, otherwise None. Returns (None, Exception) on error.
+        Optional[Dict[JID, PreKeyResp]]:
+            Map of JID to pre-key response.
+    Raises:
+        RuntimeError
+        ValueError
     """
     # TODO: Review client.send_iq to ensure its signature and behavior
     #       (especially error reporting) align with Go's sendIQ.
@@ -214,16 +220,13 @@ async def fetch_pre_keys(
 
     # Go: resp, err := cli.sendIQ(...)
     # Assuming client.send_iq is adapted to return (response, error_object)
-    resp_node, err_send_iq = await client.send_iq(
+    resp_node = await request.send_iq(
+        client,
         InfoQuery(namespace="encrypt", type=InfoQueryType.GET, to=client.server_jid,
                   content=[Node(tag="key", content=request_nodes)]))
 
-    if err_send_iq is not None:
-        # Go: return nil, fmt.Errorf("failed to send prekey request: %w", err)
-        return None, RuntimeError(f"failed to send prekey request: {err_send_iq}")
-
     if resp_node is None: # Should not happen if err_send_iq is None, but for robustness
-        return None, RuntimeError("failed to send prekey request: no response node received")
+        raise RuntimeError("failed to send prekey request: no response node received")
 
     # Go: else if len(resp.GetChildren()) == 0 { return nil, fmt.Errorf("got empty response to prekey request") }
     # Assuming get_children() returns a list of child nodes.
@@ -239,7 +242,7 @@ async def fetch_pre_keys(
     list_node = resp_node.get_child_by_tag("list")
     if list_node is None:
         # This covers the case where the <list> tag is missing, which could imply an empty or malformed response.
-        return None, ValueError("got malformed response to prekey request: missing 'list' node")
+        raise ValueError("got malformed response to prekey request: missing 'list' node")
 
 
     # Go: respData := make(map[types.JID]preKeyResp)
@@ -249,9 +252,9 @@ async def fetch_pre_keys(
     # Assuming list_node.get_children() returns the <user> nodes
     user_children = list_node.get_children()
     if not user_children and not request_nodes: # If we requested no users, an empty list is fine.
-        return resp_data, None
+        return resp_data
     if not user_children and request_nodes: # If we requested users but got an empty list.
-         return None, ValueError("got empty 'list' node in prekey response when users were requested")
+         raise ValueError("got empty 'list' node in prekey response when users were requested")
 
 
     for child_node in user_children:
@@ -276,20 +279,19 @@ async def fetch_pre_keys(
             logger.warning(f"Failed to parse JID '{jid_str}' from prekey response: {e_jid_parse}")
             continue
 
-
         # Go: bundle, err := nodeToPreKeyBundle(uint32(jid.Device), child)
         # Go: respData[jid] = preKeyResp{bundle, err}
         try:
             # TODO: Confirm jid.device attribute exists and is of the correct type for uint32 conversion.
             # The original Python port directly passed jid.device.
             device_id = int(jid.device) # Ensure it's an int if node_to_pre_key_bundle expects it.
-            bundle = node_to_pre_key_bundle(device_id, child_node) # Assuming async
+            bundle = await node_to_pre_key_bundle(device_id, child_node) # Assuming async
             resp_data[jid] = PreKeyResp(bundle=bundle, error=None)
-        except Exception as e_bundle: # Catching broad Exception to mirror Go's err in preKeyResp
-            resp_data[jid] = PreKeyResp(bundle=None, error=e_bundle)
+        except Exception as e: # Catching broad Exception to mirror Go's err in preKeyResp
+            resp_data[jid] = PreKeyResp(bundle=None, error=e)
 
     # Go: return respData, nil
-    return resp_data, None
+    return resp_data
 
 def pre_key_to_node(key: PreKey) -> Node:
     """Port of Go's preKeyToNode function.
@@ -323,7 +325,7 @@ def pre_key_to_node(key: PreKey) -> Node:
 async def node_to_pre_key_bundle(
     device_id: int,  # Go: deviceID uint32
     node: "Node"
-) -> Tuple[Optional["PreKeyBundle"], Optional[Exception]]:
+) -> Optional["PreKeyBundle"]:
     """
     Port of Go's nodeToPreKeyBundle function.
 
@@ -334,8 +336,9 @@ async def node_to_pre_key_bundle(
         node: The node to parse.
 
     Returns:
-        Tuple[Optional[PreKeyBundle], Optional[Exception]]: The parsed pre-key bundle
-            and an Exception if an error occurred, otherwise None.
+        Optional[PreKeyBundle]: The parsed pre-key bundle
+    Raises:
+        ValueError
     """
     # Go: errorNode, ok := node.GetOptionalChildByTag("error")
     # Go: if ok && errorNode.Tag == "error" { ... }
@@ -347,13 +350,13 @@ async def node_to_pre_key_bundle(
     error_node, found_error_node = node.get_optional_child_by_tag("error")
     if found_error_node and error_node is not None and error_node.tag == "error":
         xml_string_val = error_node.xml_string() if hasattr(error_node, 'xml_string') else str(error_node)
-        return None, ValueError(f"got error getting prekeys: {xml_string_val}") # Using ValueError for parsing issues
+        raise ValueError(f"got error getting prekeys: {xml_string_val}") # Using ValueError for parsing issues
 
     # Go: registrationBytes, ok := node.GetChildByTag("registration").Content.([]byte)
     # Go: if !ok || len(registrationBytes) != 4 { ... }
     registration_node = node.get_child_by_tag("registration")
     if registration_node is None or not isinstance(registration_node.content, bytes) or len(registration_node.content) != 4:
-        return None, ValueError("invalid registration ID in prekey response")
+        raise ValueError("invalid registration ID in prekey response")
     registration_id_bytes = registration_node.content
     # Go: registrationID := binary.BigEndian.Uint32(registrationBytes)
     registration_id = struct.unpack(">I", registration_id_bytes)[0]
@@ -372,7 +375,7 @@ async def node_to_pre_key_bundle(
     # Go: if !ok || len(identityKeyRaw) != 32 { ... }
     identity_key_node = keys_node.get_child_by_tag("identity")
     if identity_key_node is None or not isinstance(identity_key_node.content, bytes) or len(identity_key_node.content) != 32:
-        return None, ValueError("invalid identity key in prekey response")
+        raise ValueError("invalid identity key in prekey response")
     identity_key_pub_bytes = identity_key_node.content
     # Go: identityKeyPub := *(*[32]byte)(identityKeyRaw) -> Python uses bytes directly
 
@@ -390,9 +393,9 @@ async def node_to_pre_key_bundle(
         # Assuming node_to_pre_key is async and returns (PreKey|None, Error|None)
         temp_pre_key, err_pre_key = await node_to_pre_key(pre_key_node_optional)
         if err_pre_key is not None:
-            return None, ValueError(f"invalid prekey in prekey response: {err_pre_key}")
+            raise ValueError(f"invalid prekey in prekey response: {err_pre_key}")
         if temp_pre_key is None: # Should not happen if err_pre_key is None, but good check
-             return None, ValueError("failed to parse prekey but no error reported by node_to_pre_key")
+             raise ValueError("failed to parse prekey but no error reported by node_to_pre_key")
         parsed_pre_key_obj = temp_pre_key
 
     # Go: signedPreKey, err := nodeToPreKey(keysNode.GetChildByTag("skey"))
@@ -403,15 +406,15 @@ async def node_to_pre_key_bundle(
     # Python: if not signed_pre_key or not signed_pre_key.signature: raise PreKeyError(...)
     skey_node = keys_node.get_child_by_tag("skey")
     if skey_node is None:
-        return None, ValueError("missing signed prekey ('skey' node) in prekey response")
+        raise ValueError("missing signed prekey ('skey' node) in prekey response")
 
     parsed_signed_pre_key_obj, err_signed_pre_key = await node_to_pre_key(skey_node)
     if err_signed_pre_key is not None:
-        return None, ValueError(f"invalid signed prekey in prekey response: {err_signed_pre_key}")
+        raise ValueError(f"invalid signed prekey in prekey response: {err_signed_pre_key}")
     if parsed_signed_pre_key_obj is None: # Should not happen if err_signed_pre_key is None
-        return None, ValueError("failed to parse signed prekey but no error reported by node_to_pre_key")
+        raise ValueError("failed to parse signed prekey but no error reported by node_to_pre_key")
     if parsed_signed_pre_key_obj.signature is None: # Go's `*signedPreKey.Signature` implies it must exist
-        return None, ValueError("parsed signed prekey is missing signature")
+        raise ValueError("parsed signed prekey is missing signature")
 
 
     # Constructing the bundle. The Python PreKeyBundle constructor seems simpler,
@@ -457,10 +460,10 @@ async def node_to_pre_key_bundle(
             signed_pre_key=parsed_signed_pre_key_obj,
             identity_key=identity_key_pub_bytes # Assuming PreKeyBundle handles creating IdentityKey internally
         )
-    except Exception as e_bundle_creation: # Catch errors during PreKeyBundle instantiation
-        return None, RuntimeError(f"failed to create prekey bundle: {e_bundle_creation}")
+    except Exception as e: # Catch errors during PreKeyBundle instantiation
+        raise RuntimeError(f"failed to create prekey bundle") from e
 
-    return bundle, None
+    return bundle
 
 async def node_to_pre_key(node: "Node") -> Tuple[Optional[PreKey], Optional[Exception]]:
     """Port of Go's nodeToPreKey function (adapted for error tuple return).

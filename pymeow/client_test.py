@@ -171,11 +171,9 @@ async def main():
             device_store = await container.new_device(test_jid)
 
         # Create WhatsApp client
-        client = Client(device_store)
-
+        client = await Client(device_store).ainit()
         # Add event handler
-        await client.add_event_handler(event_handler)
-
+        client.add_event_handler(event_handler)
         # Set up signal handling for graceful shutdown
         shutdown_event = asyncio.Event()
 

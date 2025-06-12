@@ -12,7 +12,7 @@ functionality as the Go implementation where DecodePatches is a method on the Pr
 """
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Callable, Tuple, Optional, Awaitable
 
 from typing_extensions import Sequence
@@ -161,8 +161,9 @@ async def parse_patch_list(node: Node, download_external: DownloadExternalFunc) 
         snapshot=snapshot
     )
 
-    if ag.error():
-        raise ag.error()
+    error = ag.error()
+    if error is not None:
+        raise error
 
     return patch_list
 
@@ -170,18 +171,9 @@ async def parse_patch_list(node: Node, download_external: DownloadExternalFunc) 
 @dataclass
 class PatchOutput:
     """Internal class for processing patch outputs."""
-    removed_macs: List[bytes] = None
-    # added_macs: List[Dict[str, bytes]] = None
-    added_macs: List[AppStateMutationMAC] = None
-    mutations: List[Mutation] = None
-
-    def __post_init__(self):
-        if self.removed_macs is None:
-            self.removed_macs = []
-        if self.added_macs is None:
-            self.added_macs = []
-        if self.mutations is None:
-            self.mutations = []
+    removed_macs: List[bytes] = field(default_factory=list)
+    added_macs: List[AppStateMutationMAC] = field(default_factory=list)
+    mutations: List[Mutation] = field(default_factory=list)
 
 
 class Decoder(Processor):
@@ -203,9 +195,7 @@ async def decode_mutations(processor: Processor, mutations: Sequence[WAServerSyn
     """
     for i, mutation in enumerate(mutations):
         key_id = mutation.record.keyID.ID
-        keys, err = await processor.get_app_state_key(key_id)
-        if err:
-            raise ValueError(f"Failed to get key {key_id.hex().upper()} to decode mutation: {err}")
+        keys = await processor.get_app_state_key(key_id)
 
         content = mutation.record.value.blob
         content, value_mac = content[:-32], content[-32:]
@@ -296,10 +286,7 @@ async def validate_snapshot_mac(processor: Processor, name: WAPatchName, current
         ValueError
         ErrMismatchingLTHash
     """
-    keys, err = await processor.get_app_state_key(key_id)
-    if err:
-        raise ValueError(f"Failed to get key {key_id.hex().upper()} to verify patch v{current_state.version} MACs: {err}")
-
+    keys = await processor.get_app_state_key(key_id)
     snapshot_mac = current_state.generate_snapshot_mac(name, keys.snapshot_mac)
     if snapshot_mac != expected_snapshot_mac:
         raise ErrMismatchingLTHash(f"Failed to verify patch v{current_state.version}")
@@ -338,21 +325,15 @@ async def decode_snapshot(processor: Processor, name: WAPatchName, ss: WAServerS
     async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> Optional[bytes]:
         return None
 
-    warnings, err = current_state.update_hash(encrypted_mutations, get_prev_set_value_mac)
+    warnings = current_state.update_hash(encrypted_mutations, get_prev_set_value_mac)
     if warnings:
         logger.warning(f"Warnings while updating hash for {name}: {warnings}")
-    if err:
-        raise ValueError(f"Failed to update state hash: {err}")
 
     if validate_macs:
         _ = await validate_snapshot_mac(processor, name, current_state, ss.keyID.ID, ss.mac)
 
     out = PatchOutput(mutations=new_mutations_input)
-    try:
-        await decode_mutations(processor, encrypted_mutations, out, validate_macs)
-    except Exception as err:
-        raise ValueError(f"Failed to decode snapshot of v{current_state.version}: {err}")
-
+    await decode_mutations(processor, encrypted_mutations, out, validate_macs)
     await store_macs(processor, name, current_state, out)
     return out.mutations, current_state
 
@@ -381,7 +362,7 @@ async def decode_patches(processor: Processor, patch_list: PatchList, initial_st
     for patch in patch_list.patches:
         expected_length += len(patch.mutations)
 
-    new_mutations = []
+    new_mutations:List[Mutation] = []
 
     if patch_list.snapshot:
         new_mutations, current_state = await decode_snapshot(

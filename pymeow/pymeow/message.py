@@ -527,7 +527,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
             await migrate_session_store(client, info.sender, info.sender_alt)
         else:
             try:
-                lid, err = await client.store.lids.get_lid_for_pn(info.sender)
+                lid = await client.store.lids.get_lid_for_pn(info.sender)
                 if lid and not lid.is_empty():
                     await migrate_session_store(client, info.sender, lid)
                     sender_encryption_jid = lid
@@ -674,7 +674,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
 async def clear_untrusted_identity(
     client: 'Client',
     target: JID
-) -> Optional[Exception]:
+) -> None:
     """
     Port of Go method clearUntrustedIdentity from client.go.
 
@@ -685,29 +685,22 @@ async def clear_untrusted_identity(
         client:
         target: The target JID whose identity should be cleared
 
-    Returns:
-        Optional[Exception]: Any error that occurred, None on success
+    Returns: None
+    Raises:
+        Exception:
     """
     # TODO: Review Store.Identities.DeleteIdentity implementation
     # TODO: Review Store.Sessions.DeleteSession implementation
     # TODO: Review dispatchEvent implementation
     # TODO: Review events.IdentityChange implementation
 
-    err = await client.store.identities.delete_identity(target.signal_address().string())
-    if err is not None:
-        return Exception(f"failed to delete identity: {err}")
-
-    err = await client.store.sessions.delete_session(target.signal_address().string())
-    if err is not None:
-        return Exception(f"failed to delete session: {err}")
-
+    await client.store.identities.delete_identity(str(target.signal_address()))
+    await client.store.sessions.delete_session(str(target.signal_address()))
     await client.dispatch_event(events.IdentityChange(
         jid=target,
         timestamp=datetime.now(),
         implicit=True
     ))
-
-    return None
 
 
 async def buffered_decrypt(
@@ -823,7 +816,7 @@ def decrypt_dm(
     remote_addr = address.ProtocolAddress(from_jid.user, from_jid.device)
 
     # Create session cipher
-    cipher = session_cipher.SessionCipher(client.store, remote_addr)
+    cipher = session_cipher.SessionCipher(client.signal_store, remote_addr)
 
     ciphertext = child.content
 
@@ -887,7 +880,7 @@ async def decrypt_group_msg(
     # Create group session builder and cipher
     # Go: builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
     # Go: cipher := groups.NewGroupCipher(builder, senderKeyName, cli.Store)
-    cipher = group_cipher.GroupCipher(client.store, sender_address, str(chat))
+    cipher = group_cipher.GroupCipher(client.signal_store, sender_address, str(chat))
 
     # Use buffered decryption (equivalent to cli.bufferedDecrypt)
     async def decrypt_func():
