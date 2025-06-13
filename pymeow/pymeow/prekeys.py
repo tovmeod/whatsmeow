@@ -177,7 +177,7 @@ async def upload_prekeys(client: "Client") -> None:
 async def fetch_pre_keys(
     client: "Client",
     users: List[JID]
-) -> Optional[Dict[JID, PreKeyResp]]:
+) -> Dict[JID, PreKeyResp]:
     """
     Port of Go's (*Client).fetchPreKeys method.
 
@@ -189,7 +189,7 @@ async def fetch_pre_keys(
         users: List of user JIDs to fetch pre-keys for.
 
     Returns:
-        Optional[Dict[JID, PreKeyResp]]:
+        Dict[JID, PreKeyResp]:
             Map of JID to pre-key response.
     Raises:
         RuntimeError

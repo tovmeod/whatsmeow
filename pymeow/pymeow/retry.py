@@ -335,7 +335,7 @@ async def handle_retry_receipt(
     _, has_keys = node.get_optional_child_by_tag("keys")
     bundle = None
     if has_keys:
-        bundle = prekeys.node_to_pre_key_bundle(receipt.message_source.sender.device, node)
+        bundle = await prekeys.node_to_pre_key_bundle(receipt.message_source.sender.device, node)
     else:
         reason, recreate = await should_recreate_session(client, retry_count, receipt.message_source.sender)
         if recreate:
@@ -347,7 +347,11 @@ async def handle_retry_receipt(
             if err is not None:
                 raise Exception(f"failed to fetch prekeys") from err
             elif bundle is None:
-                raise Exception(f"didn't get prekey bundle for {receipt.message_source.sender} (response size: {len(keys)})")
+                if keys:
+                    len_keys = len(keys)
+                else:
+                    len_keys = None
+                raise Exception(f"didn't get prekey bundle for {receipt.message_source.sender} (response size: {len_keys})")
 
     enc_attrs = {}
     msg_attrs = sendfb.MessageAttrs()  # TODO: Review MessageAttrs implementation
@@ -367,8 +371,8 @@ async def handle_retry_receipt(
         encryption_identity = receipt.message_source.sender
         if receipt.message_source.sender.server == DEFAULT_USER_SERVER:  # TODO: Review types.DEFAULT_USER_SERVER
             try:
-                lid_for_pn = client.store.lids.get_lid_for_pn(receipt.message_source.sender)
-                if not lid_for_pn.is_empty():
+                lid_for_pn = await client.store.lids.get_lid_for_pn(receipt.message_source.sender)
+                if lid_for_pn and not lid_for_pn.is_empty():
                     await message.migrate_session_store(client, receipt.message_source.sender, lid_for_pn)
                     encryption_identity = lid_for_pn
             except Exception as e:
@@ -610,7 +614,7 @@ async def send_retry_receipt(
                 logger.error("Failed to marshal account info: %v", e)
                 return
 
-            payload.content.append(Node(
+            payload.content = payload.get_children() + [Node(
                 tag="keys",
                 content=[
                     Node(tag="type", content=bytes([ECC_DJB_TYPE])),
@@ -619,7 +623,7 @@ async def send_retry_receipt(
                     prekeys.pre_key_to_node(client.store.signed_pre_key),
                     Node(tag="device-identity", content=device_identity)
                 ]
-            ))
+            )]
         except Exception as e:
             logger.error("Failed to get prekey for retry receipt: %v", e)
 

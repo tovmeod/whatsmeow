@@ -428,7 +428,7 @@ class Device:
 
     id: Optional[JID] = None
     lid: JID = field(default_factory=lambda: EMPTY_JID)
-    account: Optional[WAAdv_pb2.ADVSignedDeviceIdentity] = None
+    account: WAAdv_pb2.ADVSignedDeviceIdentity
     platform: str = ""
     business_name: str = ""
     push_name: str = ""

@@ -20,7 +20,7 @@ class Node:
     containing a tag, attributes, and optional content.
     """
     tag: str
-    attrs: Attrs = field(default_factory=dict) = None
+    attrs: Attrs = field(default_factory=dict)
     content: Optional[Union[List['Node'], bytes]] = None
 
     def attr_getter(self) -> AttrUtility:
