@@ -2,11 +2,10 @@
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, Optional
+from datetime import datetime
+from typing import Awaitable, Callable, Dict
 
-from ..types.expiration import ExpirationType
-from ..types.message import Message, MessageInfo
+from ..types.message import Message
 
 logger = logging.getLogger(__name__)
 

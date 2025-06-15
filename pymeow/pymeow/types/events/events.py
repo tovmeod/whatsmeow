@@ -364,7 +364,7 @@ class Message:
     Emitted when receiving a new message.
     """
     info: MessageInfo  # Information about the message like the chat and sender IDs
-    message: Optional[WAE2E_pb2.Message] = None  # The actual message struct
+    message: Optional[WAWebProtobufsE2E_pb2] = None  # The actual message struct
     is_ephemeral: bool = False  # True if the message was unwrapped from an EphemeralMessage
     is_view_once: bool = False  # True if the message was unwrapped from a ViewOnceMessage, ViewOnceMessageV2 or ViewOnceMessageV2Extension
     is_view_once_v2: bool = False  # True if the message was unwrapped from a ViewOnceMessageV2 or ViewOnceMessageV2Extension
@@ -376,7 +376,7 @@ class Message:
     unavailable_request_id: Optional[MessageID] = None  # If this event is a response to an unavailable message request, the request ID is here
     retry_count: int = 0  # If the message was re-requested from the sender, this is the number of retries it took
     newsletter_meta: Optional[NewsletterMessageMeta] = None
-    raw_message: Optional[WAE2E_pb2.Message] = None  # The raw message struct
+    raw_message: Optional[WAWebProtobufsE2E_pb2.Message] = None  # The raw message struct
 
     def unwrap_raw(self) -> 'Message':
         """

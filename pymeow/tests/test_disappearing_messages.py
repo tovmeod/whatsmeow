@@ -4,11 +4,10 @@ Tests for disappearing messages functionality in PyMeow.
 import asyncio
 import logging
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from pymeow.pymeow import ExpirationType, MessageUtils
 from pymeow.pymeow.client import Client
-from pymeow.pymeow.protocol import ProtocolNode
 
 logger = logging.getLogger(__name__)
 

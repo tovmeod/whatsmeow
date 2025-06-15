@@ -4,7 +4,6 @@ Binary unpacking functionality for the WhatsApp protocol.
 This module provides functions for unpacking binary data from the WhatsApp web API.
 """
 
-import io
 import zlib
 
 

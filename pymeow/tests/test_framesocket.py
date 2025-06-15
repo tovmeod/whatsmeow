@@ -4,8 +4,7 @@ Tests for the FrameSocket implementation.
 This tests the WebSocket framing and integration with NoiseSocket in legacy mode.
 """
 import asyncio
-import struct
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp import ClientWebSocketResponse, WSMessage, WSMsgType

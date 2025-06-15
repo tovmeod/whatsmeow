@@ -10,7 +10,7 @@ import time
 import traceback
 import zlib
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Tuple
 
 from . import receipt
 from .appstate.keys import ALL_PATCH_NAMES
@@ -513,6 +513,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
     # TODO: Review EventAlreadyProcessed exception
     # TODO: Review signalerror.ErrNoSenderKeyForUser exception
     from signal_protocol import error as signal_error
+
     from . import retry
 
     unavailable_node, ok = node.get_optional_child_by_tag("unavailable")
@@ -815,7 +816,7 @@ def decrypt_dm(
     Returns:
         Tuple containing (plaintext, ciphertext_hash, error)
     """
-    from signal_protocol import session_cipher, address, protocol
+    from signal_protocol import address, protocol, session_cipher
     # TODO: Review waBinary.Node implementation
     # TODO: Review session.NewBuilderFromSignal implementation
     # TODO: Review session.NewCipher implementation
@@ -882,7 +883,7 @@ async def decrypt_group_msg(
     # TODO: Review protocol.NewSenderKeyMessageFromBytes implementation
     # TODO: Review pbSerializer implementation
     # TODO: Review unpad_message implementation
-    from signal_protocol import group_cipher, address, sender_keys
+    from signal_protocol import address, group_cipher
     # Check content is bytes
     content = child.content
     if not isinstance(content, bytes):
@@ -1007,7 +1008,7 @@ async def handle_sender_key_distribution_message(
     Returns:
         None
     """
-    from signal_protocol import sender_keys, address, protocol
+    from signal_protocol import address, protocol, sender_keys
 
     try:
         # Create sender address

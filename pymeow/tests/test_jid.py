@@ -10,7 +10,6 @@ from pymeow.pymeow.types.jid import (
     EMPTY_JID,
     GROUP_SERVER,
     JID,
-    LEGACY_USER_SERVER,
     NEWSLETTER_SERVER,
     STATUS_BROADCAST_JID,
 )

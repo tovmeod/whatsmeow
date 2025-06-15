@@ -17,10 +17,8 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from warnings import deprecated
 
-from signal_protocol import protocol, session, session_cipher
+from signal_protocol import session, session_cipher
 from signal_protocol.error import SignalProtocolException
-from signal_protocol.protocol import CiphertextMessage
-from signal_protocol.state import PreKeyBundle
 
 from . import prekeys
 from .binary.node import Attrs, Node
@@ -1033,7 +1031,8 @@ async def send_group(
     timings.marshal = time.time() - start
     start = time.time()
 
-    from signal_protocol.address import ProtocolAddress
+    from signal_protocol.group_cipher import create_sender_key_distribution_message, group_encrypt
+    from signal_protocol.sender_keys import SenderKeyName
     sender_address = client.get_own_lid().signal_address()
     sender_key_name = SenderKeyName(str(to), sender_address)
     signal_skd_message = create_sender_key_distribution_message(

@@ -3,16 +3,14 @@ Connection events handling for WhatsApp client.
 
 Port of whatsmeow/connectionevents.go
 """
-import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from . import request
 from .binary.node import Node
 from .prekeys import get_server_pre_key_count, upload_prekeys
 from .request import InfoQuery, InfoQueryType
-from .store import store
 from .store.clientpayload import get_wa_version
 from .types import events, jid
 

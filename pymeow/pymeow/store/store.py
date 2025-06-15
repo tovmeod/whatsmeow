@@ -3,7 +3,6 @@ Store interfaces for WhatsApp data needed for multidevice functionality.
 
 Port of whatsmeow/store/store.go
 """
-import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field

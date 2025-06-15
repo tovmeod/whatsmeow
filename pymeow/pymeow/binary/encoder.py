@@ -4,12 +4,10 @@ Binary encoder for WhatsApp protocol.
 Port of whatsmeow/binary/encoder.go
 """
 import math
-import struct
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Dict, Union
 
 from ..types.jid import (
-    BOT_SERVER,
     DEFAULT_USER_SERVER,
     HIDDEN_USER_SERVER,
     HOSTED_SERVER,

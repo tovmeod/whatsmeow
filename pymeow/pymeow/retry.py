@@ -4,8 +4,6 @@ Retry logic for WhatsApp operations.
 Port of whatsmeow/retry.go
 """
 import asyncio
-import hashlib
-import hmac
 import logging
 import struct
 from dataclasses import dataclass
@@ -18,7 +16,6 @@ from signal_protocol.sender_keys import SenderKeyName
 from . import message, prekeys, send, sendfb
 from .binary.node import Node
 from .exceptions import ElementMissingError
-from .generated.waCommon import WACommon_pb2
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
 from .generated.waE2E.WAWebProtobufsE2E_pb2 import Message
 from .generated.waMsgApplication import WAMsgApplication_pb2

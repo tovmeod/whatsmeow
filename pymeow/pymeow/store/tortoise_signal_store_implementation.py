@@ -1,7 +1,7 @@
 # from signal_protocol.storage import InMemSignalProtocolStore
 from typing import List, Optional
 
-from signal_protocol import address, curve, identity_key, state, storage
+from signal_protocol import address, curve, identity_key, state
 from signal_protocol.storage import InMemSignalProtocolStore
 from tortoise import fields
 from tortoise.models import Model

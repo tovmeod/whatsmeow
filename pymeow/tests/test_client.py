@@ -1,7 +1,6 @@
 """
 Tests for the pymeow client.
 """
-import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest

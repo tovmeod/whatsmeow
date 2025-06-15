@@ -10,8 +10,6 @@ import pytest
 
 from ..pymeow.generated.waWa6.WAWebProtobufsWa6_pb2 import HandshakeMessage
 from ..pymeow.handshake import CertificateVerificationError, HandshakeError, do_handshake
-from ..pymeow.socket.framesocket import FrameSocket
-from ..pymeow.socket.noisehandshake import NoiseHandshake
 from ..pymeow.socket.noisesocket import NoiseSocket
 from ..pymeow.util.keys.keypair import KeyPair
 

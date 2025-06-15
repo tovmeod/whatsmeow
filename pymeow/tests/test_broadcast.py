@@ -1,9 +1,8 @@
 """Test broadcast list handling."""
-from datetime import datetime
 
 import pytest
 
-from ..pymeow.broadcast import BroadcastList, BroadcastListHandler
+from ..pymeow.broadcast import BroadcastListHandler
 from ..pymeow.generated.waMsgTransport import WAMsgTransport_pb2
 
 

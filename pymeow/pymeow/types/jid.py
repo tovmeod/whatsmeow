@@ -5,7 +5,7 @@ Port of whatsmeow/types/jid.go
 """
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 from signal_protocol import address
 

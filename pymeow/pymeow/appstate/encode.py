@@ -10,7 +10,6 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-from google.protobuf import proto_pb2
 
 from ..generated.waCommon import WACommon_pb2
 from ..generated.waServerSync import WAServerSync_pb2
