@@ -14,7 +14,7 @@ from ..generated.waCommon import WACommon_pb2
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
 from ..types import jid
-from ..util.cbcutil import encrypt_cbc
+from ..util.cbcutil import encrypt
 from .hash import HashState, concat_and_hmac, generate_content_mac, generate_patch_mac
 from .keys import (
     INDEX_ARCHIVE,
@@ -85,9 +85,9 @@ def build_mute(target: jid.JID, mute: bool, mute_duration: Optional[float] = Non
                 index=[INDEX_MUTE, str(target)],
                 version=2,
                 value=WASyncAction_pb2.SyncActionValue(
-                    mute_action=WASyncAction_pb2.MuteAction(
+                    muteAction=WASyncAction_pb2.MuteAction(
                         muted=mute,
-                        mute_end_timestamp=mute_end_timestamp
+                        muteEndTimestamp=mute_end_timestamp
                     )
                 )
             )
@@ -110,7 +110,7 @@ def _new_pin_mutation_info(target: jid.JID, pin: bool) -> MutationInfo:
         index=[INDEX_PIN, str(target)],
         version=5,
         value=WASyncAction_pb2.SyncActionValue(
-            pin_action=WASyncAction_pb2.PinAction(
+            pinAction=WASyncAction_pb2.PinAction(
                 pinned=pin
             )
         )
@@ -160,10 +160,10 @@ def build_archive(target: jid.JID, archive: bool, last_message_timestamp: Option
         index=[INDEX_ARCHIVE, str(target)],
         version=3,
         value=WASyncAction_pb2.SyncActionValue(
-            archive_chat_action=WASyncAction_pb2.ArchiveChatAction(
+            archiveChatAction=WASyncAction_pb2.ArchiveChatAction(
                 archived=archive,
-                message_range=WASyncAction_pb2.SyncActionMessageRange(
-                    last_message_timestamp=int(last_message_timestamp)
+                messageRange=WASyncAction_pb2.SyncActionMessageRange(
+                    lastMessageTimestamp=int(last_message_timestamp)
                     # TODO: set LastSystemMessageTimestamp?
                 )
             )
@@ -171,7 +171,7 @@ def build_archive(target: jid.JID, archive: bool, last_message_timestamp: Option
     )
 
     if last_message_key is not None:
-        archive_mutation_info.value.archive_chat_action.message_range.messages.append(
+        archive_mutation_info.value.archiveChatAction.messageRange.messages.append(
             WASyncAction_pb2.SyncActionMessage(
                 key=last_message_key,
                 timestamp=int(last_message_timestamp)
@@ -204,7 +204,7 @@ def _new_label_chat_mutation(target: jid.JID, label_id: str, labeled: bool) -> M
         index=[INDEX_LABEL_ASSOCIATION_CHAT, label_id, str(target)],
         version=3,
         value=WASyncAction_pb2.SyncActionValue(
-            label_association_action=WASyncAction_pb2.LabelAssociationAction(
+            labelAssociationAction=WASyncAction_pb2.LabelAssociationAction(
                 labeled=labeled
             )
         )
@@ -248,7 +248,7 @@ def _new_label_message_mutation(target: jid.JID, label_id: str, message_id: str,
         index=[INDEX_LABEL_ASSOCIATION_MESSAGE, label_id, str(target), message_id, "0", "0"],
         version=3,
         value=WASyncAction_pb2.SyncActionValue(
-            label_association_action=WASyncAction_pb2.LabelAssociationAction(
+            labelAssociationAction=WASyncAction_pb2.LabelAssociationAction(
                 labeled=labeled
             )
         )
@@ -293,7 +293,7 @@ def _new_label_edit_mutation(label_id: str, label_name: str, label_color: int, d
         index=[INDEX_LABEL_EDIT, label_id],
         version=3,
         value=WASyncAction_pb2.SyncActionValue(
-            label_edit_action=WASyncAction_pb2.LabelEditAction(
+            labelEditAction=WASyncAction_pb2.LabelEditAction(
                 name=label_name,
                 color=label_color,
                 deleted=deleted
@@ -337,7 +337,7 @@ def _new_setting_push_name_mutation(push_name: str) -> MutationInfo:
         index=[INDEX_SETTING_PUSH_NAME],
         version=1,
         value=WASyncAction_pb2.SyncActionValue(
-            push_name_setting=WASyncAction_pb2.PushNameSetting(
+            pushNameSetting=WASyncAction_pb2.PushNameSetting(
                 name=push_name
             )
         )
@@ -380,7 +380,7 @@ def _new_star_mutation(target_jid: str, sender_jid: str, message_id: str, from_m
         index=[INDEX_STAR, target_jid, message_id, from_me, sender_jid],
         version=2,
         value=WASyncAction_pb2.SyncActionValue(
-            star_action=WASyncAction_pb2.StarAction(
+            starAction=WASyncAction_pb2.StarAction(
                 starred=starred
             )
         )
@@ -453,7 +453,7 @@ async def encode_patch(processor: Processor, key_id: bytes, state: HashState, pa
 
         # Generate a random IV (16 bytes)
         iv = bytes([x & 0xFF for x in range(16)])
-        encrypted_content = encrypt_cbc(keys.value_encryption, iv, content)
+        encrypted_content = encrypt(keys.value_encryption, iv, content)
         encrypted_content = iv + encrypted_content
 
         value_mac = generate_content_mac(
@@ -470,7 +470,7 @@ async def encode_patch(processor: Processor, key_id: bytes, state: HashState, pa
             record=WAServerSync_pb2.SyncdRecord(
                 index=WAServerSync_pb2.SyncdIndex(blob=index_mac),
                 value=WAServerSync_pb2.SyncdValue(blob=encrypted_content + value_mac),
-                key_id=WAServerSync_pb2.KeyId(id=key_id)
+                keyID=WAServerSync_pb2.KeyId(ID=key_id)
             )
         ))
 
@@ -478,21 +478,19 @@ async def encode_patch(processor: Processor, key_id: bytes, state: HashState, pa
         return await processor.store.app_state.get_app_state_mutation_mac(str(patch_info.type), index_mac)
 
 
-    warnings, err = state.update_hash(mutations, get_prev_set_value_mac)
+    warnings = state.update_hash(mutations, get_prev_set_value_mac)
     if warnings:
         logger.warning(f"Warnings while updating hash for {patch_info.type} (sending new app state): {warnings}")
-    if err:
-        raise ValueError(f"Failed to update state hash: {err}")
 
     state.version += 1
 
     syncd_patch = WAServerSync_pb2.SyncdPatch(
-        snapshot_mac=state.generate_snapshot_mac(patch_info.type, keys.snapshot_mac),
-        key_id=WAServerSync_pb2.KeyId(id=key_id),
+        snapshotMAC=state.generate_snapshot_mac(patch_info.type, keys.snapshot_mac),
+        keyID=WAServerSync_pb2.KeyId(ID=key_id),
         mutations=mutations
     )
 
-    syncd_patch.patch_mac = generate_patch_mac(syncd_patch, patch_info.type, keys.patch_mac, state.version)
+    syncd_patch.patchMAC = generate_patch_mac(syncd_patch, patch_info.type, keys.patch_mac, state.version)
 
     result = syncd_patch.SerializeToString()
 

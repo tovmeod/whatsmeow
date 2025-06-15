@@ -10,7 +10,6 @@ from . import sealed_sender
 from . import sender_keys
 from . import session
 from . import session_cipher
-from . import signal_protocol
 from . import state
 from . import storage
 
@@ -27,7 +26,6 @@ __all__ = [
 	'sender_keys',
 	'session',
 	'session_cipher',
-	'signal_protocol',
 	'state',
 	'storage'
 ]

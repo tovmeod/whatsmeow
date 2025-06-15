@@ -3,7 +3,7 @@ Events for WhatsApp client.
 
 Port of whatsmeow/types/events/events.go
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol
@@ -312,7 +312,7 @@ class Disconnected(BaseEvent):
 
 # HistorySync is emitted when the phone has sent a blob of historical messages.
 @dataclass
-class HistorySync:
+class HistorySync(BaseEvent):
     """
     Emitted when the phone has sent a blob of historical messages.
     """
@@ -359,12 +359,13 @@ class NewsletterMessageMeta:
 
 # Message is emitted when receiving a new message.
 @dataclass
-class Message:
+class Message(BaseEvent):
     """
     Emitted when receiving a new message.
     """
     info: MessageInfo  # Information about the message like the chat and sender IDs
-    message: Optional[WAWebProtobufsE2E_pb2] = None  # The actual message struct
+    raw_message: WAWebProtobufsE2E_pb2.Message  # The raw message struct
+    message: Optional[WAWebProtobufsE2E_pb2.Message] = None  # The actual message struct
     is_ephemeral: bool = False  # True if the message was unwrapped from an EphemeralMessage
     is_view_once: bool = False  # True if the message was unwrapped from a ViewOnceMessage, ViewOnceMessageV2 or ViewOnceMessageV2Extension
     is_view_once_v2: bool = False  # True if the message was unwrapped from a ViewOnceMessageV2 or ViewOnceMessageV2Extension
@@ -376,7 +377,6 @@ class Message:
     unavailable_request_id: Optional[MessageID] = None  # If this event is a response to an unavailable message request, the request ID is here
     retry_count: int = 0  # If the message was re-requested from the sender, this is the number of retries it took
     newsletter_meta: Optional[NewsletterMessageMeta] = None
-    raw_message: Optional[WAWebProtobufsE2E_pb2.Message] = None  # The raw message struct
 
     def unwrap_raw(self) -> 'Message':
         """
@@ -391,7 +391,7 @@ class Message:
         device_sent = self.message.deviceSentMessage
         if device_sent and device_sent.message:
             self.info.device_sent_meta = DeviceSentMeta(
-                destination_jid=device_sent.destinationJid,
+                destination_jid=device_sent.destinationJID,
                 phash=device_sent.phash,
             )
             self.message = device_sent.message
@@ -445,7 +445,7 @@ class Message:
 
 # FBMessage is emitted when receiving a new Facebook message.
 @dataclass
-class FBMessage:
+class FBMessage(BaseEvent):
     """
     Emitted when receiving a new Facebook message.
     """
@@ -480,15 +480,15 @@ class Receipt(BaseEvent):
     N.B. WhatsApp on Android sends message IDs from newest message to oldest, but WhatsApp on iOS sends them in the opposite order (oldest first).
     """
     message_source: MessageSource
-    message_ids: List[MessageID]
     timestamp: datetime
     type: ReceiptType  # Type of receipt (delivered, read, etc.)
+    message_ids: List[MessageID] = field(default_factory=list)
     message_sender: Optional[JID] = None  # When you read the message of another user in a group, this field contains the sender of the message.
                                           # For receipts from other users, the message sender is always you.
 
 # ChatPresence is emitted when a chat state update (also known as typing notification) is received.
 @dataclass
-class ChatPresenceEvent:
+class ChatPresenceEvent(BaseEvent):
     """
     Emitted when a chat state update (also known as typing notification) is received.
 
@@ -502,7 +502,7 @@ class ChatPresenceEvent:
 
 # Presence is emitted when a presence update is received.
 @dataclass
-class PresenceEvent:
+class PresenceEvent(BaseEvent):
     """
     Emitted when a presence update is received.
 
@@ -530,7 +530,7 @@ class JoinedGroup:
     name: Optional[str] = None
     topic: Optional[str] = None
     creation_time: Optional[datetime] = None
-    participants: List[Dict[str, Any]] = None
+    participants: List[Dict[str, Any]] = field(default_factory=list)
 
 # GroupInfo is emitted when the metadata of a group changes.
 @dataclass
@@ -564,26 +564,13 @@ class GroupInfo:
 
     join_reason: str = ""  # This will be "invite" if the user joined via invite link
 
-    join: List[JID] = None  # Users who joined or were added the group
-    leave: List[JID] = None  # Users who left or were removed from the group
+    join: List[JID] = field(default_factory=list)  # Users who joined or were added the group
+    leave: List[JID] = field(default_factory=list)  # Users who left or were removed from the group
 
-    promote: List[JID] = None  # Users who were promoted to admins
-    demote: List[JID] = None  # Users who were demoted to normal users
+    promote: List[JID] = field(default_factory=list)  # Users who were promoted to admins
+    demote: List[JID] = field(default_factory=list)  # Users who were demoted to normal users
 
-    unknown_changes: List[Node] = None
-
-    def __post_init__(self):
-        """Initialize empty lists."""
-        if self.join is None:
-            self.join = []
-        if self.leave is None:
-            self.leave = []
-        if self.promote is None:
-            self.promote = []
-        if self.demote is None:
-            self.demote = []
-        if self.unknown_changes is None:
-            self.unknown_changes = []
+    unknown_changes: List[Node] = field(default_factory=list)
 
 # Picture is emitted when a user's profile picture or group's photo is changed.
 @dataclass
@@ -621,11 +608,11 @@ class IdentityChange(BaseEvent):
 
 # PrivacySettings is emitted when the user changes their privacy settings.
 @dataclass
-class PrivacySettingsEvent:
+class PrivacySettingsEvent(BaseEvent):
     """
     Emitted when the user changes their privacy settings.
     """
-    new_settings: Optional[Dict[str, Any]] = None  # types.PrivacySettings
+    new_settings: Dict[str, Any] = field(default_factory=dict)  # types.PrivacySettings
     group_add_changed: bool = False
     last_seen_changed: bool = False
     status_changed: bool = False
@@ -634,9 +621,6 @@ class PrivacySettingsEvent:
     online_changed: bool = False
     call_add_changed: bool = False
 
-    def __post_init__(self):
-        if self.new_settings is None:
-            self.new_settings = {}
 
 # OfflineSyncPreview is emitted right after connecting if the server is going to send events that the client missed during downtime.
 @dataclass
@@ -672,8 +656,8 @@ class MediaRetry(BaseEvent):
     """
     Emitted when the phone sends a response to a media retry request.
     """
-    ciphertext: bytes = None
-    iv: bytes = None
+    ciphertext: bytes = b''
+    iv: bytes = b''
     error: Optional[MediaRetryError] = None  # Sometimes there's an unencrypted media retry error
     timestamp: Optional[datetime] = None  # The time of the response
     message_id: Optional[MessageID] = None  # The ID of the message
@@ -709,12 +693,7 @@ class Blocklist(BaseEvent):
     action: BlocklistAction = BlocklistAction.DEFAULT  # If it's empty, there should be a list of changes in the Changes list
     d_hash: str = ""
     prev_d_hash: str = ""
-    changes: List[BlocklistChange] = None
-
-    def __post_init__(self):
-        """Initialize empty lists."""
-        if self.changes is None:
-            self.changes = []
+    changes: List[BlocklistChange] = field(default_factory=list)
 
 # NewsletterJoin is emitted when the user joins a newsletter.
 @dataclass
@@ -756,9 +735,4 @@ class NewsletterLiveUpdate(BaseEvent):
     """
     jid: JID
     time: datetime
-    messages: List[Dict[str, Any]]  # List[*types.NewsletterMessage]
-
-    def __post_init__(self):
-        """Initialize empty lists."""
-        if self.messages is None:
-            self.messages = []
+    messages: List[Dict[str, Any]] = field(default_factory=list)  # List[*types.NewsletterMessage]

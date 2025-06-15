@@ -6,6 +6,8 @@ Port of whatsmeow/binary/attrs.go
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from .node import Node
+
 if TYPE_CHECKING:
     from ..types import JID
 
@@ -24,7 +26,7 @@ class AttrUtility:
 
     def __init__(self, attrs: Attrs):
         self.attrs = attrs
-        self.errors: List[Exception] = []
+        self.errors: List[Exception] = []  # todo: just raise instead of collecting
 
     def get_jid(self, key: str, require: bool) -> Tuple['JID', bool]:
         """Get JID attribute with error handling."""
@@ -174,11 +176,6 @@ class AttrUtility:
         val, _ = self.get_int64(key, False)
         return val
 
-    def int(self, key: str) -> int:
-        """Int returns the int under the given key."""
-        val, _ = self.get_int64(key, True)
-        return val
-
     def int64(self, key: str) -> int:
         """Int64 returns the int64 under the given key."""
         val, _ = self.get_int64(key, True)
@@ -192,11 +189,6 @@ class AttrUtility:
     def optional_bool(self, key: str) -> bool:
         """OptionalBool returns the bool under the given key or False if not found."""
         val, _ = self.get_bool(key, False)
-        return val
-
-    def bool(self, key: str) -> bool:
-        """Bool returns the bool under the given key."""
-        val, _ = self.get_bool(key, True)
         return val
 
     def optional_unix_time(self, key: str) -> datetime:
@@ -229,6 +221,16 @@ class AttrUtility:
             return None
         return ErrorList(self.errors)
 
+    def int(self, key: str) -> int:
+        """Int returns the int under the given key."""
+        val, _ = self.get_int64(key, True)
+        return val
+
+    def bool(self, key: str) -> bool:
+        """Bool returns the bool under the given key."""
+        val, _ = self.get_bool(key, True)
+        return val
+
 
 class ErrorList(Exception):
     """ErrorList is a list of errors that implements the error interface itself."""
@@ -243,6 +245,6 @@ class ErrorList(Exception):
 
 
 # This would be added to the Node class in node.py:
-def attr_getter(node) -> AttrUtility:
+def attr_getter(node: Node) -> AttrUtility:
     """AttrGetter returns the AttrUtility for this Node."""
     return AttrUtility(node.attrs)

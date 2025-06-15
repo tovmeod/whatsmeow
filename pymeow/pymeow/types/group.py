@@ -3,7 +3,7 @@ Group-related types for PyMeow.
 
 Port of whatsmeow/types/group.go
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import List, Optional
@@ -92,7 +92,7 @@ class GroupParticipantAddRequest:
 @dataclass
 class GroupParticipant:
     """Contains info about a participant of a WhatsApp group chat."""
-    jid: Optional[JID] = None
+    jid: JID
     phone_number: Optional[JID] = None
     lid: Optional[JID] = None
 
@@ -162,27 +162,23 @@ class GroupInfo:
     owner_jid: Optional[JID] = None
     owner_pn: Optional[JID] = None
 
-    group_name: Optional[GroupName] = None
-    group_topic: Optional[GroupTopic] = None
-    group_locked: Optional[GroupLocked] = None
-    group_announce: Optional[GroupAnnounce] = None
-    group_ephemeral: Optional[GroupEphemeral] = None
-    group_incognito: Optional[GroupIncognito] = None
+    group_name: GroupName = field(default_factory=GroupName)
+    group_topic: GroupTopic = field(default_factory=GroupTopic)
+    group_locked: GroupLocked = field(default_factory=GroupLocked)
+    group_announce: GroupAnnounce = field(default_factory=GroupAnnounce)
+    group_ephemeral: GroupEphemeral = field(default_factory=GroupEphemeral)
+    group_incognito: GroupIncognito = field(default_factory=GroupIncognito)
 
-    group_parent: Optional[GroupParent] = None
-    group_linked_parent: Optional[GroupLinkedParent] = None
-    group_is_default_sub: Optional[GroupIsDefaultSub] = None
-    group_membership_approval_mode: Optional[GroupMembershipApprovalMode] = None
+    group_parent: GroupParent = field(default_factory=GroupParent)
+    group_linked_parent: GroupLinkedParent = field(default_factory=GroupLinkedParent)
+    group_is_default_sub: GroupIsDefaultSub = field(default_factory=GroupIsDefaultSub)
+    group_membership_approval_mode: GroupMembershipApprovalMode = field(default_factory=GroupMembershipApprovalMode)
 
     addressing_mode: Optional[AddressingMode] = None
     group_created: Optional[datetime] = None
     creator_country_code: str = ""
 
     participant_version_id: str = ""
-    participants: Optional[List[GroupParticipant]] = None
+    participants: List[GroupParticipant] = field(default_factory=list)
 
     member_add_mode: Optional[GroupMemberAddMode] = None
-
-    def __post_init__(self):
-        if self.participants is None:
-            self.participants = []

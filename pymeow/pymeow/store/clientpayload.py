@@ -7,6 +7,7 @@ import hashlib
 import struct
 from typing import Tuple
 
+from .store import Device
 from ..generated.waCompanionReg import WACompanionReg_pb2
 from ..generated.waWa6 import WAWebProtobufsWa6_pb2
 from ..types.jid import EMPTY_JID
@@ -65,11 +66,11 @@ class WAVersionContainer:
         """Allow array-like access."""
         return self._version[index]
 
-    def __eq__(self, other) -> bool:
-        """Equality comparison."""
-        if isinstance(other, WAVersionContainer):
-            return self._version == other._version
-        return False
+    # def __eq__(self, other) -> bool:
+    #     """Equality comparison."""
+    #     if isinstance(other, WAVersionContainer):
+    #         return self._version == other._version
+    #     return False
 
 
 # Global WhatsApp version - matches Go's waVersion
@@ -158,7 +159,7 @@ def set_os_info(name: str, version: Tuple[int, int, int]) -> None:
     BASE_CLIENT_PAYLOAD.userAgent.osBuildNumber = version_str
 
 
-def get_registration_payload(device) -> WAWebProtobufsWa6_pb2.ClientPayload:
+def get_registration_payload(device: 'Device') -> WAWebProtobufsWa6_pb2.ClientPayload:
     """Get client payload for device registration - matches Go's getRegistrationPayload."""
     # Clone the base payload - matches Go's proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
     payload = WAWebProtobufsWa6_pb2.ClientPayload()
@@ -181,7 +182,8 @@ def get_registration_payload(device) -> WAWebProtobufsWa6_pb2.ClientPayload:
     device_pairing_data.eKeytype = bytes([5])  # matches Go's []byte{ecc.DjbType} where DjbType = 5
     device_pairing_data.eIdent = device.identity_key.pub  # matches Go's device.IdentityKey.Pub[:]
     device_pairing_data.eSkeyID = bytes(pre_key_id[1:])  # matches Go's preKeyID[1:]
-    device_pairing_data.eSkeyVal = device.signed_pre_key.public_key  # matches Go's device.SignedPreKey.Pub[:]
+    device_pairing_data.eSkeyVal = device.signed_pre_key.pub  # matches Go's device.SignedPreKey.Pub[:]
+    assert device.signed_pre_key.signature is not None
     device_pairing_data.eSkeySig = device.signed_pre_key.signature  # matches Go's device.SignedPreKey.Signature[:]
     device_pairing_data.buildHash = get_wa_version_hash()  # matches Go's waVersionHash[:]
     device_pairing_data.deviceProps = device_props_bytes
@@ -196,13 +198,14 @@ def get_registration_payload(device) -> WAWebProtobufsWa6_pb2.ClientPayload:
     return payload
 
 
-def get_login_payload(device) -> WAWebProtobufsWa6_pb2.ClientPayload:
+def get_login_payload(device: 'Device') -> WAWebProtobufsWa6_pb2.ClientPayload:
     """Get client payload for login - matches Go's getLoginPayload."""
     # Clone the base payload - matches Go's proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
     payload = WAWebProtobufsWa6_pb2.ClientPayload()
     payload.CopyFrom(BASE_CLIENT_PAYLOAD)
 
     # Set username and device - matches Go's payload.Username = proto.Uint64(device.ID.UserInt()); payload.Device = proto.Uint32(uint32(device.ID.Device))
+    assert device.id is not None
     payload.username = device.id.user_int()
     payload.device = device.id.device
 
@@ -213,7 +216,7 @@ def get_login_payload(device) -> WAWebProtobufsWa6_pb2.ClientPayload:
     return payload
 
 
-def get_client_payload(device) -> WAWebProtobufsWa6_pb2.ClientPayload:
+def get_client_payload(device: 'Device') -> WAWebProtobufsWa6_pb2.ClientPayload:
     """Get appropriate client payload based on device state - matches Go's GetClientPayload."""
     if device.id is not None:
         if device.id == EMPTY_JID:

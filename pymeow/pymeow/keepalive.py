@@ -14,6 +14,7 @@ from . import request
 from .request import InfoQuery, InfoQueryType
 from .types import JID
 from .types.events.events import KeepAliveRestored, KeepAliveTimeout
+from .types.message import MessageID
 
 if TYPE_CHECKING:
     from .client import Client
@@ -107,7 +108,7 @@ async def send_keep_alive(client: 'Client') -> Tuple[bool, bool]:
     try:
         # Create a proper InfoQuery for keepalive
         ping_query = InfoQuery(
-            id=str(uuid.uuid4()),
+            id=MessageID(str(uuid.uuid4())),
             namespace="w:p",
             type=InfoQueryType.GET,
             to=JID.server_jid(),
@@ -116,12 +117,7 @@ async def send_keep_alive(client: 'Client') -> Tuple[bool, bool]:
 
         # Send info query for keepalive using the actual client API
         # send_iq_async returns (queue, error) tuple, not a future
-        response_queue, error = await request.send_iq_async(client, ping_query)
-
-        if error is not None:
-            logger.warning(f"Keepalive failed with error: {error}")
-            return False, True  # Error but continue
-
+        response_queue = await request.send_iq_async(client, ping_query)
         # Wait for response from the queue with timeout
         try:
             response = await asyncio.wait_for(

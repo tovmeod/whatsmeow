@@ -4,7 +4,7 @@ Decoder for WhatsApp binary protocol.
 Port of whatsmeow/binary/decoder.go
 """
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Union
 
 from ..exceptions import PymeowError
 from ..types.jid import INTEROP_SERVER, JID, MESSENGER_SERVER
@@ -160,14 +160,12 @@ class BinaryDecoder:
         result = []
 
         for i in range(start_byte & 127):
-            curr_byte, err = self.read_byte()
-            if err:
+            try:
+                curr_byte = self.read_byte()
+            except EOFError as e:
                 return ""
 
             lower = unpack_byte(tag, (curr_byte & 0xF0) >> 4)
-            if err:
-                return ""
-
             upper = unpack_byte(tag, curr_byte & 0x0F)
             result.append(chr(lower))
             result.append(chr(upper))
@@ -262,8 +260,11 @@ class BinaryDecoder:
         if server is None:
             raise InvalidJIDTypeError()
         elif user is None:
+            assert isinstance(server, str)
             return JID.new_jid("", server)
 
+        assert isinstance(user, str)
+        assert isinstance(server, str)
         return JID.new_jid(user, server)
 
     def read_interop_jid(self) -> JID:
@@ -281,8 +282,9 @@ class BinaryDecoder:
         integrator = self.read_int16(False)
         server = self.read(True)
         if server != INTEROP_SERVER:
-            raise InvalidJIDTypeError(f"expected {INTEROP_SERVER}, got {server}")
+            raise InvalidJIDTypeError(f"expected {INTEROP_SERVER!r}, got {server!r}")
 
+        assert isinstance(user, str)
         return JID(
             user=user,
             device=device,
@@ -304,8 +306,10 @@ class BinaryDecoder:
         device= self.read_int16(False)
         server = self.read(True)
         if server != MESSENGER_SERVER:
-            raise InvalidJIDTypeError(f"expected {MESSENGER_SERVER}, got {server}")
+            raise InvalidJIDTypeError(f"expected {MESSENGER_SERVER!r}, got {server!r}")
 
+        assert isinstance(user, str)
+        assert isinstance(server, str)
         return JID(
             user=user,
             device=device,
@@ -324,6 +328,7 @@ class BinaryDecoder:
         agent = self.read_byte()
         device = self.read_byte()
         user = self.read(True)
+        assert isinstance(user, str)
         return JID.new_ad_jid(user, agent, device)
 
     def read_attributes(self, n: int) -> Dict[str, Any]:
@@ -345,7 +350,7 @@ class BinaryDecoder:
         for i in range(n):
             key_ifc = self.read(True)
             if not isinstance(key_ifc, str):
-                raise NonStringKeyError(f"at position {self.index} ({type(key_ifc)}): {key_ifc}")
+                raise NonStringKeyError(f"at position {self.index} ({type(key_ifc)}): {key_ifc!r}")
             key = key_ifc
             ret[key] = self.read(True)
         return ret
@@ -383,6 +388,9 @@ class BinaryDecoder:
         size = self.read_int8(False)
         list_size = self.read_list_size(size)
         raw_desc = self.read(True)
+        # Ensure tag is a string
+        if not isinstance(raw_desc, str):
+            raise InvalidNodeError(f"Expected string tag, got {type(raw_desc)}")
         tag = raw_desc
         if list_size == 0 or not tag:
             raise InvalidNodeError()
@@ -390,7 +398,28 @@ class BinaryDecoder:
         attrs = self.read_attributes((list_size - 1) >> 1)
         if list_size % 2 == 1:
             return Node(tag=tag, attrs=attrs)
-        content = self.read(False)
+        raw_content = self.read(False)
+        content: Optional[Union[List[Node], bytes]] = None
+
+        if raw_content is not None:
+            if isinstance(raw_content, (bytes, list)):
+                # For list, we need to ensure it's a list of Nodes
+                if isinstance(raw_content, list):
+                    # Validate that all items in the list are Node objects
+                    if all(isinstance(item, Node) for item in raw_content):
+                        content = raw_content
+                    else:
+                        raise InvalidNodeError("List content must contain only Node objects")
+                else:
+                    content = raw_content
+            else:
+                # If it's not bytes or list, it shouldn't be used as content
+                # The Go implementation would handle this differently, but for safety we'll convert
+                if isinstance(raw_content, str):
+                    content = raw_content.encode('utf-8')
+                else:
+                    raise InvalidNodeError(f"Invalid content type: {type(raw_content)}")
+
         return Node(tag=tag, attrs=attrs, content=content)
 
     def read_bytes_or_string(self, length: int, as_string: bool) -> bytes | str:

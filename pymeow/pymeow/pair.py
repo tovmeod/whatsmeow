@@ -125,6 +125,10 @@ async def handle_pair_success(client: "Client", node: Node) -> None:
 
     platform = pair_success.get_child_by_tag("platform").attrs.get("name", "")
 
+    if not isinstance(device_identity_bytes, bytes):
+        logger.error("Device identity content is not bytes")
+        return
+
     # Handle pairing in a separate task (equivalent to Go's goroutine)
     await _handle_pair_task(client, device_identity_bytes, req_id,
                                          business_name, platform, device_jid, device_lid)
@@ -291,7 +295,10 @@ def verify_device_identity_account_signature(device_identity: WAAdv_pb2.ADVSigne
 
 def generate_device_signature(device_identity: WAAdv_pb2.ADVSignedDeviceIdentity,
                             ikp: KeyPair, is_hosted_account: bool) -> bytes:
-    """Generate a device signature for a device identity."""
+    """Generate a device signature for a device identity.
+    Raises:
+         ValueError: if private key is None.
+    """
     prefix = ADV_PREFIX_DEVICE_SIGNATURE_GENERATE
     if is_hosted_account:
         prefix = ADV_HOSTED_PREFIX_DEVICE_IDENTITY_DEVICE_SIGNATURE_VERIFICATION
@@ -302,6 +309,8 @@ def generate_device_signature(device_identity: WAAdv_pb2.ADVSignedDeviceIdentity
         ikp.pub,
         device_identity.accountSignatureKey
     )
+    if ikp.priv is None:
+        raise ValueError("Private key is None, cannot generate device signature")
 
     private_key = curve.PrivateKey.deserialize(ikp.priv)
     return private_key.calculate_signature(message)

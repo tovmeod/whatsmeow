@@ -308,9 +308,9 @@ class GraphQLErrors(Exception):
         """Allow indexing into the errors."""
         return self.errors[index]
 
-    def __iter__(self):
-        """Allow iteration over the errors."""
-        return iter(self.errors)
+    # def __iter__(self):
+    #     """Allow iteration over the errors."""
+    #     return iter(self.errors)
 
 
 @dataclass

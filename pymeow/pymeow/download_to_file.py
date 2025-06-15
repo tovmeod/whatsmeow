@@ -1,11 +1,14 @@
+import typing
 from pathlib import Path
 from typing import Union
 
 from .download import download, DownloadableMessage
 
+if typing.TYPE_CHECKING:
+    from .client import Client
 
 async def download_to_file(
-    client,
+    client: 'Client',
     msg: DownloadableMessage,
     file_path: Union[str, Path],
     decrypt: bool = True
@@ -22,9 +25,8 @@ async def download_to_file(
         DownloadError: If download fails
     """
     data = await download(client, msg)
-
     # Write to file
     if isinstance(file_path, str):
         file_path = Path(file_path)
-
-    file_path.write_bytes(data)
+    if data is not None:
+        file_path.write_bytes(data)

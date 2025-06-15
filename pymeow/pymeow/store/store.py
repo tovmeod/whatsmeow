@@ -7,7 +7,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Awaitable
 
 # Protobuf imports
 from ..generated.waAdv import WAAdv_pb2
@@ -47,7 +47,7 @@ class SessionStore(ABC):
     """Interface for storing session data."""
 
     @abstractmethod
-    async def get_session(self, address: str) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_session(self, address: str) -> Optional[bytes]:
         """Get a session for an address."""
         pass
 
@@ -120,7 +120,7 @@ class SenderKeyStore(ABC):
         pass
 
     @abstractmethod
-    async def get_sender_key(self, group: str, user: str) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_sender_key(self, group: str, user: str) -> Optional[bytes]:
         """Get a sender key for a group and user."""
         pass
 
@@ -143,7 +143,7 @@ class AppStateSyncKeyStore(ABC):
         pass
 
     @abstractmethod
-    async def get_app_state_sync_key(self, id: bytes) -> Tuple[Optional[AppStateSyncKey], Optional[Exception]]:
+    async def get_app_state_sync_key(self, key_id: bytes) -> Optional[AppStateSyncKey]:
         """Get an app state sync key by ID."""
         pass
 
@@ -170,7 +170,7 @@ class AppStateStore(ABC):
         pass
 
     @abstractmethod
-    async def get_app_state_version(self, name: str) -> Tuple[int, bytes]:
+    async def get_app_state_version(self, name: str) -> Tuple[int, bytearray]:
         """Get an app state version by name."""
         pass
 
@@ -208,17 +208,17 @@ class ContactStore(ABC):
     """Interface for storing contact data."""
 
     @abstractmethod
-    async def put_push_name(self, user: JID, push_name: str) -> Tuple[bool, str, Optional[Exception]]:
+    async def put_push_name(self, user: JID, push_name: str) -> Tuple[bool, str]:
         """Store a push name for a user."""
         pass
 
     @abstractmethod
-    async def put_business_name(self, user: JID, business_name: str) -> Tuple[bool, str, Optional[Exception]]:
+    async def put_business_name(self, user: JID, business_name: str) -> Tuple[bool, str]:
         """Store a business name for a user."""
         pass
 
     @abstractmethod
-    async def put_contact_name(self, user: JID, full_name: str, first_name: str) -> None:
+    async def put_contact_name(self, user: JID, first_name: str, full_name: str) -> None:
         """Store a contact name for a user."""
         pass
 
@@ -228,12 +228,12 @@ class ContactStore(ABC):
         pass
 
     @abstractmethod
-    async def get_contact(self, user: JID) -> Tuple[Any, Optional[Exception]]:
+    async def get_contact(self, user: JID) -> ContactInfo:
         """Get contact info for a user."""
         pass
 
     @abstractmethod
-    async def get_all_contacts(self) -> Dict[str, 'ContactInfo']:
+    async def get_all_contacts(self) -> Dict[JID, 'ContactInfo']:
         """Get contact info for all users."""
         pass
 
@@ -300,7 +300,7 @@ class MsgSecretStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_message_secret(self, chat: JID, sender: JID, id: str) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_message_secret(self, chat: JID, sender: JID, id: str) -> bytes:
         """Get a message secret."""
         pass
 
@@ -351,7 +351,7 @@ class EventBuffer(ABC):
         pass
 
     @abstractmethod
-    async def do_decryption_txn(self, fn: Callable[[Any], Any]) -> None:
+    async def do_decryption_txn(self, fn: Awaitable[None]) -> None:
         """Execute a function within a decryption transaction."""
         raise NotImplementedError # todo implement in sqlstore
 
@@ -388,12 +388,12 @@ class LIDStore(ABC):
         pass
 
     @abstractmethod
-    async def get_pn_for_lid(self, lid: JID) -> Tuple[Optional[JID], Optional[Exception]]:
+    async def get_pn_for_lid(self, lid: JID) -> Optional[JID]:
         """Get a phone number for a LID."""
         pass
 
     @abstractmethod
-    async def get_lid_for_pn(self, pn: JID) -> Optional[JID]:
+    async def get_lid_for_pn(self, pn: JID) -> JID:
         """Get a LID for a phone number."""
         pass
 
@@ -422,32 +422,31 @@ class Device:
     noise_key: KeyPair
     identity_key: KeyPair
     signed_pre_key: PreKey
+    identities: IdentityStore
+    sessions: SessionStore
+    pre_keys: PreKeyStore
+    sender_keys: SenderKeyStore
+    app_state_keys: AppStateSyncKeyStore
+    app_state: AppStateStore
+    contacts: ContactStore
+    chat_settings: ChatSettingsStore
+    msg_secrets: MsgSecretStore
+    privacy_tokens: PrivacyTokenStore
+    event_buffer: EventBuffer
+    lids: LIDStore
+    device_container: DeviceContainer
+
+    account: WAAdv_pb2.ADVSignedDeviceIdentity
     registration_id: int = 0
     adv_secret_key: bytes = field(default_factory=bytes)
 
     id: Optional[JID] = None
     lid: JID = field(default_factory=lambda: EMPTY_JID)
-    account: WAAdv_pb2.ADVSignedDeviceIdentity
     platform: str = ""
     business_name: str = ""
     push_name: str = ""
-
     facebook_uuid: uuid.UUID = field(default_factory=uuid.uuid4)
-
     initialized: bool = False
-    identities: IdentityStore
-    sessions: SessionStore
-    pre_keys: PreKeyStore
-    sender_keys: Optional[SenderKeyStore] = None
-    app_state_keys: AppStateSyncKeyStore
-    app_state: AppStateStore
-    contacts: Optional[ContactStore] = None
-    chat_settings: Optional[ChatSettingsStore] = None
-    msg_secrets: MsgSecretStore
-    privacy_tokens: PrivacyTokenStore
-    event_buffer: Optional[EventBuffer] = None
-    lids: LIDStore
-    device_container: Optional[DeviceContainer] = None
 
     # todo: check if and where these are used, maybe not here in this class
     adv_details: bytes = field(default_factory=bytes)
@@ -490,18 +489,15 @@ class Device:
             return EMPTY_JID
         return self.lid
 
-    async def save(self) -> Optional[Exception]:
+    async def save(self) -> None:
         """Save this device to its container."""
         if self.device_container:
-            return await self.device_container.put_device(self)
-        return None
+            await self.device_container.put_device(self)
 
     async def delete(self) -> Optional[Exception]:
         """Delete this device from its container."""
         if self.device_container:
-            err = await self.device_container.delete_device(self)
-            if err:
-                return err
+            await self.device_container.delete_device(self)
             self.id = None
             self.lid = EMPTY_JID
         return None

@@ -58,7 +58,21 @@ disallow_untyped_defs = true
 check_untyped_defs = true
 exclude = [
     "tests/",
+    "pymeow/pymeow/store/sqlstore/models",
+    "pymeow/pymeow/generated",
+	"pymeow/tools/fix_proto_imports.py",
+	"pymeow/tools/generate_protos.py",
+	"analyze_deps.py",
+	"check_file_equivalence.py",
+	"fix_imports.py",
 ]
+# Skip imports that can't be resolved in generated code
+[[tool.mypy.overrides]]
+module = [
+    "pymeow.pymeow.generated.*",
+    "pymeow.pymeow.store.sqlstore.models.*",
+]
+ignore_errors = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

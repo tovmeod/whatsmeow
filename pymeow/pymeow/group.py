@@ -25,7 +25,7 @@ from .types.group import (
     GroupParticipantAddRequest,
     GroupParticipantRequest,
 )
-from .types.jid import DEFAULT_USER_SERVER, GROUP_SERVER, GROUP_SERVER_JID, HIDDEN_USER_SERVER, SERVER_JID
+from .types.jid import DEFAULT_USER_SERVER, GROUP_SERVER, GROUP_SERVER_JID, HIDDEN_USER_SERVER, SERVER_JID, JID
 from .types.message import AddressingMode
 
 if TYPE_CHECKING:
@@ -331,7 +331,7 @@ async def set_group_photo(client: "Client", jid: types.JID, avatar: Optional[byt
         )]
 
     try:
-        resp, err = await client.send_iq(InfoQuery(
+        resp = await request.send_iq(client, InfoQuery(
             namespace="w:profile:picture",
             type=InfoQueryType.SET,
             to=SERVER_JID,
@@ -350,7 +350,7 @@ async def set_group_photo(client: "Client", jid: types.JID, avatar: Optional[byt
     if not picture_id:
         raise Exception("didn't find picture ID in response")
 
-    return picture_id
+    return str(picture_id)
 
 
 async def set_group_name(client: "Client", jid: types.JID, name: str) -> None:
@@ -456,7 +456,7 @@ async def get_group_invite_link(client: "Client", jid: types.JID, reset: bool = 
     if not code:
         raise Exception("didn't find invite code in response")
 
-    return INVITE_LINK_PREFIX + code
+    return INVITE_LINK_PREFIX + str(code)
 
 
 async def get_group_info_from_invite(
@@ -547,7 +547,7 @@ async def get_group_info_from_link(client: "Client", code: str) -> types.GroupIn
     return await parse_group_node(client, group_node)
 
 
-async def join_group_with_link(client: "Client", code: str) -> types.JID:
+async def join_group_with_link(client: "Client", code: str) -> Optional[JID]:
     """Joins a group using an invite link.
 
     Returns the JID of the joined group.
@@ -570,7 +570,7 @@ async def join_group_with_link(client: "Client", code: str) -> types.JID:
     if not group_jid:
         raise Exception("didn't find group JID in response")
 
-    return types.JID.from_string(group_jid)
+    return JID.from_string(group_jid)
 
 
 async def get_joined_groups(client: "Client") -> List[types.GroupInfo]:
@@ -710,7 +710,7 @@ async def get_group_info_internal(client: "Client", jid: types.JID, lock_partici
     return group_info
 
 
-async def get_cached_group_data(client: "Client", jid: types.JID) -> Optional['GroupMetaCache']:
+async def get_cached_group_data(client: "Client", jid: types.JID) -> GroupMetaCache:
     """Gets cached group data if available, fetches it if not."""
     async with client.group_cache_lock:
         if jid in client.group_cache:
@@ -718,7 +718,9 @@ async def get_cached_group_data(client: "Client", jid: types.JID) -> Optional['G
 
     # If not cached, fetch group info and populate cache
     await get_group_info_internal(client, jid, lock_participant_cache=False)
-    return client.group_cache.get(jid)
+    group_meta_cache = client.group_cache.get(jid)
+    assert group_meta_cache is not None
+    return group_meta_cache
 
 
 def parse_participant(child_ag: AttrUtility, child: Node) -> types.GroupParticipant:
@@ -774,23 +776,25 @@ async def parse_group_node(client: "Client", group_node: Node) -> types.GroupInf
     Raises:
         Exception: If there's an error parsing the group node
     """
-    group = types.GroupInfo()
     ag = group_node.attr_getter()
+    group = types.GroupInfo(
+        # Basic group information
+        jid=types.JID.new_jid(ag.string("id"), GROUP_SERVER)
+    )
 
-    # Basic group information
-    group.jid = types.JID.new_jid(ag.string("id"), GROUP_SERVER)
+
     group.owner_jid = ag.optional_jid_or_empty("creator")
     group.owner_pn = ag.optional_jid_or_empty("creator_pn")
 
-    group.name = ag.string("subject")
-    group.name_set_at = ag.unix_time("s_t")
-    group.name_set_by = ag.optional_jid_or_empty("s_o")
-    group.name_set_by_pn = ag.optional_jid_or_empty("s_o_pn")
+    group.group_name.name = ag.string("subject")
+    group.group_name.name_set_at = ag.unix_time("s_t")
+    group.group_name.name_set_by = ag.optional_jid_or_empty("s_o")
+    group.group_name.name_set_by_pn = ag.optional_jid_or_empty("s_o_pn")
 
     group.group_created = ag.unix_time("creation")
     group.creator_country_code = ag.optional_string("creator_country_code")
 
-    group.announce_version_id = ag.optional_string("a_v_id")
+    group.group_announce.announce_version_id = ag.optional_string("a_v_id")
     group.participant_version_id = ag.optional_string("p_v_id")
     group.addressing_mode = AddressingMode(ag.optional_string("addressing_mode") or "")
 
@@ -804,36 +808,36 @@ async def parse_group_node(client: "Client", group_node: Node) -> types.GroupInf
             body, found = child.get_optional_child_by_tag("body")
             if body:
                 if isinstance(body.content, bytes):
-                    group.topic = body.content.decode('utf-8')
+                    group.group_topic.topic = body.content.decode('utf-8')
                 else:
-                    group.topic = str(body.content) if body.content else ""
-                group.topic_id = child_ag.string("id")
-                group.topic_set_by = child_ag.optional_jid_or_empty("participant")
-                group.topic_set_by_pn = child_ag.optional_jid_or_empty("participant_pn")
-                group.topic_set_at = child_ag.unix_time("t")
+                    group.group_topic.topic = str(body.content) if body.content else ""
+                group.group_topic.topic_id = child_ag.string("id")
+                group.group_topic.topic_set_by = child_ag.optional_jid_or_empty("participant")
+                group.group_topic.topic_set_by_pn = child_ag.optional_jid_or_empty("participant_pn")
+                group.group_topic.topic_set_at = child_ag.unix_time("t")
         elif child.tag == "announcement":
-            group.is_announce = True
+            group.group_announce.is_announce = True
         elif child.tag == "locked":
-            group.is_locked = True
+            group.group_locked.is_locked = True
         elif child.tag == "ephemeral":
-            group.is_ephemeral = True
-            group.disappearing_timer = int(child_ag.uint64("expiration"))  # Cast to int (Python equivalent of uint32)
+            group.group_ephemeral.is_ephemeral = True
+            group.group_ephemeral.disappearing_timer = int(child_ag.uint64("expiration"))  # Cast to int (Python equivalent of uint32)
         elif child.tag == "member_add_mode":
             if isinstance(child.content, bytes):
                 group.member_add_mode = GroupMemberAddMode(child.content)
             else:
                 group.member_add_mode = GroupMemberAddMode(child.content)
         elif child.tag == "linked_parent":
-            group.linked_parent_jid = child_ag.jid("jid")
+            group.group_linked_parent.linked_parent_jid = child_ag.jid("jid")
         elif child.tag == "default_sub_group":
-            group.is_default_sub_group = True
+            group.group_is_default_sub.is_default_sub_group = True
         elif child.tag == "parent":
-            group.is_parent = True
-            group.default_membership_approval_mode = child_ag.optional_string("default_membership_approval_mode")
+            group.group_parent.is_parent = True
+            group.group_parent.default_membership_approval_mode = child_ag.optional_string("default_membership_approval_mode")
         elif child.tag == "incognito":
-            group.is_incognito = True
+            group.group_incognito.is_incognito = True
         elif child.tag == "membership_approval_mode":
-            group.is_join_approval_required = True
+            group.group_membership_approval_mode.is_join_approval_required = True
         else:
             logger.debug(f"Unknown element in group node {group.jid}: {child.xml_string()}")
 

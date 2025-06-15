@@ -33,7 +33,7 @@ class ColoredFormatter(logging.Formatter):
     }
     RESET = '\033[0m'  # Reset color
 
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         log_message = super().format(record)
         color = self.COLORS.get(record.levelname, self.RESET)
         return f"{color}{log_message}{self.RESET}"
@@ -45,7 +45,7 @@ class ShortPathFormatter(ColoredFormatter):
     A custom formatter that replaces {pathname} with {shortpathname} by trimming
     everything before the project root.
     """
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         # Add shortpathname attribute to the record
         if hasattr(record, 'pathname'):
             try:
@@ -60,7 +60,7 @@ class ShortPathFormatter(ColoredFormatter):
                 record.shortpathname = record.pathname
 
         return super().format(record)
-def setup_logging() -> logging.Logger:
+def setup_logging() -> None:
     """Set up logging for the client."""
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)
@@ -123,7 +123,7 @@ async def event_handler(event: Any) -> None:
         logger.debug(f"client_test event handler ignoring Received event: {type(event).__name__}")
 
 
-async def main():
+async def main() -> None:
     """
     Main example function demonstrating PyMeow client usage.
 
@@ -175,7 +175,7 @@ async def main():
         # Set up signal handling for graceful shutdown
         shutdown_event = asyncio.Event()
 
-        def signal_handler(sig, frame):
+        def signal_handler(sig: int, frame: Any) -> None:
             print("\nReceived interrupt signal, shutting down...")
             shutdown_event.set()
 

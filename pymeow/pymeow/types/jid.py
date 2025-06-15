@@ -52,6 +52,11 @@ class JID:
     integrator: int = 0
 
     @classmethod
+    def new_server(cls) -> 'JID':
+        """Creates a new server JID."""
+        return cls(user="", server="s.whatsapp.net", device=0)
+
+    @classmethod
     def server_jid(cls) -> 'JID':
         """Returns the WhatsApp server JID."""
         return cls(user="", server="s.whatsapp.net")
@@ -254,10 +259,13 @@ class JID:
         return parsed_jid
 
     @classmethod
-    def from_string(cls, jid: Optional[Union[str, 'JID']]) -> Optional['JID']:
-        """Create a JID from a string."""
+    def from_string(cls, jid: Optional[Union[str, 'JID']]) -> 'JID':  # todo: receive only str, check all uses
+        """Create a JID from a string.
+        Raises:
+            ValueError:
+        """
         if not jid:
-            return None
+            raise ValueError("JID cannot be empty")
         if isinstance(jid, JID):
             return jid
         return cls.parse_jid(jid)

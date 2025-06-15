@@ -4,20 +4,29 @@ WhatsApp Web pairing with phone number and code.
 Port of whatsmeow/pair-code.go
 """
 import base64
+import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, TYPE_CHECKING
 
-import nacl.bindings
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+from . import request
 from .binary.node import Attrs, Node
+from .request import InfoQuery, InfoQueryType
 from .types.jid import JID
 from .util.hkdfutil.hkdf import sha256 as hkdf_sha256
 from .util.keys.keypair import KeyPair
+
+if TYPE_CHECKING:
+    from .client import Client
+
+logger = logging.getLogger(__name__)
 
 
 class PairCodeError(Exception):
@@ -58,8 +67,16 @@ class PairClientType(int):
 # Regular expression to remove non-numeric characters from phone numbers
 NOT_NUMBERS = re.compile(r"[^0-9]")
 
-# Base32 encoding for linking codes
-LINKING_BASE32 = base64.b32encode(b"123456789ABCDEFGHJKLMNPQRSTVWXYZ").decode()
+def encode_linking_base32(data: bytes) -> str:
+    """Custom base32 encoding matching Go's linkingBase32."""
+    # Standard base32 encode
+    standard_encoded = base64.b32encode(data).decode()
+    # Translate alphabet: standard -> WhatsApp custom
+    translation = str.maketrans(
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567',
+        '123456789ABCDEFGHJKLMNPQRSTVWXYZ'
+    )
+    return standard_encoded.translate(translation).rstrip('=')
 
 # Phone validation constants
 MIN_PHONE_LENGTH = 6
@@ -100,45 +117,49 @@ def generate_companion_ephemeral_key() -> Tuple[KeyPair, bytes, str]:
     Returns:
         Tuple containing:
         - ephemeral_key_pair: The generated key pair
-        - ephemeral_key: The encoded ephemeral key
+        - ephemeral_key: The encoded ephemeral key (80 bytes)
         - encoded_linking_code: The linking code for pairing
     """
     ephemeral_key_pair = KeyPair.generate()
-    salt = os.urandom(SALT_SIZE)
-    iv = os.urandom(IV_SIZE)
-    linking_code = os.urandom(LINKING_CODE_SIZE)
-    encoded_linking_code = base64.b32encode(linking_code).decode()
+    salt = os.urandom(32)  # 32 bytes salt
+    iv = os.urandom(16)    # 16 bytes IV
+    linking_code = os.urandom(5)  # 5 bytes linking code
 
-    # Generate link code key using PBKDF2
+    # Use the same base32 encoding as Go (custom alphabet)
+    encoded_linking_code = encode_linking_base32(linking_code)
+
+    # Generate link code key using PBKDF2 with 2<<16 iterations (131072)
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
-        length=SALT_SIZE,
+        length=32,  # 32 bytes key length
         salt=salt,
-        iterations=PBKDF2_ITERATIONS,
+        iterations=2 << 16,  # Same as Go: 2<<16 = 131072
     )
     link_code_key = kdf.derive(encoded_linking_code.encode())
 
-    # Encrypt the public key
+    # Create CTR cipher and encrypt the public key IN-PLACE (like Go's XORKeyStream)
     cipher = Cipher(algorithms.AES(link_code_key), modes.CTR(iv))
     encryptor = cipher.encryptor()
-    encrypted_pubkey = encryptor.update(ephemeral_key_pair.pub) + encryptor.finalize()
 
-    # Combine salt, IV, and encrypted pubkey
-    ephemeral_key = bytearray(EPHEMERAL_KEY_SIZE)
-    ephemeral_key[0:SALT_SIZE] = salt
-    ephemeral_key[SALT_SIZE:SALT_SIZE+IV_SIZE] = iv
-    ephemeral_key[SALT_SIZE+IV_SIZE:EPHEMERAL_KEY_SIZE] = encrypted_pubkey
+    # Make a copy of the public key to encrypt (Go modifies the original slice)
+    encrypted_pubkey = bytearray(ephemeral_key_pair.pub)  # 32 bytes
+    encrypted_data = encryptor.update(encrypted_pubkey) + encryptor.finalize()
+
+    # Construct the 80-byte ephemeral key: salt(32) + iv(16) + encrypted_pubkey(32)
+    ephemeral_key = bytearray(80)
+    ephemeral_key[0:32] = salt
+    ephemeral_key[32:48] = iv
+    ephemeral_key[48:80] = encrypted_data
 
     return ephemeral_key_pair, bytes(ephemeral_key), encoded_linking_code
 
 
-async def pair_phone(client, ctx, phone: str, show_push_notification: bool, client_type: PairClientType, client_display_name: str) -> str:
+async def pair_phone(client: 'Client', phone: str, show_push_notification: bool, client_type: PairClientType, client_display_name: str) -> str:
     """
     Generate a pairing code that can be used to link to a phone without scanning a QR code.
 
     Args:
         client: The WhatsApp client
-        ctx: The context for the request
         phone: The phone number to pair with
         show_push_notification: Whether to show a push notification on the phone
         client_type: The type of client to use
@@ -161,9 +182,9 @@ async def pair_phone(client, ctx, phone: str, show_push_notification: bool, clie
     jid = JID.new_user_jid(phone)
 
     # Create IQ request
-    resp = await client.send_iq(
+    resp = await request.send_iq(client, InfoQuery(
         namespace="md",
-        iq_type="set",
+        type=InfoQueryType.SET,
         to=JID.new_server(),
         content=Node(
             tag="link_code_companion_reg",
@@ -175,12 +196,12 @@ async def pair_phone(client, ctx, phone: str, show_push_notification: bool, clie
             content=[
                 Node(tag="link_code_pairing_wrapped_companion_ephemeral_pub", content=ephemeral_key),
                 Node(tag="companion_server_auth_key_pub", content=client.store.noise_key.pub),
-                Node(tag="companion_platform_id", content=str(int(client_type))),
-                Node(tag="companion_platform_display", content=client_display_name),
+                Node(tag="companion_platform_id", content=str(int(client_type)).encode()),
+                Node(tag="companion_platform_display", content=client_display_name.encode()),
                 Node(tag="link_code_pairing_nonce", content=bytes([0])),
             ]
         )
-    )
+    ))
 
     # Extract pairing reference
     pairing_ref_node, ok = resp.get_optional_child_by_tag("link_code_companion_reg", "link_code_pairing_ref")
@@ -203,31 +224,29 @@ async def pair_phone(client, ctx, phone: str, show_push_notification: bool, clie
     return f"{encoded_linking_code[0:4]}-{encoded_linking_code[4:]}"
 
 
-async def handle_code_pair_notification(client, ctx, parent_node: Node) -> None:
+async def handle_code_pair_notification(client: 'Client', parent_node: Node) -> None:
     """
     Handle a code pair notification from the server.
 
     Args:
         client: The WhatsApp client
-        ctx: The context for the request
         parent_node: The notification node
 
     Raises:
         ValueError: If there's an error processing the notification
     """
     try:
-        await _handle_code_pair_notification(client, ctx, parent_node)
+        await _handle_code_pair_notification(client, parent_node)
     except Exception as e:
-        client.log.error(f"Failed to handle code pair notification: {e}")
+        logger.error(f"Failed to handle code pair notification: {e}")
 
 
-async def _handle_code_pair_notification(client, ctx, parent_node: Node) -> None:
+async def _handle_code_pair_notification(client: 'Client', parent_node: Node) -> None:
     """
     Internal implementation of handle_code_pair_notification.
 
     Args:
         client: The WhatsApp client
-        ctx: The context for the request
         parent_node: The notification node
 
     Raises:
@@ -277,12 +296,15 @@ async def _handle_code_pair_notification(client, ctx, parent_node: Node) -> None
     decryptor = cipher.decryptor()
     primary_decrypted_pubkey = decryptor.update(primary_encrypted_pubkey) + decryptor.finalize()
 
-    # Compute shared secret
+    # Compute ephemeral shared secret using X25519
     try:
-        ephemeral_shared_secret = nacl.bindings.crypto_scalarmult(
-            link_cache.key_pair.priv,
-            primary_decrypted_pubkey
-        )
+        # Convert our private key to X25519 format
+        assert link_cache.key_pair.priv is not None
+        our_private_key = X25519PrivateKey.from_private_bytes(link_cache.key_pair.priv)
+        # Convert the decrypted public key to X25519 format
+        their_public_key = X25519PublicKey.from_public_bytes(primary_decrypted_pubkey)
+        # Perform the key exchange
+        ephemeral_shared_secret = our_private_key.exchange(their_public_key)
     except Exception as e:
         raise CryptographicError(f"Failed to compute ephemeral shared secret: {e}")
 
@@ -297,42 +319,41 @@ async def _handle_code_pair_notification(client, ctx, parent_node: Node) -> None
     except Exception as e:
         raise CryptographicError(f"Failed to derive key bundle encryption key: {e}")
 
-    # Create GCM cipher for key bundle
-    cipher = Cipher(
-        algorithms.AES(key_bundle_encryption_key),
-        modes.GCM(key_bundle_nonce)
-    )
-    encryptor = cipher.encryptor()
+    # Create AESGCM cipher for key bundle
+    aesgcm = AESGCM(key_bundle_encryption_key)
 
     # Combine identity keys and random data
     plaintext_key_bundle = client.store.identity_key.pub + primary_identity_pub + adv_secret_random
 
-    # Encrypt the key bundle
-    encrypted_key_bundle = encryptor.update(plaintext_key_bundle) + encryptor.finalize()
+    # Encrypt the key bundle using AESGCM (which includes authentication)
+    encrypted_key_bundle_with_tag = aesgcm.encrypt(key_bundle_nonce, plaintext_key_bundle, None)
 
-    # Combine salt, nonce, and encrypted bundle
-    wrapped_key_bundle = key_bundle_salt + key_bundle_nonce + encrypted_key_bundle
+    # Combine salt, nonce, and encrypted bundle with auth tag
+    wrapped_key_bundle = key_bundle_salt + key_bundle_nonce + encrypted_key_bundle_with_tag
 
     # Compute the adv secret key
     try:
-        identity_shared_key = nacl.bindings.crypto_scalarmult(
-            client.store.identity_key.priv,
-            primary_identity_pub
-        )
+        # Convert our identity private key to X25519 format
+        assert client.store.identity_key.priv is not None
+        our_identity_private_key = X25519PrivateKey.from_private_bytes(client.store.identity_key.priv)
+        # Convert the primary identity public key to X25519 format
+        their_identity_public_key = X25519PublicKey.from_public_bytes(primary_identity_pub)
+        # Perform the key exchange
+        identity_shared_key = our_identity_private_key.exchange(their_identity_public_key)
     except Exception as e:
         raise CryptographicError(f"Failed to compute identity shared key: {e}")
 
     adv_secret_input = ephemeral_shared_secret + identity_shared_key + adv_secret_random
     try:
-        adv_secret = hkdf_sha256(adv_secret_input, None, b"adv_secret", ADV_SECRET_SIZE)
+        adv_secret = hkdf_sha256(adv_secret_input, b'', b"adv_secret", ADV_SECRET_SIZE)
     except Exception as e:
         raise CryptographicError(f"Failed to derive ADV secret key: {e}")
     client.store.adv_secret_key = adv_secret
 
     # Send the final pairing message
-    await client.send_iq(
+    await request.send_iq(client, InfoQuery(
         namespace="md",
-        iq_type="set",
+        type=InfoQueryType.SET,
         to=JID.new_server(),
         content=Node(
             tag="link_code_companion_reg",
@@ -346,7 +367,7 @@ async def _handle_code_pair_notification(client, ctx, parent_node: Node) -> None
                 Node(tag="link_code_pairing_ref", content=link_code_pairing_ref),
             ]
         )
-    )
+    ))
 
 
 def concat_bytes(*data: bytes) -> bytes:

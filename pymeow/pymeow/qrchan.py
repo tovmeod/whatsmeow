@@ -45,7 +45,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from . import Client
+from .client import Client
 from .exceptions import ErrClientIsNil, ErrQRAlreadyConnected, ErrQRStoreContainsID
 from .types.events.events import (
     QR,

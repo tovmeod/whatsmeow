@@ -80,9 +80,14 @@ async def handle_picture_notification(client: "Client", node: Node) -> None:
     ts = node.attr_getter().unix_time("t")
     for child in node.get_children():
         ag = child.attr_getter()
-        evt = events.Picture(timestamp=ts)
-        evt.jid = ag.jid("jid")
-        evt.author = ag.optional_jid_or_empty("author")
+        jid = ag.jid("jid")
+        author = ag.optional_jid_or_empty("author")
+
+        evt = events.Picture(
+            timestamp=ts,
+            jid=jid,
+            author=author
+        )
 
         if child.tag == "delete":
             evt.remove = True
@@ -236,8 +241,9 @@ async def handle_account_sync_notification(client: "Client", node: Node) -> None
             await handle_own_devices_notification(client, child)
         elif child.tag == "picture":
             await client.dispatch_event(events.Picture(
+                jid=get_own_id(client).to_non_ad(),
+                author=get_own_id(client).to_non_ad(),
                 timestamp=node.attr_getter().unix_time("t"),
-                jid=get_own_id(client).to_non_ad()
             ))
         elif child.tag == "blocklist":
             await handle_blocklist(client, child)
@@ -288,11 +294,11 @@ async def handle_privacy_token_notification(client: "Client", node: Node) -> Non
 
             try:
                 from .store.store import PrivacyToken
-                await client.store.privacy_tokens.put_privacy_tokens(PrivacyToken(
+                await client.store.privacy_tokens.put_privacy_tokens([PrivacyToken(
                     user=sender,
                     token=child.content,
                     timestamp=timestamp
-                ))
+                )])
                 logger.debug(f"Stored privacy token from {sender} (ts: {timestamp})")
             except Exception as err:
                 logger.error(f"Failed to save privacy token from {sender}: {err}")

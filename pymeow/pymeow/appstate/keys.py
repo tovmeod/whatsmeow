@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from .errors import KeyNotFoundError
 from ..store.store import Device
 from ..util.hkdfutil import expand_hmac
 
@@ -122,8 +123,7 @@ class Processor:
                     self.key_cache[key_cache_id] = keys
                     return keys
                 else:
-                    from .errors import ErrKeyNotFound
-                    raise ErrKeyNotFound()
+                    raise KeyNotFoundError()
             return keys
 
     async def get_missing_key_ids(self, patch_list: Any) -> List[bytes]:
@@ -139,7 +139,7 @@ class Processor:
         cache: Dict[str, bool] = {}
         missing_keys: List[bytes] = []
 
-        async def check_missing(key_id: Optional[bytes]):
+        async def check_missing(key_id: Optional[bytes]) -> None:
             if key_id is None:
                 return
 

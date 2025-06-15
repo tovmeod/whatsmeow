@@ -12,7 +12,7 @@ Port of util/cbcutil/cbc.go
 import hashlib
 import hmac
 import os
-from typing import IO, Optional, Protocol, Tuple
+from typing import IO, Optional, Protocol, Tuple, BinaryIO
 
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
@@ -93,15 +93,15 @@ def decrypt_file(key: bytes, iv: bytes, file: File) -> None:
         if write_ptr + buf_size > file_size:
             buf = buf[:file_size - write_ptr]
 
-        n = file.read(len(buf))
-        if len(n) != len(buf):
-            raise IOError(f"failed to read full buffer: {len(n)} / {len(buf)}")
+        data = file.read(len(buf))
+        if len(data) != len(buf):
+            raise IOError(f"failed to read full buffer: {len(data)} / {len(buf)}")
 
-        buf[:] = cipher.decrypt(n)
+        buf[:] = cipher.decrypt(data)
 
-        n = file.write_at(buf, write_ptr)
-        if n != len(buf):
-            raise IOError(f"failed to write full buffer: {n} / {len(buf)}")
+        bytes_written = file.write_at(buf, write_ptr)
+        if bytes_written != len(buf):
+            raise IOError(f"failed to write full buffer: {bytes_written} / {len(buf)}")
 
         write_ptr += len(buf)
         last_byte = buf[-1]
@@ -172,34 +172,35 @@ def encrypt_stream(
     has_writer_at = hasattr(ciphertext, "write_at")
 
     buf_size = 32 * 1024
-    # buf = bytearray(buf_size)
     size = 0
     extra_size = 0
     write_ptr = 0
+    has_more = True
 
-    while True:
-        n = plaintext.read(buf_size)
-        if not n:
-            # End of file reached
+    while has_more:
+        # Read data chunk
+        chunk = plaintext.read(buf_size)
+        if not chunk:
             break
 
-        plain_hasher.update(n)
-        size += len(n)
+        plain_hasher.update(chunk)
+        size += len(chunk)
 
-        # Pad the last block if needed
-        if len(n) < buf_size:
-            padding_size = AES.block_size - (len(n) % AES.block_size)
-            padded_data = pad(n, AES.block_size)
+        # Check if this is the last chunk and pad accordingly
+        if len(chunk) < buf_size:
+            # This is the last chunk, apply padding
+            padding_size = AES.block_size - (size % AES.block_size)
+            chunk = pad(chunk, AES.block_size)
             extra_size = padding_size
-        else:
-            padded_data = n
+            has_more = False
 
-        encrypted = cipher.encrypt(padded_data)
+        # Encrypt the data
+        encrypted = cipher.encrypt(chunk)
         cipher_mac.update(encrypted)
         cipher_hasher.update(encrypted)
 
         if has_writer_at:
-            ciphertext.write_at(encrypted, write_ptr)
+            ciphertext.write_at(encrypted, write_ptr)  # type: ignore[attr-defined]
             write_ptr += len(encrypted)
         else:
             ciphertext.write(encrypted)
@@ -210,7 +211,7 @@ def encrypt_stream(
     cipher_hasher.update(mac)
 
     if has_writer_at:
-        ciphertext.write_at(mac, write_ptr)
+        ciphertext.write_at(mac, write_ptr)  # type: ignore[attr-defined]
     else:
         ciphertext.write(mac)
 

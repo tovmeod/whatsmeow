@@ -147,8 +147,8 @@ class MessageInfo:
         verified_name: The verified name information.
         device_sent_meta: Metadata for direct messages sent from another one of the user's own devices.
     """
+    id: MessageID
     message_source: MessageSource = field(default_factory=lambda: MessageSource())
-    id: MessageID = None
     server_id: Optional[MessageServerID] = None
     type: str = ""
     push_name: str = ""
@@ -163,22 +163,22 @@ class MessageInfo:
     device_sent_meta: Optional[DeviceSentMeta] = None
 
     @property
-    def sender(self):
+    def sender(self) -> JID:
         """Get the sender JID from the message source."""
         return self.message_source.sender
 
     @property
-    def chat(self):
+    def chat(self) -> JID:
         """Get the chat JID from the message source."""
         return self.message_source.chat
 
     @property
-    def sender_alt(self):
+    def sender_alt(self) -> JID:
         """Get the alternative sender JID from the message source."""
         return self.message_source.sender_alt
 
     @property
-    def recipient_alt(self):
+    def recipient_alt(self) -> JID:
         """Get the alternative recipient JID from the message source."""
         return self.message_source.recipient_alt
 
@@ -187,6 +187,6 @@ class MessageInfo:
         return self.message_source.source_string()
 
     @property
-    def is_from_me(self):
+    def is_from_me(self) -> bool:
         """Get the is_from_me flag from the message source."""
         return self.message_source.is_from_me

@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import struct
 from dataclasses import dataclass
-from typing import Awaitable, Callable, List, Optional, Sequence
+from typing import Awaitable, Callable, List, Optional, Sequence, Any
 
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
@@ -19,7 +19,7 @@ from .lthash import WAPatchIntegrity
 @dataclass
 class Mutation:
     """Represents a mutation in the app state."""
-    operation: WAServerSync_pb2.SyncdMutation.SyncdOperation.ValueType
+    operation: WAServerSync_pb2.SyncdMutation.SyncdOperation
     action: WASyncAction_pb2.SyncActionValue
     index: List[str]
     index_mac: bytes
@@ -30,7 +30,7 @@ class Mutation:
 class HashState:
     """Represents the hash state of the app state."""
     version: int
-    hash: bytes  # 128 bytes
+    hash: bytearray  # 128 bytes
 
     async def update_hash(self, mutations: Sequence[WAServerSync_pb2.SyncdMutation],
                    get_prev_set_value_mac: Callable[[bytes, int], Awaitable[Optional[bytes]]]) -> List[Exception]:
@@ -42,13 +42,13 @@ class HashState:
             get_prev_set_value_mac: A function that returns the value MAC of the previous SET operation
 
         Returns:
-            A tuple containing (warnings, error)
+            A list containing warnings
         Raises:
             Exception
         """
         added = []
         removed = []
-        warnings = []
+        warnings: List[Exception] = []
 
         for i, mutation in enumerate(mutations):
             if mutation.operation == WAServerSync_pb2.SyncdMutation.SyncdOperation.SET:
@@ -101,7 +101,7 @@ def uint64_to_bytes(val: int) -> bytes:
     return struct.pack(">Q", val)
 
 
-def concat_and_hmac(alg: Callable[[], hashlib._hashlib.HASH], key: bytes, data: List[bytes]) -> bytes:
+def concat_and_hmac(alg: Callable[[], Any], key: bytes, data: List[bytes]) -> bytes:
     """
     Concatenate the given data and compute an HMAC.
 
@@ -132,7 +132,7 @@ def generate_patch_mac(patch: WAServerSync_pb2.SyncdPatch, name: WAPatchName, ke
     Returns:
         The generated MAC
     """
-    data_to_hash = [patch.snapshot_mac]
+    data_to_hash = [patch.snapshotMAC]
 
     for mutation in patch.mutations:
         val = mutation.record.value.blob
@@ -144,7 +144,7 @@ def generate_patch_mac(patch: WAServerSync_pb2.SyncdPatch, name: WAPatchName, ke
     return concat_and_hmac(hashlib.sha256, key, data_to_hash)
 
 
-def generate_content_mac(operation: WAServerSync_pb2.SyncdMutation.SyncdOperation.ValueType, data: bytes, key_id: bytes, key: bytes) -> bytes:
+def generate_content_mac(operation: WAServerSync_pb2.SyncdMutation.SyncdOperation, data: bytes, key_id: bytes, key: bytes) -> bytes:
     """
     Generate a content MAC.
 

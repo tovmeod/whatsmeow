@@ -14,7 +14,7 @@ from typing_extensions import Buffer
 
 from ..util.gcmutil import prepare
 from .framesocket import FrameSocket
-from .noisesocket import NoiseSocket, new_noise_socket
+from .noisesocket import NoiseSocket
 
 
 class NoiseHandshake:
@@ -29,7 +29,7 @@ class NoiseHandshake:
     # This matches the Go implementation's NoiseStartPattern constant
     NOISE_START_PATTERN = b"Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00"
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize a new NoiseHandshake instance."""
         self.hash: bytes = b''
         self.salt: bytes = b''
@@ -50,7 +50,7 @@ class NoiseHandshake:
         """
         return hashlib.sha256(data).digest()
 
-    def start(self, pattern: str, header: bytes) -> None:
+    def start(self, pattern: bytes, header: bytes) -> None:
         """
         Start the handshake with the given pattern and header.
 
@@ -61,15 +61,12 @@ class NoiseHandshake:
         Raises:
             ValueError: If key preparation fails
         """
-        # Convert pattern string to bytes if it's not already
-        data = pattern.encode('utf-8') if isinstance(pattern, str) else pattern
-
         # If data is already 32 bytes, use it directly as the hash
         # Otherwise, compute the SHA-256 hash of the data
-        if len(data) == 32:
-            self.hash = data
+        if len(pattern) == 32:
+            self.hash = pattern
         else:
-            self.hash = self._sha256_slice(data)
+            self.hash = self._sha256_slice(pattern)
 
         # Initialize salt with the hash
         self.salt = self.hash
@@ -87,7 +84,6 @@ class NoiseHandshake:
         Args:
             data: The data to authenticate
         """
-        data: Buffer
         self.hash = self._sha256_slice(self.hash + data)
 
     def _post_increment_counter(self) -> int:
@@ -202,7 +198,7 @@ class NoiseHandshake:
             write, read = self._extract_and_expand(self.salt, None)
             write_key = prepare(write)
             read_key = prepare(read)
-            return await new_noise_socket(fs, write_key, read_key, frame_handler, disconnect_handler)
+            return NoiseSocket(fs, write_key, read_key, frame_handler, disconnect_handler)
         except Exception as e:
             raise ValueError(f"Failed to finish handshake: {e}")
 

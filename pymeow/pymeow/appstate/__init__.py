@@ -6,7 +6,7 @@ Port of whatsmeow/appstate.go
 import logging
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from .. import download, request, send
 from ..binary import node as binary_node
@@ -16,8 +16,8 @@ from ..request import InfoQuery, InfoQueryType
 from ..store.store import ContactEntry
 from ..types import JID, events
 from ..types.events.events import BaseEvent
-from . import encode
-from .hash import Mutation
+from . import encode, decode
+from .hash import Mutation, HashState
 from .keys import WAPatchName
 
 if TYPE_CHECKING:
@@ -62,7 +62,7 @@ async def fetch_app_state(
             has_more = patches.has_more_patches
 
             try:
-                mutations, new_state = await client.app_state_proc.decode_patches(patches, state, True)
+                mutations, new_state = await decode.decode_patches(client.app_state_proc, patches, state, True)
             except Exception as err:
                 if "key not found" in str(err).lower():
                     await request_missing_app_state_keys(client, patches)
@@ -140,18 +140,17 @@ async def dispatch_app_state(
     index_type = mutation.index[0] if mutation.index else ""
 
     if index_type == "mute":
-        if hasattr(mutation.action, 'mute_action'):
-            act = mutation.action.mute_action
-            event_to_dispatch = events.Mute(
-                jid=jid,
-                timestamp=timestamp,
-                action=act,
-                from_full_sync=full_sync
-            )
+        act = mutation.action.muteAction
+        event_to_dispatch = events.Mute(
+            jid=jid,
+            timestamp=timestamp,
+            action=act,
+            from_full_sync=full_sync
+        )
 
-            muted_until = None
-            if getattr(act, 'muted', False):
-                muted_until = getattr(act, 'mute_end_timestamp', 0) / 1000
+        muted_until = None
+        if act.muted and act.muteEndTimestamp > 0:
+            muted_until = datetime.fromtimestamp(act.muteEndTimestamp / 1000)
 
             if client.store.chat_settings:
                 try:
@@ -332,7 +331,7 @@ async def dispatch_app_state(
         await client.dispatch_event(event_to_dispatch)
 
 
-async def download_external_app_state_blob(client: "Client", ref: Any) -> bytes:
+async def download_external_app_state_blob(client: "Client", ref: Any) -> Optional[bytes]:
     """Download external app state blob."""
     return await download.download(client, ref)
 
@@ -414,7 +413,7 @@ async def request_app_state_keys(client: "Client", raw_key_ids: List[bytes]) -> 
 
     logger.info(f"Sending key request for app state keys {debug_key_ids}")
     try:
-        await send.send_message(client, own_id, msg, SendRequestExtra(peer=True))
+        await send.send_message(client, own_id, msg, SendRequestExtra(id=send.generate_message_id(client), peer=True))
     except Exception as err:
         logger.warning(f"Failed to send app state key request: {err}")
 
@@ -441,7 +440,6 @@ async def send_app_state(client: "Client", patch: Any) -> None:
     if latest_key_id is None:
         raise Exception("no app state keys found, creating app state keys is not yet supported")
 
-    from .hash import HashState
     state = HashState(version=version, hash=hash_value)
 
     encoded_patch = await encode.encode_patch(client.app_state_proc, latest_key_id, state, patch)

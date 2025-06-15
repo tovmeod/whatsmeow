@@ -5,6 +5,7 @@ Port of whatsmeow/broadcast.go
 """
 from typing import TYPE_CHECKING, Dict, List
 
+from . import request
 from .binary import node as binary_node
 from .exceptions import ErrIQNotFound, PymeowError
 from .request import InfoQuery, InfoQueryType
@@ -144,13 +145,7 @@ async def get_status_privacy(client: "Client") -> List[StatusPrivacy]:
         content=[binary_node.Node(tag="privacy")]
     )
 
-    response, err = await client.send_iq(query)
-    if err is not None:
-        # Go code: if errors.Is(err, ErrIQNotFound)
-        if err == ErrIQNotFound:
-            return DEFAULT_STATUS_PRIVACY
-        raise err
-
+    response = await request.send_iq(client, query)
     privacy_lists = response.get_child_by_tag("privacy")
     outputs: List[StatusPrivacy] = []
 

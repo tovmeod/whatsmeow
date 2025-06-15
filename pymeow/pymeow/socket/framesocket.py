@@ -42,9 +42,9 @@ class FrameSocket:
         self.lock = asyncio.Lock()
         self.url: str = URL
         self.http_headers: Dict[str, str] = {"Origin": ORIGIN}
-        self.frames: asyncio.Queue[bytes] = asyncio.Queue()
+        self.frames: asyncio.Queue[bytearray] = asyncio.Queue()
         self.on_disconnect: Optional[Callable[[bool], Coroutine[Any, Any, None]]] = None
-        self.write_timeout: Optional[float] = None
+        self.write_timeout: float = 0
         self.header: bytes = WA_CONN_HEADER
         self.dialer: ClientSession = dialer
 
@@ -109,36 +109,29 @@ class FrameSocket:
             if self.on_disconnect:
                 await self.on_disconnect(code == 0)
 
-    async def connect(self) -> Optional[Exception]:
+    async def connect(self) -> None:
         """
         Port of Go method Connect from FrameSocket.
 
         Connect to WhatsApp WebSocket server.
 
-        Returns:
-            Optional[Exception]: None if successful, Exception if failed
+        Raises:
+            Exception
+            SocketAlreadyOpenError
         """
         # TODO: Review SocketAlreadyOpenError implementation
 
         async with self.lock:
             if self.conn is not None:
-                return SocketAlreadyOpenError()
+                raise SocketAlreadyOpenError()
 
             logger.debug(f"Dialing {self.url}")
-
-            try:
-                self.conn = await self.dialer.ws_connect(
-                    self.url,
-                    headers=self.http_headers
-                )
-
-                # Start read pump
-                self.read_task = asyncio.create_task(self.read_pump(self.conn))
-
-                return None
-
-            except Exception as e:
-                return Exception(f"couldn't dial whatsapp web websocket: {e}")
+            self.conn = await self.dialer.ws_connect(
+                self.url,
+                headers=self.http_headers
+            )
+            # Start read pump
+            self.read_task = asyncio.create_task(self.read_pump(self.conn))
 
     async def send_frame(self, data: bytes) -> Optional[Exception]:
         """
@@ -167,7 +160,7 @@ class FrameSocket:
         if self.header is not None:
             whole_frame[:header_length] = self.header
             # We only want to send the header once
-            self.header = None
+            self.header = b''
 
         # Encode length of frame
         whole_frame[header_length] = (data_length >> 16) & 0xFF
@@ -203,6 +196,7 @@ class FrameSocket:
         self.partial_header = None
         self.incoming_length = 0
         self.received_length = 0
+        assert data is not None
         await self.frames.put(data)
 
     async def _process_data(self, msg: bytes) -> None:
@@ -232,7 +226,7 @@ class FrameSocket:
                     msg = msg[FRAME_LENGTH_SIZE:]
 
                     if len(msg) >= length:
-                        self.incoming = msg[:length]
+                        self.incoming = bytearray(msg[:length])
                         msg = msg[length:]
                         await self._frame_complete()
                     else:

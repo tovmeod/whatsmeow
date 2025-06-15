@@ -3,13 +3,15 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Awaitable, Callable, Dict
-
-from ..types.message import Message
+from typing import Awaitable, Callable, Dict, TYPE_CHECKING
+from ..types.events import Message
 
 logger = logging.getLogger(__name__)
 
 MessageCallback = Callable[[Message], Awaitable[None]]
+
+if TYPE_CHECKING:
+    from ..client import Client
 
 @dataclass
 class ExpirationInfo:
@@ -22,10 +24,10 @@ class ExpirationInfo:
 class DisappearingMessageHandler:
     """Handles disappearing message events and callbacks."""
 
-    def __init__(self, client):
+    def __init__(self, client: 'Client') -> None:
         self.client = client
         self._expiration_tasks: Dict[str, asyncio.Task] = {}
-        self._callbacks = {
+        self._callbacks: Dict[str, list[MessageCallback]] = {
             'on_message_expiring': [],
             'on_message_expired': [],
             'on_ephemeral_message_viewed': []
@@ -55,7 +57,9 @@ class DisappearingMessageHandler:
 
     async def handle_expiring_message(self, message: Message) -> None:
         """Handle a message that is about to expire."""
-        if not message.expiration_info:
+        # Note: The Message event class doesn't have expiration_info by default
+        # You'll need to add this field to the Message class or handle it differently
+        if not hasattr(message, 'expiration_info') or not message.expiration_info:
             return
 
         await self._trigger_callbacks('on_message_expiring', message)
@@ -66,11 +70,12 @@ class DisappearingMessageHandler:
 
         if expires_in > 0:
             task = asyncio.create_task(self._schedule_message_expiration(message))
-            self._expiration_tasks[message.id] = task
+            # Use message.info.id instead of message.id
+            self._expiration_tasks[message.info.id] = task
 
     async def _schedule_message_expiration(self, message: Message) -> None:
         """Schedule the expiration of a message."""
-        if not message.expiration_info:
+        if not hasattr(message, 'expiration_info') or not message.expiration_info:
             return
 
         now = datetime.utcnow()
@@ -88,12 +93,12 @@ class DisappearingMessageHandler:
         await self._trigger_callbacks('on_message_expired', message)
 
         # Clean up any associated resources
-        if message.id in self._expiration_tasks:
-            del self._expiration_tasks[message.id]
+        if message.info.id in self._expiration_tasks:
+            del self._expiration_tasks[message.info.id]
 
     async def handle_ephemeral_message_viewed(self, message: Message) -> None:
         """Handle a view-once message that has been viewed."""
-        if not message.expiration_info or not message.expiration_info.is_ephemeral:
+        if not hasattr(message, 'expiration_info') or not message.expiration_info or not message.expiration_info.is_ephemeral:
             return
 
         message.expiration_info.viewed = True

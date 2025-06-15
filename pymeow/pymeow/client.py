@@ -25,9 +25,11 @@ from .exceptions import ErrAlreadyConnected, ErrNotConnected, ErrNotLoggedIn
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from .generated.waE2E.WAWebProtobufsE2E_pb2 import Message
 from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
+from .mediaconn import MediaConn
 from .message import handle_encrypted_message
 from .notification import handle_notification
 from .pair import handle_iq
+from .pair_code import PhoneLinkingCache
 from .presence import handle_chat_state, handle_presence
 from .privacysettings import PrivacySettings
 from .receipt import handle_receipt
@@ -109,7 +111,7 @@ class Client:
             device_store: The device store to use for storing session data
         """
         super().__init__()
-        self.store: 'Device' = device_store
+        self.store: Device = device_store
         self.recv_log = logging.getLogger(f"{logger.name}.Recv")
         self.send_log = logging.getLogger(f"{logger.name}.Send")
 
@@ -158,7 +160,7 @@ class Client:
         from .types import JID
         self.server_jid = JID.server_jid()
 
-        self.media_conn_cache = None # TODO: Type hint for media_conn_cache
+        self.media_conn_cache: MediaConn
         self.media_conn_lock = asyncio.Lock()
 
         # Response handling
@@ -247,7 +249,7 @@ class Client:
         self.auto_trust_identity = True
         self.error_on_subscribe_presence_without_token = False
 
-        self.phone_linking_cache = None # TODO: Type hint for phone_linking_cache
+        self.phone_linking_cache: PhoneLinkingCache
 
         # Generate a unique ID prefix
         unique_id_prefix = urandom(2)
@@ -298,7 +300,7 @@ class Client:
             # Generate 100 prekeys
             prekeys = generate_prekeys(1, 100)
             for prekey in prekeys:
-                await self.signal_store.store_pre_key(prekey.id(), prekey)
+                await self.signal_store.asave_pre_key(prekey.id(), prekey)
             print(f"Generated {len(prekeys)} prekeys")
 
     def create_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
@@ -394,49 +396,42 @@ class Client:
             # Timeout occurred either during `await wait_event.wait()` or elsewhere within the `async with asyncio.timeout` block.
             return False
 
-    async def connect(self) -> Exception | None:
+    async def connect(self) -> None:
         """Connect to the WhatsApp web websocket.
 
         After connection, it will either authenticate if there's data in the device store,
         or emit a QR event to set up a new link.
 
-        Returns:
-            None
-
-        Returns:
-            Optional[Exception]: None if successful or if background reconnection is
-                                 initiated, otherwise the Exception that occurred.
+        Raises:
+            Exception
         """
-        err = await self._connect()
+        try:
+            await self._connect()
+        except (aiohttp.ClientConnectionError,
+                aiohttp.ClientError,
+                ConnectionError,
+                OSError,
+                socket.error,
+                asyncio.TimeoutError,
+                aiohttp.ServerTimeoutError,
+                ):
+            if self.initial_auto_reconnect and self.enable_auto_reconnect:
+                logger.error("Initial connection failed but reconnecting in background")
 
-        if (err is not None and isinstance(err, (aiohttp.ClientConnectionError,
-                                                aiohttp.ClientError,
-                                                ConnectionError,
-                                                OSError,
-                                                socket.error,
-                                                asyncio.TimeoutError,
-                                                aiohttp.ServerTimeoutError,
-                                                aiohttp.ClientTimeout))
-            and self.initial_auto_reconnect and self.enable_auto_reconnect):
-            logger.error("Initial connection failed but reconnecting in background")
+                self.create_task(self.dispatch_event(Disconnected()))
+                self.create_task(self.auto_reconnect())
 
-            self.create_task(self.dispatch_event(Disconnected()))
-            self.create_task(self.auto_reconnect())
+                # Go: return nil (meaning the public Connect() call doesn't propagate this specific error)
+                return None  # Explicitly return None for clarity
+            else:
+                raise
 
-            # Go: return nil (meaning the public Connect() call doesn't propagate this specific error)
-            return None  # Explicitly return None for clarity
-
-        # Go: return err
-        # Python: raise -> Should return the error object
-        # If the error was None (success), this returns None.
-        # If the error was not None but didn't meet the "reconnect" condition, this returns the error.
-        return err
-
-    async def _connect(self) -> Optional[Exception]:
+    async def _connect(self) -> None:
         """Internal method to establish a connection to the WhatsApp web websocket.
 
-        Returns:
-            Optional[Exception]: None on success, or an Exception if an error occurred.
+        Raises:
+            Exception
+            ErrAlreadyConnected
         """
         # Go: if cli == nil { return ErrClientIsNil }
         # This check is typically not needed for instance methods in Python,
@@ -451,7 +446,7 @@ class Client:
                     await self._unlocked_disconnect()
                 else:
                     # Go: return ErrAlreadyConnected
-                    return ErrAlreadyConnected()
+                    raise ErrAlreadyConnected()
 
             self._reset_expected_disconnect()
 
@@ -466,31 +461,22 @@ class Client:
                 fs.http_headers["Cache-Control"] = "no-cache"
                 fs.http_headers["Pragma"] = "no-cache"
 
-            # Go: if err := fs.Connect(); err != nil { fs.Close(0); return err }
             try:
-                connect_err = await fs.connect()  # Assuming connect returns Optional[Exception]
-                if connect_err:
-                    await fs.close(0)
-                    return connect_err
-            except Exception as e_connect:  # Catching exceptions if fs.connect raises them
+                await fs.connect()
+            except Exception:
                 await fs.close(0)
-                # Return the caught exception directly to match Go's error return
-                return ValueError(f"Failed to connect: {e_connect}")
+                raise
 
             # Go: else if err = cli.doHandshake(fs, *keys.NewKeyPair()); err != nil { ... }
             # Python: Perform handshake
             ephemeral_kp = KeyPair.generate()
-            try:
                 # In Go, cli.doHandshake assigns the resulting NoiseSocket to cli.socket.
                 # The Python _do_handshake should do something similar, e.g., assign to self.socket.
-                handshake_err = await handshake.do_handshake(self, fs, ephemeral_kp)
-                if handshake_err:
-                    await fs.close(0)
-                    return ValueError(f"Noise handshake failed: {handshake_err}")
-            except Exception as e_handshake:  # Catching exceptions if _do_handshake raises them
+            try:
+                await handshake.do_handshake(self, fs, ephemeral_kp)
+            except:
                 await fs.close(0)
-                # Return the caught exception, wrapping if necessary to match Go's error message style
-                return ValueError(f"Noise handshake failed: {e_handshake}")
+                raise
 
             # Go: go cli.keepAliveLoop(cli.socket.Context())
             # Go: go cli.handlerQueueLoop(cli.socket.Context())
@@ -504,10 +490,7 @@ class Client:
                 # This case should ideally not be reached if handshake was successful
                 # and self.socket was assigned.
                 logger.error("_connect: self.socket is None after successful handshake, cannot start loops.")
-                return ValueError("_connect: self.socket is None after successful handshake")
-
-            # Go: return nil
-            return None
+                raise ValueError("_connect: self.socket is None after successful handshake")
 
     def is_logged_in(self) -> bool:
         """Check if the client is logged in.
@@ -599,24 +582,20 @@ class Client:
             # The Python `_connect` method in the input raises exceptions.
             # The Go `connect` method returns an error.
             # To match Go, `self._connect` should return Optional[Exception].
-            err = await self._connect()
-
-            # Go: if errors.Is(err, ErrAlreadyConnected)
-            if isinstance(err, ErrAlreadyConnected):  # Check for specific error type
+            try:
+                await self._connect()
+            except ErrAlreadyConnected:  # Check for specific error type
                 logger.debug("Connect() said we're already connected after autoreconnect sleep")
                 return
-            # Go: else if err != nil
-            elif err is not None:
-                logger.error(f"Error reconnecting after autoreconnect sleep: {err}")
+            except Exception as e:
+                logger.error(f"Error reconnecting after autoreconnect sleep: {e}")
                 # Go: if cli.AutoReconnectHook != nil && !cli.AutoReconnectHook(err)
-                if self.auto_reconnect_hook is not None and not self.auto_reconnect_hook(err):
+                if self.auto_reconnect_hook is not None and not self.auto_reconnect_hook(e):
                     logger.debug("AutoReconnectHook returned false, not reconnecting")
                     return
             # Go: else (meaning err == nil, successful connection)
-            else:
-                # Successful connection
-                logger.debug("Successfully reconnected after autoreconnect sleep.")
-                return
+            # Successful connection
+            logger.debug("Successfully reconnected after autoreconnect sleep.")
 
     def is_connected(self) -> bool:
         """Check if the client is connected to the WhatsApp web websocket.
@@ -908,7 +887,7 @@ class Client:
                 logger.error(f"Error in handler queue loop: {e}")
                 # Continue the loop on other errors
 
-    async def send_node_and_get_data(self, node: Node) -> Optional[bytes]:
+    async def send_node_and_get_data(self, node: Node) -> bytes:
         """
         Send a node to the server and get the raw data.
         Mirrors Go's pattern of returning (data, error).
@@ -980,8 +959,7 @@ class Client:
     # The method can be synchronous if all its internal calls are synchronous.
     # If get_own_id or JID.parse were async, this would need to be async.
     # For direct porting of Go's synchronous logic, this can be synchronous.
-    def parse_web_message(self, chat_jid: JID, web_msg: waWeb_pb2.WebMessageInfo) -> Tuple[
-        Optional[events.Message], Optional[Exception]]:
+    def parse_web_message(self, chat_jid: JID, web_msg: waWeb_pb2.WebMessageInfo) -> events.Message:
         """
         Parse a WebMessageInfo object into an events.Message.
         Mirrors Go's pattern of returning (value, error).
@@ -991,10 +969,11 @@ class Client:
             web_msg: The WebMessageInfo protobuf object to parse.
 
         Returns:
-            A tuple containing an events.Message object or None, and an Exception or None.
+            events.Message object
+        Raises:
+            ErrNotLoggedIn
+            ValueError
         """
-        err: Optional[Exception] = None
-
         # Go: if chatJID.IsEmpty()
         if chat_jid.is_empty():
             # Go: chatJID, err = types.ParseJID(webMsg.GetKey().GetRemoteJID())
@@ -1020,7 +999,7 @@ class Client:
         if info.message_source.is_from_me:
             own_id_non_ad = self.get_own_id().to_non_ad()
             if own_id_non_ad.is_empty():
-                return None, ErrNotLoggedIn("Not logged in (own ID is empty after to_non_ad)")
+                raise ErrNotLoggedIn("Not logged in (own ID is empty after to_non_ad)")
             info.message_source.sender = own_id_non_ad
         # Go: else if chatJID.Server == types.DefaultUserServer ...
         elif chat_jid.server in [DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, NEWSLETTER_SERVER]:
@@ -1032,12 +1011,10 @@ class Client:
         elif web_msg.key.participant:
             info.message_source.sender = JID.parse_jid(web_msg.key.participant)
         else:
-            return None, ValueError(f"couldn't find sender of message {info.id}")
+            raise ValueError(f"couldn't find sender of message {info.id}")
 
-        if err:
-            return None, ValueError(f"failed to parse sender of message {info.id}: {err}")
         if info.sender is None and not info.message_source.is_from_me:
-            return None, ValueError(f"sender could not be determined for message {info.id}")
+            raise ValueError(f"sender could not be determined for message {info.id}")
 
         # Go: if pk := webMsg.GetCommentMetadata().GetCommentParentKey(); pk != nil
         if web_msg.commentMetadata and web_msg.commentMetadata.commentParentKey:
@@ -1058,14 +1035,14 @@ class Client:
         evt.unwrap_raw()
 
         # Go: if evt.Message.GetProtocolMessage().GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT
-        if evt.message and evt.message.protocol_message:
-            protocol_msg = evt.message.protocol_message
+        if evt.message and evt.message.protocolMessage:
+            protocol_msg = evt.message.protocolMessage
             if protocol_msg.type == waE2E_pb2.ProtocolMessage.MESSAGE_EDIT:
                 if protocol_msg.key:
-                    info.id = protocol_msg.key.id
-                evt.message = protocol_msg.edited_message
+                    info.id = protocol_msg.key.ID
+                evt.message = protocol_msg.editedMessage
 
-        return evt, None
+        return evt
 
     async def store_lid_pn_mapping(self, first: JID, second: JID) -> None:
         """Store a mapping between a LID (Local ID) and a PN (Phone Number JID).

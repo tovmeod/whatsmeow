@@ -10,7 +10,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from . import request
+from .client import Client
 from .binary.node import Node
+from .request import InfoQuery, InfoQueryType
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +44,9 @@ class APNsPushConfig(PushConfig):
     """Apple Push Notification service configuration."""
     token: str
     voip_token: str = ""
-    msg_id_enc_key: bytes = None
+    msg_id_enc_key: bytes = b''
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.msg_id_enc_key is None or len(self.msg_id_enc_key) != 32:
             self.msg_id_enc_key = secrets.token_bytes(32)
 
@@ -88,50 +91,33 @@ class WebPushConfig(PushConfig):
         }
 
 
-async def get_server_push_notification_config(self) -> Optional[Node]:
+async def get_server_push_notification_config(client: 'Client') -> Optional[Node]:
     """Retrieves server push notification settings."""
-    if not self:
-        return None
-
-    from .request import InfoQuery, InfoQueryType
-
-    resp, err = await self.send_iq(InfoQuery(
+    resp = await request.send_iq(client, InfoQuery(
         namespace="urn:xmpp:whatsapp:push",
         type=InfoQueryType.GET,
-        to=self.server_jid,
+        to=client.server_jid,
         content=[Node(tag="settings")]
     ))
-
-    if err:
-        logger.error(f"Failed to get server push notification config: {err}")
-        return None
-
     return resp
 
-async def register_for_push_notifications(self, pc: PushConfig) -> None:
+async def register_for_push_notifications(client: 'Client', pc: PushConfig) -> None:
     """
     Registers a device for push notifications.
 
     This is generally not necessary for anything. Don't use this if you don't know what you're doing.
 
     Args:
+        client: The client instance. This is required to send the IQ.
         pc: The push configuration to register
 
     Raises:
         ElementMissingError: If the client is nil
         Exception: If there's an error registering for push notifications
     """
-    if not self:
-        raise Exception("Element missing")
-
-    from .request import InfoQuery, InfoQueryType
-
-    _, err = await self.send_iq(InfoQuery(
+    _ = await request.send_iq(client, InfoQuery(
         namespace="urn:xmpp:whatsapp:push",
         type=InfoQueryType.SET,
-        to=self.server_jid,
-        content=[Node(tag="config", attributes=pc.get_push_config_attrs())]
+        to=client.server_jid,
+        content=[Node(tag="config", attrs=pc.get_push_config_attrs())]
     ))
-
-    if err:
-        raise Exception(f"Failed to register for push notifications: {err}")

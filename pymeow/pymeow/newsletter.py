@@ -4,17 +4,22 @@ WhatsApp newsletter handling.
 Port of whatsmeow/newsletter.go - uses composition pattern instead of mixins.
 Each function receives the client as the first argument.
 """
-
+import base64
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from . import request, send
 from .binary.node import Node
 from .exceptions import ElementMissingError, ErrClientIsNil
+from .request import InfoQuery, InfoQueryType
 from .types.jid import JID, SERVER_JID
 from .types.message import MessageID, MessageServerID
 from .types.newsletter import GraphQLErrors, GraphQLResponse, NewsletterMessage, NewsletterMetadata
+
+if TYPE_CHECKING:
+    from .client import Client
 
 # GraphQL query/mutation constants - matching Go exactly
 QUERY_FETCH_NEWSLETTER = "6563316087068696"
@@ -57,7 +62,7 @@ class GetNewsletterUpdatesParams:
     after: Optional[MessageServerID] = None
 
 
-async def newsletter_subscribe_live_updates(client, jid: JID) -> int:
+async def newsletter_subscribe_live_updates(client: 'Client', jid: JID) -> int:
     """Subscribe to receive live updates from a WhatsApp channel temporarily (for the duration returned).
 
     Args:
@@ -69,20 +74,27 @@ async def newsletter_subscribe_live_updates(client, jid: JID) -> int:
 
     Raises:
         Exception: If the request fails
+        ValueError
+        TypeError
     """
-    resp = await client.send_iq({
-        "namespace": "newsletter",
-        "type": "set",
-        "to": jid,
-        "content": [Node(tag="live_updates")]
-    })
+    resp = await request.send_iq(client, InfoQuery(
+        namespace= "newsletter",
+        type=InfoQueryType.SET,
+        to=jid,
+        content=[Node(tag="live_updates")]
+    ))
 
     child = resp.get_child_by_tag("live_updates")
-    dur = child.attrs.get_int("duration")
+    duration_str = child.attrs.get("duration")
+    if duration_str is None:
+        raise ValueError("Duration attribute missing from live_updates response")
+    try:
+        dur = int(duration_str)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid duration value: {duration_str}") from e
     return dur
 
-
-async def newsletter_mark_viewed(client, jid: JID, server_ids: List[MessageServerID]) -> None:
+async def newsletter_mark_viewed(client: 'Client', jid: JID, server_ids: List[MessageServerID]) -> None:
     """Mark a channel message as viewed, incrementing the view counter.
 
     This is not the same as marking the channel as read on your other devices,
@@ -101,16 +113,16 @@ async def newsletter_mark_viewed(client, jid: JID, server_ids: List[MessageServe
 
     items = [Node(
         tag="item",
-        attributes={"server_id": server_id}
+        attrs={"server_id": server_id}
     ) for server_id in server_ids]
 
-    req_id = client.generate_request_id()
-    resp = client.wait_response(req_id)
+    req_id = request.generate_request_id(client)
+    resp = await request.wait_response(client, req_id)
 
     try:
         await client.send_node(Node(
             tag="receipt",
-            attributes={
+            attrs={
                 "to": jid,
                 "type": "view",
                 "id": req_id
@@ -121,19 +133,18 @@ async def newsletter_mark_viewed(client, jid: JID, server_ids: List[MessageServe
             )]
         ))
     except Exception as e:
-        client.cancel_response(req_id, resp)
+        await request.cancel_response(client, req_id, resp)
         raise e
 
-    # TODO handle response?
-    await resp
+    await resp.get()
 
 
 async def newsletter_send_reaction(
-    client,
+    client: 'Client',
     jid: JID,
     server_id: MessageServerID,
     reaction: str,
-    message_id: MessageID = ""
+    message_id: MessageID = MessageID("")
 ) -> None:
     """Send a reaction to a channel message.
 
@@ -147,7 +158,7 @@ async def newsletter_send_reaction(
         message_id: The message ID of the reaction itself (optional, will be generated if empty)
     """
     if not message_id:
-        message_id = client.generate_message_id()
+        message_id = send.generate_message_id(client)
 
     reaction_attrs = {}
     message_attrs = {
@@ -165,15 +176,23 @@ async def newsletter_send_reaction(
 
     await client.send_node(Node(
         tag="message",
-        attributes=message_attrs,
+        attrs=message_attrs,
         content=[Node(
             tag="reaction",
-            attributes=reaction_attrs
+            attrs=reaction_attrs
         )]
     ))
 
 
-async def send_mex_iq(client, query_id: str, variables: Any) -> bytes:
+class BytesEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles bytes objects by encoding them as base64."""
+
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, bytes):
+            return base64.b64encode(obj).decode('utf-8')
+        return super().default(obj)
+
+async def send_mex_iq(client: 'Client', query_id: str, variables: Any) -> Dict[str, Any]:
     """Send a MEX IQ request (GraphQL).
 
     Args:
@@ -182,27 +201,26 @@ async def send_mex_iq(client, query_id: str, variables: Any) -> bytes:
         variables: The variables for the query
 
     Returns:
-        The raw response data
-
+        The parsed JSON response data
     Raises:
         Exception: If the request fails
         GraphQLErrors: If the GraphQL response contains errors
     """
-    payload = json.dumps({"variables": variables}).encode('utf-8')
+    payload = json.dumps({"variables": variables}, cls=BytesEncoder).encode('utf-8')
 
-    resp = await client.send_iq({
-        "namespace": "w:mex",
-        "type": "get",
-        "to": SERVER_JID,
-        "content": [Node(
+    resp = await request.send_iq(client, InfoQuery(
+        namespace="w:mex",
+        type=InfoQueryType.GET,
+        to=SERVER_JID,
+        content=[Node(
             tag="query",
-            attributes={"query_id": query_id},
+            attrs={"query_id": query_id},
             content=payload
         )]
-    })
+    ))
 
-    result = resp.get_optional_child_by_tag("result")
-    if not result:
+    result, found = resp.get_optional_child_by_tag("result")
+    if not found or not result:
         raise ElementMissingError(tag="result", in_location="mex response")
 
     result_content = result.content
@@ -213,13 +231,22 @@ async def send_mex_iq(client, query_id: str, variables: Any) -> bytes:
     gql_resp = GraphQLResponse(**gql_resp_dict)
 
     if len(gql_resp.errors) > 0:
-        raise GraphQLErrors(gql_resp.errors)
+        raise GraphQLErrors(gql_resp.errors.errors)
 
-    return gql_resp.data
-
+    # Parse the data field if it's JSON bytes, otherwise return as dict
+    if isinstance(gql_resp.data, bytes):
+        parsed_data = json.loads(gql_resp.data.decode('utf-8'))
+        if isinstance(parsed_data, dict):
+            return parsed_data
+        else:
+            raise ValueError(f"Expected dict from parsed JSON, got {type(parsed_data)}")
+    elif isinstance(gql_resp.data, dict):
+        return gql_resp.data
+    else:
+        raise ValueError(f"Expected dict or bytes from GraphQL response data, got {type(gql_resp.data)}")
 
 async def get_newsletter_info_internal(
-    client,
+    client: 'Client',
     input_data: Dict[str, Any],
     fetch_viewer_meta: bool
 ) -> Optional[NewsletterMetadata]:
@@ -246,7 +273,7 @@ async def get_newsletter_info_internal(
     return NewsletterMetadata(**data["xwa2_newsletter"])
 
 
-async def get_newsletter_info(client, jid: JID) -> Optional[NewsletterMetadata]:
+async def get_newsletter_info(client: 'Client', jid: JID) -> Optional[NewsletterMetadata]:
     """Get the info of a newsletter that you're joined to.
 
     Args:
@@ -264,7 +291,7 @@ async def get_newsletter_info(client, jid: JID) -> Optional[NewsletterMetadata]:
     }, True)
 
 
-async def get_newsletter_info_with_invite(client, key: str) -> Optional[NewsletterMetadata]:
+async def get_newsletter_info_with_invite(client: 'Client', key: str) -> Optional[NewsletterMetadata]:
     """Get the info of a newsletter with an invite link.
 
     You can either pass the full link (https://whatsapp.com/channel/...) or just the `...` part.
@@ -290,7 +317,7 @@ async def get_newsletter_info_with_invite(client, key: str) -> Optional[Newslett
     }, False)
 
 
-async def get_subscribed_newsletters(client) -> List[NewsletterMetadata]:
+async def get_subscribed_newsletters(client: 'Client') -> List[NewsletterMetadata]:
     """Get the info of all newsletters that you're joined to.
 
     Args:
@@ -308,7 +335,7 @@ async def get_subscribed_newsletters(client) -> List[NewsletterMetadata]:
     return [NewsletterMetadata(**n) for n in newsletters_data]
 
 
-async def create_newsletter(client, params: CreateNewsletterParams) -> Optional[NewsletterMetadata]:
+async def create_newsletter(client: 'Client', params: CreateNewsletterParams) -> Optional[NewsletterMetadata]:
     """Create a new WhatsApp channel.
 
     Args:
@@ -319,7 +346,7 @@ async def create_newsletter(client, params: CreateNewsletterParams) -> Optional[
         The created newsletter metadata or None
     """
     # Convert dataclass to dictionary, filtering out None values
-    params_dict = {}
+    params_dict: Dict[str, str | bytes] = {}
     if params.name:
         params_dict["name"] = params.name
     if params.description:
@@ -337,7 +364,7 @@ async def create_newsletter(client, params: CreateNewsletterParams) -> Optional[
     return NewsletterMetadata(**resp["xwa2_newsletter_create"])
 
 
-async def accept_tos_notice(client, notice_id: str, stage: str) -> None:
+async def accept_tos_notice(client: 'Client', notice_id: str, stage: str) -> None:
     """Accept a ToS notice.
 
     To accept the terms for creating newsletters, use:
@@ -348,21 +375,21 @@ async def accept_tos_notice(client, notice_id: str, stage: str) -> None:
         notice_id: The notice ID
         stage: The stage
     """
-    await client.send_iq({
-        "namespace": "tos",
-        "type": "set",
-        "to": SERVER_JID,
-        "content": [Node(
+    await request.send_iq(client, InfoQuery(
+        namespace="tos",
+        type=InfoQueryType.SET,
+        to=SERVER_JID,
+        content=[Node(
             tag="notice",
-            attributes={
+            attrs={
                 "id": notice_id,
                 "stage": stage
             }
         )]
-    })
+    ))
 
 
-async def newsletter_toggle_mute(client, jid: JID, mute: bool) -> None:
+async def newsletter_toggle_mute(client: 'Client', jid: JID, mute: bool) -> None:
     """Change the mute status of a newsletter.
 
     Args:
@@ -376,7 +403,7 @@ async def newsletter_toggle_mute(client, jid: JID, mute: bool) -> None:
     })
 
 
-async def follow_newsletter(client, jid: JID) -> None:
+async def follow_newsletter(client: 'Client', jid: JID) -> None:
     """Make the user follow (join) a WhatsApp channel.
 
     Args:
@@ -388,7 +415,7 @@ async def follow_newsletter(client, jid: JID) -> None:
     })
 
 
-async def unfollow_newsletter(client, jid: JID) -> None:
+async def unfollow_newsletter(client: 'Client', jid: JID) -> None:
     """Make the user unfollow (leave) a WhatsApp channel.
 
     Args:
@@ -401,7 +428,7 @@ async def unfollow_newsletter(client, jid: JID) -> None:
 
 
 async def get_newsletter_messages(
-    client,
+    client: 'Client',
     jid: JID,
     params: Optional[GetNewsletterMessagesParams] = None
 ) -> List[NewsletterMessage]:
@@ -426,25 +453,25 @@ async def get_newsletter_messages(
         if params.before is not None and params.before != 0:
             attrs["before"] = params.before
 
-    resp = await client.send_iq({
-        "namespace": "newsletter",
-        "type": "get",
-        "to": SERVER_JID,
-        "content": [Node(
+    resp = await request.send_iq(client, InfoQuery(
+        namespace="newsletter",
+        type=InfoQueryType.GET,
+        to=SERVER_JID,
+        content=[Node(
             tag="messages",
-            attributes=attrs
+            attrs=attrs
         )]
-    })
+    ))
 
-    messages = resp.get_optional_child_by_tag("messages")
-    if not messages:
+    messages, found = resp.get_optional_child_by_tag("messages")
+    if not found or not messages:
         raise ElementMissingError(tag="messages", in_location="newsletter messages response")
 
-    return parse_newsletter_messages(client, messages)
+    return parse_newsletter_messages(messages)
 
 
 async def get_newsletter_message_updates(
-    client,
+    client: 'Client',
     jid: JID,
     params: Optional[GetNewsletterUpdatesParams] = None
 ) -> List[NewsletterMessage]:
@@ -471,28 +498,27 @@ async def get_newsletter_message_updates(
         if params.after is not None and params.after != 0:
             attrs["after"] = params.after
 
-    resp = await client.send_iq({
-        "namespace": "newsletter",
-        "type": "get",
-        "to": jid,
-        "content": [Node(
+    resp = await request.send_iq(client, InfoQuery(
+        namespace="newsletter",
+        type=InfoQueryType.GET,
+        to=jid,
+        content=[Node(
             tag="message_updates",
-            attributes=attrs
+            attrs=attrs
         )]
-    })
+    ))
 
-    messages = resp.get_optional_child_by_tag("message_updates", "messages")
-    if not messages:
+    messages, found = resp.get_optional_child_by_tag("message_updates", "messages")
+    if not found and not messages:
         raise ElementMissingError(tag="messages", in_location="newsletter messages response")
 
-    return parse_newsletter_messages(client, messages)
+    return parse_newsletter_messages(messages)
 
 
-def parse_newsletter_messages(client, messages: Node) -> List[NewsletterMessage]:
+def parse_newsletter_messages(messages: Node) -> List[NewsletterMessage]:
     """Parse newsletter messages from a node.
 
     Args:
-        client: The WhatsApp client (for future extensibility)
         messages: The messages node
 
     Returns:

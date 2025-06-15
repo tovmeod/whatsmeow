@@ -29,7 +29,7 @@ class Contact(BaseEvent):
 
 
 @dataclass
-class PushName:
+class PushName(BaseEvent):
     """
     Emitted when a message is received with a different push name than the previous value cached for the same user.
 
@@ -42,7 +42,7 @@ class PushName:
 
 
 @dataclass
-class BusinessName:
+class BusinessName(BaseEvent):
     """
     Emitted when a message is received with a different verified business name than the previous value cached for the same user.
 
@@ -76,10 +76,10 @@ class Star(BaseEvent):
     Port of Star in Go.
     """
     chat_jid: JID  # The chat where the message was pinned
-    sender_jid: JID  # In group chats, the user who sent the message (except if the message was sent by the user)
     is_from_me: bool  # Whether the message was sent by the user
     message_id: str  # The message which was starred or unstarred
     timestamp: datetime  # The time when the (un)starring happened
+    sender_jid: Optional[JID] = None  # In group chats, the user who sent the message (except if the message was sent by the user)
 
     action: Optional[WASyncAction_pb2.StarAction] = None  # Whether the message is now starred or not
     from_full_sync: bool = False  # Whether the action is emitted because of a fullSync
@@ -93,10 +93,10 @@ class DeleteForMe(BaseEvent):
     Port of DeleteForMe in Go.
     """
     chat_jid: JID  # The chat where the message was deleted
-    sender_jid: JID  # In group chats, the user who sent the message (except if the message was sent by the user)
     is_from_me: bool  # Whether the message was sent by the user
     message_id: str  # The message which was deleted
     timestamp: datetime  # The time when the deletion happened
+    sender_jid: Optional[JID] = None  # In group chats, the user who sent the message (except if the message was sent by the user)
 
     action: Optional[WASyncAction_pb2.DeleteMessageForMeAction] = None  # Additional information for the deletion
     from_full_sync: bool = False  # Whether the action is emitted because of a fullSync

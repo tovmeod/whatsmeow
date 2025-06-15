@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, List, Optional
 from tortoise import Tortoise, transactions
 from tortoise.exceptions import DoesNotExist
 
+from ...types import JID
+from ...types.jid import EMPTY_JID
 from ...util.keys.keypair import KeyPair, PreKey
 from .config import get_tortoise_config
 from .models.device import DeviceModel
@@ -139,9 +141,8 @@ class Container:
 
     def _device_to_store(self, device: DeviceModel) -> 'Device':
         """Convert Device model to DeviceStore"""
-        from ...store.store import Device
         store = Device(self, device.jid)
-        store.lid = device.lid if device.lid else ""
+        store.lid = JID(device.lid) if device.lid else EMPTY_JID
         store.registration_id = device.registration_id
         if device.facebook_uuid:
             store.facebook_uuid = device.facebook_uuid
@@ -185,7 +186,10 @@ class Container:
 
         # Basic device info
         device.jid = store.jid if store.jid else ""
-        device.lid = store.lid if hasattr(store, 'lid') and store.lid else None
+        if store.lid:
+            device.lid = str(store.lid)
+        else:
+            device.lid = None
         device.registration_id = store.registration_id
 
         # Facebook UUID
@@ -194,16 +198,20 @@ class Container:
 
         # Store noise key private key bytes
         if store.noise_key:
+            assert store.noise_key.priv is not None
             device.noise_key = store.noise_key.priv
 
         # Store identity key private key bytes
         if store.identity_key:
+            assert store.identity_key.priv is not None
             device.identity_key = store.identity_key.priv
 
         # Store signed pre-key info
         if store.signed_pre_key:
+            assert store.signed_pre_key.priv is not None
             device.signed_pre_key = store.signed_pre_key.priv
             device.signed_pre_key_id = store.signed_pre_key.key_id
+            assert store.signed_pre_key.signature is not None
             device.signed_pre_key_sig = store.signed_pre_key.signature
 
         # ADV fields

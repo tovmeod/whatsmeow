@@ -8,7 +8,7 @@ from typing import Optional
 
 import aiohttp
 
-from .socket import noisesocket
+from .socket import noisesocket, constants
 from .store.clientpayload import WAVersionContainer
 
 # Regex to extract client revision from web.whatsapp.com
@@ -53,7 +53,7 @@ async def get_latest_version(
             "Accept-Language": "en-US,en;q=0.9"
         }
 
-        async with http_client.get(noisesocket.ORIGIN, headers=headers) as resp:
+        async with http_client.get(constants.ORIGIN, headers=headers) as resp:
             if resp.status != 200:
                 raise Exception(f"Unexpected response with status {resp.status}: {await resp.text()}")
 

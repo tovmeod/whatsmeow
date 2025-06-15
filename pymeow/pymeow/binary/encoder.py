@@ -4,8 +4,8 @@ Binary encoder for WhatsApp protocol.
 Port of whatsmeow/binary/encoder.go
 """
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, Union, Callable
 
 from ..types.jid import (
     DEFAULT_USER_SERVER,
@@ -41,26 +41,21 @@ TAG_SIZE = 1
 @dataclass
 class BinaryEncoder:
     """Binary encoder for WhatsApp protocol."""
-    data: bytearray = None
-
-    def __post_init__(self):
-        """Initialize the encoder with a single byte."""
-        if self.data is None:
-            self.data = bytearray([0])
+    data: bytearray = field(default_factory=bytearray)
 
     def get_data(self) -> bytearray:
         """Get the encoded data."""
         return self.data
 
-    def push_byte(self, b: int):
+    def push_byte(self, b: int) -> None:
         """Push a single byte to the data."""
         self.data.append(b)
 
-    def push_bytes(self, bytes_data: bytes):
+    def push_bytes(self, bytes_data: bytes) -> None:
         """Push multiple bytes to the data."""
         self.data.extend(bytes_data)
 
-    def push_int_n(self, value: int, n: int, little_endian: bool = False):
+    def push_int_n(self, value: int, n: int, little_endian: bool = False) -> None:
         """Push n bytes of an integer to the data."""
         for i in range(n):
             if little_endian:
@@ -69,7 +64,7 @@ class BinaryEncoder:
                 cur_shift = n - i - 1
             self.push_byte((value >> (cur_shift * 8)) & 0xFF)
 
-    def push_int20(self, value: int):
+    def push_int20(self, value: int) -> None:
         """Push a 20-bit integer to the data."""
         self.push_bytes(bytes([
             (value >> 16) & 0x0F,
@@ -77,23 +72,23 @@ class BinaryEncoder:
             value & 0xFF
         ]))
 
-    def push_int8(self, value: int):
+    def push_int8(self, value: int) -> None:
         """Push an 8-bit integer to the data."""
         self.push_int_n(value, 1)
 
-    def push_int16(self, value: int):
+    def push_int16(self, value: int) -> None:
         """Push a 16-bit integer to the data."""
         self.push_int_n(value, 2)
 
-    def push_int32(self, value: int):
+    def push_int32(self, value: int) -> None:
         """Push a 32-bit integer to the data."""
         self.push_int_n(value, 4)
 
-    def push_string(self, value: str):
+    def push_string(self, value: str) -> None:
         """Push a string to the data."""
         self.push_bytes(value.encode('utf-8'))
 
-    def write_byte_length(self, length: int):
+    def write_byte_length(self, length: int) -> None:
         """Write the length of a byte array with the appropriate token."""
         if length < 256:
             self.push_byte(BINARY_8)
@@ -107,7 +102,7 @@ class BinaryEncoder:
         else:
             raise ValueError(f"length is too large: {length}")
 
-    def write_node(self, n: Node):
+    def write_node(self, n: Node) -> None:
         """Write a node to the data."""
         if n.tag == "0":
             self.push_byte(LIST_8)
@@ -115,13 +110,13 @@ class BinaryEncoder:
             return
 
         has_content = 1 if n.content is not None else 0
-        self.write_list_start(2 * self.count_attributes(n.attributes) + TAG_SIZE + has_content)
+        self.write_list_start(2 * self.count_attributes(n.attrs) + TAG_SIZE + has_content)
         self.write_string(n.tag)
-        self.write_attributes(n.attributes)
+        self.write_attributes(n.attrs)
         if n.content is not None:
             self.write(n.content)
 
-    def write(self, data: Any):
+    def write(self, data: Any) -> None:
         """Write any data to the encoder."""
         if data is None:
             self.push_byte(LIST_EMPTY)
@@ -142,7 +137,7 @@ class BinaryEncoder:
         else:
             raise InvalidTypeError(f"Unsupported type: {type(data)}")
 
-    def write_string(self, data: str):
+    def write_string(self, data: str) -> None:
         """Write a string to the data."""
         from . import token
 
@@ -167,17 +162,17 @@ class BinaryEncoder:
 
         self.write_string_raw(data)
 
-    def write_bytes(self, value: Union[bytes, bytearray]):
+    def write_bytes(self, value: Union[bytes, bytearray]) -> None:
         """Write bytes to the data."""
         self.write_byte_length(len(value))
         self.push_bytes(value)
 
-    def write_string_raw(self, value: str):
+    def write_string_raw(self, value: str) -> None:
         """Write a raw string to the data."""
         self.write_byte_length(len(value))
         self.push_string(value)
 
-    def write_jid(self, jid: JID):
+    def write_jid(self, jid: JID) -> None:
         """Write a JID to the data."""
         if ((jid.server == DEFAULT_USER_SERVER and jid.device > 0) or
                 jid.server == HIDDEN_USER_SERVER or
@@ -205,7 +200,7 @@ class BinaryEncoder:
                 self.write(jid.user)
             self.write(jid.server)
 
-    def write_attributes(self, attributes: Dict[str, Any]):
+    def write_attributes(self, attributes: Dict[str, Any]) -> None:
         """Write attributes to the data."""
         for key, val in attributes.items():
             if val == "" or val is None:
@@ -221,7 +216,7 @@ class BinaryEncoder:
                 count += 1
         return count
 
-    def write_list_start(self, list_size: int):
+    def write_list_start(self, list_size: int) -> None:
         """Write the start of a list with the appropriate token."""
         if list_size == 0:
             self.push_byte(LIST_EMPTY)
@@ -232,7 +227,7 @@ class BinaryEncoder:
             self.push_byte(LIST_16)
             self.push_int16(list_size)
 
-    def write_packed_bytes(self, value: str, data_type: int):
+    def write_packed_bytes(self, value: str, data_type: int) -> None:
         """Write packed bytes to the data."""
         if len(value) > PACKED_MAX:
             raise ValueError(f"too many bytes to pack: {len(value)}")
@@ -257,7 +252,7 @@ class BinaryEncoder:
         if len(value) % 2 != 0:
             self.push_byte(self.pack_byte_pair(packer, ord(value[-1]), 0))
 
-    def pack_byte_pair(self, packer, part1: int, part2: int) -> int:
+    def pack_byte_pair(self, packer: Callable[[int], int], part1: int, part2: int) -> int:
         """Pack two bytes into one."""
         return (packer(part1) << 4) | packer(part2)
 

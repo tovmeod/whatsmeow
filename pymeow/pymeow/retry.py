@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from signal_protocol.group_cipher import create_sender_key_distribution_message
 from signal_protocol.sender_keys import SenderKeyName
 
-from . import message, prekeys, send, sendfb
+from . import message, prekeys, send
+from .binary.attrs import Attrs
 from .binary.node import Node
 from .exceptions import ElementMissingError
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
@@ -153,14 +154,9 @@ async def get_message_for_retry(
     Raises:
         Exception
     """
-    # TODO: Review Receipt implementation
-    # TODO: Review RecentMessage implementation
-    # TODO: Review Client.GetMessageForRetry implementation
-
     msg = await get_recent_message(client, receipt.message_source.chat, message_id)
-
     if msg.is_empty():
-        wa_msg = await get_message_for_retry(client, receipt.message_source.sender, receipt.message_source.chat, message_id)
+        wa_msg = await client.my_get_message_for_retry(receipt.message_source.sender, receipt.message_source.chat, message_id)
         if wa_msg is None:
             raise Exception(f"couldn't find message {message_id}")
         else:
@@ -197,18 +193,9 @@ async def should_recreate_session(
     Returns:
         Tuple containing (reason string, recreate boolean)
     """
-    # TODO: Review Store.ContainsSession implementation
-    # TODO: Review JID.signal_address implementation
-    # TODO: Review recreate_session_timeout constant
-
     async with client.session_recreate_history_lock:
-        try:
-            contains = client.signal_store.contains_session(jid.signal_address())
-        except Exception as e:
-            logger.exception(e)
-            return "", False
-
-        if not contains:
+        has_session = await client.signal_store.contains_session(jid.signal_address())
+        if not has_session:
             client.session_recreate_history[jid] = datetime.now()
             return "we don't have a Signal session with them", True
         elif retry_count < 2:
@@ -238,16 +225,9 @@ async def handle_retry_receipt(
         node: The binary node containing the retry information
 
     Raises:
-        ElementMissingError
+        ElementMissingError: If retry tag is missing
+        Exception: Various encryption/session errors
     """
-    # TODO: Review ElementMissingError implementation
-    # TODO: Review AttrGetter implementation
-    # TODO: Review Node.get_optional_child_by_tag implementation
-    # TODO: Review IncomingRetryKey implementation
-    # TODO: Review prekey.Bundle implementation
-    # TODO: Review groups.GroupSessionBuilder implementation
-    # TODO: Review protocol.SenderKeyName implementation
-
     retry_child, ok = node.get_optional_child_by_tag("retry")
     if not ok:
         raise ElementMissingError(tag="retry", in_location="retry receipt")
@@ -257,15 +237,13 @@ async def handle_retry_receipt(
     timestamp = ag.unix_time("t")
     retry_count = ag.int("count")
     if not ag.ok():
-        raise ag.error()
+        err = ag.error()
+        if err is not None:
+            raise err
 
     msg = await get_message_for_retry(client, receipt, message_id)
 
-    fb_consumer_msg = None
-    # if msg.fb is not None:
-    #     sub_proto = msg.fb.get_payload().get_sub_protocol().get_sub_protocol()
-    #     fb_consumer_msg = sub_proto.decode()
-
+    # Handle incoming retry counter
     retry_key = IncomingRetryKey(receipt.message_source.sender, message_id)
     async with client.incoming_retry_request_counter_lock:
         client.incoming_retry_request_counter[retry_key] = client.incoming_retry_request_counter.get(retry_key, 0) + 1
@@ -276,11 +254,12 @@ async def handle_retry_receipt(
                          receipt.message_source.sender, internal_counter)
         return None
 
+    # Handle group messages - add sender key distribution
     if receipt.message_source.is_group:
         try:
             sender_key_name = SenderKeyName(
-                group_id=str(receipt.message_source.chat),  # Group JID as string
-                sender=client.get_own_lid().signal_address()  # Your own ProtocolAddress
+                group_id=str(receipt.message_source.chat),
+                sender=client.get_own_lid().signal_address()
             )
             signal_skd_message = create_sender_key_distribution_message(
                 sender_key_name=sender_key_name,
@@ -288,46 +267,39 @@ async def handle_retry_receipt(
             )
 
             if msg.wa is not None:
-                msg.wa.sender_key_distribution_message = WAE2E_pb2.SenderKeyDistributionMessage(
+                # Create sender key distribution message for WhatsApp protocol
+                skd_message = WAE2E_pb2.SenderKeyDistributionMessage(
                     groupID=str(receipt.message_source.chat),
                     axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
                 )
-            # else:
-            #     fb_skdm = WAMsgTransport_pb2.MessageTransport.Protocol.Ancillary.SenderKeyDistributionMessage(
-            #         groupID=str(receipt.message_source.chat),
-            #         axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
-            #     )
+                msg.wa.senderKeyDistributionMessage.CopyFrom(skd_message)
         except Exception as e:
             logger.warning(
-                "Failed to create sender key distribution message to include in retry of %s in %s to %s: %v",
-                message_id, receipt.message_source.chat, receipt.message_source.sender, e)
+                f"Failed to create sender key distribution message to include in retry of {message_id} in {receipt.message_source.chat} to {receipt.message_source.sender}: {e}"
+            )
+    # Handle device sent messages (from me)
     elif receipt.message_source.is_from_me:
         if msg.wa is not None:
+            original_msg = msg.wa
             msg.wa = WAE2E_pb2.Message(
                 deviceSentMessage=WAE2E_pb2.DeviceSentMessage(
                     destinationJID=str(receipt.message_source.chat),
-                    message=msg.wa
+                    message=original_msg
                 )
             )
-        # else:
-        #     fb_dsm = WAMsgTransport_pb2.MessageTransport.Protocol.Integral.DeviceSentMessage(
-        #         destinationJID=str(receipt.message_source.chat)
-        #     )
 
     # Pre-retry callback for fb - TODO comment matches Go
     if client.pre_retry_callback is not None:
         if not client.pre_retry_callback(receipt, message_id, retry_count, msg.wa):
             logger.debug("Cancelled retry receipt in PreRetryCallback")
             return None
-
+    # Serialize message
     franking_tag = None
     if msg.wa is not None:
         plaintext = msg.wa.SerializeToString()  # proto.Marshal equivalent
-    # else:
-    #     plaintext = msg.fb.SerializeToString()  # proto.Marshal equivalent
-    #
-    #     franking_hash = hmac.new(msg.fb.get_metadata().get_franking_key(), plaintext, hashlib.sha256)
-    #     franking_tag = franking_hash.digest()
+    else:
+        # FB messages not implemented
+        raise Exception("FB retry not yet implemented")
 
     _, has_keys = node.get_optional_child_by_tag("keys")
     bundle = None
@@ -350,23 +322,22 @@ async def handle_retry_receipt(
                     len_keys = None
                 raise Exception(f"didn't get prekey bundle for {receipt.message_source.sender} (response size: {len_keys})")
 
+    # Set up encryption attributes - simplified without MessageAttrs
     enc_attrs = {}
-    msg_attrs = sendfb.MessageAttrs()  # TODO: Review MessageAttrs implementation
     if msg.wa is not None:
-        msg_attrs.media_type = get_media_type_from_message(msg.wa)
-        msg_attrs.type = get_type_from_message(msg.wa)
-    elif fb_consumer_msg is not None:
-        msg_attrs = sendfb.get_attrs_from_fb_message(fb_consumer_msg)
+        media_type = get_media_type_from_message(msg.wa)
+        message_type = get_type_from_message(msg.wa)
+
+        if media_type != "":
+            enc_attrs["mediatype"] = media_type
     else:
-        msg_attrs.type = "text"
+        message_type = "text"  # Default to text
 
-    if msg_attrs.media_type != "":
-        enc_attrs["mediatype"] = msg_attrs.media_type
-
+    # Encrypt message
     include_device_identity = False
     if msg.wa is not None:
         encryption_identity = receipt.message_source.sender
-        if receipt.message_source.sender.server == DEFAULT_USER_SERVER:  # TODO: Review types.DEFAULT_USER_SERVER
+        if receipt.message_source.sender.server == DEFAULT_USER_SERVER:
             try:
                 lid_for_pn = await client.store.lids.get_lid_for_pn(receipt.message_source.sender)
                 if lid_for_pn and not lid_for_pn.is_empty():
@@ -379,24 +350,13 @@ async def handle_retry_receipt(
             client, plaintext, encryption_identity, bundle, enc_attrs)
     else:
         raise Exception("FB retry not yet implemented")
-    #     payload = WAMsgTransport_pb2.MessageTransport.Payload(
-    #         applicationPayload=WACommon_pb2.SubProtocol(
-    #             payload=plaintext,
-    #             version=sendfb.FB_MESSAGE_APPLICATION_VERSION  # TODO: Review FB_MESSAGE_APPLICATION_VERSION
-    #         ),
-    #         futureProof=WACommon_pb2.FutureProofBehavior.PLACEHOLDER
-    #     )
-        # try:
-        #     encrypted, err = sendfb.encrypt_message_for_device_v3(client, payload, fb_skdm, fb_dsm, receipt.sender, bundle,
-        #                                                           enc_attrs)
-        # except Exception as e:
-        #     return Exception(f"failed to encrypt message for retry: {e}")
 
     encrypted.attrs["count"] = retry_count
 
+    # Build message attributes
     attrs = {
         "to": node.attrs["from"],
-        "type": msg_attrs.type,
+        "type": message_type,
         "id": message_id,
         "t": int(timestamp.timestamp()),
     }
@@ -408,9 +368,10 @@ async def handle_retry_receipt(
         if attr_name in node.attrs:
             attrs[attr_name] = node.attrs[attr_name]
 
+    # Build message content
     if msg.wa is not None:
         content = send.get_message_content(
-            client, encrypted, msg.wa, attrs, include_device_identity, NodeExtraParams()  # TODO: Review NodeExtraParams
+            client, encrypted, msg.wa, attrs, include_device_identity, NodeExtraParams()
         )
     else:
         content = [
@@ -418,6 +379,7 @@ async def handle_retry_receipt(
             Node(tag="franking", content=[Node(tag="franking_tag", content=franking_tag)])
         ]
 
+    # Send the retry message
     await client.send_node(Node(
         tag="message",
         attrs=attrs,
@@ -507,7 +469,7 @@ async def delayed_request_message_from_phone(client: "Client", info: "MessageInf
                 client,
                 client.get_own_id().to_non_ad(),
                 send.build_unavailable_message_request(client, info.chat, info.sender, info.id),
-                send.SendRequestExtra(peer=True)
+                send.SendRequestExtra(id=send.generate_message_id(client), peer=True)
             )
             logger.debug("Requested message %s from phone", info.id)
         except Exception as e:

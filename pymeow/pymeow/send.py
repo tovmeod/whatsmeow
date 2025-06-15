@@ -11,7 +11,7 @@ import os
 import secrets
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
@@ -97,23 +97,17 @@ class MessageDebugTimings:
 @dataclass
 class SendResponse:
     """Response from sending a message."""
+    id: MessageID
+    sender: JID = field(default_factory=lambda: JID())
+    debug_timings: MessageDebugTimings = field(default_factory=lambda: MessageDebugTimings())
     timestamp: Optional[datetime] = None
-    id: Optional[MessageID] = None
     server_id: MessageServerID = MessageServerID(0)
-    debug_timings: MessageDebugTimings = None
-    sender: JID = None
-
-    def __post_init__(self) -> None:
-        if self.debug_timings is None:
-            self.debug_timings = MessageDebugTimings()
-        if self.sender is None:
-            self.sender = JID()
 
 @dataclass
 class SendRequestExtra:
     """Optional parameters for SendMessage."""
-    id: Optional[MessageID] = None
-    inline_bot_jid: JID = None
+    id: MessageID
+    inline_bot_jid: JID = field(default_factory=lambda: JID())
     peer: bool = False
     # A timeout for the send request. Unlike timeouts using the context parameter, this only applies
     # to the actual response waiting and not preparing/encrypting the message.
@@ -123,9 +117,6 @@ class SendRequestExtra:
     media_handle: str = ""
     meta: Optional[MsgMetaInfo] = None
 
-    def __post_init__(self) -> None:
-        if self.inline_bot_jid is None:
-            self.inline_bot_jid = JID()
 
 @dataclass
 class NodeExtraParams:
@@ -154,8 +145,8 @@ def generate_message_id(client: "Client") -> MessageID:
     # TODO: Review WEB_MESSAGE_ID_PREFIX implementation
     # TODO: Review get_own_id implementation
 
-    if client.messenger_config is not None:
-        return MessageID(str(generate_facebook_message_id()))
+    # if client.messenger_config is not None:
+    #     return MessageID(str(generate_facebook_message_id()))
 
     # Create initial 8-byte buffer for timestamp, with capacity for additional data
     data = bytearray(8)
@@ -171,34 +162,24 @@ def generate_message_id(client: "Client") -> MessageID:
     return MessageID(WEB_MESSAGE_ID_PREFIX + hash_obj.hexdigest()[:18].upper())
 
 
-def generate_facebook_message_id() -> int:
-    """
-    Port of Go function GenerateFacebookMessageID.
-
-    Generates a Facebook-style message ID using timestamp and random bits.
-
-    Returns:
-        64-bit integer message ID
-    """
-    # TODO: Review random.Bytes implementation
-
-    RANDOM_MASK = (1 << 22) - 1
-
-    timestamp_ms = int(time.time() * 1000)  # UnixMilli equivalent
-    random_bytes = secrets.token_bytes(4)
-    random_uint32 = struct.unpack('>I', random_bytes)[0]  # BigEndian.Uint32 equivalent
-
-    return (timestamp_ms << 22) | (random_uint32 & RANDOM_MASK)
-
-
-@deprecated("Use Client.generate_message_id instead")
-def deprecated_generate_message_id() -> MessageID:
-    """
-    Generate a random string that can be used as a message ID on WhatsApp.
-
-    Deprecated: WhatsApp web has switched to using a hash of the current timestamp,
-    user id and random bytes. Use Client.generate_message_id instead.
-    """
+# def generate_facebook_message_id() -> int:
+#     """
+#     Port of Go function GenerateFacebookMessageID.
+#
+#     Generates a Facebook-style message ID using timestamp and random bits.
+#
+#     Returns:
+#         64-bit integer message ID
+#     """
+#     # TODO: Review random.Bytes implementation
+#
+#     RANDOM_MASK = (1 << 22) - 1
+#
+#     timestamp_ms = int(time.time() * 1000)  # UnixMilli equivalent
+#     random_bytes = secrets.token_bytes(4)
+#     random_uint32 = struct.unpack('>I', random_bytes)[0]  # BigEndian.Uint32 equivalent
+#
+#     return (timestamp_ms << 22) | (random_uint32 & RANDOM_MASK)
 
 
 # todo: I don't think I need this, schedule to delete
@@ -316,11 +297,13 @@ async def send_message(
 
     from . import retry
 
-    req = SendRequestExtra()
+
     if len(extra) > 1:
         raise Exception("only one extra parameter may be provided to SendMessage")
     elif len(extra) == 1:
         req = extra[0]
+    else:
+        req = SendRequestExtra(id=generate_message_id(client))
 
     if to.device > 0 and not req.peer:
         raise ErrRecipientADJID
@@ -332,17 +315,15 @@ async def send_message(
     if req.timeout == timedelta():
         req.timeout = DEFAULT_REQUEST_TIMEOUT
     if len(req.id) == 0:
-        req.id = generate_message_id()
+        req.id = generate_message_id(client)
     if to.server == NEWSLETTER_SERVER:
         # TODO somehow deduplicate this with the code in send_newsletter?
-        if message.edited_message is not None:
-            req.id = MessageID(message.edited_message.message.protocol_message.key.id)
-        elif message.protocol_message is not None and message.protocol_message.type == waE2E_pb2.ProtocolMessage.REVOKE:
-            req.id = MessageID(message.protocol_message.key.id)
+        if message.editedMessage is not None:
+            req.id = MessageID(message.editedMessage.message.protocolMessage.key.id)
+        elif message.protocolMessage is not None and message.protocolMessage.type == waE2E_pb2.ProtocolMessage.REVOKE:
+            req.id = MessageID(message.protocolMessage.key.id)
 
-    resp = SendResponse()
-    resp.id = req.id
-
+    resp = SendResponse(id=req.id)
     is_inline_bot_mode = False
 
     if not req.inline_bot_jid.is_empty():
@@ -355,43 +336,46 @@ async def send_message(
     extra_params = NodeExtraParams()
 
     if needs_message_secret:
-        if message.message_context_info is None:
-            message.message_context_info = waE2E_pb2.MessageContextInfo()
-        if message.message_context_info.message_secret is None:
-            message.message_context_info.message_secret = os.urandom(32)
+        if message.messageContextInfo is None:
+            message.messageContextInfo = waE2E_pb2.MessageContextInfo()
+        if message.messageContextInfo.messageSecret is None:
+            message.messageContextInfo.messageSecret = os.urandom(32)
 
     if is_bot_mode:
-        if message.message_context_info.bot_metadata is None:
-            message.message_context_info.bot_metadata = waE2E_pb2.BotMetadata()
-            message.message_context_info.bot_metadata.persona_id = "867051314767696$760019659443059"
+        if message.messageContextInfo.botMetadata is None:
+            message.messageContextInfo.botMetadata = waE2E_pb2.BotMetadata()
+            message.messageContextInfo.botMetadata.persona_id = "867051314767696$760019659443059"
 
         if is_inline_bot_mode:
             # inline mode specific code
-            message_secret = message.message_context_info.message_secret
+            message_secret = message.messageContextInfo.messageSecret
             message = waE2E_pb2.Message(
                 botInvokeMessage=waE2E_pb2.FutureProofMessage(
                     message=waE2E_pb2.Message(
-                        extendedTextMessage=message.extended_text_message,
+                        extendedTextMessage=message.extendedTextMessage,
                         messageContextInfo=waE2E_pb2.MessageContextInfo(
-                            botMetadata=message.message_context_info.bot_metadata,
+                            botMetadata=message.messageContextInfo.botMetadata,
                         ),
                     ),
                 ),
-                messageContextInfo=message.message_context_info,
+                messageContextInfo=message.messageContextInfo,
             )
 
             bot_message = waE2E_pb2.Message(
-                botInvokeMessage=message.bot_invoke_message,
+                botInvokeMessage=message.botInvokeMessage,
                 messageContextInfo=waE2E_pb2.MessageContextInfo(
-                    botMetadata=message.message_context_info.bot_metadata,
+                    botMetadata=message.messageContextInfo.botMetadata,
                     botMessageSecret=apply_bot_message_hkdf(message_secret),
                 ),
             )
 
             message_plaintext, _ = marshal_message(req.inline_bot_jid, bot_message)
 
-            participant_nodes, _ = await encrypt_message_for_devices(client, [req.inline_bot_jid], resp.id,
-                                                                     message_plaintext, None, Attrs())
+            participant_nodes, _ = await encrypt_message_for_devices(client,
+                                                                     [req.inline_bot_jid],
+                                                                     resp.id,
+                                                                     message_plaintext,
+                                                                     None, Attrs())
             extra_params.bot_node = Node(
                 tag="bot",
                 content=participant_nodes,
@@ -409,7 +393,7 @@ async def send_message(
                 extra_params.addressing_mode = AddressingMode.LID
                 if req.meta is None:
                     req.meta = MsgMetaInfo()
-                req.meta.deprecated_lid_session = ptr.Ptr(False)
+                req.meta.deprecated_lid_session = False
             elif cached_data.community_announcement_group and req.meta is not None:
                 own_id = client.get_own_lid()
                 # Why is this set to PN?
@@ -441,58 +425,48 @@ async def send_message(
     # Sending multiple messages at a time can cause weird issues and makes it harder to retry safely
     async with client.message_send_lock:
         resp.debug_timings.queue = timedelta(seconds=time.time() - start)
-
-        resp_chan = wait_response(client, req.id)
+        resp_chan = await wait_response(client, req.id)  # Remove await here
         # Peer message retries aren't implemented yet
         if not req.peer:
             await retry.add_recent_message(client, to, req.id, message, None)
 
-        if message.message_context_info is not None and message.message_context_info.message_secret is not None:
-            err = await client.store.msg_secrets.put_message_secret(to, own_id, req.id,
-                                                                  message.message_context_info.message_secret)
-            if err is not None:
-                logger.warning("Failed to store message secret key for outgoing message %s: %v", req.id, err)
-            else:
-                logger.debug("Stored message secret key for outgoing message %s", req.id)
+        if message.messageContextInfo is not None and message.messageContextInfo.messageSecret is not None:
+            await client.store.msg_secrets.put_message_secret(to, own_id, req.id,
+                                                                    message.messageContextInfo.messageSecret)
+            logger.debug("Stored message secret key for outgoing message %s", req.id)
 
         phash = ""
         data = None
         if to.server == GROUP_SERVER or to.server == BROADCAST_SERVER:
-            phash, data, error = await send_group(client, to, group_participants, req.id, message, resp.debug_timings,
-                                                  extra_params)
+            phash, data = await send_group(client, to, group_participants, req.id, message, resp.debug_timings,
+                                           extra_params)
         elif to.server == DEFAULT_USER_SERVER or to.server == BOT_SERVER:
             if req.peer:
-                data, err = await send_peer_message(client, to, req.id, message, resp.debug_timings)
+                data = await send_peer_message(client, to, req.id, message, resp.debug_timings)
             else:
-                data, err = await send_dm(client, own_id, to, req.id, message, resp.debug_timings, extra_params)
+                data = await send_dm(client, own_id, to, req.id, message, resp.debug_timings, extra_params)
         elif to.server == NEWSLETTER_SERVER:
-            data, err = await send_newsletter(client, to, req.id, message, req.media_handle, resp.debug_timings)
+            data = await send_newsletter(client, to, req.id, message, req.media_handle, resp.debug_timings)
         else:
             await cancel_response(client, req.id, resp_chan)
             raise Exception(f"{ErrUnknownServer} {to.server}")
 
         start = time.time()
-        resp_node = None
-        timeout_chan = None
-        if req.timeout > timedelta():
-            timeout_chan = asyncio.create_task(asyncio.sleep(req.timeout.total_seconds()))
-        else:
-            timeout_chan = asyncio.create_task(asyncio.sleep(float('inf')))  # Never times out
-
         try:
-            done, pending = await asyncio.wait(
-                [resp_chan, timeout_chan],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-
-            if timeout_chan in done:
-                await cancel_response(client, req.id, resp_chan)
-                raise ErrMessageTimedOut
+            if req.timeout > timedelta():
+                # Use asyncio.wait_for for timeout
+                resp_node = await asyncio.wait_for(
+                    resp_chan.get(),
+                    timeout=req.timeout.total_seconds()
+                )
             else:
-                resp_node = await resp_chan
-        except asyncio.CancelledError as e:
+                # No timeout
+                resp_node = await resp_chan.get()
+
+        except asyncio.TimeoutError:
+            await cancel_response(client, req.id, resp_chan)
+            raise ErrMessageTimedOut
+        except asyncio.CancelledError:
             await cancel_response(client, req.id, resp_chan)
             raise
 
@@ -508,7 +482,7 @@ async def send_message(
         resp.timestamp = ag.unix_time("t")
         error_code = ag.int("error")
         if error_code != 0:
-            err = Exception(f"{ErrServerReturnedError} {error_code}")
+            raise Exception(f"{ErrServerReturnedError} {error_code}")
 
         expected_phash = ag.optional_string("phash")
         if len(expected_phash) > 0 and phash != expected_phash:
@@ -566,13 +540,13 @@ def build_message_key(
 
     key = WACommon_pb2.MessageKey()
     key.fromMe = True
-    key.id = str(id)
-    key.remote_jid = str(chat)
+    key.ID = str(id)
+    key.remoteJID = str(chat)
 
     if (not sender.is_empty() and
         sender.user != client.get_own_id().user and
         sender.user != client.get_own_lid().user):
-        key.from_me = False
+        key.fromMe = False
         if (chat.server != DEFAULT_USER_SERVER and
             chat.server != HIDDEN_USER_SERVER and
             chat.server != MESSENGER_SERVER):
@@ -612,8 +586,8 @@ def build_revoke(
     # TODO: Review waE2E_pb2.ProtocolMessage.REVOKE enum value
 
     message = waE2E_pb2.Message()
-    message.protocol_message.type = waE2E_pb2.ProtocolMessage.REVOKE
-    message.protocol_message.key.CopyFrom(build_message_key(client, chat, sender, id))
+    message.protocolMessage.type = waE2E_pb2.ProtocolMessage.REVOKE
+    message.protocolMessage.key.CopyFrom(build_message_key(client, chat, sender, id))
 
     return message
 
@@ -648,9 +622,9 @@ def build_reaction(
     # TODO: Review build_message_key implementation
 
     message = waE2E_pb2.Message()
-    message.reaction_message.key.CopyFrom(build_message_key(client, chat, sender, id))
-    message.reaction_message.text = reaction
-    message.reaction_message.sender_timestamp_ms = int(time.time() * 1000)
+    message.reactionMessage.key.CopyFrom(build_message_key(client, chat, sender, id))
+    message.reactionMessage.text = reaction
+    message.reactionMessage.senderTimestampMS = int(time.time() * 1000)
 
     return message
 
@@ -659,7 +633,7 @@ def build_unavailable_message_request(
     client: 'Client',
     chat: JID,
     sender: JID,
-    id: str
+    id_: MessageID
 ) -> waE2E_pb2.Message:
     """
     Port of Go method BuildUnavailableMessageRequest from client.go.
@@ -675,7 +649,7 @@ def build_unavailable_message_request(
         client: The WhatsApp client instance
         chat: JID of the chat where the message was sent
         sender: JID of the message sender
-        id: Message ID string to request
+        id_: Message ID string to request
 
     Returns:
         Message protobuf containing the unavailable message request
@@ -687,12 +661,12 @@ def build_unavailable_message_request(
     message.protocolMessage.type = waE2E_pb2.ProtocolMessage.PEER_DATA_OPERATION_REQUEST_MESSAGE
 
     # Create the peer data operation request message
-    peer_request = message.protocolMessage.peer_data_operation_request_message
-    peer_request.peer_data_operation_request_type = waE2E_pb2.PeerDataOperationRequestType.PLACEHOLDER_MESSAGE_RESEND
+    peer_request = message.protocolMessage.peerDataOperationRequestMessage
+    peer_request.peerDataOperationRequestType = waE2E_pb2.PeerDataOperationRequestType.PLACEHOLDER_MESSAGE_RESEND
 
     # Create placeholder message resend request
-    resend_request = peer_request.placeholder_message_resend_request.add()
-    resend_request.message_key.CopyFrom(build_message_key(client, chat, sender, id))
+    resend_request = peer_request.placeholderMessageResendRequest.add()
+    resend_request.messageKey.CopyFrom(build_message_key(client, chat, sender, id_))
 
     return message
 
@@ -725,19 +699,19 @@ def build_history_sync_request(
     # TODO: Review SendRequestExtra implementation
 
     message = waE2E_pb2.Message()
-    message.protocol_message.type = waE2E_pb2.ProtocolMessage.PEER_DATA_OPERATION_REQUEST_MESSAGE
+    message.protocolMessage.type = waE2E_pb2.ProtocolMessage.PEER_DATA_OPERATION_REQUEST_MESSAGE
 
     # Create the peer data operation request message
-    peer_request = message.protocol_message.peer_data_operation_request_message
-    peer_request.peer_data_operation_request_type = waE2E_pb2.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND
+    peer_request = message.protocolMessage.peerDataOperationRequestMessage
+    peer_request.peerDataOperationRequestType = waE2E_pb2.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND
 
     # Create history sync on demand request
-    history_request = peer_request.history_sync_on_demand_request
-    history_request.chat_jid = str(last_known_message_info.chat)
-    history_request.oldest_msg_id = str(last_known_message_info.id)
-    history_request.oldest_msg_from_me = last_known_message_info.is_from_me
-    history_request.on_demand_msg_count = count
-    history_request.oldest_msg_timestamp_ms = int(last_known_message_info.timestamp.timestamp() * 1000)
+    history_request = peer_request.historySyncOnDemandRequest
+    history_request.chatJID = str(last_known_message_info.chat)
+    history_request.oldestMsgID = str(last_known_message_info.id)
+    history_request.oldestMsgFromMe = last_known_message_info.is_from_me
+    history_request.onDemandMsgCount = count
+    history_request.oldestMsgTimestampMS = int(last_known_message_info.timestamp.timestamp() * 1000)
 
     return message
 
@@ -772,9 +746,9 @@ def build_edit(
     message = waE2E_pb2.Message()
 
     # Create the edited message structure
-    edited_message = message.edited_message
+    edited_message = message.editedMessage
     inner_message = edited_message.message
-    protocol_message = inner_message.protocol_message
+    protocol_message = inner_message.protocolMessage
 
     # Set the message key
     protocol_message.key.from_me = True
@@ -783,8 +757,8 @@ def build_edit(
 
     # Set protocol message properties
     protocol_message.type = waE2E_pb2.ProtocolMessage.MESSAGE_EDIT
-    protocol_message.edited_message.CopyFrom(new_content)
-    protocol_message.timestamp_ms = int(time.time() * 1000)
+    protocol_message.editedMessage.CopyFrom(new_content)
+    protocol_message.timestampMS = int(time.time() * 1000)
 
     return message
 
@@ -860,8 +834,8 @@ async def set_disappearing_timer(
 
     if chat.server == DEFAULT_USER_SERVER:
         message = waE2E_pb2.Message()
-        message.protocol_message.type = waE2E_pb2.ProtocolMessage.EPHEMERAL_SETTING
-        message.protocol_message.ephemeral_expiration = int(timer.total_seconds())
+        message.protocolMessage.type = waE2E_pb2.ProtocolMessage.EPHEMERAL_SETTING
+        message.protocolMessage.ephemeralExpiration = int(timer.total_seconds())
         _ = await send_message(client, chat, message)
     elif chat.server == GROUP_SERVER:
         if timer == timedelta(0):
@@ -916,10 +890,10 @@ async def send_newsletter(
     client: 'Client',
     to: JID,
     id: MessageID,
-    message: Optional[waE2E_pb2.Message],
+    message: waE2E_pb2.Message,
     media_id: str,
     timings: MessageDebugTimings
-) -> Optional[bytes]:
+) -> bytes:
     """
     Port of Go method sendNewsletter from client.go.
 
@@ -953,17 +927,22 @@ async def send_newsletter(
     if media_id != "":
         attrs["media_id"] = media_id
 
-    if message and message.edited_message is not None:
+    # Create a local variable to hold the processed message
+    message_to_send: Optional[waE2E_pb2.Message]
+
+    if message and message.editedMessage is not None:
         attrs["edit"] = str(EditAttribute.ADMIN_EDIT)
-        message = message.edited_message.message.protocol_message.edited_message
-    elif (message and message.protocol_message is not None and
-          message.protocol_message.type == waE2E_pb2.ProtocolMessage.REVOKE):
+        message_to_send = message.editedMessage.message.protocolMessage.editedMessage
+    elif (message and message.protocolMessage is not None and
+          message.protocolMessage.type == waE2E_pb2.ProtocolMessage.REVOKE):
         attrs["edit"] = str(EditAttribute.ADMIN_REVOKE)
-        message = None
+        message_to_send = None
+    else:
+        message_to_send = message
 
     start = time.time()
-    plaintext, _ = marshal_message(to, message)
-    timings.marshal = time.time() - start
+    plaintext, _ = marshal_message(to, message_to_send)
+    timings.marshal = timedelta(seconds=time.time() - start)
 
     plaintext_node = Node(
         tag="plaintext",
@@ -971,8 +950,8 @@ async def send_newsletter(
         attrs=Attrs({})
     )
 
-    if message is not None:
-        media_type = get_media_type_from_message(message)
+    if message_to_send is not None:
+        media_type = get_media_type_from_message(message_to_send)
         if media_type != "":
             plaintext_node.attrs["mediatype"] = media_type
 
@@ -984,7 +963,7 @@ async def send_newsletter(
 
     start = time.time()
     data = await client.send_node_and_get_data(node)
-    timings.send = time.time() - start
+    timings.send = timedelta(seconds=time.time() - start)
     return data
 
 async def send_group(
@@ -995,7 +974,7 @@ async def send_group(
     message: waE2E_pb2.Message,
     timings: MessageDebugTimings,
     extra_params: NodeExtraParams
-) -> Tuple[str, Optional[bytes]]:
+) -> Tuple[str, bytes]:
     """
     Port of Go method sendGroup from client.go.
 
@@ -1028,7 +1007,7 @@ async def send_group(
 
     start = time.time()
     plaintext, _ = marshal_message(to, message)
-    timings.marshal = time.time() - start
+    timings.marshal = timedelta(seconds=time.time() - start)
     start = time.time()
 
     from signal_protocol.group_cipher import create_sender_key_distribution_message, group_encrypt
@@ -1041,8 +1020,8 @@ async def send_group(
     )
 
     skd_message = waE2E_pb2.Message()
-    skd_message.sender_key_distribution_message.group_id = str(to)
-    skd_message.sender_key_distribution_message.axolotl_sender_key_distribution_message = signal_skd_message.serialize()
+    skd_message.senderKeyDistributionMessage.groupID = str(to)
+    skd_message.senderKeyDistributionMessage.axolotlSenderKeyDistributionMessage = signal_skd_message.serialize()
 
     skd_plaintext = skd_message.SerializeToString()
 
@@ -1052,7 +1031,7 @@ async def send_group(
         pad_message(plaintext)
     )
 
-    timings.group_encrypt = time.time() - start
+    timings.group_encrypt = timedelta(seconds=time.time() - start)
 
     node, all_devices = await prepare_message_node(
         client, to, id, message, participants, skd_plaintext, None, timings, extra_params,
@@ -1072,16 +1051,15 @@ async def send_group(
 
     start = time.time()
     data = await client.send_node_and_get_data(node)
-    timings.send = time.time() - start
+    timings.send = timedelta(seconds=time.time() - start)
     return phash, data
 
 async def send_peer_message(
     client: "Client",
-    ctx,
-    to_jid,
-    message_id: str,
+    to_jid: JID,
+    message_id: MessageID,
     message: waE2E_pb2.Message,
-    timings
+    timings: MessageDebugTimings
 ) -> bytes:
     """
     Send a peer message (protocol messages to your own devices).
@@ -1091,7 +1069,6 @@ async def send_peer_message(
 
     Args:
         client: Client instance
-        ctx: Context
         to_jid: Target JID (should be your own JID)
         message_id: Message ID
         message: Message object
@@ -1103,35 +1080,19 @@ async def send_peer_message(
     start_time = time.time()
 
     # Marshal the message
-    msg_plaintext, dsm_plaintext, marshal_err = marshal_message(to_jid, message)
-    timings.marshal = time.time() - start_time
+    msg_plaintext, dsm_plaintext = marshal_message(to_jid, message)
+    timings.marshal = timedelta(seconds=time.time() - start_time)
 
-    if marshal_err:
-        raise marshal_err
-
-    # Get devices for the target (your own devices)
-    start_time = time.time()
-    own_jid = client.get_own_id()
-
-    # For peer messages, we need to get our own devices
-    devices = await client.get_user_devices_cached([own_jid.to_non_ad()])
-    own_devices = devices.get(own_jid.to_non_ad(), [])
-
-    if not own_devices:
-        # If no devices found, use the own JID itself
-        own_devices = [own_jid.to_non_ad()]
-
-    timings.get_devices = time.time() - start_time
-
-    # Encrypt for own devices
+    # For peer messages, encrypt directly for the target JID
+    # No device discovery needed - just encrypt for the target directly
     start_time = time.time()
     participant_nodes, _ = await encrypt_message_for_devices(
-        client, ctx, own_devices, message_id, msg_plaintext, dsm_plaintext, {}
+        client, [to_jid], message_id, msg_plaintext, dsm_plaintext, {}
     )
-    timings.peer_encrypt = time.time() - start_time
+    timings.peer_encrypt = timedelta(seconds=time.time() - start_time)
 
     if not participant_nodes:
-        raise Exception("Failed to encrypt peer message for any devices")
+        raise Exception("Failed to encrypt peer message")
 
     # Build message attributes
     message_attrs = Attrs({
@@ -1151,7 +1112,7 @@ async def send_peer_message(
     # Send the message
     start_time = time.time()
     data = await client.send_node_and_get_data(message_node)
-    timings.send = time.time() - start_time
+    timings.send = timedelta(seconds=time.time() - start_time)
 
     if not data:
         raise Exception("Failed to send peer message node")
@@ -1163,10 +1124,10 @@ async def send_dm(
     own_id: JID,
     to: JID,
     id: MessageID,
-    message: Optional[waE2E_pb2.Message],
+    message: waE2E_pb2.Message,
     timings: MessageDebugTimings,
     extra_params: NodeExtraParams
-) -> Optional[bytes]:
+) -> bytes:
     """
     Port of Go method sendDM from client.go.
 
@@ -1189,7 +1150,7 @@ async def send_dm(
     # TODO: Review send_node_and_get_data implementation
     start = time.time()
     message_plaintext, device_sent_message_plaintext = marshal_message(to, message)
-    timings.marshal = time.time() - start
+    timings.marshal = timedelta(seconds=time.time() - start)
 
     node, _ = await prepare_message_node(
         client, to, id, message, [to, own_id.to_non_ad()],
@@ -1197,7 +1158,7 @@ async def send_dm(
     )
     start = time.time()
     data = await client.send_node_and_get_data(node)
-    timings.send = time.time() - start
+    timings.send = timedelta(seconds=time.time() - start)
     return data
 
 
@@ -1216,37 +1177,37 @@ def get_type_from_message(msg: waE2E_pb2.Message) -> str:
     """
 
     # Case 1: ViewOnceMessage - recurse on inner message
-    if msg.view_once_message is not None:
-        return get_type_from_message(msg.view_once_message.message)
+    if msg.viewOnceMessage is not None:
+        return get_type_from_message(msg.viewOnceMessage.message)
 
     # Case 2: ViewOnceMessageV2 - recurse on inner message
-    elif msg.view_once_message_v2 is not None:
-        return get_type_from_message(msg.view_once_message_v2.message)
+    elif msg.viewOnceMessageV2 is not None:
+        return get_type_from_message(msg.viewOnceMessageV2.message)
 
     # Case 3: ViewOnceMessageV2Extension - recurse on inner message
-    elif msg.view_once_message_v2_extension is not None:
-        return get_type_from_message(msg.view_once_message_v2_extension.message)
+    elif msg.viewOnceMessageV2Extension is not None:
+        return get_type_from_message(msg.viewOnceMessageV2Extension.message)
 
     # Case 4: LottieStickerMessage - recurse on inner message
-    elif msg.lottie_sticker_message is not None:
-        return get_type_from_message(msg.lottie_sticker_message.message)
+    elif msg.lottieStickerMessage is not None:
+        return get_type_from_message(msg.lottieStickerMessage.message)
 
     # Case 5: EphemeralMessage - recurse on inner message
-    elif msg.ephemeral_message is not None:
-        return get_type_from_message(msg.ephemeral_message.message)
+    elif msg.ephemeralMessage is not None:
+        return get_type_from_message(msg.ephemeralMessage.message)
 
     # Case 6: DocumentWithCaptionMessage - recurse on inner message
-    elif msg.document_with_caption_message is not None:
-        return get_type_from_message(msg.document_with_caption_message.message)
+    elif msg.documentWithCaptionMessage is not None:
+        return get_type_from_message(msg.documentWithCaptionMessage.message)
 
     # Case 7: Reaction messages (ReactionMessage or EncReactionMessage)
-    elif (msg.reaction_message is not None or
-          msg.enc_reaction_message is not None):
+    elif (msg.reactionMessage is not None or
+          msg.encReactionMessage is not None):
         return "reaction"
 
     # Case 8: Poll messages (PollCreationMessage or PollUpdateMessage)
-    elif (msg.poll_creation_message is not None or
-          msg.poll_update_message is not None):
+    elif (msg.pollCreationMessage is not None or
+          msg.pollUpdateMessage is not None):
         return "poll"
 
     # Case 9: Media message - check if has media type
@@ -1255,8 +1216,8 @@ def get_type_from_message(msg: waE2E_pb2.Message) -> str:
 
     # Case 10: Text messages (Conversation, ExtendedTextMessage, or ProtocolMessage)
     elif (msg.conversation is not None or
-          msg.extended_text_message is not None or
-          msg.protocol_message is not None):
+          msg.extendedTextMessage is not None or
+          msg.protocolMessage is not None):
         return "text"
 
     # Default case - treat as text
@@ -1279,90 +1240,90 @@ def get_media_type_from_message(msg: waE2E_pb2.Message) -> str:
     """
 
     # Case 1: ViewOnceMessage - recurse on inner message
-    if msg.view_once_message is not None:
-        return get_media_type_from_message(msg.view_once_message.message)
+    if msg.viewOnceMessage is not None:
+        return get_media_type_from_message(msg.viewOnceMessage.message)
 
     # Case 2: ViewOnceMessageV2 - recurse on inner message
-    elif msg.view_once_message_v2 is not None:
-        return get_media_type_from_message(msg.view_once_message_v2.message)
+    elif msg.viewOnceMessageV2 is not None:
+        return get_media_type_from_message(msg.viewOnceMessageV2.message)
 
     # Case 3: ViewOnceMessageV2Extension - recurse on inner message
-    elif msg.view_once_message_v2_extension is not None:
-        return get_media_type_from_message(msg.view_once_message_v2_extension.message)
+    elif msg.viewOnceMessageV2Extension is not None:
+        return get_media_type_from_message(msg.viewOnceMessageV2Extension.message)
 
     # Case 4: LottieStickerMessage - recurse on inner message
-    elif msg.lottie_sticker_message is not None:
-        return get_media_type_from_message(msg.lottie_sticker_message.message)
+    elif msg.lottieStickerMessage is not None:
+        return get_media_type_from_message(msg.lottieStickerMessage.message)
 
     # Case 5: EphemeralMessage - recurse on inner message
-    elif msg.ephemeral_message is not None:
-        return get_media_type_from_message(msg.ephemeral_message.message)
+    elif msg.ephemeralMessage is not None:
+        return get_media_type_from_message(msg.ephemeralMessage.message)
 
     # Case 6: DocumentWithCaptionMessage - recurse on inner message
-    elif msg.document_with_caption_message is not None:
-        return get_media_type_from_message(msg.document_with_caption_message.message)
+    elif msg.documentWithCaptionMessage is not None:
+        return get_media_type_from_message(msg.documentWithCaptionMessage.message)
 
     # Case 7: ExtendedTextMessage with title (URL)
-    elif (msg.extended_text_message is not None and
-          msg.extended_text_message.title is not None):
+    elif (msg.extendedTextMessage is not None and
+          msg.extendedTextMessage.title is not None):
         return "url"
 
     # Case 8: ImageMessage
-    elif msg.image_message is not None:
+    elif msg.imageMessage is not None:
         return "image"
 
     # Case 9: StickerMessage
-    elif msg.sticker_message is not None:
+    elif msg.stickerMessage is not None:
         return "sticker"
 
     # Case 10: DocumentMessage
-    elif msg.document_message is not None:
+    elif msg.documentMessage is not None:
         return "document"
 
     # Case 11: AudioMessage - check for PTT vs regular audio
-    elif msg.audio_message is not None:
-        if msg.audio_message.ptt:
+    elif msg.audioMessage is not None:
+        if msg.audioMessage.PTT:
             return "ptt"
         else:
             return "audio"
 
     # Case 12: VideoMessage - check for GIF vs regular video
-    elif msg.video_message is not None:
-        if msg.video_message.gif_playback:
+    elif msg.videoMessage is not None:
+        if msg.videoMessage.gifPlayback:
             return "gif"
         else:
             return "video"
 
     # Case 13: ContactMessage
-    elif msg.contact_message is not None:
+    elif msg.contactMessage is not None:
         return "vcard"
 
     # Case 14: ContactsArrayMessage
-    elif msg.contacts_array_message is not None:
+    elif msg.contactsArrayMessage is not None:
         return "contact_array"
 
     # Case 15: ListMessage
-    elif msg.list_message is not None:
+    elif msg.listMessage is not None:
         return "list"
 
     # Case 16: ListResponseMessage
-    elif msg.list_response_message is not None:
+    elif msg.listResponseMessage is not None:
         return "list_response"
 
     # Case 17: ButtonsResponseMessage
-    elif msg.buttons_response_message is not None:
+    elif msg.buttonsResponseMessage is not None:
         return "buttons_response"
 
     # Case 18: OrderMessage
-    elif msg.order_message is not None:
+    elif msg.orderMessage is not None:
         return "order"
 
     # Case 19: ProductMessage
-    elif msg.product_message is not None:
+    elif msg.productMessage is not None:
         return "product"
 
     # Case 20: InteractiveResponseMessage
-    elif msg.interactive_response_message is not None:
+    elif msg.interactiveResponseMessage is not None:
         return "native_flow_response"
 
     # Default case - no media type found
@@ -1385,35 +1346,35 @@ def get_button_type_from_message(msg: waE2E_pb2.Message) -> str:
     """
 
     # Case 1: ViewOnceMessage - recurse on inner message
-    if msg.view_once_message is not None:
-        return get_button_type_from_message(msg.view_once_message.message)
+    if msg.viewOnceMessage is not None:
+        return get_button_type_from_message(msg.viewOnceMessage.message)
 
     # Case 2: ViewOnceMessageV2 - recurse on inner message
-    elif msg.view_once_message_v2 is not None:
-        return get_button_type_from_message(msg.view_once_message_v2.message)
+    elif msg.viewOnceMessageV2 is not None:
+        return get_button_type_from_message(msg.viewOnceMessageV2.message)
 
     # Case 3: EphemeralMessage - recurse on inner message
-    elif msg.ephemeral_message is not None:
-        return get_button_type_from_message(msg.ephemeral_message.message)
+    elif msg.ephemeralMessage is not None:
+        return get_button_type_from_message(msg.ephemeralMessage.message)
 
     # Case 4: ButtonsMessage
-    elif msg.buttons_message is not None:
+    elif msg.buttonsMessage is not None:
         return "buttons"
 
     # Case 5: ButtonsResponseMessage
-    elif msg.buttons_response_message is not None:
+    elif msg.buttonsResponseMessage is not None:
         return "buttons_response"
 
     # Case 6: ListMessage
-    elif msg.list_message is not None:
+    elif msg.listMessage is not None:
         return "list"
 
     # Case 7: ListResponseMessage
-    elif msg.list_response_message is not None:
+    elif msg.listResponseMessage is not None:
         return "list_response"
 
     # Case 8: InteractiveResponseMessage
-    elif msg.interactive_response_message is not None:
+    elif msg.interactiveResponseMessage is not None:
         return "interactive_response"
 
     # Default case - no button type found
@@ -1437,25 +1398,25 @@ def get_button_attributes(msg: waE2E_pb2.Message) -> Attrs:
     # TODO: Review waBinary.Attrs implementation
 
     # Case 1: ViewOnceMessage - recurse on inner message
-    if msg.view_once_message is not None:
-        return get_button_attributes(msg.view_once_message.message)
+    if msg.viewOnceMessage is not None:
+        return get_button_attributes(msg.viewOnceMessage.message)
 
     # Case 2: ViewOnceMessageV2 - recurse on inner message
-    elif msg.view_once_message_v2 is not None:
-        return get_button_attributes(msg.view_once_message_v2.message)
+    elif msg.viewOnceMessageV2 is not None:
+        return get_button_attributes(msg.viewOnceMessageV2.message)
 
     # Case 3: EphemeralMessage - recurse on inner message
-    elif msg.ephemeral_message is not None:
-        return get_button_attributes(msg.ephemeral_message.message)
+    elif msg.ephemeralMessage is not None:
+        return get_button_attributes(msg.ephemeralMessage.message)
 
     # Case 4: TemplateMessage - return empty attributes
-    elif msg.template_message is not None:
+    elif msg.templateMessage is not None:
         return Attrs({})
 
     # Case 5: ListMessage - return version and type attributes
-    elif msg.list_message is not None:
+    elif msg.listMessage is not None:
         # Get the list type enum value and convert to lowercase string
-        list_type_value = msg.list_message.list_type
+        list_type_value = msg.listMessage.ListType
         list_type_name = waE2E_pb2.ListMessage.ListType.Name(list_type_value)
         return Attrs({
             "v": "2",
@@ -1484,34 +1445,34 @@ def get_edit_attribute(msg: waE2E_pb2.Message) -> 'EditAttribute':
     # TODO: Review REMOVE_REACTION_TEXT constant implementation
 
     # Case 1: Edited message - recurse on the inner message
-    if (msg.edited_message is not None and
-        msg.edited_message.message is not None):
-        return get_edit_attribute(msg.edited_message.message)
+    if (msg.editedMessage is not None and
+        msg.editedMessage.message is not None):
+        return get_edit_attribute(msg.editedMessage.message)
 
     # Case 2: Protocol message with key
-    if (msg.protocol_message is not None and
-        msg.protocol_message.key is not None):
+    if (msg.protocolMessage is not None and
+        msg.protocolMessage.key is not None):
 
-        if msg.protocol_message.type == waE2E_pb2.ProtocolMessage.REVOKE:
-            if msg.protocol_message.key.from_me:
+        if msg.protocolMessage.type == waE2E_pb2.ProtocolMessage.REVOKE:
+            if msg.protocolMessage.key.from_me:
                 return EditAttribute.SENDER_REVOKE
             else:
                 return EditAttribute.ADMIN_REVOKE
 
-        elif msg.protocol_message.type == waE2E_pb2.ProtocolMessage.MESSAGE_EDIT:
-            if msg.protocol_message.edited_message is not None:
+        elif msg.protocolMessage.type == waE2E_pb2.ProtocolMessage.MESSAGE_EDIT:
+            if msg.protocolMessage.editedMessage is not None:
                 return EditAttribute.MESSAGE_EDIT
 
     # Case 3: Reaction message with remove text
-    if (msg.reaction_message is not None and
-        msg.reaction_message.text == REMOVE_REACTION_TEXT):
+    if (msg.reactionMessage is not None and
+        msg.reactionMessage.text == REMOVE_REACTION_TEXT):
         return EditAttribute.SENDER_REVOKE
 
     # Case 4: Keep-in-chat message with undo operation
-    if (msg.keep_in_chat_message is not None and
-        msg.keep_in_chat_message.key is not None and
-        msg.keep_in_chat_message.key.from_me and
-        msg.keep_in_chat_message.keep_type == waE2E_pb2.KeepType.UNDO_KEEP_FOR_ALL):
+    if (msg.keepInChatMessage is not None and
+        msg.keepInChatMessage.key is not None and
+        msg.keepInChatMessage.key.from_me and
+        msg.keepInChatMessage.keepType == waE2E_pb2.KeepType.UNDO_KEEP_FOR_ALL):
         return EditAttribute.SENDER_REVOKE
 
     return EditAttribute.EMPTY
@@ -1553,8 +1514,8 @@ async def prepare_peer_message_node(
     })
 
     # Check for APP_STATE_SYNC_KEY_REQUEST to set high priority
-    if (message.protocol_message is not None and
-        message.protocol_message.type == waE2E_pb2.ProtocolMessage.APP_STATE_SYNC_KEY_REQUEST):
+    if (message.protocolMessage is not None and
+        message.protocolMessage.type == waE2E_pb2.ProtocolMessage.APP_STATE_SYNC_KEY_REQUEST):
         attrs["push_priority"] = "high"
 
     start = time.time()
@@ -1562,13 +1523,11 @@ async def prepare_peer_message_node(
         plaintext = message.SerializeToString()
     except Exception as err:
         return None, Exception(f"failed to marshal message: {err}")
-    timings.marshal = time.time() - start
+    timings.marshal = timedelta(seconds=time.time() - start)
 
     start = time.time()
-    encrypted, is_pre_key, err = await encrypt_message_for_device(client, plaintext, to, None, None)
-    timings.peer_encrypt = time.time() - start
-    if err is not None:
-        return None, Exception(f"failed to encrypt peer message for {to}: {err}")
+    encrypted, is_pre_key = await encrypt_message_for_device(client, plaintext, to, None)
+    timings.peer_encrypt = timedelta(seconds=time.time() - start)
 
     content = [encrypted]
     if is_pre_key and client.messenger_config is None:
@@ -1598,6 +1557,7 @@ def get_message_content(
     identity, poll metadata, bot/meta nodes, and button information.
 
     Args:
+        client
         base_node: Base message node (usually participants node)
         message: Message protobuf containing message data
         msg_attrs: Message attributes dictionary
@@ -1620,7 +1580,7 @@ def get_message_content(
 
     if msg_attrs["type"] == "poll":
         poll_type = "creation"
-        if message.poll_update_message is not None:
+        if message.pollUpdateMessage is not None:
             poll_type = "vote"
         content.append(Node(
             tag="meta",
@@ -1658,7 +1618,7 @@ async def prepare_message_node(
     dsm_plaintext: Optional[bytes],
     timings: MessageDebugTimings,
     extra_params: NodeExtraParams,
-) -> Tuple[Optional[Node], Optional[List[JID]]]:
+) -> Tuple[Node, List[JID]]:
     """
     Port of Go method prepareMessageNode from client.go.
 
@@ -1693,7 +1653,7 @@ async def prepare_message_node(
 
     start = time.time()
     all_devices = await get_user_devices_context(client, participants)
-    timings.get_devices = time.time() - start
+    timings.get_devices = timedelta(seconds=time.time() - start)
 
     msg_type = get_type_from_message(message)
     enc_attrs = Attrs({})
@@ -1718,14 +1678,14 @@ async def prepare_message_node(
         attrs["edit"] = str(edit_attr)
         enc_attrs["decrypt-fail"] = str(events.DecryptFailMode.HIDE)
 
-    if msg_type == "reaction" or message.poll_update_message is not None:
+    if msg_type == "reaction" or message.pollUpdateMessage is not None:
         enc_attrs["decrypt-fail"] = str(events.DecryptFailMode.HIDE)
 
     start = time.time()
     participant_nodes, include_identity = await encrypt_message_for_devices(
         client, all_devices, id, plaintext, dsm_plaintext, enc_attrs,
     )
-    timings.peer_encrypt = time.time() - start
+    timings.peer_encrypt = timedelta(seconds=time.time() - start)
 
     participant_node = Node(
         tag="participants",
@@ -1736,14 +1696,14 @@ async def prepare_message_node(
         tag="message",
         attrs=attrs,
         content=get_message_content(
-            participant_node, message, attrs, include_identity, extra_params,
+            client, participant_node, message, attrs, include_identity, extra_params,
         ),
     )
 
     return message_node, all_devices
 
 
-def marshal_message(to_jid: JID, message: waE2E_pb2.Message) -> Tuple[bytes, Optional[bytes]]:
+def marshal_message(to_jid: JID, message: Optional[waE2E_pb2.Message]) -> Tuple[bytes, Optional[bytes]]:
     """
     Marshal a message for sending over WhatsApp.
 
@@ -1802,7 +1762,7 @@ def make_device_identity_node(client: 'Client') -> Node:
 async def encrypt_message_for_devices(
     client: 'Client',
     all_devices: List[JID],
-    id: str,
+    id: MessageID,
     msg_plaintext: bytes,
     dsm_plaintext: Optional[bytes],
     enc_attrs: Attrs
@@ -1815,7 +1775,6 @@ async def encrypt_message_for_devices(
 
     Args:
         client: The WhatsApp client instance
-        ctx: Context for the operation
         all_devices: List of all target device JIDs
         id: Message ID for logging
         msg_plaintext: The main message plaintext
@@ -1911,7 +1870,7 @@ async def encrypt_message_for_device_and_wrap(
     encryption_identity: JID,
     bundle: Optional[prekeys.PreKeyBundle],
     enc_attrs: Attrs
-) -> Tuple[Optional[Node], bool]:
+) -> Tuple[Node, bool]:
     """
     Port of Go method encryptMessageForDeviceAndWrap from send.go.
 
@@ -1920,7 +1879,6 @@ async def encrypt_message_for_device_and_wrap(
 
     Args:
         client: The WhatsApp client instance
-        ctx: Context for the operation
         plaintext: The message plaintext to encrypt
         wire_identity: The JID to use in the "to" node attributes
         encryption_identity: The JID to use for actual encryption
@@ -1969,7 +1927,7 @@ async def encrypt_message_for_device(
     plaintext: bytes,
     to: JID,
     bundle: Optional[prekeys.PreKeyBundle],
-    extra_attrs: Attrs
+    extra_attrs: Optional[Attrs] = None
 ) -> Tuple[Node, bool]:
     """
     Port of Go method encryptMessageForDevice from send.go.
@@ -1992,6 +1950,7 @@ async def encrypt_message_for_device(
         ErrNoSession: When no session exists and no bundle provided
         Exception: Various encryption/session errors
     """
+    extra_attrs = extra_attrs or Attrs({})
     remote_address = to.signal_address()
     if bundle is not None:
         logger.debug(f"Processing prekey bundle for {to}")

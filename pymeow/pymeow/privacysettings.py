@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 async def try_fetch_privacy_settings(
     client: 'Client',
     ignore_cache: bool
-) -> Tuple[Optional[PrivacySettings], Optional[Exception]]:
+) -> PrivacySettings:
     """
     Port of Go method TryFetchPrivacySettings from privacy.go.
 
@@ -64,7 +64,9 @@ async def try_fetch_privacy_settings(
         ignore_cache: Whether to ignore the cached settings and fetch from server
 
     Returns:
-        Tuple containing (PrivacySettings or None, error or None)
+        PrivacySettings or None
+    Raises:
+        ErrClientIsNil:
     """
     # TODO: Review PrivacySettings implementation
     # TODO: Review ErrClientIsNil implementation
@@ -79,34 +81,30 @@ async def try_fetch_privacy_settings(
     from .binary.node import Node
 
     if client is None:
-        return None, ErrClientIsNil
+        raise ErrClientIsNil
 
     if not ignore_cache:
-        val = client._privacy_settings_cache.load()
+        val = client._privacy_settings_cache
         if val is not None:
-            return val, None
+            return val
 
-    resp, err = await request.send_iq(client, InfoQuery(
+    resp = await request.send_iq(client, InfoQuery(
         namespace="privacy",
         type=InfoQueryType.GET,
         to=SERVER_JID,
         content=[Node(tag="privacy")]
     ))
-
-    if err is not None:
-        return None, err
-
     privacy_node, ok = resp.get_optional_child_by_tag("privacy")
     if not ok:
-        return None, ElementMissingError(
+        raise ElementMissingError(
             tag="privacy",
             in_location="response to privacy settings query"
         )
 
     settings = PrivacySettings()
     parse_privacy_settings(client, privacy_node, settings)
-    client._privacy_settings_cache.store(settings)
-    return settings, None
+    client._privacy_settings_cache = settings
+    return settings
 
 
 async def get_privacy_settings(client: 'Client') -> PrivacySettings:
@@ -132,135 +130,126 @@ async def get_privacy_settings(client: 'Client') -> PrivacySettings:
     if client is None or client.messenger_config is not None:
         return settings
 
-    settings_ptr, err = await try_fetch_privacy_settings(client, False)
-    if err is not None:
-        logger.error("Failed to fetch privacy settings: %v", err)
-    else:
-        settings = settings_ptr
-
-    return settings
+    return await try_fetch_privacy_settings(client, False)
 
 
-async def set_privacy_setting(
-    client: 'Client',
-    name: PrivacySettingType,
-    value: PrivacySetting
-) -> Tuple[PrivacySettings, Optional[Exception]]:
-    """
-    Port of Go method SetPrivacySetting from privacy.go.
+# async def set_privacy_setting(
+#     client: 'Client',
+#     name: PrivacySettingType,
+#     value: PrivacySetting
+# ) -> Tuple[PrivacySettings, Optional[Exception]]:
+#     """
+#     Port of Go method SetPrivacySetting from privacy.go.
+#
+#     Set the given privacy setting to the given value.
+#     The privacy settings will be fetched from the server after the change and the new settings will be returned.
+#     If an error occurs while fetching the new settings, will return an empty struct.
+#
+#     Args:
+#         client: The WhatsApp client instance
+#         name: The privacy setting type to change
+#         value: The new value for the privacy setting
+#
+#     Returns:
+#         Tuple containing (PrivacySettings, error, or None)
+#     """
+#     # TODO: Review PrivacySettings implementation
+#     # TODO: Review PrivacySettingType implementation
+#     # TODO: Review PrivacySetting implementation
+#     # TODO: Review try_fetch_privacy_settings implementation
+#     # TODO: Review send_iq implementation
+#     # TODO: Review info_query implementation
+#     # TODO: Review IQ_SET constant implementation
+#     # TODO: Review SERVER_JID constant implementation
+#     # TODO: Review Node implementation
+#     # TODO: Review Attrs implementation
+#     # TODO: Review PRIVACY_SETTING_TYPE_* constants implementation
+#     # TODO: Review privacy_settings_cache implementation
+#     from .binary.attrs import Attrs
+#     from .binary.node import Node
+#
+#     settings = PrivacySettings()
+#
+#     settings_ptr, err = await try_fetch_privacy_settings(client, False)
+#     if err is not None:
+#         return settings, err
+#
+#     _, err = await request.send_iq(client, InfoQuery(
+#         namespace="privacy",
+#         type=InfoQueryType.SET,
+#         to=SERVER_JID,
+#         content=[Node(
+#             tag="privacy",
+#             content=[Node(
+#                 tag="category",
+#                 attrs=Attrs({
+#                     "name": str(name),
+#                     "value": str(value),
+#                 })
+#             )]
+#         )]
+#     ))
+#
+#     if err is not None:
+#         return settings, err
+#
+#     settings = settings_ptr
+#
+#     if name == PrivacySettingType.GROUP_ADD:
+#         settings.group_add = value
+#     elif name == PrivacySettingType.LAST_SEEN:
+#         settings.last_seen = value
+#     elif name == PrivacySettingType.STATUS:
+#         settings.status = value
+#     elif name == PrivacySettingType.PROFILE:
+#         settings.profile = value
+#     elif name == PrivacySettingType.READ_RECEIPTS:
+#         settings.read_receipts = value
+#     elif name == PrivacySettingType.ONLINE:
+#         settings.online = value
+#     elif name == PrivacySettingType.CALL_ADD:
+#         settings.call_add = value
+#
+#     client._privacy_settings_cache.store(settings)
+#     return settings, None
 
-    Set the given privacy setting to the given value.
-    The privacy settings will be fetched from the server after the change and the new settings will be returned.
-    If an error occurs while fetching the new settings, will return an empty struct.
 
-    Args:
-        client: The WhatsApp client instance
-        name: The privacy setting type to change
-        value: The new value for the privacy setting
-
-    Returns:
-        Tuple containing (PrivacySettings, error, or None)
-    """
-    # TODO: Review PrivacySettings implementation
-    # TODO: Review PrivacySettingType implementation
-    # TODO: Review PrivacySetting implementation
-    # TODO: Review try_fetch_privacy_settings implementation
-    # TODO: Review send_iq implementation
-    # TODO: Review info_query implementation
-    # TODO: Review IQ_SET constant implementation
-    # TODO: Review SERVER_JID constant implementation
-    # TODO: Review Node implementation
-    # TODO: Review Attrs implementation
-    # TODO: Review PRIVACY_SETTING_TYPE_* constants implementation
-    # TODO: Review privacy_settings_cache implementation
-    from .binary.attrs import Attrs
-    from .binary.node import Node
-
-    settings = PrivacySettings()
-
-    settings_ptr, err = await try_fetch_privacy_settings(client, False)
-    if err is not None:
-        return settings, err
-
-    _, err = await request.send_iq(client, InfoQuery(
-        namespace="privacy",
-        type=InfoQueryType.SET,
-        to=SERVER_JID,
-        content=[Node(
-            tag="privacy",
-            content=[Node(
-                tag="category",
-                attrs=Attrs({
-                    "name": str(name),
-                    "value": str(value),
-                })
-            )]
-        )]
-    ))
-
-    if err is not None:
-        return settings, err
-
-    settings = settings_ptr
-
-    if name == PrivacySettingType.GROUP_ADD:
-        settings.group_add = value
-    elif name == PrivacySettingType.LAST_SEEN:
-        settings.last_seen = value
-    elif name == PrivacySettingType.STATUS:
-        settings.status = value
-    elif name == PrivacySettingType.PROFILE:
-        settings.profile = value
-    elif name == PrivacySettingType.READ_RECEIPTS:
-        settings.read_receipts = value
-    elif name == PrivacySettingType.ONLINE:
-        settings.online = value
-    elif name == PrivacySettingType.CALL_ADD:
-        settings.call_add = value
-
-    client._privacy_settings_cache.store(settings)
-    return settings, None
-
-
-async def set_default_disappearing_timer(
-    client: 'Client',
-    timer: timedelta
-) -> Optional[Exception]:
-    """
-    Port of Go method SetDefaultDisappearingTimer from disappearing.go.
-
-    Set the default disappearing message timer.
-
-    Args:
-        client: The WhatsApp client instance
-        timer: The duration for the disappearing message timer
-
-    Returns:
-        Exception if error occurred, None if successful
-    """
-    # TODO: Review send_iq implementation
-    # TODO: Review info_query implementation
-    # TODO: Review IQ_SET constant implementation
-    # TODO: Review SERVER_JID constant implementation
-    # TODO: Review Node implementation
-    # TODO: Review Attrs implementation
-    from .binary.attrs import Attrs
-    from .binary.node import Node
-
-    _, err = await request.send_iq(client, InfoQuery(
-        namespace="disappearing_mode",
-        type=InfoQueryType.SET,
-        to=SERVER_JID,
-        content=[Node(
-            tag="disappearing_mode",
-            attrs=Attrs({
-                "duration": str(int(timer.total_seconds())),
-            })
-        )]
-    ))
-
-    return err
-
+# async def set_default_disappearing_timer(
+#     client: 'Client',
+#     timer: timedelta
+# ) -> None:
+#     """
+#     Port of Go method SetDefaultDisappearingTimer from disappearing.go.
+#
+#     Set the default disappearing message timer.
+#
+#     Args:
+#         client: The WhatsApp client instance
+#         timer: The duration for the disappearing message timer
+#
+#     Returns:
+#         Exception if error occurred, None if successful
+#     """
+#     # TODO: Review send_iq implementation
+#     # TODO: Review info_query implementation
+#     # TODO: Review IQ_SET constant implementation
+#     # TODO: Review SERVER_JID constant implementation
+#     # TODO: Review Node implementation
+#     # TODO: Review Attrs implementation
+#     from .binary.attrs import Attrs
+#     from .binary.node import Node
+#
+#     _ = await request.send_iq(client, InfoQuery(
+#         namespace="disappearing_mode",
+#         type=InfoQueryType.SET,
+#         to=SERVER_JID,
+#         content=[Node(
+#             tag="disappearing_mode",
+#             attrs=Attrs({
+#                 "duration": str(int(timer.total_seconds())),
+#             })
+#         )]
+#     ))
 
 def parse_privacy_settings(
     client: 'Client',
@@ -324,35 +313,35 @@ def parse_privacy_settings(
     return evt
 
 
-async def handle_privacy_settings_notification(
-    client: 'Client',
-    privacy_node: 'Node'
-) -> None:
-    """
-    Port of Go method handlePrivacySettingsNotification from privacy.go.
-
-    Handle privacy settings change notification by parsing the notification,
-    updating cached settings, and dispatching an event.
-
-    Args:
-        client: The WhatsApp client instance
-        privacy_node: The privacy XML node containing the notification
-
-    Returns:
-        None
-    """
-    # TODO: Review try_fetch_privacy_settings implementation
-    # TODO: Review parse_privacy_settings implementation
-    # TODO: Review privacy_settings_cache implementation
-    # TODO: Review dispatch_event implementation
-
-    logger.debug("Parsing privacy settings change notification")
-
-    settings, err = await try_fetch_privacy_settings(client, False)
-    if err is not None:
-        logger.error("Failed to fetch privacy settings when handling change: %v", err)
-        return
-
-    evt = parse_privacy_settings(client, privacy_node, settings)
-    client._privacy_settings_cache.store(settings)
-    await client.dispatch_event(evt)
+# async def handle_privacy_settings_notification(
+#     client: 'Client',
+#     privacy_node: 'Node'
+# ) -> None:
+#     """
+#     Port of Go method handlePrivacySettingsNotification from privacy.go.
+#
+#     Handle privacy settings change notification by parsing the notification,
+#     updating cached settings, and dispatching an event.
+#
+#     Args:
+#         client: The WhatsApp client instance
+#         privacy_node: The privacy XML node containing the notification
+#
+#     Returns:
+#         None
+#     """
+#     # TODO: Review try_fetch_privacy_settings implementation
+#     # TODO: Review parse_privacy_settings implementation
+#     # TODO: Review privacy_settings_cache implementation
+#     # TODO: Review dispatch_event implementation
+#
+#     logger.debug("Parsing privacy settings change notification")
+#
+#     settings, err = await try_fetch_privacy_settings(client, False)
+#     if err is not None:
+#         logger.error("Failed to fetch privacy settings when handling change: %v", err)
+#         return
+#
+#     evt = parse_privacy_settings(client, privacy_node, settings)
+#     client._privacy_settings_cache.store(settings)
+#     await client.dispatch_event(evt)

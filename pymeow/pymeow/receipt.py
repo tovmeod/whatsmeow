@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def handle_receipt(client, node: Node) -> None:
+async def handle_receipt(client: 'Client', node: Node) -> None:
     """
     Port of Go method handleReceipt from receipt.go.
 
@@ -48,14 +48,9 @@ async def handle_receipt(client, node: Node) -> None:
         elif receipt is not None:
             if receipt.type == ReceiptType.RETRY:
                 # Create async task equivalent to Go's goroutine
-                async def retry_task():
+                async def retry_task() -> None:
                     try:
-                        err = await retry.handle_retry_receipt(client, receipt, node)
-                        if err is not None:
-                            logger.error(
-                                f"Failed to handle retry receipt for {receipt.message_source.chat}/"
-                                f"{receipt.message_ids[0]} from {receipt.message_source.sender}: {err}"
-                            )
+                        await retry.handle_retry_receipt(client, receipt, node)
                     except Exception as e:
                         logger.error(
                             f"Failed to handle retry receipt for {receipt.message_source.chat}/"
@@ -65,7 +60,7 @@ async def handle_receipt(client, node: Node) -> None:
                 # Execute in background (equivalent to Go's goroutine)
                 client.create_task(retry_task())
 
-            client.dispatch_event(receipt)
+            await client.dispatch_event(receipt)
     finally:
         client.create_task(send_ack(client, node))
 
@@ -87,7 +82,7 @@ async def handle_grouped_receipt(client: 'Client', partial_receipt: Receipt, par
     # TODO: Review dispatch_event implementation
 
     pag = participants.attr_getter()
-    partial_receipt.message_ids = [pag.string("key")]
+    partial_receipt.message_ids = [MessageID(pag.string("key"))]
 
     for child in participants.get_children():
         if child.tag != "user":
@@ -128,10 +123,7 @@ async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt]
     # TODO: Review handle_grouped_receipt implementation
 
     ag = node.attr_getter()
-    source, err = await message.parse_message_source(client, node, False)
-    if err is not None:
-        return None, err
-
+    source = await message.parse_message_source(client, node, False)
     receipt = Receipt(
         message_source=source,
         timestamp=ag.unix_time("t"),
@@ -149,7 +141,7 @@ async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt]
 
         return None, None
 
-    main_message_id = ag.string("id")
+    main_message_id = MessageID(ag.string("id"))
     if not ag.ok():
         return None, Exception(f"failed to parse read receipt attrs: {ag.errors}")
 
@@ -163,7 +155,7 @@ async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt]
             if item.tag == "item" and "id" in item.attrs:
                 item_id = item.attrs["id"]
                 if isinstance(item_id, str):
-                    receipt.message_ids.append(item_id)
+                    receipt.message_ids.append(MessageID(item_id))
     else:
         receipt.message_ids = [main_message_id]
 
@@ -171,25 +163,25 @@ async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt]
 
 
 # todo: maybe I don't need this method
-def maybe_deferred_ack(client, node: Node) -> Callable[[], None]:
-    """
-    Create a function that will send an acknowledgement for the given node.
-
-    If synchronous_ack is True, the function will send the acknowledgement when called.
-    Otherwise, it will start a task to send the acknowledgement and return a no-op function.
-
-    Args:
-        client: The WhatsApp client instance
-        node: The node to acknowledge
-
-    Returns:
-        A function that will send the acknowledgement when called
-    """
-    if client.synchronous_ack:
-        return lambda: asyncio.create_task(send_ack(client, node))
-    else:
-        asyncio.create_task(send_ack(client, node))
-        return lambda: None
+# def maybe_deferred_ack(client, node: Node) -> Callable[[], None]:
+#     """
+#     Create a function that will send an acknowledgement for the given node.
+#
+#     If synchronous_ack is True, the function will send the acknowledgement when called.
+#     Otherwise, it will start a task to send the acknowledgement and return a no-op function.
+#
+#     Args:
+#         client: The WhatsApp client instance
+#         node: The node to acknowledge
+#
+#     Returns:
+#         A function that will send the acknowledgement when called
+#     """
+#     if client.synchronous_ack:
+#         return lambda: asyncio.create_task(send_ack(client, node))
+#     else:
+#         asyncio.create_task(send_ack(client, node))
+#         return lambda: None
 
 
 async def send_ack(client: 'Client', node: Node) -> None:
@@ -230,13 +222,10 @@ async def send_ack(client: 'Client', node: Node) -> None:
     if node.tag != "message" and "type" in node.attrs:
         attrs["type"] = node.attrs["type"]
 
-    err = await client.send_node(Node(
+    await client.send_node(Node(
         tag="ack",
         attrs=attrs
     ))
-
-    if err is not None:
-        logger.warning(f"Failed to send acknowledgement for {node.tag} {node.attrs['id']}: {err}")
 
 
 async def mark_read(
@@ -246,7 +235,7 @@ async def mark_read(
     chat: JID,
     sender: JID,
     *receipt_type_extra: ReceiptType
-) -> Optional[Exception]:
+) -> None:
     """
     Port of Go method MarkRead from receipt.go.
 
@@ -269,8 +258,8 @@ async def mark_read(
         sender: The user ID who sent the message (required for group chats)
         *receipt_type_extra: The type of receipt to send (defaults to RECEIPT_TYPE_READ)
 
-    Returns:
-        Exception if error occurred, None if successful
+    Raises:
+        Exception:
     """
     # TODO: Review MessageID type implementation
     # TODO: Review ReceiptType constants implementation
@@ -280,7 +269,7 @@ async def mark_read(
     # TODO: Review send_node implementation
 
     if len(ids) == 0:
-        return Exception("no message IDs specified")
+        raise Exception("no message IDs specified")
 
     receipt_type = ReceiptTypeRead
     if len(receipt_type_extra) == 1:
@@ -321,7 +310,7 @@ async def mark_read(
             content=children
         )]
 
-    return await client.send_node(node)
+    await client.send_node(node)
 
 
 def set_force_active_delivery_receipts(
@@ -358,9 +347,9 @@ def set_force_active_delivery_receipts(
         return
 
     if active:
-        client.send_active_receipts.store(2)
+        client.send_active_receipts = 2
     else:
-        client.send_active_receipts.store(0)
+        client.send_active_receipts = 0
 
 
 async def send_message_receipt(
@@ -392,7 +381,7 @@ async def send_message_receipt(
 
     if info.is_from_me:
         attrs["type"] = str(ReceiptType.SENDER)
-    elif client.send_active_receipts.load() == 0:
+    elif client.send_active_receipts == 0:
         attrs["type"] = str(ReceiptType.INACTIVE)
 
     attrs["to"] = info.chat
@@ -405,10 +394,7 @@ async def send_message_receipt(
         # Override the to attribute with the JID version with a device number
         attrs["to"] = info.sender
 
-    err = await client.send_node(Node(
+    await client.send_node(Node(
         tag="receipt",
         attrs=attrs
     ))
-
-    if err is not None:
-        logger.warning("Failed to send receipt for %s: %v", info.id, err)

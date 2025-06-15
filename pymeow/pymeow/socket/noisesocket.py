@@ -26,7 +26,7 @@ class NoiseSocket:
     """
 
     def __init__(self, fs: 'FrameSocket', write_key: AESGCM, read_key: AESGCM,
-                 on_frame: Callable[[bytes], None]):
+                 on_frame: Callable[[bytes], Awaitable[None]], disconnect_handler: Callable[["NoiseSocket", bool], Awaitable[None]]):
         """
         Initialize a new NoiseSocket.
 
@@ -40,6 +40,7 @@ class NoiseSocket:
         self.write_key = write_key
         self.read_key = read_key
         self.on_frame = on_frame
+        self.disconnect_handler = disconnect_handler
         self.write_counter = 0
         self.read_counter = 0
         self.write_lock = asyncio.Lock()
@@ -48,6 +49,12 @@ class NoiseSocket:
 
         # Start the frame consumer task
         self.consumer_task = asyncio.create_task(self._consume_frames())
+
+        # Set up disconnect handler on the FrameSocket
+        fs.on_disconnect = self.on_disconnect
+
+    async def on_disconnect(self, remote: bool) -> None:
+        await self.disconnect_handler(self, remote)
 
     async def _consume_frames(self) -> None:
         """
@@ -121,14 +128,12 @@ class NoiseSocket:
 
             # Cancel the consumer task
             self.consumer_task.cancel()
-            async with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError):
                 await self.consumer_task
-
             # Clear the disconnect handler
             self.fs.on_disconnect = None
-
             if disconnect:
-                await self.fs.close()
+                await self.fs.close(0)
 
     async def send_frame(self, plaintext: bytes) -> None:
         """
@@ -177,30 +182,3 @@ class NoiseSocket:
             True if the socket is connected, False otherwise
         """
         return self.fs.is_connected()
-
-
-async def new_noise_socket(fs: 'FrameSocket', write_key: AESGCM, read_key: AESGCM,
-                          frame_handler: Callable[[bytes], Awaitable[None]],
-                          disconnect_handler: Callable[["NoiseSocket", bool], Awaitable[None]]) -> NoiseSocket:
-    """
-    Create a new NoiseSocket.
-
-    Args:
-        fs: The underlying FrameSocket
-        write_key: The AEAD cipher for encrypting outgoing messages
-        read_key: The AEAD cipher for decrypting incoming messages
-        frame_handler: Callback for handling decrypted frames
-        disconnect_handler: Callback for handling disconnections
-
-    Returns:
-        A new NoiseSocket instance
-    """
-    ns = NoiseSocket(fs, write_key, read_key, frame_handler)
-
-    # Set up disconnect handler on the FrameSocket
-    async def on_disconnect(remote: bool) -> None:
-        await disconnect_handler(ns, remote)
-
-    fs.on_disconnect = on_disconnect
-
-    return ns

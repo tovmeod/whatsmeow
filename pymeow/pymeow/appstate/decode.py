@@ -43,7 +43,7 @@ class PatchList:
 
 
 # Type alias for a function that can download a blob of external app state patches
-DownloadExternalFunc = Callable[[WAServerSync_pb2.ExternalBlobReference], Awaitable[bytes]]
+DownloadExternalFunc = Callable[[WAServerSync_pb2.ExternalBlobReference], Awaitable[Optional[bytes]]]
 
 
 async def parse_snapshot_internal(collection: Node, download_external: DownloadExternalFunc) -> Optional[WAServerSync_pb2.SyncdSnapshot]:
@@ -63,21 +63,14 @@ async def parse_snapshot_internal(collection: Node, download_external: DownloadE
 
     raw_snapshot = snapshot_node.content
     snapshot = WAServerSync_pb2.ExternalBlobReference()
-    try:
-        snapshot.ParseFromString(raw_snapshot)
-    except Exception as err:
-        raise ValueError(f"Failed to unmarshal snapshot: {err}")
+    snapshot.ParseFromString(raw_snapshot)
 
-    try:
-        raw_data = await download_external(snapshot)
-    except Exception as err:
-        raise ValueError(f"Failed to download external mutations: {err}")
+    raw_data = await download_external(snapshot)
+    if raw_data is None:
+        raise ValueError("Failed to download external snapshot")
 
     downloaded = WAServerSync_pb2.SyncdSnapshot()
-    try:
-        downloaded.ParseFromString(raw_data)
-    except Exception as err:
-        raise ValueError(f"Failed to unmarshal mutation list: {err}")
+    downloaded.ParseFromString(raw_data)
 
     return downloaded
 
@@ -109,17 +102,12 @@ async def parse_patch_list_internal(collection: Node, download_external: Downloa
             raise ValueError(f"Failed to unmarshal patch #{i+1}: {err}")
 
         if patch.HasField("externalMutations") and download_external is not None:
-            try:
-                raw_data = await download_external(patch.externalMutations)
-            except Exception as err:
-                raise ValueError(f"Failed to download external mutations: {err}")
+            raw_data = await download_external(patch.externalMutations)
+            if raw_data is None:
+                raise ValueError(f"Failed to download external mutations for patch #{i+1}")
 
             downloaded = WAServerSync_pb2.SyncdMutations()
-            try:
-                downloaded.ParseFromString(raw_data)
-            except Exception as err:
-                raise ValueError(f"Failed to unmarshal mutation list: {err}")
-
+            downloaded.ParseFromString(raw_data)
             if len(downloaded.mutations) == 0:
                 raise ValueError("Didn't get any mutations from download")
 

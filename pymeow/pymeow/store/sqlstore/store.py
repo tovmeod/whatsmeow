@@ -8,8 +8,11 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from tortoise.transactions import in_transaction
+from typing_extensions import Awaitable
 
+from .models.lids import LIDMappingModel
 from ...types import JID, ContactInfo
+from ...types.jid import EMPTY_JID
 from ...util.keys.keypair import KeyPair, PreKey
 from ..store import (
     AllSessionSpecificStores,
@@ -274,7 +277,7 @@ class SQLStore(AllSessionSpecificStores):
             pre_key_model = await PreKeyModel.get(jid=self.jid, key_id=key_id)
             key_pair = KeyPair.from_private_key(pre_key_model.key)
             return PreKey(key_pair, pre_key_model.key_id)
-        except:
+        except Exception:
             return None
 
     async def remove_pre_key(self, key_id: int) -> None:
@@ -327,16 +330,16 @@ class SQLStore(AllSessionSpecificStores):
             }
         )
 
-    async def get_app_state_sync_key(self, key_id: bytes) -> Optional[AppStateSyncKeyModel]:
+    async def get_app_state_sync_key(self, key_id: bytes) -> Optional[AppStateSyncKey]:
         """Get an app state sync key."""
         try:
             key_model = await AppStateSyncKeyModel.get(jid=self.jid, key_id=key_id)
-            return AppStateSyncKeyModel(
+            return AppStateSyncKey(
                 data=key_model.key_data,
                 timestamp=key_model.timestamp,
                 fingerprint=key_model.fingerprint
             )
-        except:
+        except Exception:
             return None
 
     async def get_latest_app_state_sync_key_id(self) -> Optional[bytes]:
@@ -358,13 +361,13 @@ class SQLStore(AllSessionSpecificStores):
             }
         )
 
-    async def get_app_state_version(self, name: str) -> Tuple[int, bytes]:
+    async def get_app_state_version(self, name: str) -> Tuple[int, bytearray]:
         """Get an app state version."""
         try:
             version_model = await AppStateVersionModel.get(jid=self.jid, name=name)
-            return version_model.version, version_model.hash
+            return version_model.version, bytearray(version_model.hash)
         except:
-            return 0, b'\x00' * 128
+            return 0, bytearray(b'\x00' * 128)
 
     async def delete_app_state_version(self, name: str) -> None:
         """Delete an app state version."""
@@ -520,6 +523,7 @@ class SQLStore(AllSessionSpecificStores):
         contacts = await ContactModel.filter(our_jid=self.jid).all()
         for contact in contacts:
             jid = JID.from_string(contact.their_jid)
+            assert jid is not None
             contacts_result[jid] = ContactInfo(
                 first_name=contact.first_name or "",
                 full_name=contact.full_name or "",
@@ -603,18 +607,15 @@ class SQLStore(AllSessionSpecificStores):
             defaults={'key': secret}
         )
 
-    async def get_message_secret(self, chat: JID, sender: JID, id: str) -> Tuple[Optional[bytes], Optional[Exception]]:
+    async def get_message_secret(self, chat: JID, sender: JID, id: str) -> bytes:
         """Get message secret from database."""
-        try:
-            secret = await MessageSecretModel.get(
-                our_jid=self.jid,
-                chat_jid=str(chat),
-                sender_jid=str(sender),
-                message_id=id
-            )
-            return secret.key, None
-        except Exception as e:
-            return None, e
+        secret = await MessageSecretModel.get(
+            our_jid=self.jid,
+            chat_jid=str(chat),
+            sender_jid=str(sender),
+            message_id=id
+        )
+        return secret.key
 
     # Privacy Token Store methods
     async def put_privacy_tokens(self, tokens: List[PrivacyToken]) -> None:
@@ -643,11 +644,11 @@ class SQLStore(AllSessionSpecificStores):
         )
         self.buffered_events_cache[key] = event
 
-    async def do_decryption_txn(self, fn: Callable[[Any], Any]) -> None:
+    async def do_decryption_txn(self, fn: Awaitable[None]) -> None:
         """Execute a function within a decryption transaction."""
         # For in-memory implementation, just call the function
         # In a real database implementation, this would be wrapped in a transaction
-        fn(None)
+        await fn
 
     async def clear_buffered_event_plaintext(self, ciphertext_hash: bytes) -> None:
         """Stub: Clear plaintext from buffered event."""
@@ -672,37 +673,83 @@ class SQLStore(AllSessionSpecificStores):
 
     # LID Store methods
     async def put_many_lid_mappings(self, mappings: List[LIDMapping]) -> None:
-        """Stub: Put multiple LID mappings."""
-        for mapping in mappings:
-            lid_str = str(mapping.lid)
-            pn_str = str(mapping.pn)
-            self.lid_mappings_cache[lid_str] = pn_str
-            self.pn_to_lid_cache[pn_str] = lid_str
+        """Put multiple LID mappings in database."""
+        if not mappings:
+            return
 
-    async def put_lid_mapping(self, lid: JID, jid: JID) -> None:
-        """Put single LID mapping in memory."""
-        lid_str = str(lid)
-        jid_str = str(jid)
-        self.lid_mappings_cache[lid_str] = jid_str
-        self.pn_to_lid_cache[jid_str] = lid_str
+        async with in_transaction() as connection:
+            for mapping in mappings:
+                if mapping.lid.server != "lid.whatsapp.net" or mapping.pn.server != "s.whatsapp.net":
+                    continue
 
-    async def get_pn_for_lid(self, lid: JID) -> Tuple[Optional[JID], Optional[Exception]]:
-        """Get phone number for LID from memory."""
-        pn_str = self.lid_mappings_cache.get(str(lid))
-        if pn_str:
-            try:
-                from ...types.jid import JID
-                pn_jid = JID.from_string(pn_str)
-                return (pn_jid, None)
-            except Exception as e:
-                return (None, e)
-        return (None, None)
+                await LIDMappingModel.update_or_create(
+                    lid=mapping.lid.user,
+                    defaults={'pn': mapping.pn.user},
+                    using_db=connection
+                )
 
-    async def get_lid_for_pn(self, pn: JID) -> Optional[JID]:
-        """Get LID for phone number from memory."""
-        from ...types.jid import JID
-        lid_str = self.pn_to_lid_cache.get(str(pn))
-        if lid_str:
-            lid_jid = JID.from_string(lid_str)
+                # Update cache
+                self.lid_mappings_cache[str(mapping.lid)] = str(mapping.pn)
+                self.pn_to_lid_cache[str(mapping.pn)] = str(mapping.lid)
+
+    async def put_lid_mapping(self, lid: JID, pn: JID) -> None:
+        """Put single LID mapping in database."""
+        if lid.server != "lid.whatsapp.net" or pn.server != "s.whatsapp.net":
+            raise Exception(f"invalid PutLIDMapping call {lid}/{pn}")
+
+        await LIDMappingModel.update_or_create(
+            lid=lid.user,
+            defaults={'pn': pn.user}
+        )
+
+        # Update cache
+        self.lid_mappings_cache[str(lid)] = str(pn)
+        self.pn_to_lid_cache[str(pn)] = str(lid)
+
+    async def get_pn_for_lid(self, lid: JID) -> Optional[JID]:
+        """Get phone number for LID from database."""
+        if lid.server != "lid.whatsapp.net":
+            return None
+
+        # Check cache first
+        cached_pn = self.lid_mappings_cache.get(str(lid))
+        if cached_pn:
+            return JID.from_string(cached_pn)
+
+        # Query database
+        try:
+            mapping = await LIDMappingModel.get(lid=lid.user)
+            pn_jid = JID(user=mapping.pn, server="s.whatsapp.net")
+
+            # Update cache
+            self.lid_mappings_cache[str(lid)] = str(pn_jid)
+            self.pn_to_lid_cache[str(pn_jid)] = str(lid)
+
+            return pn_jid
+        except:
+            return None
+
+    async def get_lid_for_pn(self, pn: JID) -> JID:
+        """Get LID for phone number from database."""
+        if pn.server != "s.whatsapp.net":
+            return EMPTY_JID
+
+        # Check cache first
+        cached_lid = self.pn_to_lid_cache.get(str(pn))
+        if cached_lid:
+            jid = JID.from_string(cached_lid)
+            assert jid is not None
+            return jid
+
+        # Query database
+        try:
+            mapping = await LIDMappingModel.get(pn=pn.user)
+            lid_jid = JID(user=mapping.lid, server="lid.whatsapp.net")
+
+            # Update cache
+            self.lid_mappings_cache[str(lid_jid)] = str(pn)
+            self.pn_to_lid_cache[str(pn)] = str(lid_jid)
+
             return lid_jid
-        return None
+        except:
+            return EMPTY_JID

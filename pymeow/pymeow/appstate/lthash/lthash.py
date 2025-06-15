@@ -63,7 +63,7 @@ class LTHash:
             _perform_pointwise_with_overflow(base, hashed, subtract)
 
 
-def _perform_pointwise_with_overflow(base: bytearray, input_data: bytes, subtract: bool) -> bytearray:
+def _perform_pointwise_with_overflow(base: bytearray, input_data: bytes, subtract: bool) -> bytes:
     """
     Perform pointwise addition or subtraction with overflow.
 
