@@ -3,12 +3,11 @@ JID (Jabber ID) type for PyMeow.
 
 Port of whatsmeow/types/jid.go
 """
-from dataclasses import dataclass
 import re
-from typing import Optional, Union, Dict, Any, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, Union
 
 from signal_protocol import address
-
 
 # Known JID servers on WhatsApp
 DEFAULT_USER_SERVER = "s.whatsapp.net"

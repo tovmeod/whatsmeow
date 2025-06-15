@@ -1,10 +1,10 @@
-from signal_protocol import curve, identity_key, state, storage, address
 # from signal_protocol.storage import InMemSignalProtocolStore
-from typing import Optional, List
-from tortoise.models import Model
-from tortoise import fields
+from typing import List, Optional
 
+from signal_protocol import address, curve, identity_key, state, storage
 from signal_protocol.storage import InMemSignalProtocolStore
+from tortoise import fields
+from tortoise.models import Model
 
 
 # Tortoise ORM Models

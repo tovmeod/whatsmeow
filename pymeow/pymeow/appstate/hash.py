@@ -3,17 +3,18 @@ Hash utilities for WhatsApp app state.
 
 Port of whatsmeow/appstate/hash.go
 """
-import hmac
 import hashlib
+import hmac
 import struct
 from dataclasses import dataclass
-from typing import List, Callable, Optional, Awaitable, Sequence
+from typing import Awaitable, Callable, List, Optional, Sequence
 
-from . import WAPatchName
-from .lthash import WAPatchIntegrity
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
+from . import WAPatchName
 from .errors import ErrMissingPreviousSetValueOperation
+from .lthash import WAPatchIntegrity
+
 
 @dataclass
 class Mutation:

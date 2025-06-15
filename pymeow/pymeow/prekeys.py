@@ -4,17 +4,18 @@ WhatsApp prekeys handling.
 Port of whatsmeow/prekeys.go
 """
 import logging
-from dataclasses import dataclass
-from typing import List, Optional, Dict, TYPE_CHECKING, Tuple
 import struct
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from signal_protocol.state import PreKeyBundle
+
 from . import request
 from .binary.node import Node
 from .request import InfoQuery, InfoQueryType
 from .types import JID
-from .util.keys.keypair import PreKey, KeyPair
+from .util.keys.keypair import KeyPair, PreKey
 
 # Constants matching Go implementation
 WANTED_PREKEY_COUNT = 50  # WantedPreKeyCount

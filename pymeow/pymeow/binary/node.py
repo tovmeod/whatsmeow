@@ -5,10 +5,10 @@ Port of whatsmeow/binary/node.go
 """
 import json
 from dataclasses import dataclass, field
-from typing import Optional, List, Union
+from typing import List, Optional, Union
 
-from .attrs import AttrUtility, Attrs
-from ..types.jid import JID, DEFAULT_USER_SERVER, GROUP_SERVER, NEWSLETTER_SERVER, BROADCAST_SERVER
+from ..types.jid import BROADCAST_SERVER, DEFAULT_USER_SERVER, GROUP_SERVER, JID, NEWSLETTER_SERVER
+from .attrs import Attrs, AttrUtility
 
 
 @dataclass

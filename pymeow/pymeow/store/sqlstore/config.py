@@ -1,4 +1,5 @@
-from typing import Dict, Any
+from typing import Any, Dict
+
 
 def get_tortoise_config(db_url: str) -> Dict[str, Any]:
     """Generate Tortoise ORM configuration"""

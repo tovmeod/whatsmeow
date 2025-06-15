@@ -8,12 +8,12 @@ import logging
 import random
 import uuid
 from datetime import datetime, timedelta
-from typing import Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 
 from . import request
 from .request import InfoQuery, InfoQueryType
 from .types import JID
-from .types.events.events import KeepAliveTimeout, KeepAliveRestored
+from .types.events.events import KeepAliveRestored, KeepAliveTimeout
 
 if TYPE_CHECKING:
     from .client import Client

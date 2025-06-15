@@ -1,5 +1,6 @@
-from tortoise.models import Model
 from tortoise import fields
+from tortoise.models import Model
+
 
 class DeviceModel(Model):
     """Device information storage"""

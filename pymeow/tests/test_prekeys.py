@@ -1,18 +1,26 @@
 """Test prekeys handling."""
-import pytest
-from datetime import datetime, timedelta
 import struct
-import os
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from ..pymeow.prekeys import (
-    PreKeyStore, PreKey, PreKeyBundle, PreKeyResp, PreKeyError,
-    WANTED_PREKEY_COUNT, MIN_PREKEY_COUNT, DJB_TYPE,
-    pre_key_to_node, pre_keys_to_nodes, node_to_pre_key, node_to_pre_key_bundle
-)
+import pytest
+
 from ..pymeow.binary.node import Node
+from ..pymeow.prekeys import (
+    DJB_TYPE,
+    MIN_PREKEY_COUNT,
+    WANTED_PREKEY_COUNT,
+    PreKey,
+    PreKeyBundle,
+    PreKeyError,
+    PreKeyResp,
+    PreKeyStore,
+    node_to_pre_key,
+    node_to_pre_key_bundle,
+    pre_key_to_node,
+    pre_keys_to_nodes,
+)
 from ..pymeow.util.keys.keypair import KeyPair
-from ..pymeow.types import JID
+
 
 def test_pre_key_constants():
     """Test that pre-key constants match Go implementation."""
@@ -399,8 +407,6 @@ def test_serialization_roundtrip():
 @pytest.mark.asyncio
 async def test_client_integration_methods():
     """Test client integration methods with mocking."""
-    from unittest.mock import MagicMock, AsyncMock
-
     # Mock client
     mock_client = MagicMock()
     mock_client.send_iq = AsyncMock()

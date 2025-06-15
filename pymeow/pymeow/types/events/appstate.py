@@ -5,14 +5,13 @@ Port of whatsmeow/types/events/appstate.go
 """
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from typing import List, Optional
 
-from .events import BaseEvent
 from ...appstate import WAPatchName
 from ...generated.waSyncAction import WASyncAction_pb2
 from ..jid import JID
 from ..message import MessageInfo
+from .events import BaseEvent
 
 
 @dataclass

@@ -8,15 +8,21 @@ import logging
 from typing import TYPE_CHECKING
 
 from . import receipt, send
-from .binary.node import Node, Attrs
-from .types.jid import JID
+from .binary.node import Attrs, Node
+from .exceptions import ErrNotLoggedIn
 from .types.call import BasicCallMeta, CallRemoteMeta
 from .types.events.call import (
-    CallOffer, CallOfferNotice, CallRelayLatency, CallAccept,
-    CallPreAccept, CallTransport, CallTerminate, CallReject,
-    UnknownCallEvent
+    CallAccept,
+    CallOffer,
+    CallOfferNotice,
+    CallPreAccept,
+    CallReject,
+    CallRelayLatency,
+    CallTerminate,
+    CallTransport,
+    UnknownCallEvent,
 )
-from .exceptions import ErrNotLoggedIn
+from .types.jid import JID
 
 if TYPE_CHECKING:
     from .client import Client

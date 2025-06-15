@@ -4,20 +4,20 @@ WhatsApp privacy settings handling.
 Port of whatsmeow/privacysettings.go
 """
 import logging
+from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
-from typing import Optional, Tuple, TYPE_CHECKING
-from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional, Tuple
 
-from .exceptions import ErrClientIsNil, ElementMissingError
-from .request import InfoQuery, InfoQueryType
-from .types.jid import SERVER_JID
 from . import request
+from .exceptions import ElementMissingError, ErrClientIsNil
+from .request import InfoQuery, InfoQueryType
 from .types.events import PrivacySettingsEvent
+from .types.jid import SERVER_JID
 
 if TYPE_CHECKING:
-    from .client import Client
     from .binary.node import Node
+    from .client import Client
 
 class PrivacySettingType(str, Enum):
     """Types of WhatsApp privacy settings."""

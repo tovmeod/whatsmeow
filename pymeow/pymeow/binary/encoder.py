@@ -6,15 +6,35 @@ Port of whatsmeow/binary/encoder.go
 import math
 import struct
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Union, Callable
+from typing import Any, Callable, Dict, List, Optional, Union
 
-from ..types.jid import JID, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, MESSENGER_SERVER, INTEROP_SERVER, BOT_SERVER, HOSTED_SERVER
-from .node import Node
-from .token import (
-    LIST_EMPTY, DICTIONARY_0, LIST_8, LIST_16, JID_PAIR, HEX_8, BINARY_8,
-    BINARY_20, BINARY_32, NIBBLE_8, PACKED_MAX, INTEROP_JID, FB_JID, AD_JID
+from ..types.jid import (
+    BOT_SERVER,
+    DEFAULT_USER_SERVER,
+    HIDDEN_USER_SERVER,
+    HOSTED_SERVER,
+    INTEROP_SERVER,
+    JID,
+    MESSENGER_SERVER,
 )
 from .errors import InvalidTypeError
+from .node import Node
+from .token import (
+    AD_JID,
+    BINARY_8,
+    BINARY_20,
+    BINARY_32,
+    DICTIONARY_0,
+    FB_JID,
+    HEX_8,
+    INTEROP_JID,
+    JID_PAIR,
+    LIST_8,
+    LIST_16,
+    LIST_EMPTY,
+    NIBBLE_8,
+    PACKED_MAX,
+)
 
 # Size of a tag in the WhatsApp protocol
 TAG_SIZE = 1

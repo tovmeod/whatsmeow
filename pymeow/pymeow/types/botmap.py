@@ -1,6 +1,6 @@
 """Bot JID mapping from bot server to default user server."""
 
-from .jid import JID, DEFAULT_USER_SERVER, BOT_SERVER
+from .jid import BOT_SERVER, DEFAULT_USER_SERVER, JID
 
 BOT_JID_MAP = {
     JID("867051314767696", BOT_SERVER): JID("13135550002", DEFAULT_USER_SERVER),

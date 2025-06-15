@@ -3,18 +3,18 @@ WhatsApp Web pairing with phone number and code.
 
 Port of whatsmeow/pair-code.go
 """
+import base64
 import os
 import re
-import base64
 from dataclasses import dataclass
 from typing import Tuple
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import nacl.bindings
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from .binary.node import Node, Attrs
+from .binary.node import Attrs, Node
 from .types.jid import JID
 from .util.hkdfutil.hkdf import sha256 as hkdf_sha256
 from .util.keys.keypair import KeyPair

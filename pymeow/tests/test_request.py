@@ -3,16 +3,17 @@ Tests for the request handling implementation.
 """
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock
 from datetime import timedelta
+from unittest.mock import AsyncMock, MagicMock
 
+from pymeow.pymeow.binary import node as binary_node
 from pymeow.pymeow.request import (
+    ErrIQTimedOut,
     InfoQuery,
     InfoQueryType,
     IQError,
-    ErrIQTimedOut,
 )
-from pymeow.pymeow.binary import node as binary_node
+
 
 class TestRequestManager(unittest.IsolatedAsyncioTestCase):
     """Test the request manager."""

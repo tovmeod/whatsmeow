@@ -1,6 +1,7 @@
 from tortoise import fields
 from tortoise.models import Model
 
+
 class BufferedEventModel(Model):
     our_jid = fields.ForeignKeyField('models.DeviceModel', related_name='buffered_events', to_field='jid', on_delete=fields.CASCADE, on_update=fields.CASCADE)
     ciphertext_hash = fields.BinaryField()

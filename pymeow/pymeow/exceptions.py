@@ -5,7 +5,8 @@ This module defines custom exceptions used throughout the library.
 Port of whatsmeow/errors.go
 """
 
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
 
 class PymeowError(Exception):
     """Base exception for all PyMeow errors."""

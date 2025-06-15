@@ -4,16 +4,16 @@ Tests for the NoiseSocket implementation.
 This tests both the legacy mode (used by FrameSocket) and the direct mode
 of the NoiseSocket class.
 """
-import pytest
 import asyncio
-import struct
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from ..pymeow.socket.noisesocket import NoiseSocket, new_noise_socket
-from ..pymeow.binary.encoder import Encoder
 from ..pymeow.binary.decoder import Decoder
+from ..pymeow.binary.encoder import Encoder
+from ..pymeow.socket.noisesocket import NoiseSocket, new_noise_socket
+
 
 @pytest.mark.asyncio
 async def test_generate_iv():

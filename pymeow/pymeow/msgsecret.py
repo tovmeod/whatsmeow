@@ -15,23 +15,23 @@ like poll votes, reactions, and comments.
 import hashlib
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 from Crypto.Random import get_random_bytes
 
+from .exceptions import (
+    ErrClientIsNil,
+    ErrNotEncryptedCommentMessage,
+    ErrNotEncryptedReactionMessage,
+    ErrNotLoggedIn,
+    ErrNotPollUpdateMessage,
+    ErrOriginalMessageSecretNotFound,
+)
 from .types import JID
 from .types.events import Message as MessageEvent
 from .types.message import MessageID
-from .util.hkdfutil import hkdf
 from .util.gcmutil import gcm
-from .exceptions import (
-    ErrClientIsNil,
-    ErrNotLoggedIn,
-    ErrOriginalMessageSecretNotFound,
-    ErrNotEncryptedReactionMessage,
-    ErrNotEncryptedCommentMessage,
-    ErrNotPollUpdateMessage
-)
+from .util.hkdfutil import hkdf
 
 # Message secret type constants - matching Go exactly
 ENC_SECRET_POLL_VOTE = "Poll Vote"
@@ -361,8 +361,8 @@ async def encrypt_poll_vote(client, poll_info, vote):
 
 async def encrypt_comment(client, root_msg_info, comment):
     """Encrypt a comment message."""
-    from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
     from .generated.waCommon import WACommon_pb2 as waCommon_pb2
+    from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 
     plaintext = comment.SerializeToString()
 

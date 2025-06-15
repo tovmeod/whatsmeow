@@ -6,14 +6,13 @@ Port of whatsmeow/socket/noisehandshake.go
 import hashlib
 import struct
 import threading
-from typing import Optional, Tuple, Callable, Awaitable
-from typing_extensions import Buffer
+from typing import Awaitable, Callable, Optional, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from typing_extensions import Buffer
 
 from ..util.gcmutil import prepare
-
 from .framesocket import FrameSocket
 from .noisesocket import NoiseSocket, new_noise_socket
 

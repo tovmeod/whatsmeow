@@ -4,15 +4,15 @@ Armadillo message handling functionality.
 Port of whatsmeow/armadillomessage.go
 """
 import logging
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from . import message
+from .generated.waArmadilloApplication import WAArmadilloApplication_pb2 as armadillo_pb2
+from .generated.waCommon import WACommon_pb2 as wa_common_pb2
+from .generated.waMsgApplication import WAMsgApplication_pb2 as wa_msg_application_pb2
+from .generated.waMsgTransport import WAMsgTransport_pb2 as wa_msg_transport_pb2
 from .types import MessageInfo
 from .types.events import FBMessage
-from .generated.waMsgTransport import WAMsgTransport_pb2 as wa_msg_transport_pb2
-from .generated.waMsgApplication import WAMsgApplication_pb2 as wa_msg_application_pb2
-from .generated.waCommon import WACommon_pb2 as wa_common_pb2
-from .generated.waArmadilloApplication import WAArmadilloApplication_pb2 as armadillo_pb2
 
 if TYPE_CHECKING:
     from .client import Client

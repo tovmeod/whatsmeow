@@ -5,15 +5,15 @@ Port of whatsmeow/notification.go
 """
 import json
 import logging
-from typing import Any, List, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, List
 
 from . import appstate
 from .appstate import WAPatchName
 from .binary.node import Node
+from .generated.waE2E import WAWebProtobufsE2E_pb2
 from .prekeys import upload_prekeys
 from .types import events
 from .types.jid import JID
-from .generated.waE2E import WAWebProtobufsE2E_pb2
 from .types.message import MessageID, MessageServerID
 
 if TYPE_CHECKING:

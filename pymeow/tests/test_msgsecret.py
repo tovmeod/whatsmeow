@@ -1,13 +1,13 @@
 """Test message secret handling."""
-import pytest
 import os
+
 from ..pymeow.msgsecret import (
     MessageSecretStore,
-    MessageSecret,
     MsgSecretType,
     apply_bot_message_hkdf,
-    generate_msg_secret_key
+    generate_msg_secret_key,
 )
+
 
 def test_msg_secret_types():
     """Test message secret type enumeration."""

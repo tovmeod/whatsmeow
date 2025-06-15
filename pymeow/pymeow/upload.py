@@ -10,14 +10,14 @@ import io
 import os
 import tempfile
 from dataclasses import dataclass
-from typing import Optional, BinaryIO, Tuple, TYPE_CHECKING, IO
+from typing import IO, TYPE_CHECKING, BinaryIO, Optional, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
 
-from .download import MediaType, MEDIA_TYPE_TO_MMS_TYPE
-from .util.cbcutil import encrypt, encrypt_stream
+from .download import MEDIA_TYPE_TO_MMS_TYPE, MediaType
 from .exceptions import PymeowError
+from .util.cbcutil import encrypt, encrypt_stream
 
 if TYPE_CHECKING:
     from . import Client, mediaconn

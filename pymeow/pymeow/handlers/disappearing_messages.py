@@ -1,12 +1,12 @@
 """Handlers for disappearing messages functionality."""
-from typing import Optional, Dict, Any, Callable, Awaitable
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 import asyncio
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Awaitable, Callable, Dict, Optional
 
-from ..types.message import MessageInfo, Message
 from ..types.expiration import ExpirationType
+from ..types.message import Message, MessageInfo
 
 logger = logging.getLogger(__name__)
 

@@ -5,19 +5,29 @@ Port of whatsmeow/store/sqlstore/store.go
 """
 import asyncio
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Set, Any, Callable
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
 from tortoise.transactions import in_transaction
 
-from .models.chatsettings import ChatSettingsModel
-from .models.messages import MessageSecretModel
 from ...types import JID, ContactInfo
-from ...util.keys.keypair import PreKey, KeyPair
-from ..store import ContactEntry, AppStateMutationMAC, AppStateSyncKey, AllSessionSpecificStores, Device, \
-    MessageSecretInsert, PrivacyToken, BufferedEvent, LIDMapping
+from ...util.keys.keypair import KeyPair, PreKey
+from ..store import (
+    AllSessionSpecificStores,
+    AppStateMutationMAC,
+    AppStateSyncKey,
+    BufferedEvent,
+    ContactEntry,
+    Device,
+    LIDMapping,
+    MessageSecretInsert,
+    PrivacyToken,
+)
 from .container import Container
-from .models.session import IdentityKeyModel, SessionModel, PreKeyModel, SenderKeyModel
-from .models.appstate import AppStateSyncKeyModel, AppStateVersionModel, AppStateMutationMACModel
+from .models.appstate import AppStateMutationMACModel, AppStateSyncKeyModel, AppStateVersionModel
+from .models.chatsettings import ChatSettingsModel
 from .models.contacts import ContactModel
+from .models.messages import MessageSecretModel
+from .models.session import IdentityKeyModel, PreKeyModel, SenderKeyModel, SessionModel
 
 
 class ChatSettings:

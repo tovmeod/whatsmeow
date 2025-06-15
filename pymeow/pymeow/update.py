@@ -4,8 +4,9 @@ Update handling for WhatsApp.
 Port of whatsmeow/update.go
 """
 import re
-import aiohttp
 from typing import Optional
+
+import aiohttp
 
 from .socket import noisesocket
 from .store.clientpayload import WAVersionContainer

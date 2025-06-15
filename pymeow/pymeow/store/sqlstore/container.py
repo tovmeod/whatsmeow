@@ -1,14 +1,14 @@
 import logging
 import os
 import struct
-from typing import Optional, List, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional
 
 from tortoise import Tortoise, transactions
 from tortoise.exceptions import DoesNotExist
 
+from ...util.keys.keypair import KeyPair, PreKey
 from .config import get_tortoise_config
 from .models.device import DeviceModel
-from ...util.keys.keypair import KeyPair, PreKey
 
 if TYPE_CHECKING:
     from ...store.store import Device

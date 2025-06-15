@@ -3,16 +3,16 @@ Tests for the push notification implementation.
 """
 import base64
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from pymeow.pymeow.push import (
-    PushConfig,
-    FCMPushConfig,
-    APNsPushConfig,
-    WebPushConfig,
-    PushNotificationHandler,
-)
 from pymeow.pymeow.binary import node as binary_node
+from pymeow.pymeow.push import (
+    APNsPushConfig,
+    FCMPushConfig,
+    PushNotificationHandler,
+    WebPushConfig,
+)
+
 
 class TestPushConfigs(unittest.TestCase):
     """Test the push configuration classes."""

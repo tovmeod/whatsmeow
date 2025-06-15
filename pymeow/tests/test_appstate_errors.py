@@ -1,20 +1,22 @@
 """Test application state error classes."""
 import pytest
+
 from pymeow.pymeow.appstate import (
     AppStateError,
-    MissingPreviousSetValueOperationError,
-    MismatchingLTHashError,
-    MismatchingPatchMACError,
-    MismatchingContentMACError,
-    MismatchingIndexMACError,
-    KeyNotFoundError,
-    ErrMissingPreviousSetValueOperation,
-    ErrMismatchingLTHash,
-    ErrMismatchingPatchMAC,
+    ErrKeyNotFound,
     ErrMismatchingContentMAC,
     ErrMismatchingIndexMAC,
-    ErrKeyNotFound,
+    ErrMismatchingLTHash,
+    ErrMismatchingPatchMAC,
+    ErrMissingPreviousSetValueOperation,
+    KeyNotFoundError,
+    MismatchingContentMACError,
+    MismatchingIndexMACError,
+    MismatchingLTHashError,
+    MismatchingPatchMACError,
+    MissingPreviousSetValueOperationError,
 )
+
 
 def test_appstate_error_base_class():
     """Test that AppStateError is a subclass of Exception."""

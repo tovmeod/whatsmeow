@@ -3,16 +3,17 @@ Tests for the handshake functionality.
 
 This tests the handshake process between the client and server.
 """
-import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
-from ..pymeow.handshake import do_handshake, HandshakeError, CertificateVerificationError
+import pytest
+
+from ..pymeow.generated.waWa6.WAWebProtobufsWa6_pb2 import HandshakeMessage
+from ..pymeow.handshake import CertificateVerificationError, HandshakeError, do_handshake
 from ..pymeow.socket.framesocket import FrameSocket
 from ..pymeow.socket.noisehandshake import NoiseHandshake
 from ..pymeow.socket.noisesocket import NoiseSocket
 from ..pymeow.util.keys.keypair import KeyPair
-from ..pymeow.generated.waWa6.WAWebProtobufsWa6_pb2 import HandshakeMessage
 
 # Real test values captured from logs
 SAMPLE_EPHEMERAL_KEYPAIR = {

@@ -6,12 +6,12 @@ Port of types/newsletter.go
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
-from .jid import JID
-from .message import MessageServerID, MessageID
-from .user import ProfilePictureInfo
 from ..generated.waE2E import Message
+from .jid import JID
+from .message import MessageID, MessageServerID
+from .user import ProfilePictureInfo
 
 # TODO: Verify import when util/jsontime is ported
 # In Go: "go.mau.fi/util/jsontime"

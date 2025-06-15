@@ -3,8 +3,8 @@ WhatsApp message sending functionality.
 
 Port of whatsmeow/send.go
 """
-import base64
 import asyncio
+import base64
 import hashlib
 import logging
 import os
@@ -14,30 +14,45 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import IntEnum
-from typing import Any, Optional, TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from warnings import deprecated
 
-from signal_protocol import session, session_cipher, protocol
-from signal_protocol.state import PreKeyBundle
-from signal_protocol.protocol import CiphertextMessage
+from signal_protocol import protocol, session, session_cipher
 from signal_protocol.error import SignalProtocolException
+from signal_protocol.protocol import CiphertextMessage
+from signal_protocol.state import PreKeyBundle
 
 from . import prekeys
+from .binary.node import Attrs, Node
 from .broadcast import get_broadcast_list_participants
-from .exceptions import ErrRecipientADJID, ErrNotLoggedIn, ErrInvalidInlineBotID, ErrUnknownServer, ErrMessageTimedOut, \
-    ErrServerReturnedError, ErrNoSession
-from .group import get_cached_group_data, send_group_iq
-from .message import migrate_session_store, clear_untrusted_identity, pad_message
-from .msgsecret import apply_bot_message_hkdf
-from .binary.node import Node, Attrs
-from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
+from .exceptions import (
+    ErrInvalidInlineBotID,
+    ErrMessageTimedOut,
+    ErrNoSession,
+    ErrNotLoggedIn,
+    ErrRecipientADJID,
+    ErrServerReturnedError,
+    ErrUnknownServer,
+)
 from .generated.waCommon import WACommon_pb2
+from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
+from .group import get_cached_group_data, send_group_iq
+from .message import clear_untrusted_identity, migrate_session_store, pad_message
+from .msgsecret import apply_bot_message_hkdf
 from .prekeys import fetch_pre_keys
-from .request import wait_response, cancel_response, retry_frame, is_disconnect_node, InfoQueryType
+from .request import InfoQueryType, cancel_response, is_disconnect_node, retry_frame, wait_response
 from .types import events
-from .types.jid import JID, DEFAULT_USER_SERVER, GROUP_SERVER, BROADCAST_SERVER, HIDDEN_USER_SERVER, BOT_SERVER, \
-    NEWSLETTER_SERVER, MESSENGER_SERVER
-from .types.message import MessageID, MessageServerID, AddressingMode, MsgMetaInfo, EditAttribute, MessageInfo
+from .types.jid import (
+    BOT_SERVER,
+    BROADCAST_SERVER,
+    DEFAULT_USER_SERVER,
+    GROUP_SERVER,
+    HIDDEN_USER_SERVER,
+    JID,
+    MESSENGER_SERVER,
+    NEWSLETTER_SERVER,
+)
+from .types.message import AddressingMode, EditAttribute, MessageID, MessageInfo, MessageServerID, MsgMetaInfo
 from .user import get_user_devices_context
 
 if TYPE_CHECKING:
@@ -1018,11 +1033,6 @@ async def send_group(
     timings.marshal = time.time() - start
     start = time.time()
 
-    from signal_protocol.sender_keys import SenderKeyName
-    from signal_protocol.group_cipher import (
-        create_sender_key_distribution_message,
-        group_encrypt
-    )
     from signal_protocol.address import ProtocolAddress
     sender_address = client.get_own_lid().signal_address()
     sender_key_name = SenderKeyName(str(to), sender_address)

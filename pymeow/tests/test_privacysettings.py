@@ -1,15 +1,17 @@
 """Tests for the privacy settings implementation."""
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from ..pymeow.binary import node as binary_node
 from ..pymeow.privacysettings import (
-    PrivacySettingType,
     PrivacySetting,
     PrivacySettings,
+    PrivacySettingType,
 )
-from ..pymeow.binary import node as binary_node
 from ..pymeow.types.events import PrivacySettingsEvent
+
 
 def test_privacy_settings_defaults():
     """Test that privacy settings have the correct defaults."""

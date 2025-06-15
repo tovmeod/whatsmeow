@@ -7,7 +7,7 @@ import asyncio
 import contextlib
 import logging
 import struct
-from typing import Callable, Awaitable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 # TODO: Verify import when cipher is ported
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM

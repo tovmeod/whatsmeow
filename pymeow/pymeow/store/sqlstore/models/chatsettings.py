@@ -1,6 +1,7 @@
 from tortoise import fields
 from tortoise.models import Model
 
+
 class ChatSettingsModel(Model):
     our_jid = fields.ForeignKeyField('models.DeviceModel', related_name='chat_settings', to_field='jid',
                                      on_delete=fields.CASCADE, on_update=fields.CASCADE)

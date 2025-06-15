@@ -4,7 +4,7 @@ Port of whatsmeow/binary/attrs.go
 """
 
 from datetime import datetime
-from typing import List, Optional, Tuple, Any, Dict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from ..types import JID

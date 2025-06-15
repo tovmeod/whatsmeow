@@ -3,13 +3,13 @@ WhatsApp broadcast list handling.
 
 Port of whatsmeow/broadcast.go
 """
-from typing import List, Dict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List
 
 from .binary import node as binary_node
+from .exceptions import ErrIQNotFound, PymeowError
 from .request import InfoQuery, InfoQueryType
-from .types.jid import JID, STATUS_BROADCAST_JID, SERVER_JID
+from .types.jid import JID, SERVER_JID, STATUS_BROADCAST_JID
 from .types.user import StatusPrivacy, StatusPrivacyType
-from .exceptions import PymeowError, ErrIQNotFound
 
 if TYPE_CHECKING:
     from .client import Client

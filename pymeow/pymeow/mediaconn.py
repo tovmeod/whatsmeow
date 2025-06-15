@@ -7,12 +7,12 @@ Port of whatsmeow/mediaconn.go
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 from .binary.node import Node
+from .exceptions import ErrClientIsNil
 from .request import InfoQuery, InfoQueryType, send_iq
 from .types.jid import JID
-from .exceptions import ErrClientIsNil
 
 if TYPE_CHECKING:
     from .client import Client

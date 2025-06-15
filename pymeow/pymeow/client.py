@@ -4,45 +4,50 @@ WhatsApp Web client implementation.
 Port of whatsmeow/client.go
 """
 import asyncio
+import datetime
 import logging
 import socket
 import time
 from dataclasses import dataclass, field
-import datetime
 from os import urandom
-from typing import Any, Callable, List, Optional, Tuple, Awaitable, TYPE_CHECKING, Dict, Set, Coroutine, Self
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Self, Set, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
 
-from . import handshake, keepalive, request, retry, connectionevents
+from . import connectionevents, handshake, keepalive, request, retry
 from .appstate.keys import Processor
 from .binary.decoder import DecodingError
+from .binary.node import Node, marshal, unmarshal
 from .binary.unpack import unpack
 from .call import handle_call_event
 from .connectionevents import handle_ib
+from .exceptions import ElementMissingError, ErrAlreadyConnected, ErrNotConnected, ErrNotLoggedIn
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
+from .generated.waE2E.WAWebProtobufsE2E_pb2 import Message
 from .generated.waWeb import WAWebProtobufsWeb_pb2 as waWeb_pb2
 from .message import handle_encrypted_message
 from .notification import handle_notification
 from .pair import handle_iq
 from .presence import handle_chat_state, handle_presence
+from .privacysettings import PrivacySetting, PrivacySettings, PrivacySettingType
+from .push import PushConfig
 from .receipt import handle_receipt
-
+from .retry import RecentMessage, RecentMessageKey
 from .socket.framesocket import FrameSocket
-from .binary.node import Node, unmarshal, marshal
 from .socket.noisesocket import NoiseSocket
 from .store.store import Device
-from .store.tortoise_signal_store_implementation import SignalPreKeyModel, TortoiseSignalStore, generate_identity_keys, \
-    generate_prekeys
+from .store.tortoise_signal_store_implementation import (
+    SignalPreKeyModel,
+    TortoiseSignalStore,
+    generate_identity_keys,
+    generate_prekeys,
+)
 from .types import message
 from .types.events import Disconnected, PrivacySettingsEvent, events
-from .types.jid import JID, EMPTY_JID, HIDDEN_USER_SERVER, DEFAULT_USER_SERVER, NEWSLETTER_SERVER, GROUP_SERVER
-from .types.message import AddressingMode, MessageInfo, MessageSource, MessageID
-from .types.presence import Presence, ChatPresence, ChatPresenceMedia
-from .exceptions import ElementMissingError, ErrNotLoggedIn, ErrNotConnected, ErrAlreadyConnected
-from .privacysettings import PrivacySettings, PrivacySettingType, PrivacySetting
-from .push import PushConfig
+from .types.jid import DEFAULT_USER_SERVER, EMPTY_JID, GROUP_SERVER, HIDDEN_USER_SERVER, JID, NEWSLETTER_SERVER
+from .types.message import AddressingMode, MessageID, MessageInfo, MessageSource
+from .types.presence import ChatPresence, ChatPresenceMedia, Presence
 from .util.keys.keypair import KeyPair
 
 # Type for event handlers

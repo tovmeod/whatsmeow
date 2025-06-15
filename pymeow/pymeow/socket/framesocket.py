@@ -5,13 +5,19 @@ Port of whatsmeow/socket/framesocket.go
 """
 import asyncio
 import logging
-from typing import Optional, Callable, Dict, Any, Coroutine
+from typing import Any, Callable, Coroutine, Dict, Optional
 
 from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType
 
 from .constants import (
-    URL, ORIGIN, WA_CONN_HEADER, FRAME_MAX_SIZE, FRAME_LENGTH_SIZE,
-    FrameTooLargeError, SocketClosedError, SocketAlreadyOpenError
+    FRAME_LENGTH_SIZE,
+    FRAME_MAX_SIZE,
+    ORIGIN,
+    URL,
+    WA_CONN_HEADER,
+    FrameTooLargeError,
+    SocketAlreadyOpenError,
+    SocketClosedError,
 )
 
 logger = logging.getLogger(__name__)

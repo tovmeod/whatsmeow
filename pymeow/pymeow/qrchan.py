@@ -43,14 +43,22 @@ Port of whatsmeow/qrchan.go
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional, List, Any
+from typing import Any, List, Optional
 
-from .types.events.events import (
-    QR, PairSuccess, PairError, QRScannedWithoutMultidevice,
-    Connected, ConnectFailure, LoggedOut, TemporaryBan, Disconnected, ClientOutdated
-)
-from .exceptions import ErrClientIsNil, ErrQRAlreadyConnected, ErrQRStoreContainsID
 from . import Client
+from .exceptions import ErrClientIsNil, ErrQRAlreadyConnected, ErrQRStoreContainsID
+from .types.events.events import (
+    QR,
+    ClientOutdated,
+    Connected,
+    ConnectFailure,
+    Disconnected,
+    LoggedOut,
+    PairError,
+    PairSuccess,
+    QRScannedWithoutMultidevice,
+    TemporaryBan,
+)
 
 
 @dataclass

@@ -3,21 +3,21 @@ Store interfaces for WhatsApp data needed for multidevice functionality.
 
 Port of whatsmeow/store/store.go
 """
+import logging
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Callable, Any
-import uuid
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .sqlstore.container import Container
 # Protobuf imports
 from ..generated.waAdv import WAAdv_pb2
 from ..types import ContactInfo
 
 # Internal imports
-from ..types.jid import JID, EMPTY_JID
+from ..types.jid import EMPTY_JID, JID
 from ..util.keys.keypair import KeyPair, PreKey
-import logging
+from .sqlstore.container import Container
 
 
 class IdentityStore(ABC):

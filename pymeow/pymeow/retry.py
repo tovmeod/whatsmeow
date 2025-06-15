@@ -10,21 +10,24 @@ import logging
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from signal_protocol.group_cipher import create_sender_key_distribution_message
 from signal_protocol.sender_keys import SenderKeyName
-from . import prekeys, sendfb, message, send
+
+from . import message, prekeys, send, sendfb
 from .binary.node import Node
 from .exceptions import ElementMissingError
 from .generated.waCommon import WACommon_pb2
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
+from .generated.waE2E.WAWebProtobufsE2E_pb2 import Message
 from .generated.waMsgApplication import WAMsgApplication_pb2
 from .generated.waMsgTransport import WAMsgTransport_pb2
-from .send import get_media_type_from_message, get_type_from_message, NodeExtraParams
+from .send import NodeExtraParams, get_media_type_from_message, get_type_from_message
+
 # from .store import signal
 from .types.events import Receipt
-from .types.jid import JID, DEFAULT_USER_SERVER
+from .types.jid import DEFAULT_USER_SERVER, JID
 from .types.message import MessageID, MessageInfo
 
 if TYPE_CHECKING:

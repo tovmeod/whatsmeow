@@ -1,8 +1,10 @@
 """Test binary protocol encoding and decoding."""
 import pytest
-from ..pymeow.binary.encoder import Encoder
+
 from ..pymeow.binary.decoder import Decoder
+from ..pymeow.binary.encoder import Encoder
 from ..pymeow.generated.waMsgTransport import WAMsgTransport_pb2
+
 
 @pytest.mark.asyncio
 async def test_message_encode_decode():

@@ -3,10 +3,10 @@ App state encoding for WhatsApp.
 
 Port of whatsmeow/appstate/encode.go
 """
+import hashlib
 import json
 import logging
 import time
-import hashlib
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -18,7 +18,18 @@ from ..generated.waSyncAction import WASyncAction_pb2
 from ..types import jid
 from ..util.cbcutil import encrypt_cbc
 from .hash import HashState, WAPatchName, concat_and_hmac, generate_content_mac, generate_patch_mac
-from .keys import Processor, WAPatchName, INDEX_MUTE, INDEX_PIN, INDEX_ARCHIVE, INDEX_STAR, INDEX_LABEL_ASSOCIATION_CHAT, INDEX_LABEL_ASSOCIATION_MESSAGE, INDEX_LABEL_EDIT, INDEX_SETTING_PUSH_NAME
+from .keys import (
+    INDEX_ARCHIVE,
+    INDEX_LABEL_ASSOCIATION_CHAT,
+    INDEX_LABEL_ASSOCIATION_MESSAGE,
+    INDEX_LABEL_EDIT,
+    INDEX_MUTE,
+    INDEX_PIN,
+    INDEX_SETTING_PUSH_NAME,
+    INDEX_STAR,
+    Processor,
+    WAPatchName,
+)
 
 logger = logging.getLogger(__name__)
 

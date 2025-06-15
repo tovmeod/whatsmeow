@@ -1,8 +1,9 @@
 """Test newsletter handling."""
 import pytest
-from datetime import datetime
-from ..pymeow.newsletter import NewsletterHandler, NewsletterInfo
+
 from ..pymeow.generated.waMsgTransport import WAMsgTransport_pb2
+from ..pymeow.newsletter import NewsletterHandler
+
 
 @pytest.mark.asyncio
 async def test_newsletter_creation():

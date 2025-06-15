@@ -10,31 +10,44 @@ import time
 import traceback
 import zlib
 from datetime import datetime
-from typing import Any, TYPE_CHECKING, Callable, Awaitable, List
-from typing import Tuple, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Tuple
 
 from . import receipt
-from .armadillomessage import handle_decrypted_armadillo
-from .types import MessageInfo
 from .appstate.keys import ALL_PATCH_NAMES
+from .armadillomessage import handle_decrypted_armadillo
 from .binary.attrs import Attrs
 from .binary.node import Node
 from .download import download
 from .exceptions import ErrNotLoggedIn
 from .generated import waE2E
+from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .msgsecret import decrypt_bot_message
 from .receipt import send_message_receipt
 from .store import store
-from .types import JID, ReceiptType
-from .types import events
-from .types.jid import NEWSLETTER_SERVER, GROUP_SERVER, BROADCAST_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, \
-    BOT_SERVER, EMPTY_JID, LEGACY_USER_SERVER
-from .types.message import MessageSource, AddressingMode, MessageID, MessageServerID, EditAttribute, MsgBotInfo, \
-    BotEditType, MsgMetaInfo
-from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
-from .user import parse_verified_name_content, update_business_name, update_push_name, handle_historical_push_names
+from .types import JID, MessageInfo, ReceiptType, events
+from .types.jid import (
+    BOT_SERVER,
+    BROADCAST_SERVER,
+    DEFAULT_USER_SERVER,
+    EMPTY_JID,
+    GROUP_SERVER,
+    HIDDEN_USER_SERVER,
+    LEGACY_USER_SERVER,
+    NEWSLETTER_SERVER,
+)
+from .types.message import (
+    AddressingMode,
+    BotEditType,
+    EditAttribute,
+    MessageID,
+    MessageServerID,
+    MessageSource,
+    MsgBotInfo,
+    MsgMetaInfo,
+)
+from .user import handle_historical_push_names, parse_verified_name_content, update_business_name, update_push_name
 
 logger = logging.getLogger(__name__)
 

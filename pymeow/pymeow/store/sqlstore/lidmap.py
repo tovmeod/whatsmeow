@@ -5,14 +5,14 @@ Port of whatsmeow/store/sqlstore/lidmap.go
 """
 import asyncio
 import logging
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 # Internal imports
 from ...types.jid import JID
-from .. import store
 
 # TODO: Verify import when dbutil is ported
 from ...util import dbutil
+from .. import store
 
 logger = logging.getLogger(__name__)
 # SQL query constants

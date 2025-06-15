@@ -3,15 +3,16 @@ App state keys management for WhatsApp.
 
 Port of whatsmeow/appstate/keys.go
 """
-import base64
 import asyncio
+import base64
+import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 from ..store.store import Device
 from ..util.hkdfutil import expand_hmac
-import logging
+
 
 # WAPatchName represents a type of app state patch.
 class WAPatchName(str, Enum):

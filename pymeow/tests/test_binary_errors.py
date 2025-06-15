@@ -1,18 +1,20 @@
 """Test binary protocol error classes."""
 import pytest
+
 from ..pymeow.binary.errors import (
     BinaryError,
-    InvalidTypeError,
-    InvalidJIDTypeError,
-    InvalidNodeError,
-    InvalidTokenError,
-    NonStringKeyError,
-    ErrInvalidType,
     ErrInvalidJIDType,
     ErrInvalidNode,
     ErrInvalidToken,
+    ErrInvalidType,
     ErrNonStringKey,
+    InvalidJIDTypeError,
+    InvalidNodeError,
+    InvalidTokenError,
+    InvalidTypeError,
+    NonStringKeyError,
 )
+
 
 def test_binary_error_base_class():
     """Test that BinaryError is a subclass of Exception."""

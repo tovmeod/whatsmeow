@@ -9,7 +9,8 @@ import hashlib
 import hmac
 import logging
 from enum import Enum
-from typing import Optional, Any, Protocol, Tuple, cast, TYPE_CHECKING, runtime_checkable
+from typing import TYPE_CHECKING, Any, Optional, Protocol, Tuple, cast, runtime_checkable
+
 import aiohttp
 
 from . import mediaconn

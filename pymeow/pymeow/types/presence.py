@@ -9,10 +9,10 @@ in the Python implementation. These dataclasses are also defined in events.py
 for compatibility with the Go implementation's event system, but are included here
 for direct use when working with presence-related functionality.
 """
-from enum import Enum
-from typing import Optional
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
+from typing import Optional
 
 
 class Presence(str, Enum):

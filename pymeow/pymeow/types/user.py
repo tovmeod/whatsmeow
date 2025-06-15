@@ -4,9 +4,9 @@ User-related types for PyMeow.
 Port of whatsmeow/types/user.go
 """
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
 from datetime import datetime
 from enum import Enum
+from typing import Dict, List, Optional
 
 from ..generated.waVnameCert import WAWebProtobufsVnameCert_pb2
 from .jid import JID

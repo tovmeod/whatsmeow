@@ -3,12 +3,12 @@ WhatsApp push notification handling.
 
 Port of whatsmeow/push.go
 """
-import logging
-from abc import ABC, abstractmethod
 import base64
+import logging
 import secrets
-from typing import Dict, Any, Optional
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 from .binary.node import Node
 

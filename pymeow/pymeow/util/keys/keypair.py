@@ -74,8 +74,8 @@ class KeyPair:
         except Exception:
             # Fallback: generate from raw bytes using curve25519 math
             # This matches the Go implementation more closely
-            from cryptography.hazmat.primitives.asymmetric import x25519
             from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import x25519
 
             # Create X25519 private key from raw bytes
             x25519_priv = x25519.X25519PrivateKey.from_private_bytes(priv)

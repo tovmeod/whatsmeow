@@ -1,12 +1,15 @@
 """
 Tests for the pymeow client.
 """
-import pytest
 import asyncio
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from pymeow import Client
+
 from ..pymeow.exceptions import PymeowError
+
 
 @pytest.mark.asyncio
 async def test_client_initialization():

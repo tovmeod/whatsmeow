@@ -14,11 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from pymeow.client import Client
-from pymeow.store.sqlstore.container import Container
 from pymeow.qrchan import get_qr_channel
-from pymeow.types.events import Message
-from pymeow.types.events import QR
-from pymeow.types.events import Connected, Disconnected
+from pymeow.store.sqlstore.container import Container
+from pymeow.types.events import QR, Connected, Disconnected, Message
 
 logger = logging.getLogger(__name__)
 

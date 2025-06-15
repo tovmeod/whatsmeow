@@ -4,17 +4,17 @@ Media retry handling for WhatsApp.
 Port of whatsmeow/mediaretry.go
 """
 import logging
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from Crypto.Random import get_random_bytes
 
-from .binary.node import Node, Attrs
+from .binary.node import Attrs, Node
 from .exceptions import (
+    ElementMissingError,
     ErrClientIsNil,
-    ErrNotLoggedIn,
     ErrMediaNotAvailableOnPhone,
+    ErrNotLoggedIn,
     ErrUnknownMediaRetryError,
-    ElementMissingError
 )
 from .generated.waMmsRetry import WAMmsRetry_pb2
 from .types import events

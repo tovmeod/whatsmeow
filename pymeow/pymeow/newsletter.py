@@ -8,15 +8,13 @@ Each function receives the client as the first argument.
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
-from .types.jid import JID, SERVER_JID
-from .types.message import MessageServerID, MessageID
-from .types.newsletter import (
-    NewsletterMetadata, NewsletterMessage, GraphQLResponse, GraphQLErrors
-)
 from .binary.node import Node
-from .exceptions import ErrClientIsNil, ElementMissingError
+from .exceptions import ElementMissingError, ErrClientIsNil
+from .types.jid import JID, SERVER_JID
+from .types.message import MessageID, MessageServerID
+from .types.newsletter import GraphQLErrors, GraphQLResponse, NewsletterMessage, NewsletterMetadata
 
 # GraphQL query/mutation constants - matching Go exactly
 QUERY_FETCH_NEWSLETTER = "6563316087068696"

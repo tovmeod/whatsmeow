@@ -4,17 +4,28 @@ WhatsApp group management functionality.
 Port of whatsmeow/group.go
 """
 import logging
-from typing import List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional
 
-from . import types, request
+from . import request, types
 from .binary.attrs import AttrUtility
 from .binary.node import Node
-from .exceptions import ElementMissingError, IQError, ErrInvalidImageFormat, ErrGroupInviteLinkUnauthorized, \
-    ErrGroupNotFound, ErrNotInGroup
+from .exceptions import (
+    ElementMissingError,
+    ErrGroupInviteLinkUnauthorized,
+    ErrGroupNotFound,
+    ErrInvalidImageFormat,
+    ErrNotInGroup,
+    IQError,
+)
 from .request import InfoQuery, InfoQueryType
-from .types.group import GroupParticipantRequest, GroupLinkTarget, GroupMemberAddMode, GroupParticipantAddRequest, \
-    GroupName
-from .types.jid import GROUP_SERVER_JID, SERVER_JID, GROUP_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER
+from .types.group import (
+    GroupLinkTarget,
+    GroupMemberAddMode,
+    GroupName,
+    GroupParticipantAddRequest,
+    GroupParticipantRequest,
+)
+from .types.jid import DEFAULT_USER_SERVER, GROUP_SERVER, GROUP_SERVER_JID, HIDDEN_USER_SERVER, SERVER_JID
 from .types.message import AddressingMode
 
 if TYPE_CHECKING:

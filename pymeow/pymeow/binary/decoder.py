@@ -7,13 +7,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from ..exceptions import PymeowError
-from ..types.jid import JID, MESSENGER_SERVER, INTEROP_SERVER
-from .errors import (
-    InvalidTypeError, InvalidJIDTypeError, InvalidNodeError,
-    InvalidTokenError, NonStringKeyError
-)
-from .node import Node
+from ..types.jid import INTEROP_SERVER, JID, MESSENGER_SERVER
 from . import token
+from .errors import InvalidJIDTypeError, InvalidNodeError, InvalidTokenError, InvalidTypeError, NonStringKeyError
+from .node import Node
 
 
 @dataclass

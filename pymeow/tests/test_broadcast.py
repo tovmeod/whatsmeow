@@ -1,8 +1,11 @@
 """Test broadcast list handling."""
-import pytest
 from datetime import datetime
-from ..pymeow.broadcast import BroadcastListHandler, BroadcastList
+
+import pytest
+
+from ..pymeow.broadcast import BroadcastList, BroadcastListHandler
 from ..pymeow.generated.waMsgTransport import WAMsgTransport_pb2
+
 
 @pytest.mark.asyncio
 async def test_broadcast_creation():

@@ -5,11 +5,11 @@ Port of whatsmeow/presence.go
 """
 import logging
 
-from .binary.node import Node, Attrs
-from .exceptions import NoPushNameError, ErrNotLoggedIn, NoPrivacyTokenError
+from .binary.node import Attrs, Node
+from .exceptions import ErrNotLoggedIn, NoPrivacyTokenError, NoPushNameError
+from .types.events.events import ChatPresenceEvent, PresenceEvent
 from .types.jid import JID
-from .types.presence import Presence, ChatPresence, ChatPresenceMedia
-from .types.events.events import PresenceEvent, ChatPresenceEvent
+from .types.presence import ChatPresence, ChatPresenceMedia, Presence
 
 logger = logging.getLogger(__name__)
 

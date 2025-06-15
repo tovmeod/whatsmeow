@@ -6,19 +6,19 @@ Port of whatsmeow/appstate.go
 import logging
 import time
 from datetime import datetime
-from typing import Any, List, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, List
 
+from .. import download, request, send
+from ..binary import node as binary_node
+from ..exceptions import ErrAppStateUpdate
+from ..generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
+from ..request import InfoQuery, InfoQueryType
+from ..store.store import ContactEntry
+from ..types import JID, events
+from ..types.events.events import BaseEvent
 from . import encode
 from .hash import Mutation
 from .keys import WAPatchName
-from .. import download, request, send
-from ..generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
-from ..binary import node as binary_node
-from ..exceptions import ErrAppStateUpdate
-from ..request import InfoQuery, InfoQueryType
-from ..store.store import ContactEntry
-from ..types import events, JID
-from ..types.events.events import BaseEvent
 
 if TYPE_CHECKING:
     from ..client import Client

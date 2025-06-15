@@ -9,13 +9,14 @@ This package simplifies the usage of AES-256-CBC.
 
 Port of util/cbcutil/cbc.go
 """
-import os
-import hmac
-from typing import Optional, Tuple, Protocol, BinaryIO, IO
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from Crypto.Random import get_random_bytes
 import hashlib
+import hmac
+import os
+from typing import IO, BinaryIO, Optional, Protocol, Tuple
+
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
 
 
 class File(Protocol):

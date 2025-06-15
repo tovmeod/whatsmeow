@@ -1,13 +1,14 @@
 """Test token handling for WhatsApp binary protocol."""
 
 from ..pymeow.binary.token import (
-    get_double_token,
-    index_of_single_token,
-    index_of_double_byte_token,
-    SINGLE_BYTE_TOKENS,
+    DICT_VERSION,
     DOUBLE_BYTE_TOKENS,
-    DICT_VERSION
+    SINGLE_BYTE_TOKENS,
+    get_double_token,
+    index_of_double_byte_token,
+    index_of_single_token,
 )
+
 
 def test_dict_version():
     """Test that the dictionary version is set correctly."""

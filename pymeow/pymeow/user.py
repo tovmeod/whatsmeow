@@ -6,16 +6,25 @@ Each function receives the client as the first argument.
 """
 
 import logging
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
+from .binary.node import Attrs, Node
+from .exceptions import ElementMissingError
 from .types.jid import JID
 from .types.user import (
-    BusinessMessageLinkTarget, ContactQRLinkTarget, IsOnWhatsAppResponse,
-    UserInfo, BotListInfo, BotProfileInfo, BotProfileCommand, VerifiedName,
-    BusinessProfile, BusinessHoursConfig, Category, ProfilePictureInfo
+    BotListInfo,
+    BotProfileCommand,
+    BotProfileInfo,
+    BusinessHoursConfig,
+    BusinessMessageLinkTarget,
+    BusinessProfile,
+    Category,
+    ContactQRLinkTarget,
+    IsOnWhatsAppResponse,
+    ProfilePictureInfo,
+    UserInfo,
+    VerifiedName,
 )
-from .binary.node import Node, Attrs
-from .exceptions import ElementMissingError
 
 # Link prefixes
 BUSINESS_MESSAGE_LINK_PREFIX = "https://wa.me/message/"

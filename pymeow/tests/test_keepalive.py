@@ -3,17 +3,22 @@ Tests for the keepalive functionality.
 
 This tests the keepalive mechanism that maintains the connection with the WhatsApp server.
 """
-import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from ..pymeow.keepalive import (
-    keepalive_loop, send_keep_alive, dispatch_keepalive_timeout, dispatch_keepalive_restored,
-    KeepAliveManager, KEEP_ALIVE_RESPONSE_DEADLINE, KEEP_ALIVE_MAX_FAIL_TIME
-)
-from ..pymeow.types.events.events import KeepAliveTimeout, KeepAliveRestored
+import pytest
+
 from ..pymeow.binary.node import Node
+from ..pymeow.keepalive import (
+    KEEP_ALIVE_MAX_FAIL_TIME,
+    KeepAliveManager,
+    dispatch_keepalive_restored,
+    dispatch_keepalive_timeout,
+    keepalive_loop,
+    send_keep_alive,
+)
+from ..pymeow.types.events.events import KeepAliveRestored, KeepAliveTimeout
 
 # Real test values captured from logs
 SAMPLE_PING_NODE_XML = '<iq id="b7e0afa7-e9da-4ed7-8c3b-0247dbb98a6e" type="get" to="s.whatsapp.net" xmlns="w:p"></iq>'
@@ -165,15 +170,15 @@ async def test_keepalive_loop_failure_and_recovery(mock_asyncio_sleep, mock_rand
     assert mock_send.call_count == 3
 
     # Verify timeout event was dispatched for the first failure
-    timeout_events = [call for call in mock_client.dispatch_event.call_args_list
-                     if isinstance(call[0][0], KeepAliveTimeout)]
+    timeout_events = [call_ for call_ in mock_client.dispatch_event.call_args_list
+                     if isinstance(call_[0][0], KeepAliveTimeout)]
     assert len(timeout_events) == 1
     timeout_event = timeout_events[0][0][0]
     assert timeout_event.error_count == 1
 
     # Verify restored event was dispatched after recovery
-    restored_events = [call for call in mock_client.dispatch_event.call_args_list
-                      if isinstance(call[0][0], KeepAliveRestored)]
+    restored_events = [call_ for call_ in mock_client.dispatch_event.call_args_list
+                      if isinstance(call_[0][0], KeepAliveRestored)]
     assert len(restored_events) == 1
 
     # Verify no reconnect was attempted
@@ -350,7 +355,7 @@ async def test_dispatch_keepalive_restored():
 @pytest.mark.asyncio
 async def test_send_keep_alive_node_structure():
     """Test that the keepalive query has the correct structure."""
-    from ..pymeow.request import InfoQueryType, InfoQuery  # Import the classes we need
+    from ..pymeow.request import InfoQuery, InfoQueryType  # Import the classes we need
 
     # Create mock client
     mock_client = MockClient()

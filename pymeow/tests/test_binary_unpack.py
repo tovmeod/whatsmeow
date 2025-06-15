@@ -1,6 +1,8 @@
 """Test binary unpacking functionality."""
-import pytest
 import zlib
+
+import pytest
+
 from ..pymeow.binary.unpack import unpack
 
 

@@ -6,18 +6,18 @@ Port of whatsmeow/types/events/events.go
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import List, Optional, Protocol, Dict, Any
+from typing import Any, Dict, List, Optional, Protocol
 
 from ...binary.node import Node
 from ...generated.waArmadilloApplication import WAArmadilloApplication_pb2 as WAArm_pb2
 from ...generated.waConsumerApplication import WAConsumerApplication_pb2
-from ...generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
+from ...generated.waE2E import WAWebProtobufsE2E_pb2
 from ...generated.waHistorySync import WAWebProtobufsHistorySync_pb2 as WAHistorySync_pb2
 from ...generated.waMsgApplication import WAMsgApplication_pb2
 from ...generated.waMsgTransport import WAMsgTransport_pb2
 from ...generated.waWeb import WAWebProtobufsWeb_pb2 as WAWeb_pb2
 from ..jid import JID
-from ..message import MessageInfo, MessageID, MessageSource, DeviceSentMeta
+from ..message import DeviceSentMeta, MessageID, MessageInfo, MessageSource
 from ..presence import ChatPresence, ChatPresenceMedia, ReceiptType
 
 # Deprecated: use types.ReceiptType directly
@@ -355,6 +355,7 @@ class NewsletterMessageMeta:
     """
     edit_ts: Optional[datetime] = None  # The edit timestamp for edited messages
     original_ts: Optional[datetime] = None  # The timestamp of the original message for edits
+
 
 # Message is emitted when receiving a new message.
 @dataclass

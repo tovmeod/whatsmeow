@@ -4,16 +4,17 @@ Port of whatsmeow/pair.go
 """
 
 import base64
-import hmac
 import hashlib
+import hmac
 import logging
 from typing import TYPE_CHECKING
 
-from .binary.node import Node
-from .types import jid, events
-from .generated.waAdv import WAAdv_pb2
-from .util.keys.keypair import KeyPair
 from signal_protocol import curve
+
+from .binary.node import Node
+from .generated.waAdv import WAAdv_pb2
+from .types import events, jid
+from .util.keys.keypair import KeyPair
 
 logger = logging.getLogger(__name__)
 

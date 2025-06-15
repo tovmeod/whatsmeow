@@ -13,7 +13,7 @@ functionality as the Go implementation where DecodePatches is a method on the Pr
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import List, Callable, Tuple, Optional, Awaitable
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 from typing_extensions import Sequence
 
@@ -28,14 +28,7 @@ from .errors import (
     ErrMismatchingLTHash,
     ErrMismatchingPatchMAC,
 )
-from .hash import (
-    HashState,
-    Mutation,
-    WAPatchName,
-    concat_and_hmac,
-    generate_content_mac,
-    generate_patch_mac
-)
+from .hash import HashState, Mutation, WAPatchName, concat_and_hmac, generate_content_mac, generate_patch_mac
 from .keys import ExpandedAppStateKeys, Processor
 
 logger = logging.getLogger(__name__)

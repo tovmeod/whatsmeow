@@ -3,7 +3,7 @@ Token handling for WhatsApp binary protocol.
 
 Port of whatsmeow/binary/token/token.go
 """
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, List, Optional, Tuple
 
 # All the currently known string tokens - copied from Go implementation
 SINGLE_BYTE_TOKENS = [

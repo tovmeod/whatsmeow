@@ -21,16 +21,15 @@ asyncio for efficient asynchronous I/O.
 __version__ = "0.1.0"
 
 # Re-export presence-related types and enums
-from .types.presence import (
-    Presence,
-    ChatPresence,
-    ChatPresenceMedia,
-    PresenceEvent,
-    ChatPresenceEvent,
-)
-
 from .client import Client
-from .types import Message, GroupInfo, PrivacySetting
+from .types import GroupInfo, Message, PrivacySetting
+from .types.presence import (
+    ChatPresence,
+    ChatPresenceEvent,
+    ChatPresenceMedia,
+    Presence,
+    PresenceEvent,
+)
 
 __all__ = [
     'Client',

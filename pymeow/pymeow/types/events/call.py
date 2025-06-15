@@ -7,9 +7,9 @@ Port of whatsmeow/types/events/call.go
 from dataclasses import dataclass
 from typing import Optional
 
-from .events import BaseEvent
 from ...binary.node import Node
 from ..call import BasicCallMeta, CallRemoteMeta
+from .events import BaseEvent
 
 
 @dataclass
