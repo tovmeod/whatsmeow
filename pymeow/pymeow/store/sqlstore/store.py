@@ -97,7 +97,7 @@ class SQLStore(AllSessionSpecificStores):
         try:
             identity = await IdentityKeyModel.get(our_jid=self.jid, their_id=address)
             return identity.identity == key
-        except:
+        except Exception:
             # Trust if not known, it'll be saved automatically later
             return True
 

@@ -19,7 +19,6 @@ from .exceptions import ElementMissingError
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
 from .generated.waE2E.WAWebProtobufsE2E_pb2 import Message
 from .generated.waMsgApplication import WAMsgApplication_pb2
-from .generated.waMsgTransport import WAMsgTransport_pb2
 from .send import NodeExtraParams, get_media_type_from_message, get_type_from_message
 
 # from .store import signal
@@ -204,7 +203,7 @@ async def should_recreate_session(
 
     async with client.session_recreate_history_lock:
         try:
-            contains = client.signal_store.contains_session(client.store, jid.signal_address())
+            contains = client.signal_store.contains_session(jid.signal_address())
         except Exception as e:
             logger.exception(e)
             return "", False
@@ -263,9 +262,9 @@ async def handle_retry_receipt(
     msg = await get_message_for_retry(client, receipt, message_id)
 
     fb_consumer_msg = None
-    if msg.fb is not None:
-        sub_proto = msg.fb.get_payload().get_sub_protocol().get_sub_protocol()
-        fb_consumer_msg = sub_proto.decode()
+    # if msg.fb is not None:
+    #     sub_proto = msg.fb.get_payload().get_sub_protocol().get_sub_protocol()
+    #     fb_consumer_msg = sub_proto.decode()
 
     retry_key = IncomingRetryKey(receipt.message_source.sender, message_id)
     async with client.incoming_retry_request_counter_lock:
@@ -277,8 +276,6 @@ async def handle_retry_receipt(
                          receipt.message_source.sender, internal_counter)
         return None
 
-    fb_skdm = None
-    fb_dsm = None
     if receipt.message_source.is_group:
         try:
             sender_key_name = SenderKeyName(
@@ -295,11 +292,11 @@ async def handle_retry_receipt(
                     groupID=str(receipt.message_source.chat),
                     axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
                 )
-            else:
-                fb_skdm = WAMsgTransport_pb2.MessageTransport.Protocol.Ancillary.SenderKeyDistributionMessage(
-                    groupID=str(receipt.message_source.chat),
-                    axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
-                )
+            # else:
+            #     fb_skdm = WAMsgTransport_pb2.MessageTransport.Protocol.Ancillary.SenderKeyDistributionMessage(
+            #         groupID=str(receipt.message_source.chat),
+            #         axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
+            #     )
         except Exception as e:
             logger.warning(
                 "Failed to create sender key distribution message to include in retry of %s in %s to %s: %v",
@@ -312,13 +309,13 @@ async def handle_retry_receipt(
                     message=msg.wa
                 )
             )
-        else:
-            fb_dsm = WAMsgTransport_pb2.MessageTransport.Protocol.Integral.DeviceSentMessage(
-                destinationJID=str(receipt.message_source.chat)
-            )
+        # else:
+        #     fb_dsm = WAMsgTransport_pb2.MessageTransport.Protocol.Integral.DeviceSentMessage(
+        #         destinationJID=str(receipt.message_source.chat)
+        #     )
 
     # Pre-retry callback for fb - TODO comment matches Go
-    if hasattr(client, 'pre_retry_callback') and client.pre_retry_callback is not None:
+    if client.pre_retry_callback is not None:
         if not client.pre_retry_callback(receipt, message_id, retry_count, msg.wa):
             logger.debug("Cancelled retry receipt in PreRetryCallback")
             return None
@@ -326,11 +323,11 @@ async def handle_retry_receipt(
     franking_tag = None
     if msg.wa is not None:
         plaintext = msg.wa.SerializeToString()  # proto.Marshal equivalent
-    else:
-        plaintext = msg.fb.SerializeToString()  # proto.Marshal equivalent
-
-        franking_hash = hmac.new(msg.fb.get_metadata().get_franking_key(), plaintext, hashlib.sha256)
-        franking_tag = franking_hash.digest()
+    # else:
+    #     plaintext = msg.fb.SerializeToString()  # proto.Marshal equivalent
+    #
+    #     franking_hash = hmac.new(msg.fb.get_metadata().get_franking_key(), plaintext, hashlib.sha256)
+    #     franking_tag = franking_hash.digest()
 
     _, has_keys = node.get_optional_child_by_tag("keys")
     bundle = None
@@ -345,7 +342,7 @@ async def handle_retry_receipt(
             pre_key_resp = keys[receipt.message_source.sender]
             bundle, err = pre_key_resp.bundle, pre_key_resp.error
             if err is not None:
-                raise Exception(f"failed to fetch prekeys") from err
+                raise Exception("failed to fetch prekeys") from err
             elif bundle is None:
                 if keys:
                     len_keys = len(keys)

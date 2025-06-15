@@ -641,7 +641,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
 
         # Handle successful decryption
         retry_count = ag.optional_int("count")
-        retry.cancel_delayed_request_from_phone(client, info.id)
+        await retry.cancel_delayed_request_from_phone(client, info.id)
 
         version = ag.int("v")
         if version == 2:

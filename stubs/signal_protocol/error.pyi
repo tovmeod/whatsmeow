@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 
 class SignalProtocolException(Exception):
 	def __init__(self, message: str = "") -> None: ...

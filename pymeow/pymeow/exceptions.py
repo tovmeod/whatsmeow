@@ -4,7 +4,7 @@ Exceptions and error handling for the PyMeow WhatsApp Web client.
 This module defines custom exceptions used throughout the library.
 Port of whatsmeow/errors.go
 """
-
+from .binary.node import Node
 
 
 class PymeowError(Exception):

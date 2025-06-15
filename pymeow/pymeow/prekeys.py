@@ -453,17 +453,13 @@ async def node_to_pre_key_bundle(
     #     )
     #
     # However, following the provided Python's simpler PreKeyBundle constructor:
-    try:
-        bundle = PreKeyBundle(
-            registration_id=registration_id,
-            device_id=device_id,
-            pre_key=parsed_pre_key_obj, # This will be None if optional prekey wasn't found/parsed
-            signed_pre_key=parsed_signed_pre_key_obj,
-            identity_key=identity_key_pub_bytes # Assuming PreKeyBundle handles creating IdentityKey internally
-        )
-    except Exception as e: # Catch errors during PreKeyBundle instantiation
-        raise RuntimeError(f"failed to create prekey bundle") from e
-
+    bundle = PreKeyBundle(
+        registration_id=registration_id,
+        device_id=device_id,
+        pre_key=parsed_pre_key_obj, # This will be None if optional prekey wasn't found/parsed
+        signed_pre_key=parsed_signed_pre_key_obj,
+        identity_key=identity_key_pub_bytes # Assuming PreKeyBundle handles creating IdentityKey internally
+    )
     return bundle
 
 async def node_to_pre_key(node: "Node") -> Tuple[Optional[PreKey], Optional[Exception]]:

@@ -215,7 +215,7 @@ class Client:
         self.user_devices_cache_lock = asyncio.Lock()
 
         # TODO: Type hint for recent_messages_map keys and values
-        self.recent_messages_map: Dict[Any, Any] = {}
+        self.recent_messages_map: Dict[RecentMessageKey, RecentMessage] = {}
         # Go: [recentMessagesSize]recentMessageKey (fixed-size array) -> Python: List[recentMessageKey] (dynamic list)
         # This is a behavioral difference. If fixed size is critical, a different Python structure might be needed.
         # TODO: Type hint for recent_messages_list items

@@ -2030,18 +2030,15 @@ async def encrypt_message_for_device(
             raise Exception(f"failed to check session existence") from e
 
     # Encrypt the message
-    try:
-        padded_message = pad_message(plaintext)
-        # You'll need to find the correct encryption function in your signal_protocol library
-        # This might be something like:
-        ciphertext = session_cipher.message_encrypt(
-            protocol_store=client.signal_store,
-            remote_address=remote_address,
-            msg=padded_message
-        )
-        # OR it might be a different function - check your stubs
-    except Exception as e:
-        raise Exception(f"cipher encryption failed") from e
+    padded_message = pad_message(plaintext)
+    # You'll need to find the correct encryption function in your signal_protocol library
+    # This might be something like:
+    ciphertext = session_cipher.message_encrypt(
+        protocol_store=client.signal_store,
+        remote_address=remote_address,
+        msg=padded_message
+    )
+    # OR it might be a different function - check your stubs
 
     # Set up encryption attributes
     enc_attrs = {

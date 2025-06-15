@@ -10,13 +10,12 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-
 from ..generated.waCommon import WACommon_pb2
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
 from ..types import jid
 from ..util.cbcutil import encrypt_cbc
-from .hash import HashState, WAPatchName, concat_and_hmac, generate_content_mac, generate_patch_mac
+from .hash import HashState, concat_and_hmac, generate_content_mac, generate_patch_mac
 from .keys import (
     INDEX_ARCHIVE,
     INDEX_LABEL_ASSOCIATION_CHAT,

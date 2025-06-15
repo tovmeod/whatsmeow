@@ -1,4 +1,4 @@
-from typing import Any, Union, Optional, List, Dict, Tuple
+from typing import Tuple
 
 # Module-level functions
 def generate_keypair() -> Tuple[bytes, bytes]: ...

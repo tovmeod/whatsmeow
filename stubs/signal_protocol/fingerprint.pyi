@@ -1,4 +1,3 @@
-from typing import Any, Union, Optional, List, Dict, Tuple
 from signal_protocol.identity_key import IdentityKey
 
 class Fingerprint:

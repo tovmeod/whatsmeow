@@ -500,10 +500,7 @@ async def download_and_decrypt(
 
     validate_media(iv, ciphertext, mac_key, mac)
 
-    try:
-        data = decrypt(cipher_key, iv, ciphertext)
-    except Exception as e:
-        raise DownloadError(f"failed to decrypt file") from e
+    data = decrypt(cipher_key, iv, ciphertext)
 
     if file_length >= 0 and len(data) != file_length:
         raise ErrFileLengthMismatch(file_length, len(data))  # custom error assumed to exist

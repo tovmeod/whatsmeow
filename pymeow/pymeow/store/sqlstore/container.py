@@ -125,9 +125,9 @@ class Container:
             # Delete device and cascade to related tables
             await DeviceModel.filter(id=jid).delete()
             # Additional cleanup for related tables
-            from .models.session import IdentityKeyModel, SessionModel, PreKeyModel, SenderKeyModel
-            from .models.contacts import ContactModel
             from .models.appstate import AppStateSyncKeyModel, AppStateVersionModel
+            from .models.contacts import ContactModel
+            from .models.session import IdentityKeyModel, PreKeyModel, SenderKeyModel, SessionModel
 
             await IdentityKeyModel.filter(our_jid=jid).delete()
             await SessionModel.filter(our_jid=jid).delete()

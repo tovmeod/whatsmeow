@@ -321,7 +321,7 @@ async def mark_read(
             content=children
         )]
 
-    return client.send_node(node)
+    return await client.send_node(node)
 
 
 def set_force_active_delivery_receipts(

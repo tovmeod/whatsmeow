@@ -268,7 +268,7 @@ async def handle_pair(client: "Client", device_identity_bytes: bytes, req_id: st
         ))
     except Exception as e:
         await client.store.delete()
-        raise Exception(f"failed to send pairing confirmation") from e
+        raise Exception("failed to send pairing confirmation") from e
 
 def verify_device_identity_account_signature(device_identity: WAAdv_pb2.ADVSignedDeviceIdentity,
                                            ikp: KeyPair, is_hosted_account: bool) -> bool:
