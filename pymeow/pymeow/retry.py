@@ -14,21 +14,17 @@ from signal_protocol.group_cipher import create_sender_key_distribution_message
 from signal_protocol.sender_keys import SenderKeyName
 
 from . import message, prekeys, send
-from .binary.attrs import Attrs
-from .binary.node import Node
 from .exceptions import ElementMissingError
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
-from .generated.waE2E.WAWebProtobufsE2E_pb2 import Message
 from .generated.waMsgApplication import WAMsgApplication_pb2
-from .send import NodeExtraParams, get_media_type_from_message, get_type_from_message
 
-# from .store import signal
-from .types.events import Receipt
 from .types.jid import DEFAULT_USER_SERVER, JID
 from .types.message import MessageID, MessageInfo
 
 if TYPE_CHECKING:
     from .client import Client
+    from .binary.node import Node
+    from .types.events import Receipt
 
 ECC_DJB_TYPE = 0x05  # Standard Curve25519 type identifier
 
@@ -135,7 +131,7 @@ async def get_recent_message(client: "Client", to: JID, message_id: MessageID) -
 
 async def get_message_for_retry(
     client: "Client",
-    receipt: Receipt,
+    receipt: 'Receipt',
     message_id: MessageID
 ) -> RecentMessage:
     """
@@ -228,6 +224,7 @@ async def handle_retry_receipt(
         ElementMissingError: If retry tag is missing
         Exception: Various encryption/session errors
     """
+    from .binary.node import Node
     retry_child, ok = node.get_optional_child_by_tag("retry")
     if not ok:
         raise ElementMissingError(tag="retry", in_location="retry receipt")
@@ -325,8 +322,8 @@ async def handle_retry_receipt(
     # Set up encryption attributes - simplified without MessageAttrs
     enc_attrs = {}
     if msg.wa is not None:
-        media_type = get_media_type_from_message(msg.wa)
-        message_type = get_type_from_message(msg.wa)
+        media_type = send.get_media_type_from_message(msg.wa)
+        message_type = send.get_type_from_message(msg.wa)
 
         if media_type != "":
             enc_attrs["mediatype"] = media_type
@@ -371,7 +368,7 @@ async def handle_retry_receipt(
     # Build message content
     if msg.wa is not None:
         content = send.get_message_content(
-            client, encrypted, msg.wa, attrs, include_device_identity, NodeExtraParams()
+            client, encrypted, msg.wa, attrs, include_device_identity, send.NodeExtraParams()
         )
     else:
         content = [
@@ -514,6 +511,7 @@ async def send_retry_receipt(
         info: The message info containing message details
         force_include_identity: Whether to force including identity information
     """
+    from .binary.node import Node
     id_str = node.attrs.get("id", "")
     children = node.get_children()
     retry_count_in_msg = 0

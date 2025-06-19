@@ -5,28 +5,27 @@ Port of whatsmeow/receipt.go - uses composition pattern instead of mixins.
 Each function receives the client as the first argument.
 """
 
-import asyncio
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from . import message, privacysettings, retry
-from .binary.node import Attrs, Node
 from .exceptions import ElementMissingError
-from .types import ReceiptType
 from .types.botmap import BOT_JID_MAP
-from .types.events import Receipt
 from .types.events.events import ReceiptTypeRead
 from .types.jid import BOT_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, JID, MESSENGER_SERVER, NEWSLETTER_SERVER
 from .types.message import MessageID, MessageInfo
 
 if TYPE_CHECKING:
     from .client import Client
+    from .binary.node import Attrs, Node
+    from .types import ReceiptType
+    from .types.events import Receipt
 
 logger = logging.getLogger(__name__)
 
 
-async def handle_receipt(client: 'Client', node: Node) -> None:
+async def handle_receipt(client: 'Client', node: 'Node') -> None:
     """
     Port of Go method handleReceipt from receipt.go.
 
@@ -40,7 +39,7 @@ async def handle_receipt(client: 'Client', node: Node) -> None:
     # TODO: Review parse_receipt implementation
     # TODO: Review handle_retry_receipt implementation
     # TODO: Review dispatch_event implementation
-
+    from .types import ReceiptType
     try:
         receipt, err = await parse_receipt(client, node)
         if err is not None:
@@ -65,7 +64,7 @@ async def handle_receipt(client: 'Client', node: Node) -> None:
         client.create_task(send_ack(client, node))
 
 
-async def handle_grouped_receipt(client: 'Client', partial_receipt: Receipt, participants: Node) -> None:
+async def handle_grouped_receipt(client: 'Client', partial_receipt: 'Receipt', participants: 'Node') -> None:
     """
     Port of Go method handleGroupedReceipt from receipt.go.
 
@@ -102,7 +101,7 @@ async def handle_grouped_receipt(client: 'Client', partial_receipt: Receipt, par
         await client.dispatch_event(receipt)
 
 
-async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt], Optional[Exception]]:
+async def parse_receipt(client: 'Client', node: 'Node') -> Tuple[Optional['Receipt'], Optional[Exception]]:
     """
     Port of Go method parseReceipt from receipt.go.
 
@@ -121,7 +120,8 @@ async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt]
     # TODO: Review ReceiptType implementation
     # TODO: Review ElementMissingError implementation
     # TODO: Review handle_grouped_receipt implementation
-
+    from .types import ReceiptType
+    from .types.events import Receipt
     ag = node.attr_getter()
     source = await message.parse_message_source(client, node, False)
     receipt = Receipt(
@@ -184,7 +184,7 @@ async def parse_receipt(client: 'Client', node: Node) -> Tuple[Optional[Receipt]
 #         return lambda: None
 
 
-async def send_ack(client: 'Client', node: Node) -> None:
+async def send_ack(client: 'Client', node: 'Node') -> None:
     """
     Port of Go method sendAck from receipt.go.
 
@@ -199,7 +199,7 @@ async def send_ack(client: 'Client', node: Node) -> None:
     # TODO: Review send_node implementation
     # TODO: Review BotServer constant
     # TODO: Review BotJIDMap implementation
-
+    from .binary.node import Attrs, Node
     attrs = Attrs({
         "class": node.tag,
         "id": node.attrs["id"],
@@ -234,7 +234,7 @@ async def mark_read(
     timestamp: datetime,
     chat: JID,
     sender: JID,
-    *receipt_type_extra: ReceiptType
+    *receipt_type_extra: 'ReceiptType'
 ) -> None:
     """
     Port of Go method MarkRead from receipt.go.
@@ -267,7 +267,8 @@ async def mark_read(
     # TODO: Review Attrs implementation
     # TODO: Review get_privacy_settings implementation
     # TODO: Review send_node implementation
-
+    from .binary.node import Attrs, Node
+    from .types import ReceiptType
     if len(ids) == 0:
         raise Exception("no message IDs specified")
 
@@ -374,7 +375,8 @@ async def send_message_receipt(
     # TODO: Review RECEIPT_TYPE_* constants implementation
     # TODO: Review send_node implementation
     # TODO: Review Node implementation
-
+    from .binary.node import Attrs, Node
+    from .types import ReceiptType
     attrs = Attrs({
         "id": info.id,
     })

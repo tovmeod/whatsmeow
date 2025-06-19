@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING, Dict, List
 
 from . import request
 from .binary import node as binary_node
-from .exceptions import ErrIQNotFound, PymeowError
-from .request import InfoQuery, InfoQueryType
+from .exceptions import PymeowError
 from .types.jid import JID, SERVER_JID, STATUS_BROADCAST_JID
 from .types.user import StatusPrivacy, StatusPrivacyType
 
@@ -138,6 +137,7 @@ async def get_status_privacy(client: "Client") -> List[StatusPrivacy]:
     Raises:
         Exception: If there's an error getting the status privacy settings
     """
+    from .request import InfoQuery, InfoQueryType
     query = InfoQuery(
         namespace="status",
         type=InfoQueryType.GET,

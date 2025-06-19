@@ -10,11 +10,7 @@ from typing import List, Dict, Optional, TYPE_CHECKING, Any
 from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
 
 from . import request
-from .binary.node import Node, Attrs
 from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
-from .request import send_iq, InfoQuery, InfoQueryType
-from .types import MessageInfo
-from .types.events import PushName, BusinessName
 from .types.jid import JID, SERVER_JID, LEGACY_USER_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, MESSENGER_SERVER
 from .types.user import (
     BusinessMessageLinkTarget, ContactQRLinkTarget, IsOnWhatsAppResponse,
@@ -29,6 +25,8 @@ from .exceptions import (
 
 if TYPE_CHECKING:
     from .client import Client
+    from .binary.node import Node, Attrs
+    from .types import MessageInfo
 
 # Link prefixes
 BUSINESS_MESSAGE_LINK_PREFIX = "https://wa.me/message/"
@@ -62,6 +60,8 @@ async def resolve_business_message_link(client: 'Client', code: str) -> Optional
     The links look like https://wa.me/message/<code> or https://api.whatsapp.com/message/<code>.
     You can either provide the full link, or just the <code> part.
     """
+    from .binary.node import Node, Attrs
+    from .request import send_iq, InfoQuery, InfoQueryType
     code = code.removeprefix(BUSINESS_MESSAGE_LINK_PREFIX)
     code = code.removeprefix(BUSINESS_MESSAGE_LINK_DIRECT_PREFIX)
 
@@ -111,6 +111,8 @@ async def resolve_contact_qr_link(client: 'Client', code: str) -> Optional[Conta
     The links look like https://wa.me/qr/<code> or https://api.whatsapp.com/qr/<code>.
     You can either provide the full link, or just the <code> part.
     """
+    from .binary.node import Node, Attrs
+    from .request import send_iq, InfoQuery, InfoQueryType
     code = code.removeprefix(CONTACT_QR_LINK_PREFIX)
     code = code.removeprefix(CONTACT_QR_LINK_DIRECT_PREFIX)
 
@@ -151,6 +153,8 @@ async def get_contact_qr_link(client: 'Client', revoke: bool = False) -> str:
     If the revoke parameter is set to True, it will ask the server to revoke the previous
     link and generate a new one.
     """
+    from .binary.node import Node, Attrs
+    from .request import send_iq, InfoQuery, InfoQueryType
     action = "revoke" if revoke else "get"
 
     resp = await send_iq(client, InfoQuery(
@@ -186,6 +190,8 @@ async def set_status_message(client: 'Client', msg: str) -> None:
     This is different from the ephemeral status broadcast messages. Use send_message to
     STATUS_BROADCAST_JID to send such messages.
     """
+    from .binary.node import Node
+    from .request import send_iq, InfoQuery, InfoQueryType
     await send_iq(client, InfoQuery(
         namespace="status",
         type=InfoQueryType.SET,
@@ -202,6 +208,7 @@ async def is_on_whatsapp(client: 'Client', phones: List[str]) -> List[IsOnWhatsA
     Check if the given phone numbers are registered on WhatsApp.
     The phone numbers should be in international format, including the `+` prefix.
     """
+    from .binary.node import Node
     jids = [JID(user=phone, server=LEGACY_USER_SERVER) for phone in phones]
 
     list_node = await usync(client, jids, "query", "interactive", [
@@ -242,6 +249,7 @@ async def is_on_whatsapp(client: 'Client', phones: List[str]) -> List[IsOnWhatsA
 
 async def get_user_info(client: 'Client', jids: List[JID]) -> Dict[JID, UserInfo]:
     """Get basic user info (avatar, status, verified business name, device list)."""
+    from .binary.node import Node, Attrs
     list_node = await usync(client, jids, "full", "background", [
         Node(tag="business", content=[Node(tag="verified_name")]),
         Node(tag="status"),
@@ -288,6 +296,8 @@ async def get_user_info(client: 'Client', jids: List[JID]) -> Dict[JID, UserInfo
 
 async def get_bot_list_v2(client: 'Client') -> List[BotListInfo]:
     """Get the list of available bots."""
+    from .binary.node import Node, Attrs
+    from .request import send_iq, InfoQuery, InfoQueryType
     resp = await send_iq(client, InfoQuery(
         to=SERVER_JID,
         namespace="bot",
@@ -315,6 +325,7 @@ async def get_bot_list_v2(client: 'Client') -> List[BotListInfo]:
 
 async def get_bot_profiles(client: 'Client', bot_info: List[BotListInfo]) -> List[BotProfileInfo]:
     """Get detailed profile information for bots."""
+    from .binary.node import Node, Attrs
     jids = [bot.bot_jid for bot in bot_info]
 
     list_node = await usync(client, jids, "query", "interactive", [
@@ -419,7 +430,7 @@ async def get_bot_profiles(client: 'Client', bot_info: List[BotListInfo]) -> Lis
     return profiles
 
 
-def parse_business_profile(node: Node) -> BusinessProfile:
+def parse_business_profile(node: 'Node') -> BusinessProfile:
     """Parse a business profile from a node."""
     profile_node = node.get_child_by_tag("profile")
 
@@ -499,6 +510,8 @@ def parse_business_profile(node: Node) -> BusinessProfile:
 
 async def get_business_profile(client: 'Client', jid: JID) -> BusinessProfile:
     """Get the profile info of a WhatsApp business account."""
+    from .binary.node import Node, Attrs
+    from .request import send_iq, InfoQuery, InfoQueryType
     resp = await send_iq(client, InfoQuery(
         type=InfoQueryType.GET,
         to=SERVER_JID,
@@ -533,6 +546,7 @@ async def get_user_devices(client: 'Client', jids: List[JID]) -> List[JID]:
 
 async def get_user_devices_context(client: 'Client', jids: List[JID]) -> List[JID]:
     """Get user devices with context support."""
+    from .binary.node import Node, Attrs
     if client is None:
         raise ErrClientIsNil()
 
@@ -583,6 +597,8 @@ async def get_profile_picture_info(client: 'Client', jid: JID, params: Optional[
 
     To get a community photo, you should pass `is_community=True`, as otherwise you may get a 401 error.
     """
+    from .binary.node import Node, Attrs
+    from .request import send_iq, InfoQuery, InfoQueryType
     attrs = Attrs({"query": "url"})
 
     if params is None:
@@ -687,7 +703,7 @@ async def handle_historical_push_names(client: 'Client', names: RepeatedComposit
             continue
 
 
-async def update_push_name(client: 'Client', user: JID, message_info: MessageInfo, name: str) -> None:
+async def update_push_name(client: 'Client', user: JID, message_info: 'MessageInfo', name: str) -> None:
     """
     Update push name for a user and dispatch event if changed.
 
@@ -697,6 +713,7 @@ async def update_push_name(client: 'Client', user: JID, message_info: MessageInf
         message_info: MessageInfo object associated with this update (can be None)
         name: The new push name
     """
+    from .types.events import PushName
     # Convert to non-AD JID for storage
     user = user.to_non_ad()
 
@@ -722,7 +739,7 @@ async def update_push_name(client: 'Client', user: JID, message_info: MessageInf
         logger.error(f"Failed to save push name of {user} in device store: {e}")
 
 
-async def update_business_name(client: 'Client', user: JID, message_info: MessageInfo, name: str) -> None:
+async def update_business_name(client: 'Client', user: JID, message_info: 'MessageInfo', name: str) -> None:
     """
     Update business name for a user and dispatch event if changed.
 
@@ -732,6 +749,7 @@ async def update_business_name(client: 'Client', user: JID, message_info: Messag
         message_info: MessageInfo object associated with this update (can be None)
         name: The new business name
     """
+    from .types.events import BusinessName
     try:
         # Store the business name and check if it changed
         changed, previous_name = await client.store.contacts.put_business_name(user, name)
@@ -753,7 +771,7 @@ async def update_business_name(client: 'Client', user: JID, message_info: Messag
         logger.error(f"Failed to save business name of {user} in device store: {e}")
 
 
-def parse_verified_name(business_node: Node) -> Optional[VerifiedName]:
+def parse_verified_name(business_node: 'Node') -> Optional[VerifiedName]:
     """Parse verified name from business node."""
     if business_node.tag != "business":
         return None
@@ -765,7 +783,7 @@ def parse_verified_name(business_node: Node) -> Optional[VerifiedName]:
     return parse_verified_name_content(verified_name_node)
 
 
-def parse_verified_name_content(verified_name_node: Node) -> Optional[VerifiedName]:
+def parse_verified_name_content(verified_name_node: 'Node') -> Optional[VerifiedName]:
     """Parse verified name content."""
     if not isinstance(verified_name_node.content, bytes):
         return None
@@ -776,7 +794,7 @@ def parse_verified_name_content(verified_name_node: Node) -> Optional[VerifiedNa
     return VerifiedName()
 
 
-def parse_device_list(user: JID, device_node: Node) -> List[JID]:
+def parse_device_list(user: JID, device_node: 'Node') -> List[JID]:
     """Parse device list from node."""
     device_list = device_node.get_child_by_tag("device-list")
     if device_node.tag != "devices" or device_list.tag != "device-list":
@@ -795,7 +813,7 @@ def parse_device_list(user: JID, device_node: Node) -> List[JID]:
     return devices
 
 
-def parse_fb_device_list(user: JID, device_list: Node) -> Dict[str, Any]:
+def parse_fb_device_list(user: JID, device_list: 'Node') -> Dict[str, Any]:
     """Parse Facebook device list."""
     devices: List[JID] = []
     for device in device_list.get_children():
@@ -813,8 +831,10 @@ def parse_fb_device_list(user: JID, device_list: Node) -> Dict[str, Any]:
     }
 
 
-async def get_fbid_devices_internal(client: 'Client', jids: List[JID]) -> Node:
+async def get_fbid_devices_internal(client: 'Client', jids: List[JID]) -> 'Node':
     """Get Facebook ID devices internal."""
+    from .binary.node import Node, Attrs
+    from .request import send_iq, InfoQuery, InfoQueryType
     users = []
     for jid in jids:
         users.append(Node(
@@ -859,10 +879,12 @@ async def get_fbid_devices(client: 'Client', jids: List[JID]) -> List[JID]:
     return devices
 
 
-async def usync(client: 'Client', jids: List[JID], mode: str, context: str, query: List[Node], extras: Optional[UsyncQueryExtras] = None) -> Node:
+async def usync(client: 'Client', jids: List[JID], mode: str, context: str, query: List['Node'], extras: Optional[UsyncQueryExtras] = None) -> 'Node':
     """
     Perform a usync operation.
     """
+    from .binary.node import Node, Attrs
+    from .request import send_iq, InfoQuery, InfoQueryType
     if client is None:
         raise ErrClientIsNil()
 

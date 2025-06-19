@@ -14,9 +14,6 @@ from signal_protocol.identity_key import IdentityKey
 from signal_protocol.state import PreKeyBundle
 
 from . import request
-from .binary.node import Node
-from .request import InfoQuery, InfoQueryType
-from .types import JID
 from .util.keys.keypair import KeyPair, PreKey
 
 # Constants matching Go implementation
@@ -26,6 +23,8 @@ DJB_TYPE = 5             # ecc.DjbType - curve25519 key type
 
 if TYPE_CHECKING:
     from .client import Client
+    from .binary.node import Node
+    from .types import JID
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +62,8 @@ async def get_server_pre_key_count(client: "Client") -> int:
     #       (especially error reporting) align with Go's sendIQ.
     # TODO: Review client.server_jid to ensure it's the correct equivalent of types.ServerJID.
     # TODO: Review Node class and its methods like get_child_by_tag and attribute access.
-
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     resp_node = await request.send_iq(
         client,
         InfoQuery(namespace="encrypt", type=InfoQueryType.GET,
@@ -90,6 +90,8 @@ async def upload_prekeys(client: "Client") -> None:
     Args:
         client: The client instance.
     """
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     # Go: cli.uploadPreKeysLock.Lock() / defer cli.uploadPreKeysLock.Unlock()
     async with client.upload_prekeys_lock:
         # Go: if cli.lastPreKeyUpload.Add(10 * time.Minute).After(time.Now()) { ... }
@@ -172,8 +174,8 @@ async def upload_prekeys(client: "Client") -> None:
 
 async def fetch_pre_keys(
     client: "Client",
-    users: List[JID]
-) -> Dict[JID, PreKeyResp]:
+    users: List['JID']
+) -> Dict['JID', PreKeyResp]:
     """
     Port of Go's (*Client).fetchPreKeys method.
 
@@ -197,7 +199,8 @@ async def fetch_pre_keys(
     # TODO: Review client.server_jid to ensure it's the correct equivalent of types.ServerJID.
     # TODO: Review Node class for attribute naming (e.g., attributes vs. Attrs).
     # TODO: Review JID type for how it's represented as a string in Node attributes.
-
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     # Go: requests := make([]waBinary.Node, len(users))
     request_nodes: List[Node] = []
     for user_jid in users:
@@ -292,7 +295,7 @@ async def fetch_pre_keys(
     # Go: return respData, nil
     return resp_data
 
-def pre_key_to_node(key: PreKey) -> Node:
+def pre_key_to_node(key: PreKey) -> 'Node':
     """Port of Go's preKeyToNode function.
 
     Convert a pre-key to a binary Node with proper key ID encoding.
@@ -557,7 +560,7 @@ async def node_to_pre_key(node: "Node") -> Tuple[Optional[PreKey], Optional[Exce
         # Specific ValueErrors are returned above for known issues.
         return None, RuntimeError(f"unexpected error parsing prekey node: {e}")
 
-def pre_keys_to_nodes(pre_keys: List[PreKey]) -> List[Node]:
+def pre_keys_to_nodes(pre_keys: List[PreKey]) -> List['Node']:
     """Port of Go's preKeysToNodes function.
 
     Convert a list of pre-keys to a list of nodes.

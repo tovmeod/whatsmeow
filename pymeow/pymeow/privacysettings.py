@@ -5,19 +5,17 @@ Port of whatsmeow/privacysettings.go
 """
 import logging
 from dataclasses import dataclass
-from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 from . import request
 from .exceptions import ElementMissingError, ErrClientIsNil
-from .request import InfoQuery, InfoQueryType
-from .types.events import PrivacySettingsEvent
 from .types.jid import SERVER_JID
 
 if TYPE_CHECKING:
     from .binary.node import Node
     from .client import Client
+    from .types.events import PrivacySettingsEvent
 
 class PrivacySettingType(str, Enum):
     """Types of WhatsApp privacy settings."""
@@ -79,6 +77,7 @@ async def try_fetch_privacy_settings(
     # TODO: Review ElementMissingError implementation
     # TODO: Review parse_privacy_settings implementation
     from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
 
     if client is None:
         raise ErrClientIsNil
@@ -255,7 +254,7 @@ def parse_privacy_settings(
     client: 'Client',
     privacy_node: 'Node',
     settings: PrivacySettings
-) -> PrivacySettingsEvent:
+) -> 'PrivacySettingsEvent':
     """
     Port of Go method parsePrivacySettings from privacy.go.
 
@@ -277,7 +276,7 @@ def parse_privacy_settings(
     # TODO: Review PrivacySettingType implementation
     # TODO: Review PrivacySetting implementation
     # TODO: Review PRIVACY_SETTING_TYPE_* constants implementation
-
+    from .types.events import PrivacySettingsEvent
     evt = PrivacySettingsEvent()
 
     for child in privacy_node.get_children():

@@ -21,7 +21,6 @@ from signal_protocol import session, session_cipher
 from signal_protocol.error import SignalProtocolException
 
 from . import prekeys
-from .binary.node import Attrs, Node
 from .broadcast import get_broadcast_list_participants
 from .exceptions import (
     ErrInvalidInlineBotID,
@@ -38,7 +37,6 @@ from .group import get_cached_group_data, send_group_iq
 from .message import clear_untrusted_identity, migrate_session_store, pad_message
 from .msgsecret import apply_bot_message_hkdf
 from .prekeys import fetch_pre_keys
-from .request import InfoQueryType, cancel_response, is_disconnect_node, retry_frame, wait_response
 from .types import events
 from .types.jid import (
     BOT_SERVER,
@@ -55,6 +53,7 @@ from .user import get_user_devices_context
 
 if TYPE_CHECKING:
     from .client import Client
+    from .binary.node import Attrs, Node
 
 logger = logging.getLogger(__name__)
 
@@ -296,7 +295,8 @@ async def send_message(
     # TODO: Review ErrServerReturnedError implementation
 
     from . import retry
-
+    from .binary.node import Attrs, Node
+    from .request import cancel_response, is_disconnect_node, retry_frame, wait_response
 
     if len(extra) > 1:
         raise Exception("only one extra parameter may be provided to SendMessage")
@@ -831,6 +831,8 @@ async def set_disappearing_timer(
     # TODO: Review wrap_iq_error implementation
     # TODO: Review types.DEFAULT_USER_SERVER implementation
     # TODO: Review types.GROUP_SERVER implementation
+    from .binary.node import Attrs, Node
+    from .request import InfoQueryType
 
     if chat.server == DEFAULT_USER_SERVER:
         message = waE2E_pb2.Message()
@@ -918,6 +920,7 @@ async def send_newsletter(
     # TODO: Review marshal_message implementation
     # TODO: Review get_media_type_from_message implementation
     # TODO: Review send_node_and_get_data implementation
+    from .binary.node import Attrs, Node
     attrs = Attrs({
         "to": str(to),
         "id": str(id),
@@ -1004,6 +1007,7 @@ async def send_group(
     # TODO: Review getMediaTypeFromMessage implementation
     # TODO: Review waBinary.Node implementation
     # TODO: Review waBinary.Attrs implementation
+    from .binary.node import Attrs, Node
 
     start = time.time()
     plaintext, _ = marshal_message(to, message)
@@ -1077,6 +1081,8 @@ async def send_peer_message(
     Returns:
         Message data bytes
     """
+    from .binary.node import Attrs, Node
+
     start_time = time.time()
 
     # Marshal the message
@@ -1382,7 +1388,7 @@ def get_button_type_from_message(msg: waE2E_pb2.Message) -> str:
         return ""
 
 
-def get_button_attributes(msg: waE2E_pb2.Message) -> Attrs:
+def get_button_attributes(msg: waE2E_pb2.Message) -> 'Attrs':
     """
     Port of Go function getButtonAttributes from client.go.
 
@@ -1396,6 +1402,7 @@ def get_button_attributes(msg: waE2E_pb2.Message) -> Attrs:
         waBinary.Attrs dictionary containing button attributes
     """
     # TODO: Review waBinary.Attrs implementation
+    from .binary.node import Attrs, Node
 
     # Case 1: ViewOnceMessage - recurse on inner message
     if msg.viewOnceMessage is not None:
@@ -1484,7 +1491,7 @@ async def prepare_peer_message_node(
     id: MessageID,
     message: waE2E_pb2.Message,
     timings: MessageDebugTimings,
-) -> Tuple[Optional[Node], Optional[Exception]]:
+) -> Tuple[Optional['Node'], Optional[Exception]]:
     """
     Port of Go method preparePeerMessageNode from client.go.
 
@@ -1505,6 +1512,7 @@ async def prepare_peer_message_node(
     # TODO: Review waBinary.Node implementation
     # TODO: Review encrypt_message_for_device implementation
     # TODO: Review make_device_identity_node implementation
+    from .binary.node import Attrs, Node
 
     attrs = Attrs({
         "id": id,
@@ -1544,12 +1552,12 @@ async def prepare_peer_message_node(
 
 def get_message_content(
     client: 'Client',
-    base_node: Node,
+    base_node: 'Node',
     message: waE2E_pb2.Message,
-    msg_attrs: Attrs,
+    msg_attrs: 'Attrs',
     include_identity: bool,
     extra_params: NodeExtraParams,
-) -> List[Node]:
+) -> List['Node']:
     """
     Port of Go method getMessageContent from client.go.
 
@@ -1572,6 +1580,7 @@ def get_message_content(
     # TODO: Review get_button_attributes implementation
     # TODO: Review waBinary.Node implementation
     # TODO: Review waBinary.Attrs implementation
+    from .binary.node import Attrs, Node
 
     content = [base_node]
 
@@ -1618,7 +1627,7 @@ async def prepare_message_node(
     dsm_plaintext: Optional[bytes],
     timings: MessageDebugTimings,
     extra_params: NodeExtraParams,
-) -> Tuple[Node, List[JID]]:
+) -> Tuple['Node', List[JID]]:
     """
     Port of Go method prepareMessageNode from client.go.
 
@@ -1650,6 +1659,7 @@ async def prepare_message_node(
     # TODO: Review waBinary.Node implementation
     # TODO: Review waBinary.Attrs implementation
     # TODO: Review events.DecryptFailHide implementation
+    from .binary.node import Attrs, Node
 
     start = time.time()
     all_devices = await get_user_devices_context(client, participants)
@@ -1737,7 +1747,7 @@ def marshal_message(to_jid: JID, message: Optional[waE2E_pb2.Message]) -> Tuple[
     # - For most regular messages, DSM is not needed
     return message_bytes, dsm_plaintext
 
-def make_device_identity_node(client: 'Client') -> Node:
+def make_device_identity_node(client: 'Client') -> 'Node':
     """
     Port of Go method makeDeviceIdentityNode from client.go.
 
@@ -1752,6 +1762,7 @@ def make_device_identity_node(client: 'Client') -> Node:
     Raises:
         Exception: If device identity marshaling fails
     """
+    from .binary.node import Node
     device_identity = client.store.account.SerializeToString()
     return Node(
         tag="device-identity",
@@ -1765,8 +1776,8 @@ async def encrypt_message_for_devices(
     id: MessageID,
     msg_plaintext: bytes,
     dsm_plaintext: Optional[bytes],
-    enc_attrs: Attrs
-) -> Tuple[List[Node], bool]:
+    enc_attrs: 'Attrs'
+) -> Tuple[List['Node'], bool]:
     """
     Port of Go method encryptMessageForDevices from send.go.
 
@@ -1869,8 +1880,8 @@ async def encrypt_message_for_device_and_wrap(
     wire_identity: JID,
     encryption_identity: JID,
     bundle: Optional[prekeys.PreKeyBundle],
-    enc_attrs: Attrs
-) -> Tuple[Node, bool]:
+    enc_attrs: 'Attrs'
+) -> Tuple['Node', bool]:
     """
     Port of Go method encryptMessageForDeviceAndWrap from send.go.
 
@@ -1893,6 +1904,7 @@ async def encrypt_message_for_device_and_wrap(
 
     """
     # TODO: Review Client.encrypt_message_for_device implementation
+    from .binary.node import Node
     node, include_device_identity = await encrypt_message_for_device(
         client ,plaintext, encryption_identity, bundle, enc_attrs
     )
@@ -1906,7 +1918,7 @@ async def encrypt_message_for_device_and_wrap(
     return wrapped_node, include_device_identity
 
 
-def copy_attrs(from_: Attrs, to: Attrs) -> None:
+def copy_attrs(from_: 'Attrs', to: 'Attrs') -> None:
     """
     Port of Go function copyAttrs from client.go.
 
@@ -1927,8 +1939,8 @@ async def encrypt_message_for_device(
     plaintext: bytes,
     to: JID,
     bundle: Optional[prekeys.PreKeyBundle],
-    extra_attrs: Optional[Attrs] = None
-) -> Tuple[Node, bool]:
+    extra_attrs: Optional['Attrs'] = None
+) -> Tuple['Node', bool]:
     """
     Port of Go method encryptMessageForDevice from send.go.
 
@@ -1950,6 +1962,7 @@ async def encrypt_message_for_device(
         ErrNoSession: When no session exists and no bundle provided
         Exception: Various encryption/session errors
     """
+    from .binary.node import Attrs, Node
     extra_attrs = extra_attrs or Attrs({})
     remote_address = to.signal_address()
     if bundle is not None:

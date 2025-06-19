@@ -7,14 +7,15 @@ import hashlib
 import hmac
 import struct
 from dataclasses import dataclass
-from typing import Awaitable, Callable, List, Optional, Sequence, Any
+from typing import Awaitable, Callable, List, Optional, Sequence, Any, TYPE_CHECKING
 
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
-from . import WAPatchName
 from .errors import ErrMissingPreviousSetValueOperation
 from .lthash import WAPatchIntegrity
 
+if TYPE_CHECKING:
+    from . import WAPatchName
 
 @dataclass
 class Mutation:
@@ -70,7 +71,7 @@ class HashState:
         WAPatchIntegrity.subtract_then_add_in_place(self.hash, removed, added)
         return warnings
 
-    def generate_snapshot_mac(self, name: WAPatchName, key: bytes) -> bytes:
+    def generate_snapshot_mac(self, name: 'WAPatchName', key: bytes) -> bytes:
         """
         Generate a snapshot MAC.
 
@@ -119,7 +120,7 @@ def concat_and_hmac(alg: Callable[[], Any], key: bytes, data: List[bytes]) -> by
     return h.digest()
 
 
-def generate_patch_mac(patch: WAServerSync_pb2.SyncdPatch, name: WAPatchName, key: bytes, version: int) -> bytes:
+def generate_patch_mac(patch: WAServerSync_pb2.SyncdPatch, name: 'WAPatchName', key: bytes, version: int) -> bytes:
     """
     Generate a patch MAC.
 

@@ -29,14 +29,14 @@ from .exceptions import (
 )
 from .generated.waCommon import WACommon_pb2
 from .generated.waE2E import WAWebProtobufsE2E_pb2
-from .types import JID, MessageInfo
-from .types.events import Message as MessageEvent
 from .types.message import MessageID
 from .util.gcmutil import gcm
 from .util.hkdfutil import hkdf
 
 if TYPE_CHECKING:
     from .client import Client
+    from .types import JID, MessageInfo
+    from .types.events import Message as MessageEvent
 
 # Message secret type constants - matching Go exactly
 ENC_SECRET_POLL_VOTE = "Poll Vote"
@@ -69,9 +69,9 @@ def apply_bot_message_hkdf(message_secret: bytes) -> bytes:
 
 def generate_msg_secret_key(
     modification_type: str,
-    modification_sender: JID,
+    modification_sender: 'JID',
     orig_msg_id: MessageID,
-    orig_msg_sender: JID,
+    orig_msg_sender: 'JID',
     orig_msg_secret: bytes
 ) -> Tuple[bytes, Optional[bytes]]:
     """Generate message secret key for encryption/decryption."""
@@ -93,8 +93,9 @@ def generate_msg_secret_key(
     return secret_key, additional_data
 
 
-def get_orig_sender_from_key(msg: MessageEvent, key: WACommon_pb2.MessageKey) -> JID:
+def get_orig_sender_from_key(msg: 'MessageEvent', key: WACommon_pb2.MessageKey) -> 'JID':
     """Get original sender from message key."""
+    from .types import JID
     if key.fromMe:
         # fromMe always means the poll and vote were sent by the same user
         # TODO this is wrong if the message key used @s.whatsapp.net, but the new event is from @lid
@@ -113,7 +114,7 @@ def get_orig_sender_from_key(msg: MessageEvent, key: WACommon_pb2.MessageKey) ->
         return sender
 
 
-def get_key_from_info(msg_info: MessageInfo) -> Dict[str, Any]:
+def get_key_from_info(msg_info: 'MessageInfo') -> Dict[str, Any]:
     """Create message key from message info."""
     creation_key = {
         'remote_jid': str(msg_info.chat),
@@ -138,7 +139,7 @@ def hash_poll_options(option_names: List[str]) -> List[bytes]:
 
 async def decrypt_msg_secret(
     client: 'Client',
-    msg: MessageEvent,
+    msg: 'MessageEvent',
     use_case: str,
     encrypted: MessageEncryptedSecret,
     orig_msg_key: WACommon_pb2.MessageKey
@@ -185,9 +186,9 @@ async def decrypt_msg_secret(
 
 async def encrypt_msg_secret(
     client: 'Client',
-    own_id: JID,
-    chat: JID,
-    orig_sender: JID,
+    own_id: 'JID',
+    chat: 'JID',
+    orig_sender: 'JID',
     orig_msg_id: MessageID,
     use_case: str,
     plaintext: bytes
@@ -220,8 +221,8 @@ async def decrypt_bot_message(
     message_secret: bytes,
     ms_msg: WAWebProtobufsE2E_pb2.MessageSecretMessage,
     message_id: MessageID,
-    target_sender_jid: JID,
-    info: MessageInfo
+    target_sender_jid: 'JID',
+    info: 'MessageInfo'
 ) -> bytes:
     """Decrypt a bot message."""
     new_key, additional_data = generate_msg_secret_key(

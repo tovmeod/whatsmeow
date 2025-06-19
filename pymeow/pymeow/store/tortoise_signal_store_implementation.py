@@ -1,14 +1,13 @@
 # from signal_protocol.storage import InMemSignalProtocolStore
 import asyncio
 import concurrent.futures
-from typing import List, Optional, Awaitable, TypeVar, Coroutine, Any
+from typing import List, Optional, TypeVar, Coroutine, Any
 
 import signal_protocol
 from tortoise.exceptions import DoesNotExist
 
 from signal_protocol import address, curve, state
 from signal_protocol.sender_keys import SenderKeyName, SenderKeyRecord
-from signal_protocol.state import SignedPreKeyRecord, SignedPreKeyId
 from signal_protocol.storage import InMemSignalProtocolStore
 from tortoise import fields
 from tortoise.models import Model
@@ -100,7 +99,8 @@ def run_async_in_sync_context(coro: Coroutine[Any, Any, T]) -> T:
         return asyncio.run(coro)
 
 
-class TortoiseSignalStore(InMemSignalProtocolStore):
+# class TortoiseSignalStore(InMemSignalProtocolStore):
+class TortoiseSignalStore:
     """
     Tortoise ORM-backed Signal Protocol store implementation.
 
@@ -258,18 +258,18 @@ class TortoiseSignalStore(InMemSignalProtocolStore):
     def get_signed_pre_key(self, signed_pre_key_id: int) -> state.SignedPreKeyRecord:
         """Load signed prekey from database."""
 
-        async def _get() -> SignedPreKeyRecord:
+        async def _get() -> state.SignedPreKeyRecord:
             signed_prekey = await SignalSignedPreKeyModel.filter(
                 key_id=int(signed_pre_key_id)
             ).first()
             if signed_prekey:
-                return SignedPreKeyRecord.deserialize(signed_prekey.key_data)
+                return state.SignedPreKeyRecord.deserialize(signed_prekey.key_data)
             raise Exception(f"SignedPreKey {signed_pre_key_id} not found")
 
         return run_async_in_sync_context(_get())
 
-    def save_signed_pre_key(self, signed_pre_key_id: SignedPreKeyId,
-                           record: SignedPreKeyRecord) -> None:
+    def save_signed_pre_key(self, signed_pre_key_id: int,
+                           record: state.SignedPreKeyRecord) -> None:
         """Load all signed prekeys."""
 
         async def _save() -> None:

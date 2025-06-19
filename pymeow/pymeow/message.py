@@ -7,7 +7,6 @@ import asyncio
 import hashlib
 import logging
 import os
-import time
 import traceback
 import zlib
 from datetime import datetime
@@ -20,17 +19,16 @@ from . import receipt
 from .appstate.keys import ALL_PATCH_NAMES
 from .armadillomessage import handle_decrypted_armadillo
 from .binary.attrs import Attrs
-from .binary.node import Node
 from .download import download
 from .exceptions import ErrNotLoggedIn
 from .generated import waE2E
 from .generated.waE2E import WAWebProtobufsE2E_pb2
+from .generated.waE2E.WAWebProtobufsE2E_pb2 import HistorySyncNotification
 from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
 from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .msgsecret import decrypt_bot_message
 from .receipt import send_message_receipt
 from .store import store
-from .types import JID, MessageInfo, ReceiptType, events
 from .types.jid import (
     BOT_SERVER,
     BROADCAST_SERVER,
@@ -53,6 +51,9 @@ from .types.message import (
 )
 from .user import handle_historical_push_names, parse_verified_name_content, update_business_name, update_push_name
 
+if TYPE_CHECKING:
+    from .types import JID, MessageInfo, ReceiptType, events
+
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -73,6 +74,7 @@ pb_serializer = None  # Will be set when store is initialized
 
 if TYPE_CHECKING:
     from .client import Client
+    from .binary.node import Node
 
 # Define EventAlreadyProcessed locally as it's defined in the Go code
 class EventAlreadyProcessed(Exception):
@@ -81,7 +83,7 @@ class EventAlreadyProcessed(Exception):
         super().__init__(message)
 
 
-async def handle_encrypted_message(client: 'Client', node: Node) -> None:
+async def handle_encrypted_message(client: 'Client', node: 'Node') -> None:
     """
     Port of Go method handleEncryptedMessage from client.go.
 
@@ -127,7 +129,7 @@ async def handle_encrypted_message(client: 'Client', node: Node) -> None:
         client.create_task(receipt.send_ack(client, node))
 
 
-async def parse_message_source(client: 'Client', node: Node, require_participant: bool) -> 'MessageSource':
+async def parse_message_source(client: 'Client', node: 'Node', require_participant: bool) -> 'MessageSource':
     """
     Port of Go method parseMessageSource from client.go.
 
@@ -155,7 +157,7 @@ async def parse_message_source(client: 'Client', node: Node, require_participant
     # TODO: Review types.AddressingMode implementation
     # TODO: Review types.AddressingModeLID implementation
     # TODO: Review ErrNotLoggedIn implementation
-
+    from .types import JID
     source = MessageSource()
 
     client_id = client.get_own_id()
@@ -277,7 +279,7 @@ def parse_msg_bot_info(node: 'Node') -> 'MsgBotInfo':
     return bot_info
 
 
-def parse_msg_meta_info(node: Node) -> Tuple[MsgMetaInfo, Optional[Exception]]:
+def parse_msg_meta_info(node: 'Node') -> Tuple[MsgMetaInfo, Optional[Exception]]:
     """
     Port of Go method parseMsgMetaInfo from message.go.
 
@@ -317,7 +319,7 @@ def parse_msg_meta_info(node: Node) -> Tuple[MsgMetaInfo, Optional[Exception]]:
     return meta_info, err
 
 
-async def parse_message_info(client: 'Client', node: Node) -> 'MessageInfo':
+async def parse_message_info(client: 'Client', node: 'Node') -> 'MessageInfo':
     """
     Port of Go method parseMessageInfo from client.go.
 
@@ -432,6 +434,7 @@ async def handle_plaintext_message(client: 'Client', info: 'MessageInfo', node: 
     # TODO: Review dispatch_event implementation
     # TODO: Review waE2E_pb2.Message implementation
 
+    from .types import events
     # TODO edits have an additional <meta msg_edit_t="1696321271735" original_msg_t="1696321248"/> node
     plaintext, ok = node.get_optional_child_by_tag("plaintext")
     if not ok:
@@ -468,7 +471,7 @@ async def handle_plaintext_message(client: 'Client', info: 'MessageInfo', node: 
     await client.dispatch_event(evt.unwrap_raw())
 
 
-async def migrate_session_store(client: 'Client', pn: JID, lid: JID) -> None:
+async def migrate_session_store(client: 'Client', pn: 'JID', lid: 'JID') -> None:
     """Migrate session store from phone number to LID.
 
     Args:
@@ -482,7 +485,7 @@ async def migrate_session_store(client: 'Client', pn: JID, lid: JID) -> None:
         logger.error(f"Failed to migrate signal store from {pn} to {lid}: {e}")
 
 
-async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> None:
+async def decrypt_messages(client: 'Client', info: 'MessageInfo', node: 'Node') -> None:
     """
     Port of Go method decryptMessages from client.go.
 
@@ -514,6 +517,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
     # TODO: Review EventAlreadyProcessed exception
     # TODO: Review signalerror.ErrNoSenderKeyForUser exception
     from signal_protocol import error as signal_error
+    from .types import events
 
     from . import retry
 
@@ -689,7 +693,7 @@ async def decrypt_messages(client: 'Client', info: MessageInfo, node: Node) -> N
 
 async def clear_untrusted_identity(
     client: 'Client',
-    target: JID
+    target: 'JID'
 ) -> None:
     """
     Port of Go method clearUntrustedIdentity from client.go.
@@ -783,8 +787,8 @@ async def buffered_decrypt(
 
 async def decrypt_dm(
     client: 'Client',
-    child: Node,
-    from_jid: JID,
+    child: 'Node',
+    from_jid: 'JID',
     is_pre_key: bool,
     server_ts: datetime
 ) -> Tuple[bytes, bytes]:
@@ -869,9 +873,9 @@ async def decrypt_dm(
 
 async def decrypt_group_msg(
     client: 'Client',
-    child: Node,
-    from_jid: JID,
-    chat: JID,
+    child: 'Node',
+    from_jid: 'JID',
+    chat: 'JID',
     server_ts: datetime
 ) -> Tuple[bytes, bytes]:
     """
@@ -1006,8 +1010,8 @@ def pad_message(plaintext: bytes) -> bytes:
 
 async def handle_sender_key_distribution_message(
     client: 'Client',
-    chat: JID,
-    from_jid: JID,
+    chat: 'JID',
+    from_jid: 'JID',
     axolotl_skdm: bytes
 ) -> None:
     """
@@ -1088,7 +1092,7 @@ async def handle_history_sync_notification_loop(client: 'Client') -> None:
 
 async def handle_history_sync_notification(
     client: 'Client',
-    notif: waE2E.HistorySyncNotification
+    notif: HistorySyncNotification
 ) -> None:
     """
     Port of Go method handleHistorySyncNotification from client.go.
@@ -1108,7 +1112,7 @@ async def handle_history_sync_notification(
     # TODO: Review store_historical_message_secrets implementation
     # TODO: Review dispatch_event implementation
     # TODO: Review proto.unmarshal implementation
-
+    from .types import JID, MessageInfo, ReceiptType, events
     history_sync: Optional[WAWebProtobufsHistorySync_pb2.HistorySync] = None
 
     try:
@@ -1309,7 +1313,7 @@ async def handle_placeholder_resend_response(
 
 async def handle_protocol_message(
     client: 'Client',
-    info: MessageInfo,
+    info: 'MessageInfo',
     msg: WAWebProtobufsE2E_pb2.Message
 ) -> None:
     """
@@ -1333,7 +1337,7 @@ async def handle_protocol_message(
     # TODO: Review handle_app_state_sync_key_share implementation
     # TODO: Review types.ReceiptTypeHistorySync implementation
     # TODO: Review types.ReceiptTypePeerMsg implementation
-
+    from .types import JID, MessageInfo, ReceiptType, events
     proto_msg = msg.protocolMessage
 
     # Handle history sync notification
@@ -1369,7 +1373,7 @@ async def handle_protocol_message(
 
 async def process_protocol_parts(
     client: 'Client',
-    info: MessageInfo,
+    info: 'MessageInfo',
     msg: WAWebProtobufsE2E_pb2.Message
 ) -> None:
     """
@@ -1425,7 +1429,7 @@ async def process_protocol_parts(
 
 async def store_message_secret(
     client: 'Client',
-    info: MessageInfo,
+    info: 'MessageInfo',
     msg: WAWebProtobufsE2E_pb2.Message
 ) -> None:
     """
@@ -1478,7 +1482,7 @@ async def store_historical_message_secrets(
     # TODO: Review get_own_id implementation
     # TODO: Review types.parse_jid implementation
     # TODO: Review types.DEFAULT_USER_SERVER implementation
-
+    from .types import JID
     secrets: List[store.MessageSecretInsert] = []
     privacy_tokens: List[store.PrivacyToken] = []
 
@@ -1551,7 +1555,7 @@ async def store_historical_message_secrets(
 
 async def handle_decrypted_message(
     client: 'Client',
-    info: MessageInfo,
+    info: 'MessageInfo',
     msg: WAWebProtobufsE2E_pb2.Message,
     retry_count: int
 ) -> None:
@@ -1572,7 +1576,7 @@ async def handle_decrypted_message(
     # TODO: Review process_protocol_parts implementation
     # TODO: Review events.Message implementation
     # TODO: Review dispatch_event implementation
-
+    from .types import events
     await process_protocol_parts(client, info, msg)
 
     evt = events.Message(
@@ -1587,7 +1591,7 @@ async def handle_decrypted_message(
 async def send_protocol_message_receipt(
     client: 'Client',
     id: MessageID,
-    msg_type: ReceiptType
+    msg_type: 'ReceiptType'
 ) -> None:
     """
     Port of Go method sendProtocolMessageReceipt from client.go.
@@ -1606,7 +1610,7 @@ async def send_protocol_message_receipt(
     # TODO: Review waBinary.Node implementation
     # TODO: Review types.new_jid implementation
     # TODO: Review types.LEGACY_USER_SERVER implementation
-
+    from .types import JID, MessageInfo, ReceiptType, events
     client_id = client.store.id
     if len(id) == 0 or client_id is None:
         return
@@ -1623,4 +1627,3 @@ async def send_protocol_message_receipt(
         ))
     except Exception as err:
         logger.warning("Failed to send acknowledgement for protocol message %s: %v", id, err)
-

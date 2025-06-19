@@ -6,9 +6,8 @@ Port of whatsmeow/group.go
 import logging
 from typing import TYPE_CHECKING, List, Optional
 
-from . import request, types
+from . import request
 from .binary.attrs import AttrUtility
-from .binary.node import Node
 from .exceptions import (
     ElementMissingError,
     ErrGroupInviteLinkUnauthorized,
@@ -17,19 +16,19 @@ from .exceptions import (
     ErrNotInGroup,
     IQError,
 )
-from .request import InfoQuery, InfoQueryType
 from .types.group import (
     GroupLinkTarget,
     GroupMemberAddMode,
     GroupName,
     GroupParticipantAddRequest,
-    GroupParticipantRequest,
+    GroupParticipantRequest, GroupInfo, GroupParticipant, GroupLinkChangeType,
 )
 from .types.jid import DEFAULT_USER_SERVER, GROUP_SERVER, GROUP_SERVER_JID, HIDDEN_USER_SERVER, SERVER_JID, JID
 from .types.message import AddressingMode
 
 if TYPE_CHECKING:
     from .client import Client, GroupMetaCache
+    from .binary.node import Node
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +52,11 @@ class ReqCreateGroup:
     def __init__(
         self,
         name: str,
-        participants: List[types.JID],
+        participants: List[JID],
         create_key: Optional[str] = None,
         is_parent: bool = False,
         default_membership_approval_mode: str = "",
-        linked_parent_jid: Optional[types.JID] = None
+        linked_parent_jid: Optional[JID] = None
     ):
         self.name = name
         self.participants = participants
@@ -81,11 +80,12 @@ class ParticipantRequestChange:
 
 async def send_group_iq(
     client: "Client",
-    iq_type: InfoQueryType,
-    jid: types.JID,
-    content: Node
-) -> Node:
+    iq_type: 'InfoQueryType',
+    jid: JID,
+    content: 'Node'
+) -> 'Node':
     """Send a group IQ request."""
+    from .request import InfoQuery
     res = await request.send_iq(client, InfoQuery(
         namespace="w:g2",
         type=iq_type,
@@ -95,7 +95,7 @@ async def send_group_iq(
     return res
 
 
-async def create_group(client: "Client", req: ReqCreateGroup) -> types.GroupInfo:
+async def create_group(client: "Client", req: ReqCreateGroup) -> GroupInfo:
     """Creates a group on WhatsApp with the given name and participants.
 
     Args:
@@ -108,7 +108,9 @@ async def create_group(client: "Client", req: ReqCreateGroup) -> types.GroupInfo
     Raises:
         Exception: If there's an error creating the group
     """
+    from .binary.node import Node
     from .send import generate_message_id
+    from .request import InfoQueryType
     participant_nodes = []
     for participant in req.participants:
         participant_nodes.append(Node(
@@ -155,15 +157,17 @@ async def create_group(client: "Client", req: ReqCreateGroup) -> types.GroupInfo
     return await parse_group_node(client, group_node)
 
 
-async def unlink_group(client: "Client", parent: types.JID, child: types.JID) -> None:
+async def unlink_group(client: "Client", parent: JID, child: JID) -> None:
     """Removes a child group from a parent community."""
+    from .binary.node import Node
+    from .request import InfoQueryType
     await send_group_iq(
         client,
         InfoQueryType.SET,
         parent,
         Node(
             tag="unlink",
-            attrs={"unlink_type": str(types.GroupLinkChangeType.SUB)},
+            attrs={"unlink_type": str(GroupLinkChangeType.SUB)},
             content=[Node(
                 tag="group",
                 attrs={"jid": child}
@@ -172,11 +176,13 @@ async def unlink_group(client: "Client", parent: types.JID, child: types.JID) ->
     )
 
 
-async def link_group(client: "Client", parent: types.JID, child: types.JID) -> None:
+async def link_group(client: "Client", parent: JID, child: JID) -> None:
     """Adds an existing group as a child group in a community.
 
     To create a new group within a community, set linked_parent_jid in the CreateGroup request.
     """
+    from .binary.node import Node
+    from .request import InfoQueryType
     await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -185,7 +191,7 @@ async def link_group(client: "Client", parent: types.JID, child: types.JID) -> N
             tag="links",
             content=[Node(
                 tag="link",
-                attrs={"link_type": str(types.GroupLinkChangeType.SUB)},
+                attrs={"link_type": str(GroupLinkChangeType.SUB)},
                 content=[Node(
                     tag="group",
                     attrs={"jid": child}
@@ -195,8 +201,10 @@ async def link_group(client: "Client", parent: types.JID, child: types.JID) -> N
     )
 
 
-async def leave_group(client: "Client", jid: types.JID) -> None:
+async def leave_group(client: "Client", jid: JID) -> None:
     """Leaves the specified group on WhatsApp."""
+    from .binary.node import Node
+    from .request import InfoQueryType
     await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -213,11 +221,13 @@ async def leave_group(client: "Client", jid: types.JID) -> None:
 
 async def update_group_participants(
     client: "Client",
-    jid: types.JID,
-    participant_changes: List[types.JID],
+    jid: JID,
+    participant_changes: List[JID],
     action: str
-) -> List[types.GroupParticipant]:
+) -> List[GroupParticipant]:
     """Can be used to add, remove, promote and demote members in a WhatsApp group."""
+    from .binary.node import Node
+    from .request import InfoQueryType
     content = []
     for participant_jid in participant_changes:
         content.append(Node(
@@ -247,8 +257,10 @@ async def update_group_participants(
     return participants
 
 
-async def get_group_request_participants(client: "Client", jid: types.JID) -> List[GroupParticipantRequest]:
+async def get_group_request_participants(client: "Client", jid: JID) -> List[GroupParticipantRequest]:
     """Gets the list of participants that have requested to join the group."""
+    from .binary.node import Node
+    from .request import InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -273,11 +285,13 @@ async def get_group_request_participants(client: "Client", jid: types.JID) -> Li
 
 async def update_group_request_participants(
     client: "Client",
-    jid: types.JID,
-    participant_changes: List[types.JID],
+    jid: JID,
+    participant_changes: List[JID],
     action: str
-) -> List[types.GroupParticipant]:
+) -> List[GroupParticipant]:
     """Can be used to approve or reject requests to join the group."""
+    from .binary.node import Node
+    from .request import InfoQueryType
     content = []
     for participant_jid in participant_changes:
         content.append(Node(
@@ -314,14 +328,14 @@ async def update_group_request_participants(
     return participants
 
 
-async def set_group_photo(client: "Client", jid: types.JID, avatar: Optional[bytes]) -> str:
+async def set_group_photo(client: "Client", jid: JID, avatar: Optional[bytes]) -> str:
     """Updates the group picture/icon of the given group on WhatsApp.
 
     The avatar should be a JPEG photo, other formats may be rejected with ErrInvalidImageFormat.
     The bytes can be None to remove the photo. Returns the new picture ID.
     """
-    from .client import InfoQuery
-
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     content = None
     if avatar is not None:
         content = [Node(
@@ -353,8 +367,10 @@ async def set_group_photo(client: "Client", jid: types.JID, avatar: Optional[byt
     return str(picture_id)
 
 
-async def set_group_name(client: "Client", jid: types.JID, name: str) -> None:
+async def set_group_name(client: "Client", jid: JID, name: str) -> None:
     """Updates the name (subject) of the given group on WhatsApp."""
+    from .binary.node import Node
+    from .request import InfoQueryType
     await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -368,7 +384,7 @@ async def set_group_name(client: "Client", jid: types.JID, name: str) -> None:
 
 async def set_group_topic(
     client: "Client",
-    jid: types.JID,
+    jid: JID,
     previous_id: str = "",
     new_id: str = "",
     topic: str = ""
@@ -380,6 +396,8 @@ async def set_group_topic(
     specified, one will be generated with Client.generate_message_id().
     """
     from .send import generate_message_id
+    from .binary.node import Node
+    from .request import InfoQueryType
     if not previous_id:
         old_info = await get_group_info(client, jid)
         previous_id = old_info.group_topic.topic_id
@@ -412,8 +430,10 @@ async def set_group_topic(
     )
 
 
-async def set_group_locked(client: "Client", jid: types.JID, locked: bool) -> None:
+async def set_group_locked(client: "Client", jid: JID, locked: bool) -> None:
     """Changes whether the group is locked (i.e. whether only admins can modify group info)."""
+    from .binary.node import Node
+    from .request import InfoQueryType
     tag = "locked" if locked else "unlocked"
     await send_group_iq(
         client,
@@ -423,8 +443,10 @@ async def set_group_locked(client: "Client", jid: types.JID, locked: bool) -> No
     )
 
 
-async def set_group_announce(client: "Client", jid: types.JID, announce: bool) -> None:
+async def set_group_announce(client: "Client", jid: JID, announce: bool) -> None:
     """Changes whether the group is in announce mode (i.e. whether only admins can send messages)."""
+    from .binary.node import Node
+    from .request import InfoQueryType
     tag = "announcement" if announce else "not_announcement"
     await send_group_iq(
         client,
@@ -434,11 +456,13 @@ async def set_group_announce(client: "Client", jid: types.JID, announce: bool) -
     )
 
 
-async def get_group_invite_link(client: "Client", jid: types.JID, reset: bool = False) -> str:
+async def get_group_invite_link(client: "Client", jid: JID, reset: bool = False) -> str:
     """Requests the invite link to the group from the WhatsApp servers.
 
     If reset is True, then the old invite link will be revoked and a new one generated.
     """
+    from .binary.node import Node
+    from .request import InfoQueryType
     iq_type = InfoQueryType.SET if reset else InfoQueryType.GET
 
     try:
@@ -461,16 +485,18 @@ async def get_group_invite_link(client: "Client", jid: types.JID, reset: bool = 
 
 async def get_group_info_from_invite(
     client: "Client",
-    jid: types.JID,
-    inviter: types.JID,
+    jid: JID,
+    inviter: JID,
     code: str,
     expiration: int
-) -> types.GroupInfo:
+) -> GroupInfo:
     """Gets the group info from an invite message.
 
     Note that this is specifically for invite messages, not invite links.
     Use get_group_info_from_link for resolving chat.whatsapp.com links.
     """
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -497,8 +523,8 @@ async def get_group_info_from_invite(
 
 async def join_group_with_invite(
     client: "Client",
-    jid: types.JID,
-    inviter: types.JID,
+    jid: JID,
+    inviter: JID,
     code: str,
     expiration: int
 ) -> None:
@@ -507,6 +533,8 @@ async def join_group_with_invite(
     Note that this is specifically for invite messages, not invite links.
     Use join_group_with_link for joining with chat.whatsapp.com links.
     """
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -525,11 +553,13 @@ async def join_group_with_invite(
     )
 
 
-async def get_group_info_from_link(client: "Client", code: str) -> types.GroupInfo:
+async def get_group_info_from_link(client: "Client", code: str) -> GroupInfo:
     """Gets the group info from an invite link.
 
     Note that this is specifically for invite links. Use get_group_info_from_invite for invite messages.
     """
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -552,6 +582,8 @@ async def join_group_with_link(client: "Client", code: str) -> Optional[JID]:
 
     Returns the JID of the joined group.
     """
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -573,8 +605,10 @@ async def join_group_with_link(client: "Client", code: str) -> Optional[JID]:
     return JID.from_string(group_jid)
 
 
-async def get_joined_groups(client: "Client") -> List[types.GroupInfo]:
+async def get_joined_groups(client: "Client") -> List[GroupInfo]:
     """Gets the list of groups the user has joined."""
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -594,8 +628,10 @@ async def get_joined_groups(client: "Client") -> List[types.GroupInfo]:
     return groups
 
 
-async def get_sub_groups(client: "Client", jid: types.JID) -> List[GroupLinkTarget]:
+async def get_sub_groups(client: "Client", jid: JID) -> List[GroupLinkTarget]:
     """Gets the subgroups of a community."""
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -615,8 +651,10 @@ async def get_sub_groups(client: "Client", jid: types.JID) -> List[GroupLinkTarg
     return subgroups
 
 
-async def get_linked_groups_participants(client: "Client", jid: types.JID) -> List[types.GroupParticipant]:
+async def get_linked_groups_participants(client: "Client", jid: JID) -> List[GroupParticipant]:
     """Gets participants from linked groups."""
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -636,14 +674,16 @@ async def get_linked_groups_participants(client: "Client", jid: types.JID) -> Li
     return participants
 
 
-async def get_group_info(client: "Client", jid: types.JID) -> types.GroupInfo:
+async def get_group_info(client: "Client", jid: JID) -> GroupInfo:
     """Gets group information for the specified group."""
     return await get_group_info_internal(client, jid, True)
 
 
-async def get_group_info_internal(client: "Client", jid: types.JID, lock_participant_cache: bool = True) -> types.GroupInfo:
+async def get_group_info_internal(client: "Client", jid: JID, lock_participant_cache: bool = True) -> GroupInfo:
     """Internal method to get group information and populate cache."""
+    from .binary.node import Node
     from .client import GroupMetaCache
+    from .request import InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -710,7 +750,7 @@ async def get_group_info_internal(client: "Client", jid: types.JID, lock_partici
     return group_info
 
 
-async def get_cached_group_data(client: "Client", jid: types.JID) -> GroupMetaCache:
+async def get_cached_group_data(client: "Client", jid: JID) -> 'GroupMetaCache':
     """Gets cached group data if available, fetches it if not."""
     async with client.group_cache_lock:
         if jid in client.group_cache:
@@ -723,7 +763,7 @@ async def get_cached_group_data(client: "Client", jid: types.JID) -> GroupMetaCa
     return group_meta_cache
 
 
-def parse_participant(child_ag: AttrUtility, child: Node) -> types.GroupParticipant:
+def parse_participant(child_ag: AttrUtility, child: 'Node') -> GroupParticipant:
     """
     Parse a participant node into a GroupParticipant object.
 
@@ -735,7 +775,7 @@ def parse_participant(child_ag: AttrUtility, child: Node) -> types.GroupParticip
         GroupParticipant object
     """
     pcp_type = child_ag.optional_string("type")
-    participant = types.GroupParticipant(
+    participant = GroupParticipant(
         is_admin=(pcp_type == "admin" or pcp_type == "superadmin"),
         is_super_admin=(pcp_type == "superadmin"),
         jid=child_ag.jid("jid"),
@@ -763,7 +803,7 @@ def parse_participant(child_ag: AttrUtility, child: Node) -> types.GroupParticip
     return participant
 
 
-async def parse_group_node(client: "Client", group_node: Node) -> types.GroupInfo:
+async def parse_group_node(client: "Client", group_node: 'Node') -> GroupInfo:
     """Parse a group node into GroupInfo.
 
     Args:
@@ -777,9 +817,9 @@ async def parse_group_node(client: "Client", group_node: Node) -> types.GroupInf
         Exception: If there's an error parsing the group node
     """
     ag = group_node.attr_getter()
-    group = types.GroupInfo(
+    group = GroupInfo(
         # Basic group information
-        jid=types.JID.new_jid(ag.string("id"), GROUP_SERVER)
+        jid=JID.new_jid(ag.string("id"), GROUP_SERVER)
     )
 
 
@@ -852,7 +892,7 @@ async def parse_group_node(client: "Client", group_node: Node) -> types.GroupInf
     return group
 
 
-def parse_group_link_target_node(client: "Client", node: Node) -> GroupLinkTarget:
+def parse_group_link_target_node(client: "Client", node: 'Node') -> GroupLinkTarget:
     """Parses a group link target node."""
     ag = node.attr_getter()
     return GroupLinkTarget(
@@ -861,7 +901,7 @@ def parse_group_link_target_node(client: "Client", node: Node) -> GroupLinkTarge
     )
 
 
-def parse_participant_list(node: Node) -> List[types.GroupParticipant]:
+def parse_participant_list(node: 'Node') -> List[GroupParticipant]:
     """Parses a list of participants from a group node."""
     participants = []
     for participant_node in node.get_children_by_tag("participant"):

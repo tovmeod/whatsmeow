@@ -12,9 +12,7 @@ from .. import download, request, send
 from ..binary import node as binary_node
 from ..exceptions import ErrAppStateUpdate
 from ..generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
-from ..request import InfoQuery, InfoQueryType
 from ..store.store import ContactEntry
-from ..types import JID, events
 from ..types.events.events import BaseEvent
 from . import encode, decode
 from .hash import Mutation, HashState
@@ -36,6 +34,7 @@ async def fetch_app_state(
     Fetch updates to the given type of app state. If full_sync is true, the current
     cached state will be removed and all app state patches will be re-fetched from the server.
     """
+    from ..types import events
     if client is None:
         raise ValueError("Client is None")
 
@@ -91,6 +90,7 @@ async def fetch_app_state(
 
 def filter_contacts(mutations: List[Any]) -> tuple[List[Any], List[Any]]:
     """Filter contact mutations from the list and return them separately."""
+    from ..types import JID
     filtered_mutations = []
     contacts = []
 
@@ -117,6 +117,7 @@ async def dispatch_app_state(
     emit_on_full_sync: bool
 ) -> None:
     """Dispatch app state mutation as events."""
+    from ..types import JID, events
     dispatch_evts = not full_sync or emit_on_full_sync
 
     # Only handle SET operations
@@ -343,6 +344,8 @@ async def fetch_app_state_patches(
     snapshot: bool
 ) -> Any:
     """Fetch app state patches from the server."""
+    from ..request import InfoQuery, InfoQueryType
+    from ..types import JID
     attrs = {
         "name": name,
         "return_snapshot": snapshot,
@@ -423,6 +426,8 @@ async def send_app_state(client: "Client", patch: Any) -> None:
     Send the given app state patch, then resyncs that app state type from the server
     to update local caches and send events for the updates.
     """
+    from ..request import InfoQuery, InfoQueryType
+    from ..types import JID
     if client is None:
         raise ValueError("Client is None")
 

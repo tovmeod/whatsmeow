@@ -4,7 +4,6 @@ from signal_protocol.identity_key import IdentityKey
 
 # Type aliases
 PreKeyId = int
-SignedPreKeyId = int
 
 # Module-level functions
 def generate_n_prekeys(n: int, id: PreKeyId) -> List["PreKeyRecord"]: ...

@@ -6,9 +6,8 @@ Port of whatsmeow/types/events/events.go
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
 
-from ...binary.node import Node
 from ...generated.waArmadilloApplication import WAArmadilloApplication_pb2 as WAArm_pb2
 from ...generated.waConsumerApplication import WAConsumerApplication_pb2
 from ...generated.waE2E import WAWebProtobufsE2E_pb2
@@ -27,6 +26,9 @@ ReceiptTypeRetry = ReceiptType.RETRY
 ReceiptTypeRead = ReceiptType.READ
 ReceiptTypeReadSelf = ReceiptType.READ_SELF
 ReceiptTypePlayed = ReceiptType.PLAYED
+
+if TYPE_CHECKING:
+    from ...binary.node import Node
 
 class BaseEvent:
     pass
@@ -263,7 +265,7 @@ class ConnectFailure(BaseEvent):
     """
     reason: ConnectFailureReason
     message: str
-    raw: Optional[Node] = None
+    raw: Optional['Node'] = None
 
     def permanent_disconnect_description(self) -> str:
         """Returns a description of the permanent disconnect reason."""
@@ -300,7 +302,7 @@ class StreamError(BaseEvent):
     Known codes are handled internally and emitted as different events (e.g. LoggedOut).
     """
     code: str
-    raw: Optional[Node] = None
+    raw: Optional['Node'] = None
 
 # Disconnected is emitted when the websocket is closed by the server.
 @dataclass
@@ -570,7 +572,7 @@ class GroupInfo:
     promote: List[JID] = field(default_factory=list)  # Users who were promoted to admins
     demote: List[JID] = field(default_factory=list)  # Users who were demoted to normal users
 
-    unknown_changes: List[Node] = field(default_factory=list)
+    unknown_changes: List['Node'] = field(default_factory=list)
 
 # Picture is emitted when a user's profile picture or group's photo is changed.
 @dataclass

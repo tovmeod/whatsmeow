@@ -12,18 +12,18 @@ from .generated.waMsgTransport import WAMsgTransport_pb2
 from .generated.waMsgApplication import WAMsgApplication_pb2
 from .generated.waMultiDevice import WAMultiDevice_pb2
 from .generated.waArmadilloApplication import WAArmadilloApplication_pb2
-from .types import MessageInfo
-from .types.events import FBMessage
 from .types.message import MessageID
 
 if TYPE_CHECKING:
     from .client import Client
+    from .types import MessageInfo
+    from .types.events import FBMessage
 
 logger = logging.getLogger(__name__)
 
 async def handle_decrypted_armadillo(
     client: 'Client',
-    info: MessageInfo,
+    info: 'MessageInfo',
     decrypted: bytes,
     retry_count: int
 ) -> bool:
@@ -77,7 +77,7 @@ async def handle_decrypted_armadillo(
     return True
 
 
-def decode_armadillo(data: bytes) -> Tuple[FBMessage, Optional[Exception]]:
+def decode_armadillo(data: bytes) -> Tuple['FBMessage', Optional[Exception]]:
     """
     Port of Go method decodeArmadillo from armadillomessage.go.
 
@@ -89,6 +89,8 @@ def decode_armadillo(data: bytes) -> Tuple[FBMessage, Optional[Exception]]:
     Returns:
         Tuple containing the decoded FBMessage and an optional error
     """
+    from .types import MessageInfo
+    from .types.events import FBMessage
     # Fixed: FBMessage requires info and message parameters
     # Use placeholder values that will be overwritten
     dec = FBMessage(

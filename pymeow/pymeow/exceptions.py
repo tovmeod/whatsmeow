@@ -4,11 +4,11 @@ Exceptions and error handling for the PyMeow WhatsApp Web client.
 This module defines custom exceptions used throughout the library.
 Port of whatsmeow/errors.go
 """
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from .binary.node import Node
-from .types import JID
-
+if TYPE_CHECKING:
+    from .binary.node import Node
+    from .types import JID
 
 class PymeowError(Exception):
     """Base exception for all PyMeow errors."""
@@ -127,7 +127,7 @@ class NoPrivacyTokenError(PymeowError):
     Port of Go's ErrNoPrivacyToken: "no privacy token stored"
     """
 
-    def __init__(self, jid: JID) -> None:
+    def __init__(self, jid: 'JID') -> None:
         super().__init__(f"no privacy token stored for {jid}")
 
 

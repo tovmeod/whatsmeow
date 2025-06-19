@@ -13,11 +13,10 @@ functionality as the Go implementation where DecodePatches is a method on the Pr
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple, TYPE_CHECKING
 
 from typing_extensions import Sequence
 
-from ..binary.node import Node
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
 from ..store.store import AppStateMutationMAC
@@ -28,8 +27,11 @@ from .errors import (
     ErrMismatchingLTHash,
     ErrMismatchingPatchMAC,
 )
-from .hash import HashState, Mutation, WAPatchName, concat_and_hmac, generate_content_mac, generate_patch_mac
-from .keys import ExpandedAppStateKeys, Processor
+from .hash import HashState, Mutation, concat_and_hmac, generate_content_mac, generate_patch_mac
+from .keys import ExpandedAppStateKeys, Processor, WAPatchName
+
+if TYPE_CHECKING:
+    from ..binary.node import Node
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,7 @@ class PatchList:
 DownloadExternalFunc = Callable[[WAServerSync_pb2.ExternalBlobReference], Awaitable[Optional[bytes]]]
 
 
-async def parse_snapshot_internal(collection: Node, download_external: DownloadExternalFunc) -> Optional[WAServerSync_pb2.SyncdSnapshot]:
+async def parse_snapshot_internal(collection: 'Node', download_external: DownloadExternalFunc) -> Optional[WAServerSync_pb2.SyncdSnapshot]:
     """
     Parse a snapshot from a binary node.
 
@@ -75,7 +77,7 @@ async def parse_snapshot_internal(collection: Node, download_external: DownloadE
     return downloaded
 
 
-async def parse_patch_list_internal(collection: Node, download_external: DownloadExternalFunc) -> List[WAServerSync_pb2.SyncdPatch]:
+async def parse_patch_list_internal(collection: 'Node', download_external: DownloadExternalFunc) -> List[WAServerSync_pb2.SyncdPatch]:
     """
     Parse patches from a binary node.
 
@@ -118,7 +120,7 @@ async def parse_patch_list_internal(collection: Node, download_external: Downloa
     return patches
 
 
-async def parse_patch_list(node: Node, download_external: DownloadExternalFunc) -> PatchList:
+async def parse_patch_list(node: 'Node', download_external: DownloadExternalFunc) -> PatchList:
     """
     Decode an XML node containing app state patches, including downloading any external blobs.
 

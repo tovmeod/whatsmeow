@@ -9,9 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, List
 
-from .binary.node import Node
 from .exceptions import ErrClientIsNil
-from .request import InfoQuery, InfoQueryType, send_iq
 from .types.jid import JID
 
 if TYPE_CHECKING:
@@ -84,6 +82,8 @@ async def query_media_conn(client: 'Client') -> MediaConn:
     Raises:
         Various exceptions: If the query fails or response is invalid
     """
+    from .binary.node import Node
+    from .request import InfoQuery, InfoQueryType, send_iq
     # Create info query for media connections
     query = InfoQuery(
         namespace="w:m",

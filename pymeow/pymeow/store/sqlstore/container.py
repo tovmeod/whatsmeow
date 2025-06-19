@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 from tortoise import Tortoise, transactions
 from tortoise.exceptions import DoesNotExist
 
-from ...types import JID
 from ...types.jid import EMPTY_JID
 from ...util.keys.keypair import KeyPair, PreKey
 from .config import get_tortoise_config
@@ -141,6 +140,8 @@ class Container:
 
     def _device_to_store(self, device: DeviceModel) -> 'Device':
         """Convert Device model to DeviceStore"""
+        from ...types import JID
+        from ...store.store import Device
         store = Device(self, device.jid)
         store.lid = JID(device.lid) if device.lid else EMPTY_JID
         store.registration_id = device.registration_id

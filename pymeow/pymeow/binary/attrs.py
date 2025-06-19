@@ -6,10 +6,9 @@ Port of whatsmeow/binary/attrs.go
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from .node import Node
-
 if TYPE_CHECKING:
     from ..types import JID
+    from .node import Node
 
 # Type alias for attributes (equivalent to Go's Attrs = map[string]any)
 Attrs = Dict[str, Any]
@@ -245,6 +244,6 @@ class ErrorList(Exception):
 
 
 # This would be added to the Node class in node.py:
-def attr_getter(node: Node) -> AttrUtility:
+def attr_getter(node: 'Node') -> AttrUtility:
     """AttrGetter returns the AttrUtility for this Node."""
     return AttrUtility(node.attrs)

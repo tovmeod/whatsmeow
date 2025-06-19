@@ -7,17 +7,20 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple, Awaitable
+from typing import Any, Dict, List, Optional, Tuple, Awaitable
+
+from PIL.GifImagePlugin import TYPE_CHECKING
 
 # Protobuf imports
 from ..generated.waAdv import WAAdv_pb2
-from ..types import ContactInfo
 
 # Internal imports
 from ..types.jid import EMPTY_JID, JID
 from ..util.keys.keypair import KeyPair, PreKey
 from .sqlstore.container import Container
 
+if TYPE_CHECKING:
+    from ..types import ContactInfo
 
 class IdentityStore(ABC):
     """Interface for storing identity keys."""
@@ -228,7 +231,7 @@ class ContactStore(ABC):
         pass
 
     @abstractmethod
-    async def get_contact(self, user: JID) -> ContactInfo:
+    async def get_contact(self, user: JID) -> 'ContactInfo':
         """Get contact info for a user."""
         pass
 
