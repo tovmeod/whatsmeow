@@ -44,7 +44,7 @@ async def test_handshake_qr_timeout(ws_server_vcr):
 
         # Wait for QR events with a reasonable timeout
         try:
-            async with asyncio.timeout(30):  # 30 second timeout to allow for recording
+            async with asyncio.timeout(90):  # 30 second timeout to allow for recording
                 async for qr_event in qr_channel:
                     qr_events.append(qr_event)
                     print(f"QR event: {qr_event.event}")

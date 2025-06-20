@@ -172,16 +172,40 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False):
                             logger.warning(f"Client message {expected_client_idx} differs from recording")
                         expected_client_idx += 1
                 elif msg.type == WSMsgType.CLOSE:
+                    logger.info("Client closed WebSocket connection during replay.")
                     break
         except Exception as e:
-            logger.error(f"Error in replay: {e}")
+            logger.error(f"Error in replay while handling client messages: {e}")
         finally:
-            server_task.cancel()
+            # Ensure server messages are processed or server_task is cancelled
+            if not server_task.done():
+                try:
+                    logger.debug("Waiting for server_task to complete...")
+                    await asyncio.wait_for(server_task, timeout=5.0) # Wait for task to complete
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout waiting for server_task to complete, cancelling.")
+                    server_task.cancel()
+                except Exception as e:
+                    logger.error(f"Error awaiting server_task: {e}")
+                    server_task.cancel() # Ensure cancellation on other errors
+            else:
+                # If task is done, retrieve exception if any to log it
+                try:
+                    server_task.result()
+                except Exception as e:
+                    logger.error(f"Server_task completed with an error: {e}")
+
+            logger.info("All server messages replayed or client disconnected, closing connection to client.")
+            if not ws.closed:
+                await ws.close()
 
     async def _send_server_messages(ws, server_messages):
         """Send server messages to client with appropriate timing."""
         for i, msg in enumerate(server_messages):
             try:
+                if ws.closed:
+                    logger.warning(f"WebSocket closed before sending server message {i}, stopping.")
+                    break
                 if msg["type"] == "text":
                     await ws.send_str(msg["payload"])
                     logger.debug(f"Sent server text message {i}")
@@ -189,15 +213,20 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False):
                     await ws.send_bytes(bytes.fromhex(msg["payload"]))
                     logger.debug(f"Sent server binary message {i}")
                 elif msg["type"] == "close":
-                    await ws.close()
+                    if not ws.closed:
+                        await ws.close()
                     logger.debug("Sent server close message")
                     break
 
                 # Add small delay between messages to simulate real timing
                 await asyncio.sleep(0.1)
-            except Exception as e:
-                logger.error(f"Error sending server message {i}: {e}")
+            except ConnectionResetError:
+                logger.warning(f"Connection reset while sending server message {i}. Client likely disconnected.")
                 break
+            except Exception as e: # Broad exception to catch errors like sending on closed socket
+                logger.error(f"Error sending server message {i} ('{msg.get('type', 'unknown')}') type: {e}")
+                break
+        logger.debug(f"Finished sending all {len(server_messages)} server messages.")
 
     app = web.Application()
     app.router.add_get("/ws", handler)
