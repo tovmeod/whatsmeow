@@ -29,7 +29,7 @@ from .generated.waWeb import WAWebProtobufsWeb_pb2
 from .msgsecret import decrypt_bot_message
 from .receipt import send_message_receipt
 from .store import store
-from .types.jid import (
+from .datatypes.jid import (
     BOT_SERVER,
     BROADCAST_SERVER,
     DEFAULT_USER_SERVER,
@@ -39,7 +39,7 @@ from .types.jid import (
     LEGACY_USER_SERVER,
     NEWSLETTER_SERVER,
 )
-from .types.message import (
+from .datatypes.message import (
     AddressingMode,
     BotEditType,
     EditAttribute,
@@ -52,7 +52,7 @@ from .types.message import (
 from .user import handle_historical_push_names, parse_verified_name_content, update_business_name, update_push_name
 
 if TYPE_CHECKING:
-    from .types import JID, MessageInfo, ReceiptType, events
+    from .datatypes import JID, MessageInfo, ReceiptType, events
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ async def parse_message_source(client: 'Client', node: 'Node', require_participa
     # TODO: Review types.AddressingMode implementation
     # TODO: Review types.AddressingModeLID implementation
     # TODO: Review ErrNotLoggedIn implementation
-    from .types import JID
+    from .datatypes import JID
     source = MessageSource()
 
     client_id = client.get_own_id()
@@ -434,7 +434,7 @@ async def handle_plaintext_message(client: 'Client', info: 'MessageInfo', node: 
     # TODO: Review dispatch_event implementation
     # TODO: Review waE2E_pb2.Message implementation
 
-    from .types import events
+    from .datatypes import events
     # TODO edits have an additional <meta msg_edit_t="1696321271735" original_msg_t="1696321248"/> node
     plaintext, ok = node.get_optional_child_by_tag("plaintext")
     if not ok:
@@ -517,7 +517,7 @@ async def decrypt_messages(client: 'Client', info: 'MessageInfo', node: 'Node') 
     # TODO: Review EventAlreadyProcessed exception
     # TODO: Review signalerror.ErrNoSenderKeyForUser exception
     from signal_protocol import error as signal_error
-    from .types import events
+    from .datatypes import events
 
     from . import retry
 
@@ -1112,7 +1112,7 @@ async def handle_history_sync_notification(
     # TODO: Review store_historical_message_secrets implementation
     # TODO: Review dispatch_event implementation
     # TODO: Review proto.unmarshal implementation
-    from .types import JID, MessageInfo, ReceiptType, events
+    from .datatypes import JID, MessageInfo, ReceiptType, events
     history_sync: Optional[WAWebProtobufsHistorySync_pb2.HistorySync] = None
 
     try:
@@ -1235,7 +1235,7 @@ async def handle_app_state_sync_key_share(
     # Fetch app state for all patch names
     for name in ALL_PATCH_NAMES:
         try:
-            from pymeow.pymeow.appstate import fetch_app_state
+            from py.pymeow.appstate import fetch_app_state
             await fetch_app_state(client, name, False, only_resync_if_not_synced)
         except Exception as err:
             logger.error("Failed to do initial fetch of app state %s: %v", name, err)
@@ -1337,7 +1337,7 @@ async def handle_protocol_message(
     # TODO: Review handle_app_state_sync_key_share implementation
     # TODO: Review types.ReceiptTypeHistorySync implementation
     # TODO: Review types.ReceiptTypePeerMsg implementation
-    from .types import JID, MessageInfo, ReceiptType, events
+    from .datatypes import JID, MessageInfo, ReceiptType, events
     proto_msg = msg.protocolMessage
 
     # Handle history sync notification
@@ -1482,7 +1482,7 @@ async def store_historical_message_secrets(
     # TODO: Review get_own_id implementation
     # TODO: Review types.parse_jid implementation
     # TODO: Review types.DEFAULT_USER_SERVER implementation
-    from .types import JID
+    from .datatypes import JID
     secrets: List[store.MessageSecretInsert] = []
     privacy_tokens: List[store.PrivacyToken] = []
 
@@ -1576,7 +1576,7 @@ async def handle_decrypted_message(
     # TODO: Review process_protocol_parts implementation
     # TODO: Review events.Message implementation
     # TODO: Review dispatch_event implementation
-    from .types import events
+    from .datatypes import events
     await process_protocol_parts(client, info, msg)
 
     evt = events.Message(
@@ -1610,7 +1610,7 @@ async def send_protocol_message_receipt(
     # TODO: Review waBinary.Node implementation
     # TODO: Review types.new_jid implementation
     # TODO: Review types.LEGACY_USER_SERVER implementation
-    from .types import JID, MessageInfo, ReceiptType, events
+    from .datatypes import JID, MessageInfo, ReceiptType, events
     client_id = client.store.id
     if len(id) == 0 or client_id is None:
         return

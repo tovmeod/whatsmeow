@@ -6,8 +6,8 @@ import unittest
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
-from pymeow.pymeow.binary import node as binary_node
-from pymeow.pymeow.request import (
+from py.pymeow.binary import node as binary_node
+from py.pymeow.request import (
     ErrIQTimedOut,
     InfoQuery,
     InfoQueryType,

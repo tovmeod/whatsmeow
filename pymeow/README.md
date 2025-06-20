@@ -92,10 +92,11 @@ await client.connect()
 ```python
 import asyncio
 import logging
-from pymeow import Client, AuthState
+from py import Client, AuthState
 
 # Enable debug logging
 logging.basicConfig(level=logging.DEBUG)
+
 
 async def main():
     # Initialize with authentication state
@@ -135,6 +136,7 @@ async def main():
     finally:
         await client.disconnect()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -145,7 +147,8 @@ Pymeow includes a robust message queue system with delivery tracking. Here's how
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
@@ -187,6 +190,7 @@ async def main():
     finally:
         await client.disconnect()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -197,7 +201,8 @@ Pymeow supports sending contact information using vCards or simple phone numbers
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
@@ -233,6 +238,7 @@ async def main():
     finally:
         await client.disconnect()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -243,16 +249,17 @@ Pymeow includes built-in rate limiting to help prevent being blocked by the serv
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
 
     # Configure rate limits (optional, defaults are sensible)
     client.set_rate_limits(
-        global_rate=1.0,           # 1 message per second globally
-        global_capacity=5,         # Allow bursts of up to 5 messages
-        per_recipient_rate=0.5,    # 1 message every 2 seconds per recipient
+        global_rate=1.0,  # 1 message per second globally
+        global_capacity=5,  # Allow bursts of up to 5 messages
+        per_recipient_rate=0.5,  # 1 message every 2 seconds per recipient
         per_recipient_capacity=10  # Allow bursts of up to 10 messages per recipient
     )
 
@@ -293,6 +300,7 @@ async def main():
         print("\n🛑 Disconnecting...")
     finally:
         await client.disconnect()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -589,7 +597,8 @@ Pymeow provides comprehensive message status tracking and read receipt functiona
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
@@ -640,6 +649,7 @@ async def main():
         client.remove_message_status_handler(handle_message_status)
         await client.disconnect()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -650,7 +660,8 @@ Pymeow supports advanced message features like disappearing messages and message
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
@@ -696,6 +707,7 @@ async def main():
     finally:
         await client.disconnect()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -706,7 +718,8 @@ Pymeow provides comprehensive message management features including editing, for
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
@@ -752,6 +765,7 @@ async def main():
     finally:
         await client.disconnect()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -762,7 +776,8 @@ Pymeow supports rich message interactions including reactions and replies:
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
@@ -803,6 +818,7 @@ async def main():
     finally:
         await client.disconnect()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -813,7 +829,8 @@ Pymeow provides powerful message history and search capabilities:
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
@@ -858,6 +875,7 @@ async def main():
     finally:
         await client.disconnect()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -868,7 +886,8 @@ Pymeow supports sending various types of media including images, videos, and doc
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def main():
     client = Client()
@@ -906,6 +925,7 @@ async def main():
 
         # Track upload progress
         print("\n📤 Uploading with progress tracking...")
+
         def progress_callback(uploaded: int, total: int):
             percent = (uploaded / total) * 100
             print(f"Upload progress: {percent:.1f}%")
@@ -920,6 +940,7 @@ async def main():
         print(f"❌ Error: {e}")
     finally:
         await client.disconnect()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -984,7 +1005,7 @@ The `Client` class is the main entry point for interacting with the Web API.
 #### Initialization
 
 ```python
-from pymeow import Client, AuthState
+from py import Client, AuthState
 
 # Basic initialization
 client = Client()
@@ -996,7 +1017,7 @@ import logging
 auth = AuthState()  # Persistent authentication state
 client = Client(
     auth_state=auth,  # Optional: for persistent sessions
-    session=None,     # Optional: custom aiohttp.ClientSession
+    session=None,  # Optional: custom aiohttp.ClientSession
     log_level=logging.INFO  # Logging level
 )
 ```
@@ -1020,7 +1041,7 @@ client = Client(
 The client handles authentication automatically using the Noise Protocol. You can manage the authentication state using the `AuthState` class:
 
 ```python
-from pymeow import AuthState
+from py import AuthState
 
 # Create a new auth state
 auth = AuthState()
@@ -1087,7 +1108,8 @@ await client.set_group_setting(group['id'], "ephemeral", 86400)  # 1 day
 You can customize the WebSocket connection by providing your own WebSocket client implementation:
 
 ```python
-from pymeow.websocket import WebSocketClient
+from py.websocket import WebSocketClient
+
 
 class CustomWebSocket(WebSocketClient):
     async def connect(self):
@@ -1098,9 +1120,16 @@ class CustomWebSocket(WebSocketClient):
         # Custom send logic
         pass
 
+
 ## Contact Management
 
-Pymeow provides comprehensive contact management capabilities. Here's how to work with contacts:
+Pymeow
+provides
+comprehensive
+contact
+management
+capabilities.Here
+'s how to work with contacts:
 
 ### Get Contact Information
 
@@ -1155,7 +1184,8 @@ Here's a complete example that demonstrates contact management:
 
 ```python
 import asyncio
-from pymeow import Client
+from py import Client
+
 
 async def manage_contacts():
     client = Client()
@@ -1193,6 +1223,7 @@ async def manage_contacts():
     finally:
         await client.disconnect()
 
+
 # Run the example
 if __name__ == "__main__":
     asyncio.run(manage_contacts())
@@ -1204,7 +1235,8 @@ Pymeow allows you to manage your privacy settings programmatically. Here's how t
 
 ```python
 import asyncio
-from pymeow import Client, PrivacySetting
+from py import Client, PrivacySetting
+
 
 async def manage_privacy():
     client = Client()
@@ -1245,6 +1277,7 @@ async def manage_privacy():
         print(f"Error: {e}")
     finally:
         await client.disconnect()
+
 
 # Run the example
 if __name__ == "__main__":

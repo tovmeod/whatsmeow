@@ -12,7 +12,7 @@ from .binary.node import Node
 from .prekeys import get_server_pre_key_count, upload_prekeys
 from .request import InfoQuery, InfoQueryType
 from .store.clientpayload import get_wa_version
-from .types import events, jid
+from .datatypes import events, jid
 
 if TYPE_CHECKING:
     from .client import Client

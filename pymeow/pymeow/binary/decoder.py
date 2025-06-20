@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from ..exceptions import PymeowError
-from ..types.jid import INTEROP_SERVER, JID, MESSENGER_SERVER
+from ..datatypes.jid import INTEROP_SERVER, JID, MESSENGER_SERVER
 from . import token
 from .errors import InvalidJIDTypeError, InvalidNodeError, InvalidTokenError, InvalidTypeError, NonStringKeyError
 from .node import Node

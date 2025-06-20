@@ -10,9 +10,9 @@ from typing import Optional
 from . import message
 from .binary.node import Attrs, Node
 from .exceptions import ErrNotLoggedIn, NoPrivacyTokenError, NoPushNameError
-from .types.events.events import ChatPresenceEvent, PresenceEvent
-from .types.jid import JID
-from .types.presence import ChatPresence, ChatPresenceMedia, Presence
+from .datatypes.events.events import ChatPresenceEvent, PresenceEvent
+from .datatypes.jid import JID
+from .datatypes.presence import ChatPresence, ChatPresenceMedia, Presence
 
 if typing.TYPE_CHECKING:
     from .client import Client

@@ -47,7 +47,7 @@ from typing import Any, List, Optional
 
 from .client import Client
 from .exceptions import ErrClientIsNil, ErrQRAlreadyConnected, ErrQRStoreContainsID
-from .types.events.events import (
+from .datatypes.events.events import (
     QR,
     ClientOutdated,
     Connected,

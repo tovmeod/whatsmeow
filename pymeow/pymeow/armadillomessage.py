@@ -12,12 +12,12 @@ from .generated.waMsgTransport import WAMsgTransport_pb2
 from .generated.waMsgApplication import WAMsgApplication_pb2
 from .generated.waMultiDevice import WAMultiDevice_pb2
 from .generated.waArmadilloApplication import WAArmadilloApplication_pb2
-from .types.message import MessageID
+from .datatypes.message import MessageID
 
 if TYPE_CHECKING:
     from .client import Client
-    from .types import MessageInfo
-    from .types.events import FBMessage
+    from .datatypes import MessageInfo
+    from .datatypes.events import FBMessage
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,8 @@ def decode_armadillo(data: bytes) -> Tuple['FBMessage', Optional[Exception]]:
     Returns:
         Tuple containing the decoded FBMessage and an optional error
     """
-    from .types import MessageInfo
-    from .types.events import FBMessage
+    from .datatypes import MessageInfo
+    from .datatypes.events import FBMessage
     # Fixed: FBMessage requires info and message parameters
     # Use placeholder values that will be overwritten
     dec = FBMessage(

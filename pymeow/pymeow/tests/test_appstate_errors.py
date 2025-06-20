@@ -1,7 +1,7 @@
 """Test application state error classes."""
 import pytest
 
-from pymeow.pymeow.appstate import (
+from py.pymeow.appstate import (
     AppStateError,
     ErrKeyNotFound,
     ErrMismatchingContentMAC,

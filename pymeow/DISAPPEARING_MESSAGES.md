@@ -14,7 +14,7 @@ PyMeow now supports disappearing messages feature, allowing you to send messages
 You can send a disappearing message by specifying the `expiration_seconds` parameter when calling `send_message`:
 
 ```python
-from pymeow import Client, ExpirationType
+from py import Client, ExpirationType
 
 # Initialize client...
 

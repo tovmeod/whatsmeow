@@ -6,8 +6,8 @@ import logging
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-from pymeow.pymeow import ExpirationType, MessageUtils
-from pymeow.pymeow.client import Client
+from py.pymeow import ExpirationType, MessageUtils
+from py.pymeow.client import Client
 
 logger = logging.getLogger(__name__)
 
@@ -17,37 +17,37 @@ class TestDisappearingMessages(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         """Set up test fixtures."""
         print("[0] Setting up test")
-        
+
         # Create a mock client with required attributes
         self.client = MagicMock(spec=Client)
         self.client._enqueue_message = AsyncMock()
         self.client._send_iq_and_wait = AsyncMock()
         self.client.logger = logging.getLogger(__name__)
-        
+
         # Mock the message store
         self.client._message_store = AsyncMock()
         self.client._message_store.get_message = AsyncMock(return_value=None)
-        
+
         # Mock the message queue
         self.client._message_queue = MagicMock()
         self.client._message_queue.put = AsyncMock()
-        
+
         # Set up mock connection state
         self.client.connected = True
         self.client.logged_in = True
         self.client.is_connected = MagicMock(return_value=True)
         self.client._is_connected = True
         self.client._is_authenticated = True
-        
+
         print("[0] Test setup complete")
 
     async def test_send_disappearing_message_90_days(self):
         """Test sending a disappearing message with 90-day expiration."""
         print("\n[1] Starting test_send_disappearing_message_90_days")
-        
+
         # Configure the mock client's send_message method
         self.client.send_message = AsyncMock(return_value="3EB01234567890")
-        
+
         # Call the method with the 90-day expiration
         try:
             result = await self.client.send_message(
@@ -55,24 +55,24 @@ class TestDisappearingMessages(unittest.IsolatedAsyncioTestCase):
                 content="Test disappearing message with 90-day expiration",
                 expiration_seconds=ExpirationType.NINETY_DAYS.value
             )
-            
+
             # Verify the message was sent with the correct parameters
             self.client.send_message.assert_called_once_with(
                 to="1234567890@s.whatsapp.net",
                 content="Test disappearing message with 90-day expiration",
                 expiration_seconds=ExpirationType.NINETY_DAYS.value
             )
-            
+
             # Verify the message ID was returned
             self.assertTrue(result.startswith('3EB0'), "Should return a valid message ID")
-            
+
         except Exception as e:
             self.fail(f"Unexpected exception: {e}")
-    
+
     async def test_set_90_day_disappearing_messages(self):
         """Test setting 90-day disappearing messages for a chat."""
         print("\n[2] Starting test_set_90_day_disappearing_messages")
-        
+
         # Configure the mock client's set_disappearing_messages method
         expected_result = {
             'status': 'success',
@@ -80,18 +80,18 @@ class TestDisappearingMessages(unittest.IsolatedAsyncioTestCase):
             'enabled': True
         }
         self.client.set_disappearing_messages = AsyncMock(return_value=expected_result)
-        
+
         # Call the method with 90-day expiration
         result = await self.client.set_disappearing_messages(
             chat_jid="1234567890@s.whatsapp.net",
             duration_seconds=ExpirationType.NINETY_DAYS.value
         )
-        
+
         # Verify the result
         self.assertEqual(result['status'], 'success')
         self.assertEqual(result['duration_seconds'], ExpirationType.NINETY_DAYS.value)
         self.assertTrue(result['enabled'])
-        
+
         # Verify the method was called with the correct parameters
         self.client.set_disappearing_messages.assert_called_once_with(
             chat_jid="1234567890@s.whatsapp.net",
@@ -119,7 +119,7 @@ class TestDisappearingMessages(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'success')
         self.assertEqual(result['duration_seconds'], duration)
         self.assertTrue(result['enabled'])
-        
+
         # Verify the method was called with the correct parameters
         self.client.set_disappearing_messages.assert_called_once_with(
             chat_jid="1234567890@s.whatsapp.net",
@@ -138,12 +138,12 @@ class TestDisappearingMessages(unittest.IsolatedAsyncioTestCase):
 
         # Get disappearing messages settings
         settings = await self.client.get_disappearing_messages("1234567890@s.whatsapp.net")
-        
+
         # Verify the result
         self.assertEqual(settings['duration_seconds'], 86400)
         self.assertFalse(settings['is_ephemeral'])
         self.assertTrue(settings['enabled'])
-        
+
         # Verify the method was called with the correct parameters
         self.client.get_disappearing_messages.assert_called_once_with("1234567890@s.whatsapp.net")
 
@@ -200,18 +200,18 @@ class TestMessageUtils(unittest.TestCase):
 
 if __name__ == "__main__":
     import sys
-    
+
     # Enable debug logging
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         stream=sys.stdout
     )
-    
+
     # Run the specific test directly
     test = TestDisappearingMessages('test_send_disappearing_message')
     test.setUp()
-    
+
     # Run the test with debug info
     print("\n=== Starting test with debug output ===\n")
     try:

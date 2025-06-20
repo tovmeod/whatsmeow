@@ -17,6 +17,7 @@ def get_tortoise_config(db_url: str) -> Dict[str, Any]:
                     "pymeow.store.sqlstore.models.privacy",
                     "pymeow.store.sqlstore.models.events",
                     "pymeow.store.sqlstore.models.lids",
+                    "pymeow.store.tortoise_signal_store_implementation"
                 ],
                 "default_connection": "default",
             }

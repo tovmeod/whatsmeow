@@ -12,9 +12,9 @@ from .appstate import WAPatchName
 from .binary.node import Node
 from .generated.waE2E import WAWebProtobufsE2E_pb2
 from .prekeys import upload_prekeys
-from .types import events
-from .types.jid import JID
-from .types.message import MessageID, MessageServerID
+from .datatypes import events
+from .datatypes.jid import JID
+from .datatypes.message import MessageID, MessageServerID
 
 if TYPE_CHECKING:
     from .client import Client
@@ -314,7 +314,7 @@ def parse_newsletter_messages(client: "Client", node: Node) -> List[Any]:
             continue
 
         ag = child.attr_getter()
-        from .types.newsletter import NewsletterMessage
+        from .datatypes.newsletter import NewsletterMessage
         msg = NewsletterMessage(
             message_server_id=MessageServerID(ag.int("server_id")),
             message_id=MessageID(ag.string("id")),

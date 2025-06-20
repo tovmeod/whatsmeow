@@ -45,9 +45,6 @@ async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair)
     Raises:
         Exception
     """
-    # TODO: Review NoiseHandshake implementation
-    # TODO: Review FrameSocket implementation
-    # TODO: Review KeyPair implementation
     nh = NoiseHandshake()
     nh.start(nh.NOISE_START_PATTERN, fs.header)
     nh.authenticate(ephemeral_kp.pub)
@@ -67,7 +64,7 @@ async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair)
     )
     # Unmarshal handshake response
     handshake_response = WAWebProtobufsWa6_pb2.HandshakeMessage()
-    handshake_response.ParseFromString(resp)
+    handshake_response.ParseFromString(bytes(resp))
     server_ephemeral = handshake_response.serverHello.ephemeral
     server_static_ciphertext = handshake_response.serverHello.static
     certificate_ciphertext = handshake_response.serverHello.payload
@@ -122,83 +119,115 @@ async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair)
     ns = await nh.finish(fs, client.handle_frame, client.on_disconnect)
     client.socket = ns
 
-def verify_server_cert(cert_decrypted: bytes, static_decrypted: bytes) -> Optional[Exception]:
+
+def verify_server_cert(cert_decrypted: bytes, static_decrypted: bytes) -> Optional[str]:
     """
     Port of Go method verifyServerCert from handshake.go.
 
-    Verify the server certificate chain.
+    Verify the server certificate chain exactly as the Go implementation does.
 
     Args:
         cert_decrypted: The decrypted certificate data
         static_decrypted: The decrypted static key
 
     Returns:
-        None if verification succeeds, Exception if it fails
+        None if verification succeeds, error string if it fails
     """
-    # TODO: Review signal_protocol ecc module implementation
-
     try:
         # Parse certificate chain
         cert_chain = WACert_pb2.CertChain()
         cert_chain.ParseFromString(cert_decrypted)
-    except Exception as e:
-        return e
 
-    # Extract certificate details
-    intermediate_cert_details_raw = cert_chain.intermediate.details
-    intermediate_cert_signature = cert_chain.intermediate.signature
-    leaf_cert_details_raw = cert_chain.leaf.details
-    leaf_cert_signature = cert_chain.leaf.signature
+        # Extract certificate components (matching Go implementation)
+        intermediate_cert_details_raw = cert_chain.intermediate.details
+        intermediate_cert_signature = cert_chain.intermediate.signature
+        leaf_cert_details_raw = cert_chain.leaf.details
+        leaf_cert_signature = cert_chain.leaf.signature
 
-    # Validate certificate parts
-    if (not intermediate_cert_details_raw or
-        not intermediate_cert_signature or
-        not leaf_cert_details_raw or
-        not leaf_cert_signature):
-        return Exception("Missing parts of noise certificate")
+        # Basic validation (matching Go implementation checks)
+        if (intermediate_cert_details_raw is None or
+            intermediate_cert_signature is None or
+            leaf_cert_details_raw is None or
+            leaf_cert_signature is None):
+            return "missing parts of noise certificate"
 
-    if len(intermediate_cert_signature) != 64:
-        return Exception(f"Unexpected length of intermediate cert signature {len(intermediate_cert_signature)} (expected 64)")
+        if len(intermediate_cert_signature) != 64:
+            return f"unexpected length of intermediate cert signature {len(intermediate_cert_signature)} (expected 64)"
 
-    if len(leaf_cert_signature) != 64:
-        return Exception(f"Unexpected length of leaf cert signature {len(leaf_cert_signature)} (expected 64)")
+        if len(leaf_cert_signature) != 64:
+            return f"unexpected length of leaf cert signature {len(leaf_cert_signature)} (expected 64)"
 
-    # Verify intermediate certificate signature
-    if not signal_protocol.curve.verify_signature(signal_protocol.curve.PublicKey.deserialize(WA_CERT_PUB_KEY), intermediate_cert_details_raw, intermediate_cert_signature):
-        return Exception("failed to verify intermediate cert signature")
+        # Verify intermediate certificate signature with WhatsApp's root public key
+        # This matches: ecc.VerifySignature(ecc.NewDjbECPublicKey(WACertPubKey), intermediateCertDetailsRaw, [64]byte(intermediateCertSignature))
+        if not _verify_djb_signature(WA_CERT_PUB_KEY, intermediate_cert_details_raw, intermediate_cert_signature):
+            return "failed to verify intermediate cert signature"
 
-    # Parse intermediate cert details
-    try:
+        # Parse intermediate certificate details
         intermediate_cert_details = WACert_pb2.CertChain.NoiseCertificate.Details()
         intermediate_cert_details.ParseFromString(intermediate_cert_details_raw)
-    except Exception as e:
-        return e
 
-    # Verify issuer serial - use issuerSerial (camelCase) not issuer_serial (snake_case)
-    if intermediate_cert_details.issuerSerial != WA_CERT_ISSUER_SERIAL:
-        return Exception(f"Unexpected intermediate issuer serial {intermediate_cert_details.issuerSerial} (expected {WA_CERT_ISSUER_SERIAL})")
+        if intermediate_cert_details.issuerSerial != WA_CERT_ISSUER_SERIAL:
+            return f"unexpected intermediate issuer serial {intermediate_cert_details.issuerSerial} (expected {WA_CERT_ISSUER_SERIAL})"
 
-    # Verify intermediate key length
-    if len(intermediate_cert_details.key) != 32:
-        return Exception(f"Unexpected length of intermediate cert key {len(intermediate_cert_details.key)} (expected 32)")
+        if len(intermediate_cert_details.key) != 32:
+            return f"unexpected length of intermediate cert key {len(intermediate_cert_details.key)} (expected 32)"
 
-    # Verify leaf certificate signature
-    if not signal_protocol.curve.verify_signature(signal_protocol.curve.PublicKey.deserialize(intermediate_cert_details.key), leaf_cert_details_raw, leaf_cert_signature):
-        return Exception("Failed to verify leaf cert signature")
+        # Verify leaf certificate signature with intermediate's public key
+        # This matches: ecc.VerifySignature(ecc.NewDjbECPublicKey([32]byte(intermediateCertDetails.GetKey())), leafCertDetailsRaw, [64]byte(leafCertSignature))
+        if not _verify_djb_signature(intermediate_cert_details.key, leaf_cert_details_raw, leaf_cert_signature):
+            return "failed to verify leaf cert signature"
 
-    # Parse leaf certificate details
-    try:
+        # Parse leaf certificate details
         leaf_cert_details = WACert_pb2.CertChain.NoiseCertificate.Details()
         leaf_cert_details.ParseFromString(leaf_cert_details_raw)
+
+        if leaf_cert_details.issuerSerial != intermediate_cert_details.serial:
+            return f"unexpected leaf issuer serial {leaf_cert_details.issuerSerial} (expected {intermediate_cert_details.serial})"
+
+        if leaf_cert_details.key != static_decrypted:
+            return "cert key doesn't match decrypted static"
+
+        logger.debug("Certificate verification completed successfully")
+        return None
+
     except Exception as e:
-        return e
+        return f"certificate verification failed: {e}"
 
-    # Verify leaf issuer serial - use issuerSerial (camelCase) not issuer_serial (snake_case)
-    if leaf_cert_details.issuerSerial != intermediate_cert_details.serial:
-        return Exception(f"Unexpected leaf issuer serial {leaf_cert_details.issuerSerial} (expected {intermediate_cert_details.serial})")
 
-    # Verify leaf key matches static key
-    if leaf_cert_details.key != static_decrypted:
-        return Exception("Cert key doesn't match decrypted static")
+def _verify_djb_signature(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    """
+    Verify DJB signature exactly as the Go implementation does.
 
-    return None
+    This matches the Go code: ecc.VerifySignature(ecc.NewDjbECPublicKey(key), message, signature)
+
+    Args:
+        public_key: 32-byte DJB public key
+        message: Message that was signed
+        signature: 64-byte signature
+
+    Returns:
+        True if signature is valid, False otherwise
+    """
+    try:
+        from signal_protocol import curve
+
+        # The Go implementation uses ecc.NewDjbECPublicKey which expects a 32-byte key
+        if len(public_key) != 32:
+            logger.debug(f"Invalid public key length: {len(public_key)} (expected 32)")
+            return False
+
+        if len(signature) != 64:
+            logger.debug(f"Invalid signature length: {len(signature)} (expected 64)")
+            return False
+
+        # Create DJB public key from the raw 32 bytes - this matches Go's ecc.NewDjbECPublicKey
+        # The signal_protocol library expects a type byte (0x05) followed by the 32-byte key
+        djb_key = bytes([0x05]) + public_key
+        public_key_obj = curve.PublicKey.deserialize(djb_key)
+
+        # Verify the signature
+        return public_key_obj.verify_signature(message, signature)
+
+    except Exception as e:
+        logger.debug(f"DJB signature verification failed: {e}")
+        return False

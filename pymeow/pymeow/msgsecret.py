@@ -29,14 +29,14 @@ from .exceptions import (
 )
 from .generated.waCommon import WACommon_pb2
 from .generated.waE2E import WAWebProtobufsE2E_pb2
-from .types.message import MessageID
+from .datatypes.message import MessageID
 from .util.gcmutil import gcm
 from .util.hkdfutil import hkdf
 
 if TYPE_CHECKING:
     from .client import Client
-    from .types import JID, MessageInfo
-    from .types.events import Message as MessageEvent
+    from .datatypes import JID, MessageInfo
+    from .datatypes.events import Message as MessageEvent
 
 # Message secret type constants - matching Go exactly
 ENC_SECRET_POLL_VOTE = "Poll Vote"
@@ -95,7 +95,7 @@ def generate_msg_secret_key(
 
 def get_orig_sender_from_key(msg: 'MessageEvent', key: WACommon_pb2.MessageKey) -> 'JID':
     """Get original sender from message key."""
-    from .types import JID
+    from .datatypes import JID
     if key.fromMe:
         # fromMe always means the poll and vote were sent by the same user
         # TODO this is wrong if the message key used @s.whatsapp.net, but the new event is from @lid

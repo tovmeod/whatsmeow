@@ -3,7 +3,7 @@ Tests for the JID class.
 """
 import unittest
 
-from pymeow.pymeow.types.jid import (
+from py.pymeow.datatypes.jid import (
     BOT_SERVER,
     BROADCAST_SERVER,
     DEFAULT_USER_SERVER,

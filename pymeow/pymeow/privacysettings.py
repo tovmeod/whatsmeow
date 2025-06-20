@@ -10,12 +10,12 @@ from typing import TYPE_CHECKING
 
 from . import request
 from .exceptions import ElementMissingError, ErrClientIsNil
-from .types.jid import SERVER_JID
+from .datatypes.jid import SERVER_JID
 
 if TYPE_CHECKING:
     from .binary.node import Node
     from .client import Client
-    from .types.events import PrivacySettingsEvent
+    from .datatypes.events import PrivacySettingsEvent
 
 class PrivacySettingType(str, Enum):
     """Types of WhatsApp privacy settings."""
@@ -276,7 +276,7 @@ def parse_privacy_settings(
     # TODO: Review PrivacySettingType implementation
     # TODO: Review PrivacySetting implementation
     # TODO: Review PRIVACY_SETTING_TYPE_* constants implementation
-    from .types.events import PrivacySettingsEvent
+    from .datatypes.events import PrivacySettingsEvent
     evt = PrivacySettingsEvent()
 
     for child in privacy_node.get_children():

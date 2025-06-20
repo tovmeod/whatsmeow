@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from pymeow import Client
+from py import Client
 
 from ..pymeow.exceptions import PymeowError
 

@@ -11,8 +11,8 @@ from tortoise.transactions import in_transaction
 from typing_extensions import Awaitable
 
 from .models.lids import LIDMappingModel
-from ...types import JID, ContactInfo
-from ...types.jid import EMPTY_JID
+from ...datatypes import JID, ContactInfo
+from ...datatypes.jid import EMPTY_JID
 from ...util.keys.keypair import KeyPair, PreKey
 from ..store import (
     AllSessionSpecificStores,

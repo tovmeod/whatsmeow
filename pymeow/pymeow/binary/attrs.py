@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
-    from ..types import JID
+    from ..datatypes import JID
     from .node import Node
 
 # Type alias for attributes (equivalent to Go's Attrs = map[string]any)
@@ -29,7 +29,7 @@ class AttrUtility:
 
     def get_jid(self, key: str, require: bool) -> Tuple['JID', bool]:
         """Get JID attribute with error handling."""
-        from ..types import JID
+        from ..datatypes import JID
         if key not in self.attrs:
             if require:
                 self.errors.append(ValueError(f"didn't find required JID attribute '{key}'"))

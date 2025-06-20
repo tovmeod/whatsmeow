@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING, Tuple
 
 from . import request
 from .request import InfoQuery, InfoQueryType
-from .types import JID
-from .types.events.events import KeepAliveRestored, KeepAliveTimeout
-from .types.message import MessageID
+from .datatypes import JID
+from .datatypes.events.events import KeepAliveRestored, KeepAliveTimeout
+from .datatypes.message import MessageID
 
 if TYPE_CHECKING:
     from .client import Client

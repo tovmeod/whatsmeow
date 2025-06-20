@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from ..types.jid import JID
+from ..datatypes.jid import JID
 
 
 class AddressingMode(str, Enum):

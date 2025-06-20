@@ -8,7 +8,7 @@ from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .binary.node import Node
-    from .types import JID
+    from .datatypes import JID
 
 class PymeowError(Exception):
     """Base exception for all PyMeow errors."""

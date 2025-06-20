@@ -32,10 +32,10 @@ python pymeow/tools/generate_protos.py
 1. Replace hand-implemented message classes with generated ones:
    ```python
    # Old
-   from pymeow.types import Message
+   from py.types import Message
 
    # New
-   from pymeow.generated.waMsgTransport.WAMsgTransport_pb2 import Message
+   from py.generated.waMsgTransport.WAMsgTransport_pb2 import Message
    ```
 
 2. Update message construction:
@@ -79,8 +79,9 @@ python pymeow/tools/generate_protos.py
 ## Type Hints
 
 The generated files include `.pyi` stub files with proper type hints:
+
 ```python
-from pymeow.generated.waAdv.WAAdv_pb2 import ADVEncryptionType
+from py.generated.waAdv.WAAdv_pb2 import ADVEncryptionType
 ```
 
 ## Common Issues and Solutions

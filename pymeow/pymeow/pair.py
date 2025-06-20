@@ -13,7 +13,7 @@ from signal_protocol import curve
 
 from .binary.node import Node
 from .generated.waAdv import WAAdv_pb2
-from .types import events, jid
+from .datatypes import events, jid
 from .util.keys.keypair import KeyPair
 
 logger = logging.getLogger(__name__)

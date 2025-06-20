@@ -8,12 +8,13 @@ import base64
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .errors import KeyNotFoundError
-from ..store.store import Device
 from ..util.hkdfutil import expand_hmac
 
+if TYPE_CHECKING:
+    from ..store.store import Device
 
 # WAPatchName represents a type of app state patch.
 class WAPatchName(str, Enum):
@@ -69,7 +70,7 @@ class ExpandedAppStateKeys:
 class Processor:
     """Processor for app state patches."""
 
-    def __init__(self, store: Device):
+    def __init__(self, store: 'Device'):
         """
         Initialize a new app state processor.
 

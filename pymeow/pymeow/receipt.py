@@ -11,16 +11,16 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from . import message, privacysettings, retry
 from .exceptions import ElementMissingError
-from .types.botmap import BOT_JID_MAP
-from .types.events.events import ReceiptTypeRead
-from .types.jid import BOT_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, JID, MESSENGER_SERVER, NEWSLETTER_SERVER
-from .types.message import MessageID, MessageInfo
+from .datatypes.botmap import BOT_JID_MAP
+from .datatypes.events.events import ReceiptTypeRead
+from .datatypes.jid import BOT_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, JID, MESSENGER_SERVER, NEWSLETTER_SERVER
+from .datatypes.message import MessageID, MessageInfo
 
 if TYPE_CHECKING:
     from .client import Client
     from .binary.node import Attrs, Node
-    from .types import ReceiptType
-    from .types.events import Receipt
+    from .datatypes import ReceiptType
+    from .datatypes.events import Receipt
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ async def handle_receipt(client: 'Client', node: 'Node') -> None:
     # TODO: Review parse_receipt implementation
     # TODO: Review handle_retry_receipt implementation
     # TODO: Review dispatch_event implementation
-    from .types import ReceiptType
+    from .datatypes import ReceiptType
     try:
         receipt, err = await parse_receipt(client, node)
         if err is not None:
@@ -120,8 +120,8 @@ async def parse_receipt(client: 'Client', node: 'Node') -> Tuple[Optional['Recei
     # TODO: Review ReceiptType implementation
     # TODO: Review ElementMissingError implementation
     # TODO: Review handle_grouped_receipt implementation
-    from .types import ReceiptType
-    from .types.events import Receipt
+    from .datatypes import ReceiptType
+    from .datatypes.events import Receipt
     ag = node.attr_getter()
     source = await message.parse_message_source(client, node, False)
     receipt = Receipt(
@@ -268,7 +268,7 @@ async def mark_read(
     # TODO: Review get_privacy_settings implementation
     # TODO: Review send_node implementation
     from .binary.node import Attrs, Node
-    from .types import ReceiptType
+    from .datatypes import ReceiptType
     if len(ids) == 0:
         raise Exception("no message IDs specified")
 
@@ -376,7 +376,7 @@ async def send_message_receipt(
     # TODO: Review send_node implementation
     # TODO: Review Node implementation
     from .binary.node import Attrs, Node
-    from .types import ReceiptType
+    from .datatypes import ReceiptType
     attrs = Attrs({
         "id": info.id,
     })

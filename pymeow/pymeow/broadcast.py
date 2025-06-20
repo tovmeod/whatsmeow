@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Dict, List
 from . import request
 from .binary import node as binary_node
 from .exceptions import PymeowError
-from .types.jid import JID, SERVER_JID, STATUS_BROADCAST_JID
-from .types.user import StatusPrivacy, StatusPrivacyType
+from .datatypes.jid import JID, SERVER_JID, STATUS_BROADCAST_JID
+from .datatypes.user import StatusPrivacy, StatusPrivacyType
 
 if TYPE_CHECKING:
     from .client import Client

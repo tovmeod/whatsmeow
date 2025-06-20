@@ -5,8 +5,8 @@ import base64
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-from pymeow.pymeow.binary import node as binary_node
-from pymeow.pymeow.push import (
+from py.pymeow.binary import node as binary_node
+from py.pymeow.push import (
     APNsPushConfig,
     FCMPushConfig,
     PushNotificationHandler,

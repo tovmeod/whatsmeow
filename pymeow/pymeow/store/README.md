@@ -80,7 +80,7 @@ This package provides storage interfaces and implementations for WhatsApp data n
 Import the `Device` class from this package to get the full functionality:
 
 ```python
-from pymeow.pymeow.store import Device
+from py.pymeow.store import Device
 ```
 
 This will give you a `Device` class that has all the Signal Protocol methods mixed in, similar to how `signal.go` extends the `Device` struct in the Go implementation.

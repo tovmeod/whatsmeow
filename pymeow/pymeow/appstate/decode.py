@@ -19,7 +19,6 @@ from typing_extensions import Sequence
 
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
-from ..store.store import AppStateMutationMAC
 from ..util.cbcutil import decrypt
 from .errors import (
     ErrMismatchingContentMAC,
@@ -32,6 +31,7 @@ from .keys import ExpandedAppStateKeys, Processor, WAPatchName
 
 if TYPE_CHECKING:
     from ..binary.node import Node
+    from ..store.store import AppStateMutationMAC
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +155,7 @@ async def parse_patch_list(node: 'Node', download_external: DownloadExternalFunc
 class PatchOutput:
     """Internal class for processing patch outputs."""
     removed_macs: List[bytes] = field(default_factory=list)
-    added_macs: List[AppStateMutationMAC] = field(default_factory=list)
+    added_macs: List['AppStateMutationMAC'] = field(default_factory=list)
     mutations: List[Mutation] = field(default_factory=list)
 
 
@@ -176,6 +176,7 @@ async def decode_mutations(processor: Processor, mutations: Sequence[WAServerSyn
     Raises:
         ValueError: If decoding fails
     """
+    from ..store.store import AppStateMutationMAC
     for i, mutation in enumerate(mutations):
         key_id = mutation.record.keyID.ID
         keys = await processor.get_app_state_key(key_id)

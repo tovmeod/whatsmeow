@@ -58,10 +58,10 @@ disallow_untyped_defs = true
 check_untyped_defs = true
 exclude = [
     "tests/",
-    "pymeow/pymeow/store/sqlstore/models",
-    "pymeow/pymeow/generated",
-	"pymeow/tools/fix_proto_imports.py",
-	"pymeow/tools/generate_protos.py",
+    "pymeowproj/pymeow/store/sqlstore/models",
+    "pymeowproj/pymeow/generated",
+	"pymeowproj/tools/fix_proto_imports.py",
+	"pymeowproj/tools/generate_protos.py",
 	"analyze_deps.py",
 	"check_file_equivalence.py",
 	"fix_imports.py",
@@ -76,9 +76,10 @@ ignore_errors = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+pythonpath = ["pymeowproj/pymeow"]
+testpaths = ["pymeowproj/pymeow/tests"]
 python_files = "test_*.py"
-addopts = "-v --cov=pymeow --cov-report=term-missing"
+addopts = "--cov=pymeow --cov-report=term-missing"
 
 [tool.black]
 line-length = 100
@@ -93,6 +94,7 @@ dev = [
     "pytest==8.4.0",
     "pytest-asyncio==1.0.0",
     "pytest-cov==6.1.1",
+    "pyyaml>=6.0.2",
     "ruff==0.11.13",
     "types-protobuf>=4.24.0,<5.0.0",
 ]

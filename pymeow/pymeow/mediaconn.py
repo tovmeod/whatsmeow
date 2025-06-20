@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, List
 
 from .exceptions import ErrClientIsNil
-from .types.jid import JID
+from .datatypes.jid import JID
 
 if TYPE_CHECKING:
     from .client import Client

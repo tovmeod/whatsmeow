@@ -7,10 +7,10 @@ Python objects into WhatsApp's binary protocol format.
 
 import pytest
 
-from pymeow.pymeow.binary.encoder import BinaryEncoder, marshal_and_pack, new_encoder, pack
-from pymeow.pymeow.binary.node import Node
-from pymeow.pymeow.binary.token import DOUBLE_BYTE_TOKENS, SINGLE_BYTE_TOKENS
-from pymeow.pymeow.types.jid import JID
+from py.pymeow.binary.encoder import BinaryEncoder, marshal_and_pack, new_encoder, pack
+from py.pymeow.binary.node import Node
+from py.pymeow.binary.token import DOUBLE_BYTE_TOKENS, SINGLE_BYTE_TOKENS
+from py.pymeow.datatypes.jid import JID
 
 
 def test_encoder_initialization():

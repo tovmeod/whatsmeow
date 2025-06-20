@@ -10,7 +10,7 @@ from typing import Tuple
 from .store import Device
 from ..generated.waCompanionReg import WACompanionReg_pb2
 from ..generated.waWa6 import WAWebProtobufsWa6_pb2
-from ..types.jid import EMPTY_JID
+from ..datatypes.jid import EMPTY_JID
 
 
 class WAVersionContainer:

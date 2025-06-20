@@ -15,12 +15,12 @@ from PIL.GifImagePlugin import TYPE_CHECKING
 from ..generated.waAdv import WAAdv_pb2
 
 # Internal imports
-from ..types.jid import EMPTY_JID, JID
+from ..datatypes.jid import EMPTY_JID, JID
 from ..util.keys.keypair import KeyPair, PreKey
 from .sqlstore.container import Container
 
 if TYPE_CHECKING:
-    from ..types import ContactInfo
+    from ..datatypes import ContactInfo
 
 class IdentityStore(ABC):
     """Interface for storing identity keys."""

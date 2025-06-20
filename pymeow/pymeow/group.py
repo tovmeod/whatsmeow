@@ -16,15 +16,15 @@ from .exceptions import (
     ErrNotInGroup,
     IQError,
 )
-from .types.group import (
+from .datatypes.group import (
     GroupLinkTarget,
     GroupMemberAddMode,
     GroupName,
     GroupParticipantAddRequest,
     GroupParticipantRequest, GroupInfo, GroupParticipant, GroupLinkChangeType,
 )
-from .types.jid import DEFAULT_USER_SERVER, GROUP_SERVER, GROUP_SERVER_JID, HIDDEN_USER_SERVER, SERVER_JID, JID
-from .types.message import AddressingMode
+from .datatypes.jid import DEFAULT_USER_SERVER, GROUP_SERVER, GROUP_SERVER_JID, HIDDEN_USER_SERVER, SERVER_JID, JID
+from .datatypes.message import AddressingMode
 
 if TYPE_CHECKING:
     from .client import Client, GroupMetaCache

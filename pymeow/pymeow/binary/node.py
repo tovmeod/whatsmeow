@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
-from ..types.jid import BROADCAST_SERVER, DEFAULT_USER_SERVER, GROUP_SERVER, JID, NEWSLETTER_SERVER
+from ..datatypes.jid import BROADCAST_SERVER, DEFAULT_USER_SERVER, GROUP_SERVER, JID, NEWSLETTER_SERVER
 from .attrs import Attrs, AttrUtility
 
 

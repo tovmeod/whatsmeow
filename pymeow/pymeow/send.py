@@ -37,8 +37,8 @@ from .group import get_cached_group_data, send_group_iq
 from .message import clear_untrusted_identity, migrate_session_store, pad_message
 from .msgsecret import apply_bot_message_hkdf
 from .prekeys import fetch_pre_keys
-from .types import events
-from .types.jid import (
+from .datatypes import events
+from .datatypes.jid import (
     BOT_SERVER,
     BROADCAST_SERVER,
     DEFAULT_USER_SERVER,
@@ -48,7 +48,7 @@ from .types.jid import (
     MESSENGER_SERVER,
     NEWSLETTER_SERVER,
 )
-from .types.message import AddressingMode, EditAttribute, MessageID, MessageInfo, MessageServerID, MsgMetaInfo
+from .datatypes.message import AddressingMode, EditAttribute, MessageID, MessageInfo, MessageServerID, MsgMetaInfo
 from .user import get_user_devices_context
 
 if TYPE_CHECKING:

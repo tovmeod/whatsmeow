@@ -29,6 +29,7 @@ class FrameSocket:
     This class provides a frame-based abstraction over WebSocket connections,
     handling the framing protocol used by WhatsApp Web.
     """
+    url: str = URL
 
     def __init__(self, dialer: ClientSession):
         """
@@ -40,7 +41,6 @@ class FrameSocket:
         self.conn: Optional[ClientWebSocketResponse] = None
         # Go: lock: sync.Mutex -> Python asyncio equivalent
         self.lock = asyncio.Lock()
-        self.url: str = URL
         self.http_headers: Dict[str, str] = {"Origin": ORIGIN}
         self.frames: asyncio.Queue[bytearray] = asyncio.Queue()
         self.on_disconnect: Optional[Callable[[bool], Coroutine[Any, Any, None]]] = None
@@ -49,7 +49,6 @@ class FrameSocket:
         self.dialer: ClientSession = dialer
 
         # self._task: Optional[asyncio.Task] = None
-
 
         # Frame processing state
         self.incoming_length: int = 0

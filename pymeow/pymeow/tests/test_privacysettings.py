@@ -10,7 +10,7 @@ from ..pymeow.privacysettings import (
     PrivacySettings,
     PrivacySettingType,
 )
-from ..pymeow.types.events import PrivacySettingsEvent
+from ..pymeow.datatypes.events import PrivacySettingsEvent
 
 
 def test_privacy_settings_defaults():

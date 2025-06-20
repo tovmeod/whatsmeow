@@ -14,9 +14,9 @@ from . import request, send
 from .binary.node import Node
 from .exceptions import ElementMissingError, ErrClientIsNil
 from .request import InfoQuery, InfoQueryType
-from .types.jid import JID, SERVER_JID
-from .types.message import MessageID, MessageServerID
-from .types.newsletter import GraphQLErrors, GraphQLResponse, NewsletterMessage, NewsletterMetadata
+from .datatypes.jid import JID, SERVER_JID
+from .datatypes.message import MessageID, MessageServerID
+from .datatypes.newsletter import GraphQLErrors, GraphQLResponse, NewsletterMessage, NewsletterMetadata
 
 if TYPE_CHECKING:
     from .client import Client
@@ -283,7 +283,7 @@ async def get_newsletter_info(client: 'Client', jid: JID) -> Optional[Newsletter
     Returns:
         The newsletter metadata or None
     """
-    from .types.newsletter import NewsletterKeyType
+    from .datatypes.newsletter import NewsletterKeyType
 
     return await get_newsletter_info_internal(client, {
         "key": str(jid),
@@ -305,7 +305,7 @@ async def get_newsletter_info_with_invite(client: 'Client', key: str) -> Optiona
     Returns:
         The newsletter metadata or None
     """
-    from .types.newsletter import NewsletterKeyType
+    from .datatypes.newsletter import NewsletterKeyType
 
     clean_key = key
     if key.startswith(NEWSLETTER_LINK_PREFIX):

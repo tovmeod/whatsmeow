@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, TYPE_CHECKING
-from ..types.events import Message
+from ..datatypes.events import Message
 
 logger = logging.getLogger(__name__)
 

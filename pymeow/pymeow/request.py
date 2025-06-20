@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from .binary.node import Node
 from .exceptions import DisconnectedError, ErrClientIsNil, ErrIQTimedOut, ErrNotConnected, IQError, parse_iq_error
-from .types.jid import JID
-from .types.message import MessageID
+from .datatypes.jid import JID
+from .datatypes.message import MessageID
 
 logger = logging.getLogger(__name__)
 

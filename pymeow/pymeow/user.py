@@ -11,8 +11,8 @@ from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
 
 from . import request
 from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
-from .types.jid import JID, SERVER_JID, LEGACY_USER_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, MESSENGER_SERVER
-from .types.user import (
+from .datatypes.jid import JID, SERVER_JID, LEGACY_USER_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, MESSENGER_SERVER
+from .datatypes.user import (
     BusinessMessageLinkTarget, ContactQRLinkTarget, IsOnWhatsAppResponse,
     UserInfo, BotListInfo, BotProfileInfo, BusinessProfile, ProfilePictureInfo,
     VerifiedName, BusinessHoursConfig, Category, BotProfileCommand
@@ -26,7 +26,7 @@ from .exceptions import (
 if TYPE_CHECKING:
     from .client import Client
     from .binary.node import Node, Attrs
-    from .types import MessageInfo
+    from .datatypes import MessageInfo
 
 # Link prefixes
 BUSINESS_MESSAGE_LINK_PREFIX = "https://wa.me/message/"
@@ -713,7 +713,7 @@ async def update_push_name(client: 'Client', user: JID, message_info: 'MessageIn
         message_info: MessageInfo object associated with this update (can be None)
         name: The new push name
     """
-    from .types.events import PushName
+    from .datatypes.events import PushName
     # Convert to non-AD JID for storage
     user = user.to_non_ad()
 
@@ -749,7 +749,7 @@ async def update_business_name(client: 'Client', user: JID, message_info: 'Messa
         message_info: MessageInfo object associated with this update (can be None)
         name: The new business name
     """
-    from .types.events import BusinessName
+    from .datatypes.events import BusinessName
     try:
         # Store the business name and check if it changed
         changed, previous_name = await client.store.contacts.put_business_name(user, name)

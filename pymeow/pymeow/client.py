@@ -43,9 +43,9 @@ from .store.tortoise_signal_store_implementation import (
     generate_identity_keys,
     generate_prekeys,
 )
-from .types.events import Disconnected, events
-from .types.jid import DEFAULT_USER_SERVER, EMPTY_JID, GROUP_SERVER, HIDDEN_USER_SERVER, JID, NEWSLETTER_SERVER
-from .types.message import AddressingMode, MessageID, MessageInfo, MessageSource
+from .datatypes.events import Disconnected, events
+from .datatypes.jid import DEFAULT_USER_SERVER, EMPTY_JID, GROUP_SERVER, HIDDEN_USER_SERVER, JID, NEWSLETTER_SERVER
+from .datatypes.message import AddressingMode, MessageID, MessageInfo, MessageSource
 from .util.keys.keypair import KeyPair
 
 # Type for event handlers
@@ -157,7 +157,7 @@ class Client:
         self.last_pre_key_upload: Optional[datetime.datetime] = None
 
         # Import JID here to avoid circular imports
-        from .types import JID
+        from .datatypes import JID
         self.server_jid = JID.server_jid()
 
         self.media_conn_cache: MediaConn
@@ -279,6 +279,7 @@ class Client:
 
     async def initialize_signal_protocol(self) -> None:
         """Initialize Signal Protocol on startup."""
+        logger.debug("Initializing Signal protocol...")
 
         # 1. Generate or load identity keys
         identity_keys = generate_identity_keys()
@@ -1083,3 +1084,11 @@ class Client:
             await self.store.lids.put_lid_mapping(lid, pn)
         except Exception as e:  # Catch if put_lid_mapping raises directly
             logger.exception(f"Failed to store LID-PN mapping for {lid} -> {pn}: {e}")
+
+    async def my_get_message_for_retry(self, sender: JID, chat: JID, message_id: MessageID) -> Optional[Message]:
+        # todo: message storage systems (databases, files, etc.) to provide messages for retry scenarios.
+        return None
+        # my_message_retrieval(sender, chat, message_id):
+        # User's custom logic
+        # return retrieve_from_my_database(sender, chat, message_id)
+

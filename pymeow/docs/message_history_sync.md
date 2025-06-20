@@ -33,7 +33,8 @@ PyMeow supports different types of sync operations through the `HistorySyncType`
 ### Basic Sync on Connection
 
 ```python
-from pymeow import Client, HistorySyncType
+from py import Client, HistorySyncType
+
 
 async def main():
     client = Client()

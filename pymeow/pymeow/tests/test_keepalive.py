@@ -18,7 +18,7 @@ from ..pymeow.keepalive import (
     keepalive_loop,
     send_keep_alive,
 )
-from ..pymeow.types.events.events import KeepAliveRestored, KeepAliveTimeout
+from ..pymeow.datatypes.events.events import KeepAliveRestored, KeepAliveTimeout
 
 # Real test values captured from logs
 SAMPLE_PING_NODE_XML = '<iq id="b7e0afa7-e9da-4ed7-8c3b-0247dbb98a6e" type="get" to="s.whatsapp.net" xmlns="w:p"></iq>'

@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from . import request
 from .binary.node import Attrs, Node
 from .request import InfoQuery, InfoQueryType
-from .types.jid import JID
+from .datatypes.jid import JID
 from .util.hkdfutil.hkdf import sha256 as hkdf_sha256
 from .util.keys.keypair import KeyPair
 

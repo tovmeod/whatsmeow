@@ -18,13 +18,13 @@ from .exceptions import ElementMissingError
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as WAE2E_pb2
 from .generated.waMsgApplication import WAMsgApplication_pb2
 
-from .types.jid import DEFAULT_USER_SERVER, JID
-from .types.message import MessageID, MessageInfo
+from .datatypes.jid import DEFAULT_USER_SERVER, JID
+from .datatypes.message import MessageID, MessageInfo
 
 if TYPE_CHECKING:
     from .client import Client
     from .binary.node import Node
-    from .types.events import Receipt
+    from .datatypes.events import Receipt
 
 ECC_DJB_TYPE = 0x05  # Standard Curve25519 type identifier
 

@@ -12,8 +12,7 @@ from .. import download, request, send
 from ..binary import node as binary_node
 from ..exceptions import ErrAppStateUpdate
 from ..generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
-from ..store.store import ContactEntry
-from ..types.events.events import BaseEvent
+from ..datatypes.events.events import BaseEvent
 from . import encode, decode
 from .hash import Mutation, HashState
 from .keys import WAPatchName
@@ -34,7 +33,7 @@ async def fetch_app_state(
     Fetch updates to the given type of app state. If full_sync is true, the current
     cached state will be removed and all app state patches will be re-fetched from the server.
     """
-    from ..types import events
+    from ..datatypes import events
     if client is None:
         raise ValueError("Client is None")
 
@@ -90,7 +89,8 @@ async def fetch_app_state(
 
 def filter_contacts(mutations: List[Any]) -> tuple[List[Any], List[Any]]:
     """Filter contact mutations from the list and return them separately."""
-    from ..types import JID
+    from ..datatypes import JID
+    from ..store.store import ContactEntry
     filtered_mutations = []
     contacts = []
 
@@ -117,7 +117,7 @@ async def dispatch_app_state(
     emit_on_full_sync: bool
 ) -> None:
     """Dispatch app state mutation as events."""
-    from ..types import JID, events
+    from ..datatypes import JID, events
     dispatch_evts = not full_sync or emit_on_full_sync
 
     # Only handle SET operations
@@ -345,7 +345,7 @@ async def fetch_app_state_patches(
 ) -> Any:
     """Fetch app state patches from the server."""
     from ..request import InfoQuery, InfoQueryType
-    from ..types import JID
+    from ..datatypes import JID
     attrs = {
         "name": name,
         "return_snapshot": snapshot,
@@ -427,7 +427,7 @@ async def send_app_state(client: "Client", patch: Any) -> None:
     to update local caches and send events for the updates.
     """
     from ..request import InfoQuery, InfoQueryType
-    from ..types import JID
+    from ..datatypes import JID
     if client is None:
         raise ValueError("Client is None")
 

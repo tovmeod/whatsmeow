@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Union, Callable
 
-from ..types.jid import (
+from ..datatypes.jid import (
     DEFAULT_USER_SERVER,
     HIDDEN_USER_SERVER,
     HOSTED_SERVER,
