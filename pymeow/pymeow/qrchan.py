@@ -284,10 +284,14 @@ class QRChannel:
         Args:
             raw_evt: The event received from the client
         """
+        logger.debug(f"QRChannel received event: {type(raw_evt).__name__}")
         try:
             if self.closed:
                 logger.debug("Dropping event of type %s, channel is closed", type(raw_evt).__name__)
                 return
+
+            if isinstance(raw_evt, Disconnected):
+                logger.info("QRChannel: Received Disconnected event during playback.")
 
             if isinstance(raw_evt, QR):
                 logger.debug("Received QR code event, starting to emit codes to channel")
