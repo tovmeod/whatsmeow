@@ -1,8 +1,9 @@
 from typing import Optional
+
 from signal_protocol.address import ProtocolAddress
 from signal_protocol.identity_key import IdentityKey, IdentityKeyPair
-from signal_protocol.state import PreKeyRecord, SignedPreKeyRecord, SessionRecord, PreKeyId, SignedPreKeyId
 from signal_protocol.sender_keys import SenderKeyName, SenderKeyRecord
+from signal_protocol.state import PreKeyId, PreKeyRecord, SessionRecord, SignedPreKeyId, SignedPreKeyRecord
 
 class InMemSignalProtocolStore:
 	def __init__(self, key_pair: IdentityKeyPair, registration_id: int) -> None: ...

@@ -27,10 +27,11 @@ from pathlib import Path
 from typing import Any
 
 from pymeow.client import Client
-from pymeow.store.sqlstore.container import Container
+from pymeow.datatypes.events import Connected, Disconnected, LoggedIn, Message, PairError, PairSuccess
+
 # Make sure pair_phone and PairClientType are correctly imported
-from pymeow.pair_code import pair_phone, PairClientType
-from pymeow.datatypes.events import Message, Connected, Disconnected, LoggedIn, PairSuccess, PairError
+from pymeow.pair_code import PairClientType, pair_phone
+from pymeow.store.sqlstore.container import Container
 
 # Basic logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')

@@ -5,7 +5,7 @@ Port of whatsmeow/binary/encoder.go
 """
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Union, Callable
+from typing import Any, Callable, Dict, Union
 
 from ..datatypes.jid import (
     DEFAULT_USER_SERVER,

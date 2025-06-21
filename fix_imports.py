@@ -3,6 +3,7 @@ import os
 import re
 from pathlib import Path
 
+
 def fix_imports_in_file(file_path: Path):
     """Fix import statements in a generated protobuf file."""
     if not file_path.exists() or not file_path.is_file() or not file_path.suffix == '.py':

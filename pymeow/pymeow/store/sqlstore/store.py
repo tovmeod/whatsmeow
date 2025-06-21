@@ -4,13 +4,13 @@ SQL-backed store implementation using Tortoise ORM.
 Port of whatsmeow/store/sqlstore/store.go
 """
 import asyncio
+import logging
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tortoise.transactions import in_transaction
 from typing_extensions import Awaitable
 
-from .models.lids import LIDMappingModel
 from ...datatypes import JID, ContactInfo
 from ...datatypes.jid import EMPTY_JID
 from ...util.keys.keypair import KeyPair, PreKey
@@ -29,9 +29,11 @@ from .container import Container
 from .models.appstate import AppStateMutationMACModel, AppStateSyncKeyModel, AppStateVersionModel
 from .models.chatsettings import ChatSettingsModel
 from .models.contacts import ContactModel
+from .models.lids import LIDMappingModel
 from .models.messages import MessageSecretModel
 from .models.session import IdentityKeyModel, PreKeyModel, SenderKeyModel, SessionModel
 
+logger = logging.getLogger(__name__)
 
 class ChatSettings:
     def __init__(self, muted_until: Optional[int] = None, pinned: bool = False, archived: bool = False):
@@ -110,7 +112,8 @@ class SQLStore(AllSessionSpecificStores):
         try:
             session = await SessionModel.get(our_jid=self.jid, their_id=address)
             return session.session
-        except:
+        except Exception as e:
+            logger.exception(e)
             return None
 
     async def has_session(self, address: str) -> bool:
@@ -314,7 +317,8 @@ class SQLStore(AllSessionSpecificStores):
                 sender_id=user
             )
             return sender_key.sender_key
-        except:
+        except Exception as e:
+            logger.exception(e)
             return None
 
     # App state sync key methods
@@ -366,7 +370,8 @@ class SQLStore(AllSessionSpecificStores):
         try:
             version_model = await AppStateVersionModel.get(jid=self.jid, name=name)
             return version_model.version, bytearray(version_model.hash)
-        except:
+        except Exception as e:
+            logger.exception(e)
             return 0, bytearray(b'\x00' * 128)
 
     async def delete_app_state_version(self, name: str) -> None:
@@ -432,7 +437,8 @@ class SQLStore(AllSessionSpecificStores):
                 business_name=contact.business_name or "",
                 found=True
             )
-        except:
+        except Exception as e:
+            logger.exception(e)
             contact_info = ContactInfo(found=False)
 
         self.contact_cache[jid] = contact_info
@@ -572,7 +578,8 @@ class SQLStore(AllSessionSpecificStores):
                 pinned=settings.pinned,
                 archived=settings.archived
             )
-        except:
+        except Exception as e:
+            logger.exception(e)
             return None
 
     # Device Container methods
@@ -726,7 +733,8 @@ class SQLStore(AllSessionSpecificStores):
             self.pn_to_lid_cache[str(pn_jid)] = str(lid)
 
             return pn_jid
-        except:
+        except Exception as e:
+            logger.exception(e)
             return None
 
     async def get_lid_for_pn(self, pn: JID) -> JID:
@@ -751,5 +759,6 @@ class SQLStore(AllSessionSpecificStores):
             self.pn_to_lid_cache[str(pn)] = str(lid_jid)
 
             return lid_jid
-        except:
+        except Exception as e:
+            logger.exception(e)
             return EMPTY_JID

@@ -9,8 +9,8 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from . import request
-from .exceptions import ElementMissingError, ErrClientIsNil
 from .datatypes.jid import SERVER_JID
+from .exceptions import ElementMissingError, ErrClientIsNil
 
 if TYPE_CHECKING:
     from .binary.node import Node

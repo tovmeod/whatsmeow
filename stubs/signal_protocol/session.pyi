@@ -1,4 +1,5 @@
 from typing import Optional
+
 from signal_protocol.address import ProtocolAddress
 from signal_protocol.protocol import PreKeySignalMessage
 from signal_protocol.state import PreKeyBundle, PreKeyId, SessionRecord

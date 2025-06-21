@@ -10,7 +10,6 @@ from typing import Awaitable, Callable, Optional, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from typing_extensions import Buffer
 
 from ..util.gcmutil import prepare
 from .framesocket import FrameSocket

@@ -3,7 +3,8 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable, Dict
+
 from ..datatypes.events import Message
 
 logger = logging.getLogger(__name__)

@@ -15,21 +15,18 @@ like poll votes, reactions, and comments.
 import hashlib
 import time
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Dict, TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from Crypto.Random import get_random_bytes
 
+from .datatypes.message import MessageID
 from .exceptions import (
     ErrClientIsNil,
-    ErrNotEncryptedCommentMessage,
-    ErrNotEncryptedReactionMessage,
     ErrNotLoggedIn,
-    ErrNotPollUpdateMessage,
     ErrOriginalMessageSecretNotFound,
 )
 from .generated.waCommon import WACommon_pb2
 from .generated.waE2E import WAWebProtobufsE2E_pb2
-from .datatypes.message import MessageID
 from .util.gcmutil import gcm
 from .util.hkdfutil import hkdf
 

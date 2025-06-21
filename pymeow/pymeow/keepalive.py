@@ -11,10 +11,10 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Tuple
 
 from . import request
-from .request import InfoQuery, InfoQueryType
 from .datatypes import JID
 from .datatypes.events.events import KeepAliveRestored, KeepAliveTimeout
 from .datatypes.message import MessageID
+from .request import InfoQuery, InfoQueryType
 
 if TYPE_CHECKING:
     from .client import Client
@@ -120,7 +120,7 @@ async def send_keep_alive(client: 'Client') -> Tuple[bool, bool]:
         response_queue = await request.send_iq_async(client, ping_query)
         # Wait for response from the queue with timeout
         try:
-            response = await asyncio.wait_for(
+            _ = await asyncio.wait_for(
                 response_queue.get(),  # Get response from the queue
                 timeout=KEEP_ALIVE_RESPONSE_DEADLINE.total_seconds()
             )

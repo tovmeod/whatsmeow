@@ -8,11 +8,10 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from ..generated.waE2E.WAWebProtobufsE2E_pb2 import Message
 from .jid import JID
 from .message import MessageID, MessageServerID
 from .user import ProfilePictureInfo
-from ..generated.waE2E.WAWebProtobufsE2E_pb2 import Message
-
 
 # TODO: Verify import when util/jsontime is ported
 # In Go: "go.mau.fi/util/jsontime"

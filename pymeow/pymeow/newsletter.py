@@ -8,15 +8,15 @@ import base64
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from . import request, send
 from .binary.node import Node
-from .exceptions import ElementMissingError, ErrClientIsNil
-from .request import InfoQuery, InfoQueryType
 from .datatypes.jid import JID, SERVER_JID
 from .datatypes.message import MessageID, MessageServerID
 from .datatypes.newsletter import GraphQLErrors, GraphQLResponse, NewsletterMessage, NewsletterMetadata
+from .exceptions import ElementMissingError, ErrClientIsNil
+from .request import InfoQuery, InfoQueryType
 
 if TYPE_CHECKING:
     from .client import Client

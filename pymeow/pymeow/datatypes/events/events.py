@@ -6,7 +6,7 @@ Port of whatsmeow/types/events/events.go
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
 
 from ...generated.waArmadilloApplication import WAArmadilloApplication_pb2 as WAArm_pb2
 from ...generated.waConsumerApplication import WAConsumerApplication_pb2

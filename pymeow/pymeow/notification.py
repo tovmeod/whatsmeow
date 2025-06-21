@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any, List
 from . import appstate
 from .appstate import WAPatchName
 from .binary.node import Node
-from .generated.waE2E import WAWebProtobufsE2E_pb2
-from .prekeys import upload_prekeys
 from .datatypes import events
 from .datatypes.jid import JID
 from .datatypes.message import MessageID, MessageServerID
+from .generated.waE2E import WAWebProtobufsE2E_pb2
+from .prekeys import upload_prekeys
 
 if TYPE_CHECKING:
     from .client import Client

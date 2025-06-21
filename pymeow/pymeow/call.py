@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 from . import receipt, send
 from .binary.node import Attrs, Node
-from .exceptions import ErrNotLoggedIn
 from .datatypes.call import BasicCallMeta, CallRemoteMeta
 from .datatypes.events.call import (
     CallAccept,
@@ -23,6 +22,7 @@ from .datatypes.events.call import (
     UnknownCallEvent,
 )
 from .datatypes.jid import JID
+from .exceptions import ErrNotLoggedIn
 
 if TYPE_CHECKING:
     from .client import Client

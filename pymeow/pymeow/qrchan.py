@@ -46,7 +46,6 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from .client import Client
-from .exceptions import ErrClientIsNil, ErrQRAlreadyConnected, ErrQRStoreContainsID
 from .datatypes.events.events import (
     QR,
     ClientOutdated,
@@ -59,6 +58,7 @@ from .datatypes.events.events import (
     QRScannedWithoutMultidevice,
     TemporaryBan,
 )
+from .exceptions import ErrClientIsNil, ErrQRAlreadyConnected, ErrQRStoreContainsID
 
 
 @dataclass

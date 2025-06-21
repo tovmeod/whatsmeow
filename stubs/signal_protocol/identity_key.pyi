@@ -1,4 +1,4 @@
-from signal_protocol.curve import PublicKey, PrivateKey
+from signal_protocol.curve import PrivateKey, PublicKey
 
 class IdentityKey:
 	def __init__(self, public_key: bytes) -> None: ...

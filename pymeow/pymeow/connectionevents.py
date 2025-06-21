@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING
 
 from . import request
 from .binary.node import Node
+from .datatypes import events, jid
 from .prekeys import get_server_pre_key_count, upload_prekeys
 from .request import InfoQuery, InfoQueryType
 from .store.clientpayload import get_wa_version
-from .datatypes import events, jid
 
 if TYPE_CHECKING:
     from .client import Client

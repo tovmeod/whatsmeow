@@ -9,14 +9,13 @@ import hashlib
 import hmac
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Protocol, Tuple, cast, runtime_checkable, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import aiohttp
 
 from . import mediaconn
 from .exceptions import PymeowError
 from .generated.waE2E import WAWebProtobufsE2E_pb2
-from .generated.waMediaTransport import WAMediaTransport_pb2
 from .util.cbcutil import decrypt
 from .util.hkdfutil import sha256 as hkdf_sha256
 

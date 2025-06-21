@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from .. import download, request, send
 from ..binary import node as binary_node
+from ..datatypes.events.events import BaseEvent
 from ..exceptions import ErrAppStateUpdate
 from ..generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
-from ..datatypes.events.events import BaseEvent
-from . import encode, decode
-from .hash import Mutation, HashState
+from . import decode, encode
+from .hash import HashState, Mutation
 from .keys import WAPatchName
 
 if TYPE_CHECKING:
@@ -344,8 +344,8 @@ async def fetch_app_state_patches(
     snapshot: bool
 ) -> Any:
     """Fetch app state patches from the server."""
-    from ..request import InfoQuery, InfoQueryType
     from ..datatypes import JID
+    from ..request import InfoQuery, InfoQueryType
     attrs = {
         "name": name,
         "return_snapshot": snapshot,
@@ -426,8 +426,8 @@ async def send_app_state(client: "Client", patch: Any) -> None:
     Send the given app state patch, then resyncs that app state type from the server
     to update local caches and send events for the updates.
     """
-    from ..request import InfoQuery, InfoQueryType
     from ..datatypes import JID
+    from ..request import InfoQuery, InfoQueryType
     if client is None:
         raise ValueError("Client is None")
 

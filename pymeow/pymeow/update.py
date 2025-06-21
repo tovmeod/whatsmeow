@@ -8,7 +8,7 @@ from typing import Optional
 
 import aiohttp
 
-from .socket import noisesocket, constants
+from .socket import constants
 from .store.clientpayload import WAVersionContainer
 
 # Regex to extract client revision from web.whatsapp.com

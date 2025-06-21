@@ -8,6 +8,18 @@ from typing import TYPE_CHECKING, List, Optional
 
 from . import request
 from .binary.attrs import AttrUtility
+from .datatypes.group import (
+    GroupInfo,
+    GroupLinkChangeType,
+    GroupLinkTarget,
+    GroupMemberAddMode,
+    GroupName,
+    GroupParticipant,
+    GroupParticipantAddRequest,
+    GroupParticipantRequest,
+)
+from .datatypes.jid import DEFAULT_USER_SERVER, GROUP_SERVER, GROUP_SERVER_JID, HIDDEN_USER_SERVER, JID, SERVER_JID
+from .datatypes.message import AddressingMode
 from .exceptions import (
     ElementMissingError,
     ErrGroupInviteLinkUnauthorized,
@@ -16,19 +28,11 @@ from .exceptions import (
     ErrNotInGroup,
     IQError,
 )
-from .datatypes.group import (
-    GroupLinkTarget,
-    GroupMemberAddMode,
-    GroupName,
-    GroupParticipantAddRequest,
-    GroupParticipantRequest, GroupInfo, GroupParticipant, GroupLinkChangeType,
-)
-from .datatypes.jid import DEFAULT_USER_SERVER, GROUP_SERVER, GROUP_SERVER_JID, HIDDEN_USER_SERVER, SERVER_JID, JID
-from .datatypes.message import AddressingMode
 
 if TYPE_CHECKING:
-    from .client import Client, GroupMetaCache
     from .binary.node import Node
+    from .client import Client, GroupMetaCache
+    from .request import InfoQueryType
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +113,8 @@ async def create_group(client: "Client", req: ReqCreateGroup) -> GroupInfo:
         Exception: If there's an error creating the group
     """
     from .binary.node import Node
-    from .send import generate_message_id
     from .request import InfoQueryType
+    from .send import generate_message_id
     participant_nodes = []
     for participant in req.participants:
         participant_nodes.append(Node(
@@ -395,9 +399,9 @@ async def set_group_topic(
     automatically fetch the current group info to find the previous topic ID. If the new ID is not
     specified, one will be generated with Client.generate_message_id().
     """
-    from .send import generate_message_id
     from .binary.node import Node
     from .request import InfoQueryType
+    from .send import generate_message_id
     if not previous_id:
         old_info = await get_group_info(client, jid)
         previous_id = old_info.group_topic.topic_id
@@ -496,7 +500,7 @@ async def get_group_info_from_invite(
     Use get_group_info_from_link for resolving chat.whatsapp.com links.
     """
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -534,7 +538,7 @@ async def join_group_with_invite(
     Use join_group_with_link for joining with chat.whatsapp.com links.
     """
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQueryType
     await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -559,7 +563,7 @@ async def get_group_info_from_link(client: "Client", code: str) -> GroupInfo:
     Note that this is specifically for invite links. Use get_group_info_from_invite for invite messages.
     """
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -583,7 +587,7 @@ async def join_group_with_link(client: "Client", code: str) -> Optional[JID]:
     Returns the JID of the joined group.
     """
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -608,7 +612,7 @@ async def join_group_with_link(client: "Client", code: str) -> Optional[JID]:
 async def get_joined_groups(client: "Client") -> List[GroupInfo]:
     """Gets the list of groups the user has joined."""
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -631,7 +635,7 @@ async def get_joined_groups(client: "Client") -> List[GroupInfo]:
 async def get_sub_groups(client: "Client", jid: JID) -> List[GroupLinkTarget]:
     """Gets the subgroups of a community."""
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
@@ -654,7 +658,7 @@ async def get_sub_groups(client: "Client", jid: JID) -> List[GroupLinkTarget]:
 async def get_linked_groups_participants(client: "Client", jid: JID) -> List[GroupParticipant]:
     """Gets participants from linked groups."""
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQueryType
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,

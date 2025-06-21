@@ -20,8 +20,8 @@ from .exceptions import PymeowError
 from .util.cbcutil import encrypt, encrypt_stream
 
 if TYPE_CHECKING:
-    from .client import Client
     from . import mediaconn
+    from .client import Client
 
 
 class UploadError(PymeowError):

@@ -1,5 +1,5 @@
 from signal_protocol.address import ProtocolAddress
-from signal_protocol.protocol import CiphertextMessage, SignalMessage, PreKeySignalMessage
+from signal_protocol.protocol import CiphertextMessage, PreKeySignalMessage, SignalMessage
 from signal_protocol.storage import InMemSignalProtocolStore
 
 # Module-level functions

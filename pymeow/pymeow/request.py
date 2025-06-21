@@ -10,14 +10,13 @@ Port of whatsmeow/request.go
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from .binary.node import Node
-from .exceptions import DisconnectedError, ErrClientIsNil, ErrIQTimedOut, ErrNotConnected, IQError, parse_iq_error
 from .datatypes.jid import JID
 from .datatypes.message import MessageID
+from .exceptions import DisconnectedError, ErrClientIsNil, ErrIQTimedOut, ErrNotConnected, IQError, parse_iq_error
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +288,7 @@ async def send_iq(client: 'Client', query: InfoQuery) -> Node:
         raise
 
 
-async def retry_frame(client: 'Client', req_type: str, req_id: MessageID, data: bytes, orig_resp: Node, timeout: float) -> Node:
+async def retry_frame(client: 'Client', req_type: str, req_id: MessageID, data: bytes, orig_resp: Node, timeout_seconds: float) -> Node:
     """
     Retry sending a frame after a disconnection.
 
@@ -299,7 +298,7 @@ async def retry_frame(client: 'Client', req_type: str, req_id: MessageID, data: 
         req_id: The ID of the request
         data: The raw data of the original request
         orig_resp: The original response that indicated a disconnection
-        timeout: The timeout duration for the retry
+        timeout_seconds: The timeout duration for the retry
 
     Returns:
         The response node
@@ -337,8 +336,8 @@ async def retry_frame(client: 'Client', req_type: str, req_id: MessageID, data: 
         raise e
 
     try:
-        if timeout > 0:
-            resp = await asyncio.wait_for(resp_queue.get(), timeout=timeout)
+        if timeout_seconds > 0:
+            resp = await asyncio.wait_for(resp_queue.get(), timeout=timeout_seconds)
         else:
             resp = await resp_queue.get()
     except asyncio.TimeoutError:

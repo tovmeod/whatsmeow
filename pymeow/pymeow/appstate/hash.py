@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import struct
 from dataclasses import dataclass
-from typing import Awaitable, Callable, List, Optional, Sequence, Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Sequence
 
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2

@@ -1,9 +1,9 @@
-import yaml
 import asyncio
-import aiohttp
-from pathlib import Path
-from aiohttp import web, WSMsgType
 import logging
+
+import aiohttp
+import yaml
+from aiohttp import WSMsgType, web
 
 logger = logging.getLogger(__name__)
 

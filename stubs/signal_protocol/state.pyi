@@ -1,6 +1,7 @@
-from typing import Optional, List
-from signal_protocol.curve import PublicKey, PrivateKey, KeyPair
-from signal_protocol.identity_key import IdentityKey
+from typing import List, Optional
+
+from .curve import KeyPair, PrivateKey, PublicKey
+from .identity_key import IdentityKey
 
 # Type aliases
 PreKeyId = int
@@ -15,7 +16,7 @@ class PreKeyBundle:
 		device_id: int,
 		pre_key_id: Optional[PreKeyId],
 		pre_key_public: Optional[PublicKey],
-		signed_pre_key_id: SignedPreKeyId,
+		signed_pre_key_id: int,
 		signed_pre_key_public: PublicKey,
 		signed_pre_key_signature: bytes,
 		identity_key: IdentityKey,
@@ -25,7 +26,7 @@ class PreKeyBundle:
 	def device_id(self) -> int: ...
 	def pre_key_id(self) -> Optional[PreKeyId]: ...
 	def pre_key_public(self) -> Optional[PublicKey]: ...
-	def signed_pre_key_id(self) -> SignedPreKeyId: ...
+	def signed_pre_key_id(self) -> int: ...
 	def signed_pre_key_public(self) -> PublicKey: ...
 	def signed_pre_key_signature(self) -> bytes: ...
 	def identity_key(self) -> IdentityKey: ...
@@ -45,7 +46,7 @@ class PreKeyRecord:
 class SignedPreKeyRecord:
 	def __init__(
 		self,
-		id: SignedPreKeyId,
+		id: int,
 		timestamp: int,
 		keypair: KeyPair,
 		signature: bytes,
@@ -54,7 +55,7 @@ class SignedPreKeyRecord:
 	@staticmethod
 	def deserialize(data: bytes) -> "SignedPreKeyRecord": ...
 
-	def id(self) -> SignedPreKeyId: ...
+	def id(self) -> int: ...
 	def timestamp(self) -> int: ...
 	def signature(self) -> bytes: ...
 	def key_pair(self) -> KeyPair: ...

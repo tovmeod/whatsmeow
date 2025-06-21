@@ -7,10 +7,10 @@ import hashlib
 import struct
 from typing import Tuple
 
-from .store import Device
+from ..datatypes.jid import EMPTY_JID
 from ..generated.waCompanionReg import WACompanionReg_pb2
 from ..generated.waWa6 import WAWebProtobufsWa6_pb2
-from ..datatypes.jid import EMPTY_JID
+from .store import Device
 
 
 class WAVersionContainer:

@@ -10,25 +10,15 @@ import os
 import traceback
 import zlib
 from datetime import datetime
-from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Tuple, Iterable
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterable, List, Optional, Tuple
 
 import signal_protocol
-
 from signal_protocol.group_cipher import process_sender_key_distribution_message
+
 from . import receipt
 from .appstate.keys import ALL_PATCH_NAMES
 from .armadillomessage import handle_decrypted_armadillo
 from .binary.attrs import Attrs
-from .download import download
-from .exceptions import ErrNotLoggedIn
-from .generated import waE2E
-from .generated.waE2E import WAWebProtobufsE2E_pb2
-from .generated.waE2E.WAWebProtobufsE2E_pb2 import HistorySyncNotification
-from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
-from .generated.waWeb import WAWebProtobufsWeb_pb2
-from .msgsecret import decrypt_bot_message
-from .receipt import send_message_receipt
-from .store import store
 from .datatypes.jid import (
     BOT_SERVER,
     BROADCAST_SERVER,
@@ -49,6 +39,15 @@ from .datatypes.message import (
     MsgBotInfo,
     MsgMetaInfo,
 )
+from .download import download
+from .exceptions import ErrNotLoggedIn
+from .generated.waE2E import WAWebProtobufsE2E_pb2
+from .generated.waE2E.WAWebProtobufsE2E_pb2 import HistorySyncNotification
+from .generated.waHistorySync import WAWebProtobufsHistorySync_pb2
+from .generated.waWeb import WAWebProtobufsWeb_pb2
+from .msgsecret import decrypt_bot_message
+from .receipt import send_message_receipt
+from .store import store
 from .user import handle_historical_push_names, parse_verified_name_content, update_business_name, update_push_name
 
 if TYPE_CHECKING:
@@ -73,8 +72,8 @@ ENC_SECRET_BOT_MSG = "bot_msg_enc"
 pb_serializer = None  # Will be set when store is initialized
 
 if TYPE_CHECKING:
-    from .client import Client
     from .binary.node import Node
+    from .client import Client
 
 # Define EventAlreadyProcessed locally as it's defined in the Go code
 class EventAlreadyProcessed(Exception):
@@ -517,9 +516,9 @@ async def decrypt_messages(client: 'Client', info: 'MessageInfo', node: 'Node') 
     # TODO: Review EventAlreadyProcessed exception
     # TODO: Review signalerror.ErrNoSenderKeyForUser exception
     from signal_protocol import error as signal_error
-    from .datatypes import events
 
     from . import retry
+    from .datatypes import events
 
     unavailable_node, ok = node.get_optional_child_by_tag("unavailable")
     if ok and len(node.get_children_by_tag("enc")) == 0:
@@ -1112,7 +1111,7 @@ async def handle_history_sync_notification(
     # TODO: Review store_historical_message_secrets implementation
     # TODO: Review dispatch_event implementation
     # TODO: Review proto.unmarshal implementation
-    from .datatypes import JID, MessageInfo, ReceiptType, events
+    from .datatypes import events
     history_sync: Optional[WAWebProtobufsHistorySync_pb2.HistorySync] = None
 
     try:
@@ -1337,7 +1336,7 @@ async def handle_protocol_message(
     # TODO: Review handle_app_state_sync_key_share implementation
     # TODO: Review types.ReceiptTypeHistorySync implementation
     # TODO: Review types.ReceiptTypePeerMsg implementation
-    from .datatypes import JID, MessageInfo, ReceiptType, events
+    from .datatypes import ReceiptType
     proto_msg = msg.protocolMessage
 
     # Handle history sync notification
@@ -1610,7 +1609,7 @@ async def send_protocol_message_receipt(
     # TODO: Review waBinary.Node implementation
     # TODO: Review types.new_jid implementation
     # TODO: Review types.LEGACY_USER_SERVER implementation
-    from .datatypes import JID, MessageInfo, ReceiptType, events
+    from .datatypes import JID
     client_id = client.store.id
     if len(id) == 0 or client_id is None:
         return

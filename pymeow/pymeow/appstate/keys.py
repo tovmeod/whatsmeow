@@ -8,10 +8,10 @@ import base64
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from .errors import KeyNotFoundError
 from ..util.hkdfutil import expand_hmac
+from .errors import KeyNotFoundError
 
 if TYPE_CHECKING:
     from ..store.store import Device

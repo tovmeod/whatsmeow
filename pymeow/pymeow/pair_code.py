@@ -8,9 +8,9 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -18,8 +18,8 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from . import request
 from .binary.node import Attrs, Node
-from .request import InfoQuery, InfoQueryType
 from .datatypes.jid import JID
+from .request import InfoQuery, InfoQueryType
 from .util.hkdfutil.hkdf import sha256 as hkdf_sha256
 from .util.keys.keypair import KeyPair
 

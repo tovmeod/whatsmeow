@@ -10,7 +10,7 @@ import socket
 import time
 from dataclasses import dataclass, field
 from os import urandom
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Set
 
 import aiohttp
 
@@ -21,6 +21,9 @@ from .binary.node import Node, marshal, unmarshal
 from .binary.unpack import unpack
 from .call import handle_call_event
 from .connectionevents import handle_ib
+from .datatypes.events import Disconnected, events
+from .datatypes.jid import DEFAULT_USER_SERVER, EMPTY_JID, GROUP_SERVER, HIDDEN_USER_SERVER, JID, NEWSLETTER_SERVER
+from .datatypes.message import AddressingMode, MessageID, MessageInfo, MessageSource
 from .exceptions import ErrAlreadyConnected, ErrNotConnected, ErrNotLoggedIn
 from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 from .generated.waE2E.WAWebProtobufsE2E_pb2 import Message
@@ -43,9 +46,6 @@ from .store.tortoise_signal_store_implementation import (
     generate_identity_keys,
     generate_prekeys,
 )
-from .datatypes.events import Disconnected, events
-from .datatypes.jid import DEFAULT_USER_SERVER, EMPTY_JID, GROUP_SERVER, HIDDEN_USER_SERVER, JID, NEWSLETTER_SERVER
-from .datatypes.message import AddressingMode, MessageID, MessageInfo, MessageSource
 from .util.keys.keypair import KeyPair
 
 # Type for event handlers
@@ -356,11 +356,11 @@ class Client:
             return EMPTY_JID
         return self.store.get_lid()
 
-    async def wait_for_connection(self, timeout: float) -> bool:
+    async def wait_for_connection(self, timeout_seconds: float) -> bool:
         """Wait for the client to connect and log in.
 
         Args:
-            timeout: The maximum time to wait in seconds.
+            timeout_seconds: The maximum time to wait in seconds.
 
         Returns:
             True if connected and logged in, False if timed out.
@@ -370,7 +370,7 @@ class Client:
         # The Go equivalent `if cli == nil` is a check on the receiver itself.
 
         try:
-            async with asyncio.timeout(timeout):  # Overall timeout for the entire operation
+            async with asyncio.timeout(timeout_seconds):  # Overall timeout for the entire operation
                 while True:  # Loop until connected or timed out by the context manager
                     async with self.socket_lock:  # Acquire lock to check state
                         # Go: cli.socket == nil || !cli.socket.IsConnected() || !cli.IsLoggedIn()
@@ -851,13 +851,13 @@ class Client:
                 done_event = asyncio.Event()
 
                 # Go: go func() { start := time.Now(); cli.nodeHandlers[node.Tag](node); ... }()
-                async def process_node() -> None:
+                async def process_node(current_node=node, event=done_event) -> None:
                     start = time.time()
-                    await self.node_handlers[node.tag](self, node)
+                    await self.node_handlers[current_node.tag](self, current_node)
                     duration = time.time() - start
-                    done_event.set()
+                    event.set()
                     if duration > 5.0:  # 5 seconds
-                        logger.warning(f"Node handling took {duration:.2f}s for {node.xml_string()}")
+                        logger.warning(f"Node handling took {duration:.2f}s for {current_node.xml_string()}")
 
                 # Start the node processing task
                 process_node_task = asyncio.create_task(process_node())
@@ -1091,4 +1091,3 @@ class Client:
         # my_message_retrieval(sender, chat, message_id):
         # User's custom logic
         # return retrieve_from_my_database(sender, chat, message_id)
-

@@ -22,8 +22,8 @@ MIN_PREKEY_COUNT = 5      # MinPreKeyCount
 DJB_TYPE = 5             # ecc.DjbType - curve25519 key type
 
 if TYPE_CHECKING:
-    from .client import Client
     from .binary.node import Node
+    from .client import Client
     from .datatypes import JID
 
 logger = logging.getLogger(__name__)

@@ -1,5 +1,6 @@
 from typing import Optional
-from signal_protocol.curve import PublicKey, PrivateKey
+
+from signal_protocol.curve import PrivateKey, PublicKey
 from signal_protocol.identity_key import IdentityKey
 
 class CiphertextMessage:

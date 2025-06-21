@@ -2,7 +2,7 @@ import typing
 from pathlib import Path
 from typing import Union
 
-from .download import download, DownloadableMessage
+from .download import DownloadableMessage, download
 
 if typing.TYPE_CHECKING:
     from .client import Client

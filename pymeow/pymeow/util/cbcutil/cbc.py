@@ -12,7 +12,7 @@ Port of util/cbcutil/cbc.go
 import hashlib
 import hmac
 import os
-from typing import IO, Optional, Protocol, Tuple, BinaryIO
+from typing import IO, Optional, Protocol, Tuple
 
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes

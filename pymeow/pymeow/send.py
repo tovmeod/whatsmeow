@@ -22,6 +22,18 @@ from signal_protocol.error import SignalProtocolException
 
 from . import prekeys
 from .broadcast import get_broadcast_list_participants
+from .datatypes import events
+from .datatypes.jid import (
+    BOT_SERVER,
+    BROADCAST_SERVER,
+    DEFAULT_USER_SERVER,
+    GROUP_SERVER,
+    HIDDEN_USER_SERVER,
+    JID,
+    MESSENGER_SERVER,
+    NEWSLETTER_SERVER,
+)
+from .datatypes.message import AddressingMode, EditAttribute, MessageID, MessageInfo, MessageServerID, MsgMetaInfo
 from .exceptions import (
     ErrInvalidInlineBotID,
     ErrMessageTimedOut,
@@ -37,23 +49,11 @@ from .group import get_cached_group_data, send_group_iq
 from .message import clear_untrusted_identity, migrate_session_store, pad_message
 from .msgsecret import apply_bot_message_hkdf
 from .prekeys import fetch_pre_keys
-from .datatypes import events
-from .datatypes.jid import (
-    BOT_SERVER,
-    BROADCAST_SERVER,
-    DEFAULT_USER_SERVER,
-    GROUP_SERVER,
-    HIDDEN_USER_SERVER,
-    JID,
-    MESSENGER_SERVER,
-    NEWSLETTER_SERVER,
-)
-from .datatypes.message import AddressingMode, EditAttribute, MessageID, MessageInfo, MessageServerID, MsgMetaInfo
 from .user import get_user_devices_context
 
 if TYPE_CHECKING:
-    from .client import Client
     from .binary.node import Attrs, Node
+    from .client import Client
 
 logger = logging.getLogger(__name__)
 
@@ -1402,7 +1402,7 @@ def get_button_attributes(msg: waE2E_pb2.Message) -> 'Attrs':
         waBinary.Attrs dictionary containing button attributes
     """
     # TODO: Review waBinary.Attrs implementation
-    from .binary.node import Attrs, Node
+    from .binary.node import Attrs
 
     # Case 1: ViewOnceMessage - recurse on inner message
     if msg.viewOnceMessage is not None:
@@ -1979,27 +1979,19 @@ async def encrypt_message_for_device(
                     f"Got {e} error while trying to process prekey bundle for {to}, "
                     f"clearing stored identity and retrying"
                 )
-                try:
-                    await clear_untrusted_identity(client, to)
-                    session.process_prekey_bundle(
-                        remote_address=remote_address,
-                        protocol_store=client.signal_store,
-                        bundle=bundle
-                    )
-                except Exception as clear_err:
-                    raise Exception(f"failed to clear untrusted identity") from clear_err
+                await clear_untrusted_identity(client, to)
+                session.process_prekey_bundle(
+                    remote_address=remote_address,
+                    protocol_store=client.signal_store,
+                    bundle=bundle
+                )
             else:
-                raise Exception(f"failed to process prekey bundle") from e
-        except Exception as e:
-            raise Exception(f"failed to process prekey bundle") from e
+                raise Exception("failed to process prekey bundle") from e
     else:
         # Check if session exists
-        try:
-            has_session = await client.signal_store.contains_session(remote_address)
-            if not has_session:
-                raise ErrNoSession
-        except Exception as e:
-            raise Exception(f"failed to check session existence") from e
+        has_session = await client.signal_store.contains_session(remote_address)
+        if not has_session:
+            raise ErrNoSession
 
     # Encrypt the message
     padded_message = pad_message(plaintext)
@@ -2050,5 +2042,3 @@ DISAPPEARING_TIMER_OFF = timedelta(0)
 DISAPPEARING_TIMER_24_HOURS = timedelta(hours=24)
 DISAPPEARING_TIMER_7_DAYS = timedelta(days=7)
 DISAPPEARING_TIMER_90_DAYS = timedelta(days=90)
-
-

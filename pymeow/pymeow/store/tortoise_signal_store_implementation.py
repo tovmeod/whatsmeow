@@ -1,15 +1,13 @@
 # from signal_protocol.storage import InMemSignalProtocolStore
 import asyncio
 import concurrent.futures
-from typing import List, Optional, TypeVar, Coroutine, Any
+from typing import Any, Coroutine, List, Optional, TypeVar
 
 import signal_protocol
-from tortoise.exceptions import DoesNotExist
-
 from signal_protocol import address, curve, state
 from signal_protocol.sender_keys import SenderKeyName, SenderKeyRecord
-from signal_protocol.storage import InMemSignalProtocolStore
 from tortoise import fields
+from tortoise.exceptions import DoesNotExist
 from tortoise.models import Model
 
 
@@ -79,8 +77,8 @@ def run_async_in_sync_context(coro: Coroutine[Any, Any, T]) -> T:
     - When there's no running event loop (uses asyncio.run)
     """
     try:
-        # Check if there's a running event loop
-        loop = asyncio.get_running_loop()
+        # Check if there's a running event loop, if it is not running this raises RuntimeError
+        asyncio.get_running_loop()
 
         # If we get here, we're in an async context, so use thread pool
         def run_in_new_thread() -> T:
@@ -99,7 +97,7 @@ def run_async_in_sync_context(coro: Coroutine[Any, Any, T]) -> T:
         return asyncio.run(coro)
 
 
-# class TortoiseSignalStore(InMemSignalProtocolStore):
+# class TortoiseSignalStore(signal_protocol.storage.InMemSignalProtocolStore):
 class TortoiseSignalStore:
     """
     Tortoise ORM-backed Signal Protocol store implementation.

@@ -7,15 +7,15 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Awaitable
+from typing import Any, Awaitable, Dict, List, Optional, Tuple
 
 from PIL.GifImagePlugin import TYPE_CHECKING
 
-# Protobuf imports
-from ..generated.waAdv import WAAdv_pb2
-
 # Internal imports
 from ..datatypes.jid import EMPTY_JID, JID
+
+# Protobuf imports
+from ..generated.waAdv import WAAdv_pb2
 from ..util.keys.keypair import KeyPair, PreKey
 from .sqlstore.container import Container
 

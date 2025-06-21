@@ -125,8 +125,8 @@ select = [
     "E",    # pycodestyle errors
     "W",    # pycodestyle warnings
     "F",    # Pyflakes
-#    "I",    # isort
-#    "B",    # flake8-bugbear
+    "I",    # isort
+    "B",    # flake8-bugbear
     "C4",   # flake8-comprehensions
 #    "UP",   # pyupgrade
 #    "ARG",  # flake8-unused-arguments

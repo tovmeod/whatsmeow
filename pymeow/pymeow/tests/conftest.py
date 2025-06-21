@@ -4,12 +4,14 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from tortoise.contrib.test import finalizer, initializer
 import pytest
 import pytest_asyncio
+from tortoise.contrib.test import finalizer, initializer
 
 from pymeow.store.sqlstore.config import get_tortoise_config
+
 from .ws_server_vcr import create_ws_server_from_cassette
+
 
 @pytest.fixture(scope="session", autouse=True)
 def configure_logging():

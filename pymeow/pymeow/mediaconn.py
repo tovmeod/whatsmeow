@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, List
 
-from .exceptions import ErrClientIsNil
 from .datatypes.jid import JID
+from .exceptions import ErrClientIsNil
 
 if TYPE_CHECKING:
     from .client import Client

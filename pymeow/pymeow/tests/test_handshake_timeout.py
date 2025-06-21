@@ -2,6 +2,7 @@
 """Test handshake timeout scenario using ws_server_vcr fixture."""
 
 import asyncio
+
 import pytest
 
 from pymeow.client import Client
@@ -40,7 +41,6 @@ async def test_handshake_qr_timeout(ws_server_vcr):
 
         # Track QR events
         qr_events = []
-        timeout_occurred = False
 
         # Wait for QR events with a reasonable timeout
         try:
@@ -56,7 +56,6 @@ async def test_handshake_qr_timeout(ws_server_vcr):
 
                     elif qr_event.event == "timeout":
                         # Timeout occurred - this is what we're testing
-                        timeout_occurred = True
                         print("QR code timed out as expected")
                         break
 
@@ -83,7 +82,7 @@ async def test_handshake_qr_timeout(ws_server_vcr):
         if client:
             try:
                 await client.disconnect()
-            except:
+            except Exception:
                 pass
         if container:
             await container.close()

@@ -4,12 +4,14 @@ Node handling for WhatsApp binary protocol.
 Port of whatsmeow/binary/node.go
 """
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
 from ..datatypes.jid import BROADCAST_SERVER, DEFAULT_USER_SERVER, GROUP_SERVER, JID, NEWSLETTER_SERVER
 from .attrs import Attrs, AttrUtility
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Node:
@@ -156,7 +158,8 @@ class Node:
                                    parsed.server == GROUP_SERVER or
                                    parsed.server == BROADCAST_SERVER)):
                         attrs[key] = parsed
-                except:
+                except Exception as e:
+                    logger.exception(e)
                     pass
             elif isinstance(val, float):
                 # Convert floats to ints

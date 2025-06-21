@@ -13,7 +13,7 @@ functionality as the Go implementation where DecodePatches is a method on the Pr
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Tuple
 
 from typing_extensions import Sequence
 
@@ -357,10 +357,10 @@ async def decode_patches(processor: Processor, patch_list: PatchList, initial_st
         version = patch.version.version
         current_state.version = version
 
-        async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> Optional[bytes]:
+        async def get_prev_set_value_mac(index_mac: bytes, max_index: int, current_patch=patch) -> Optional[bytes]:
             for i in range(max_index - 1, -1, -1):
-                if patch.mutations[i].record.index.blob == index_mac:
-                    value = patch.mutations[i].record.value.blob
+                if current_patch.mutations[i].record.index.blob == index_mac:
+                    value = current_patch.mutations[i].record.value.blob
                     return value[-32:]
 
             # Previous value not found in current patch, look in the database

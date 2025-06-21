@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from Crypto.Random import get_random_bytes
 
 from .binary.node import Attrs, Node
+from .datatypes import events
+from .datatypes.message import MessageID, MessageInfo
 from .exceptions import (
     ElementMissingError,
     ErrClientIsNil,
@@ -17,8 +19,6 @@ from .exceptions import (
     ErrUnknownMediaRetryError,
 )
 from .generated.waMmsRetry import WAMmsRetry_pb2
-from .datatypes import events
-from .datatypes.message import MessageID, MessageInfo
 from .util import gcmutil, hkdfutil
 
 if TYPE_CHECKING:

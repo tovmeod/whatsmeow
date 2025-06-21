@@ -1,6 +1,7 @@
 from typing import Optional
-from signal_protocol.curve import PublicKey, PrivateKey
+
 from signal_protocol.address import ProtocolAddress
+from signal_protocol.curve import PrivateKey, PublicKey
 from signal_protocol.storage import InMemSignalProtocolStore
 
 # Module-level functions

@@ -10,10 +10,10 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
+from ..datatypes import jid
 from ..generated.waCommon import WACommon_pb2
 from ..generated.waServerSync import WAServerSync_pb2
 from ..generated.waSyncAction import WASyncAction_pb2
-from ..datatypes import jid
 from ..util.cbcutil import encrypt
 from .hash import HashState, concat_and_hmac, generate_content_mac, generate_patch_mac
 from .keys import (

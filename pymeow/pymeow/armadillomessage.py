@@ -7,12 +7,12 @@ import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from . import message
-from .generated.waConsumerApplication import WAConsumerApplication_pb2
-from .generated.waMsgTransport import WAMsgTransport_pb2
-from .generated.waMsgApplication import WAMsgApplication_pb2
-from .generated.waMultiDevice import WAMultiDevice_pb2
-from .generated.waArmadilloApplication import WAArmadilloApplication_pb2
 from .datatypes.message import MessageID
+from .generated.waArmadilloApplication import WAArmadilloApplication_pb2
+from .generated.waConsumerApplication import WAConsumerApplication_pb2
+from .generated.waMsgApplication import WAMsgApplication_pb2
+from .generated.waMsgTransport import WAMsgTransport_pb2
+from .generated.waMultiDevice import WAMultiDevice_pb2
 
 if TYPE_CHECKING:
     from .client import Client

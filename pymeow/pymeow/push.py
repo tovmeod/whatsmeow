@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from . import request
-from .client import Client
 from .binary.node import Node
+from .client import Client
 from .request import InfoQuery, InfoQueryType
 
 logger = logging.getLogger(__name__)

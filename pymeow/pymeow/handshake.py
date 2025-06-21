@@ -7,8 +7,6 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Optional
 
-import signal_protocol
-
 from .generated.waCert import WACert_pb2
 from .generated.waWa6 import WAWebProtobufsWa6_pb2
 from .socket.framesocket import FrameSocket

@@ -17,7 +17,7 @@ async def migrate_from_raw_sql(old_db_path: str, new_container: Container):
 
     # Migrate devices
     cursor.execute("SELECT * FROM whatsmeow_device")
-    for row in cursor.fetchall():
+    for _row in cursor.fetchall():
         # Convert and save to new format
         pass
 

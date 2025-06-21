@@ -3,15 +3,17 @@ Decoder for WhatsApp binary protocol.
 
 Port of whatsmeow/binary/decoder.go
 """
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
-from ..exceptions import PymeowError
 from ..datatypes.jid import INTEROP_SERVER, JID, MESSENGER_SERVER
+from ..exceptions import PymeowError
 from . import token
 from .errors import InvalidJIDTypeError, InvalidNodeError, InvalidTokenError, InvalidTypeError, NonStringKeyError
 from .node import Node
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class BinaryDecoder:
@@ -159,10 +161,11 @@ class BinaryDecoder:
         start_byte = self.read_byte()
         result = []
 
-        for i in range(start_byte & 127):
+        for _ in range(start_byte & 127):
             try:
                 curr_byte = self.read_byte()
             except EOFError as e:
+                logger.exception(e)
                 return ""
 
             lower = unpack_byte(tag, (curr_byte & 0xF0) >> 4)
@@ -347,7 +350,7 @@ class BinaryDecoder:
         if n == 0:
             return {}
         ret = {}
-        for i in range(n):
+        for _ in range(n):
             key_ifc = self.read(True)
             if not isinstance(key_ifc, str):
                 raise NonStringKeyError(f"at position {self.index} ({type(key_ifc)}): {key_ifc!r}")
@@ -370,7 +373,7 @@ class BinaryDecoder:
         """
         size = self.read_list_size(tag)
         ret = []
-        for i in range(size):
+        for _ in range(size):
             n = self.read_node()
             ret.append(n)
         return ret

@@ -10,15 +10,15 @@ from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from . import message, privacysettings, retry
-from .exceptions import ElementMissingError
 from .datatypes.botmap import BOT_JID_MAP
 from .datatypes.events.events import ReceiptTypeRead
 from .datatypes.jid import BOT_SERVER, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, JID, MESSENGER_SERVER, NEWSLETTER_SERVER
 from .datatypes.message import MessageID, MessageInfo
+from .exceptions import ElementMissingError
 
 if TYPE_CHECKING:
+    from .binary.node import Node
     from .client import Client
-    from .binary.node import Attrs, Node
     from .datatypes import ReceiptType
     from .datatypes.events import Receipt
 
