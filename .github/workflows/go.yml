@@ -35,3 +35,30 @@ jobs:
 
     - name: Run pre-commit
       uses: pre-commit/action@v3.0.1
+
+  python-checks:
+    name: Python Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13' # As derived from .python-version in problem description
+
+      - name: Install Python QA Tools
+        run: |
+          pip install ruff
+          pip install mypy
+          pip install pytest pytest-cov
+
+      - name: Run Ruff
+        run: ruff check pymeow/pymeow
+
+      - name: Run Mypy
+        run: mypy pymeow/pymeow --ignore-missing-imports
+
+      - name: Run Pytest with Coverage
+        run: pytest pymeow/pymeow/tests --cov=pymeow/pymeow --cov-report=xml --cov-report=term
