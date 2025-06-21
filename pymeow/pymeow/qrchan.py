@@ -284,6 +284,7 @@ class QRChannel:
         Args:
             raw_evt: The event received from the client
         """
+        logger.debug(f"QRChannel received event: {type(raw_evt).__name__}")
         try:
             if self.closed:
                 logger.debug("Dropping event of type %s, channel is closed", type(raw_evt).__name__)
