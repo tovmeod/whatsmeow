@@ -3,13 +3,13 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ pymeow ]
     paths:
       - 'pymeow/**'
       - '.github/workflows/py.yml'
       - 'pyproject.toml'
   pull_request:
-    branches: [ main, master ]
+      # Run on all PRs regardless of target branch
     paths:
       - 'pymeow/**'
       - '.github/workflows/py.yml'
