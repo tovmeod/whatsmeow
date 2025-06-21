@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'pymeow/**'
+      - '.github/workflows/py.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'pymeow/**'
+      - '.github/workflows/py.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      run: uv python install
+
+    - name: Install dependencies
+      run: uv sync --locked --all-extras --dev
+
+    - name: Run ruff linter
+      run: uv run ruff check --output-format=github .
+
+    - name: Run ruff formatter
+      run: uv run ruff format --check --force-exclude .
+
+    - name: Run mypy
+      run: |
+        uv run mypy --python-version 3.11 --show-column-numbers --pretty . || (
+          echo "::group::MyPy Annotations"
+          uv run mypy --python-version 3.11 --show-column-numbers --no-pretty . | \
+            awk -F: '/:[0-9]+:[0-9]+:/ {printf "::error file=%s,line=%s,col=%s::%s\n", $1, $2, $3, $4}' || true
+          echo "::endgroup::"
+          exit 1
+        )
+
+    - name: Run pytest with coverage
+      run: |
+        uv run pytest --cov=. --cov-report=xml --cov-report=term-missing -v || (
+          echo "::group::Pytest Failures as Annotations"
+          uv run pytest -v 2>&1 | grep -A3 FAILED | grep -v "^$" | grep -v "^==" | \
+            awk -F: '/FAILED/ {printf "::error file=%s,line=%s::%s\n", $1, $2, $0}' || true
+          echo "::endgroup::"
+          exit 1
+        )
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
