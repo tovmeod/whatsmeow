@@ -1,16 +1,19 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main, master ]
     paths:
       - 'pymeow/**'
       - '.github/workflows/py.yml'
+      - 'pyproject.toml'
   pull_request:
     branches: [ main, master ]
     paths:
       - 'pymeow/**'
       - '.github/workflows/py.yml'
+      - 'pyproject.toml'
 
 jobs:
   test:
