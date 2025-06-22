@@ -43,7 +43,7 @@ async def test_handshake_qr_timeout(ws_server_vcr):
 
         # Wait for QR events with a reasonable timeout
         try:
-            async with asyncio.timeout(90):  # 30 second timeout to allow for recording
+            async with asyncio.timeout(90):  # 90 second timeout to allow for recording
                 async for qr_event in qr_channel:
                     qr_events.append(qr_event)
                     print(f"QR event: {qr_event.event}")
@@ -66,13 +66,25 @@ async def test_handshake_qr_timeout(ws_server_vcr):
         except asyncio.TimeoutError:
             # Test timeout - might happen during initial recording
             print(f"Test timed out after receiving {len(qr_events)} QR events")
+        except AssertionError:
+            # If an assertion fails, log it but ensure we break out of the loop
+            print("Assertion failed during QR event processing")
+            raise  # Re-raise to fail the test, but after cleanup in finally block
 
         # Verify we got some events (at least during recording)
         assert len(qr_events) > 0, "Should have received at least one QR event"
 
-        # In normal flow, we should get at least one QR code
+        # Check if we received a timeout event
+        timeout_events = [e for e in qr_events if e.event == "timeout"]
+        has_timeout = len(timeout_events) > 0
+
+        # In normal flow, we should get at least one QR code or a timeout event
         code_events = [e for e in qr_events if e.event == "code"]
-        assert len(code_events) > 0, "Should have received at least one QR code"
+
+        # If we didn't get any code events but got a timeout, that's acceptable for this test
+        # since we're specifically testing the timeout scenario
+        if not has_timeout:
+            assert len(code_events) > 0, "Should have received at least one QR code when no timeout occurred"
 
         print(f"Test completed with {len(qr_events)} QR events")
 

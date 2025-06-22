@@ -534,6 +534,31 @@ class Client:
                 # Go: cli.clearResponseWaiters(xmlStreamEndNode)
                 await request.clear_response_waiters(self, request.XML_STREAM_END_NODE)
 
+                # Cancel handler and keepalive tasks to prevent hanging
+                if self._handler_task and not self._handler_task.done():
+                    logger.debug("Cancelling handler task in on_disconnect")
+                    self._handler_task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self._handler_task), timeout=1.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.debug("Handler task cancelled or timed out during cancellation")
+                    except Exception as e:
+                        logger.error(f"Exception during handler task cancellation: {e}")
+                    finally:
+                        self._handler_task = None
+
+                if self._keepalive_task and not self._keepalive_task.done():
+                    logger.debug("Cancelling keepalive task in on_disconnect")
+                    self._keepalive_task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self._keepalive_task), timeout=1.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.debug("Keepalive task cancelled or timed out during cancellation")
+                    except Exception as e:
+                        logger.error(f"Exception during keepalive task cancellation: {e}")
+                    finally:
+                        self._keepalive_task = None
+
                 # Go: if !cli.isExpectedDisconnect() && remote
                 if not self._is_expected_disconnect() and remote:
                     # Go: cli.Log.Debugf("Emitting Disconnected event")
