@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from client_test import setup_logging
 from pymeow.client import Client
 from pymeow.datatypes.events import Connected, Disconnected, Message, PairError, PairSuccess
 
@@ -76,6 +77,7 @@ async def main() -> None:
     """
     logger.info("PyMeow WhatsApp Client Phone Pairing Example")
     logger.info("=" * 40)
+    setup_logging()
 
     container = None
     client = None
@@ -92,9 +94,9 @@ async def main() -> None:
     try:
         # Setup database for storing device session information
         # Using a different directory to avoid conflicts with client_test.py's store
-        data_dir = Path.home() / ".pymeow_phone_example"
+        data_dir = Path.home() / ".pymeow"
         data_dir.mkdir(exist_ok=True)
-        db_path = data_dir / "device_storage.db"
+        db_path = data_dir / "device.db"
         db_url = f"sqlite:///{db_path}"
         logger.info(f"Using database for session storage: {db_path}")
 

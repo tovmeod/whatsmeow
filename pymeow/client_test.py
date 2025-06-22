@@ -145,7 +145,6 @@ async def main() -> None:
 
     # Set up logging
     setup_logging()
-    logger = logging.getLogger(__name__)
 
     container = None
     client = None

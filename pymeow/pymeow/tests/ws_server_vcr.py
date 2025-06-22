@@ -300,7 +300,9 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                             # Instead of stopping the replay, we'll continue with server-to-client messages
                             # This allows tests to proceed even if the client closes the connection unexpectedly
                             # during the handshake process
-                            logger.warning("Client closed connection unexpectedly. Continuing with server-to-client messages only.")
+                            logger.warning(
+                                "Client closed connection unexpectedly. Continuing with server-to-client messages only."
+                            )
 
                             # Skip to the next server-to-client message
                             continue_from_index = i + 1
@@ -317,7 +319,9 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                                 logger.info("Early connection closure detected, likely during handshake.")
 
                             if remaining_server_messages:
-                                logger.info(f"Continuing with {len(remaining_server_messages)} remaining server-to-client messages")
+                                logger.info(
+                                    f"Continuing with {len(remaining_server_messages)} remaining server-to-client messages"
+                                )
                                 for j, (interaction_index, interaction) in enumerate(remaining_server_messages):
                                     if ws.closed:
                                         logger.warning("WebSocket is closed, cannot send more messages")
@@ -326,7 +330,9 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                                     msg_type = interaction["type"]
                                     payload = interaction["payload"]
 
-                                    logger.debug(f"Replaying server message {interaction_index} (post-close): type={msg_type}")
+                                    logger.debug(
+                                        f"Replaying server message {interaction_index} (post-close): type={msg_type}"
+                                    )
                                     try:
                                         if msg_type == "text":
                                             await ws.send_str(payload)
@@ -334,7 +340,9 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                                             try:
                                                 await ws.send_bytes(bytes.fromhex(payload))
                                             except ValueError as e:
-                                                logger.error(f"Error converting hex to bytes: {e}, payload: {payload[:50]}...")
+                                                logger.error(
+                                                    f"Error converting hex to bytes: {e}, payload: {payload[:50]}..."
+                                                )
                                                 continue
                                         elif msg_type == "close":
                                             logger.info("Replaying server close message.")
