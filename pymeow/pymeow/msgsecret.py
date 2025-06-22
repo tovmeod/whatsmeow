@@ -387,7 +387,6 @@ async def encrypt_comment(
     return msg
 
 
-
 async def encrypt_reaction(
     client: "Client", root_msg_info: Any, reaction: WAWebProtobufsE2E_pb2.ReactionMessage
 ) -> WAWebProtobufsE2E_pb2.EncReactionMessage:

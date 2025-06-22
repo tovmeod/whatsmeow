@@ -223,10 +223,10 @@ class FrameSocket:
                     self.partial_header = msg
                     msg = b""
             elif self.received_length + len(msg) >= self.incoming_length:
-                    bytes_needed = self.incoming_length - self.received_length
-                    self.incoming[self.received_length : self.received_length + bytes_needed] = msg[:bytes_needed]
-                    msg = msg[bytes_needed:]
-                    await self._frame_complete()
+                bytes_needed = self.incoming_length - self.received_length
+                self.incoming[self.received_length : self.received_length + bytes_needed] = msg[:bytes_needed]
+                msg = msg[bytes_needed:]
+                await self._frame_complete()
             else:
                 self.incoming[self.received_length : self.received_length + len(msg)] = msg
                 self.received_length += len(msg)

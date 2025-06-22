@@ -859,7 +859,7 @@ class Client:
                 done_event = asyncio.Event()
 
                 # Go: go func() { start := time.Now(); cli.nodeHandlers[node.Tag](node); ... }()
-                async def process_node(current_node: Node=node, event: asyncio.Event=done_event) -> None:
+                async def process_node(current_node: Node = node, event: asyncio.Event = done_event) -> None:
                     start = time.time()
                     await self.node_handlers[current_node.tag](self, current_node)
                     duration = time.time() - start

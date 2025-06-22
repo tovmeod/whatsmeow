@@ -499,7 +499,6 @@ async def send_message(client: "Client", to: JID, message: waE2E_pb2.Message, *e
     return resp
 
 
-
 def build_message_key(client: "Client", chat: JID, sender: JID, id: MessageID) -> WACommon_pb2.MessageKey:
     """
     Port of Go method BuildMessageKey from client.go.

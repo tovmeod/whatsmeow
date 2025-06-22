@@ -62,15 +62,12 @@ def fix_imports(output_dir: Path) -> None:
                     r"^from\s+(wa\w+)\s+import\s+(\w+_pb2)\s+as\s+(\w+)",
                     r"from ..\1 import \2 as \3",
                     content,
-                    flags=re.MULTILINE
+                    flags=re.MULTILINE,
                 )
 
                 # Pattern 2: from waXXX import YYY_pb2
                 content = re.sub(
-                    r"^from\s+(wa\w+)\s+import\s+(\w+_pb2)",
-                    r"from ..\1 import \2",
-                    content,
-                    flags=re.MULTILINE
+                    r"^from\s+(wa\w+)\s+import\s+(\w+_pb2)", r"from ..\1 import \2", content, flags=re.MULTILINE
                 )
 
                 # Pattern 3: import waXXX.YYY_pb2 as ZZZ
@@ -78,24 +75,14 @@ def fix_imports(output_dir: Path) -> None:
                     r"^import\s+(wa\w+)\.(\w+_pb2)\s+as\s+(\w+)",
                     r"from ..\1 import \2 as \3",
                     content,
-                    flags=re.MULTILINE
+                    flags=re.MULTILINE,
                 )
 
                 # Pattern 4: import waXXX.YYY_pb2
-                content = re.sub(
-                    r"^import\s+(wa\w+)\.(\w+_pb2)",
-                    r"from ..\1 import \2",
-                    content,
-                    flags=re.MULTILINE
-                )
+                content = re.sub(r"^import\s+(wa\w+)\.(\w+_pb2)", r"from ..\1 import \2", content, flags=re.MULTILINE)
 
                 # Pattern 5: import waXXX (standalone module import)
-                content = re.sub(
-                    r"^import\s+(wa\w+)$",
-                    r"from .. import \1",
-                    content,
-                    flags=re.MULTILINE
-                )
+                content = re.sub(r"^import\s+(wa\w+)$", r"from .. import \1", content, flags=re.MULTILINE)
 
                 if content != original_content:
                     print(f"  Fixed imports in {pb2_file.relative_to(output_dir.parent.parent.parent)}")
