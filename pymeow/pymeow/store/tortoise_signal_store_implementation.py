@@ -98,7 +98,7 @@ def run_async_in_sync_context(coro: Coroutine[Any, Any, T]) -> T:
 
 
 class TortoiseSignalStore(signal_protocol.storage.InMemSignalProtocolStore):
-# class TortoiseSignalStore:
+    # class TortoiseSignalStore:
     """
     Tortoise ORM-backed Signal Protocol store implementation.
 
