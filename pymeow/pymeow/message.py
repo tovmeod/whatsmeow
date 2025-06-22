@@ -17,7 +17,6 @@ import signal_protocol
 from signal_protocol.group_cipher import process_sender_key_distribution_message
 
 from . import receipt
-from .appstate import fetch_app_state
 from .appstate.keys import ALL_PATCH_NAMES
 from .armadillomessage import handle_decrypted_armadillo
 from .binary.attrs import Attrs
@@ -1127,6 +1126,7 @@ async def handle_app_state_sync_key_share(client: "Client", keys: WAWebProtobufs
     # TODO: Review FetchAppState implementation
     # TODO: Review appstate.AllPatchNames implementation
     # TODO: Review store.AppStateSyncKey implementation
+    from .appstate import fetch_app_state
 
     only_resync_if_not_synced = True
 
