@@ -1,9 +1,11 @@
+from typing import Optional
+
 from tortoise import fields
 from tortoise.models import Model
 
 
 class ChatSettingsModel(Model):
-    our_jid = fields.ForeignKeyField(
+    our_jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="chat_settings",
         to_field="jid",

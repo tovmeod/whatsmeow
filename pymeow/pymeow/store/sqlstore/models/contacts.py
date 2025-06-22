@@ -5,7 +5,7 @@ from tortoise.models import Model
 class ContactModel(Model):
     """Contact information"""
 
-    our_jid = fields.ForeignKeyField(
+    our_jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="contacts",
         to_field="jid",

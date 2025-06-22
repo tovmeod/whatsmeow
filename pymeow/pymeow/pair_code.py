@@ -9,6 +9,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import TYPE_CHECKING, Tuple
 
 from cryptography.hazmat.primitives import hashes
@@ -55,7 +56,7 @@ class CryptographicError(PairCodeError):
 
 
 # PairClientType is the type of client to use with PairCode
-class PairClientType(int):
+class PairClientType(IntEnum):
     """Type of client to use with PairCode."""
 
     UNKNOWN = 0

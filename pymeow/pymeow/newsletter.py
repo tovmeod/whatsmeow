@@ -449,7 +449,7 @@ async def get_newsletter_message_updates(
     if params:
         if params.count != 0:
             attrs["count"] = params.count
-        if params.since is not None and not params.since == datetime.min:
+        if params.since is not None and params.since != datetime.min:
             attrs["since"] = int(params.since.timestamp())
         if params.after is not None and params.after != 0:
             attrs["after"] = params.after

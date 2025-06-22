@@ -8,7 +8,7 @@ class DeviceModel(Model):
     """Device information storage"""
 
     jid = fields.CharField(max_length=255, pk=True)
-    lid: Optional[str] = fields.CharField(max_length=255, null=True)
+    lid: Optional[str] = fields.CharField(max_length=255, null=True)  # type: ignore[assignment]
     facebook_uuid = fields.UUIDField(null=True)
 
     registration_id = fields.BigIntField()

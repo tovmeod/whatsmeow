@@ -529,10 +529,7 @@ def should_retry_media_download(err: Exception) -> bool:
         status_code = err.status_code
         return should_retry_http_status(status_code)
 
-    if isinstance(err, Exception) and "stream error" in str(err).lower():
-        return True
-
-    return False
+    return isinstance(err, Exception) and "stream error" in str(err).lower()
 
 
 def should_retry_http_status(status_code: int) -> bool:

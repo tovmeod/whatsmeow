@@ -108,7 +108,7 @@ class SendResponse:
     sender: JID = field(default_factory=lambda: JID())
     debug_timings: MessageDebugTimings = field(default_factory=lambda: MessageDebugTimings())
     timestamp: Optional[datetime] = None
-    server_id: MessageServerID = MessageServerID(0)
+    server_id: MessageServerID = MessageServerID()
 
 
 @dataclass
@@ -324,9 +324,9 @@ async def send_message(client: "Client", to: JID, message: waE2E_pb2.Message, *e
     if to.server == NEWSLETTER_SERVER:
         # TODO somehow deduplicate this with the code in send_newsletter?
         if message.editedMessage is not None:
-            req.id = MessageID(message.editedMessage.message.protocolMessage.key.id)
+            req.id = MessageID(message.editedMessage.message.protocolMessage.key.ID)
         elif message.protocolMessage is not None and message.protocolMessage.type == waE2E_pb2.ProtocolMessage.REVOKE:
-            req.id = MessageID(message.protocolMessage.key.id)
+            req.id = MessageID(message.protocolMessage.key.ID)
 
     resp = SendResponse(id=req.id)
     is_inline_bot_mode = False
@@ -720,9 +720,9 @@ def build_edit(client: "Client", chat: JID, id: MessageID, new_content: waE2E_pb
     protocol_message = inner_message.protocolMessage
 
     # Set the message key
-    protocol_message.key.from_me = True
-    protocol_message.key.id = str(id)
-    protocol_message.key.remote_jid = str(chat)
+    protocol_message.key.fromMe = True
+    protocol_message.key.ID = str(id)
+    protocol_message.key.remoteJID = str(chat)
 
     # Set protocol message properties
     protocol_message.type = waE2E_pb2.ProtocolMessage.MESSAGE_EDIT
@@ -1010,7 +1010,7 @@ async def send_group(
     media_type = get_media_type_from_message(message)
     if media_type:
         sk_msg.attrs["mediatype"] = media_type
-    node.content = node.get_children() + [sk_msg]
+    node.content = [*node.get_children(), sk_msg]
 
     start = time.time()
     data = await client.send_node_and_get_data(node)

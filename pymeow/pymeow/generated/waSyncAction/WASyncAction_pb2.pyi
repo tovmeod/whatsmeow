@@ -1,6 +1,6 @@
-from waChatLockSettings import WAProtobufsChatLockSettings_pb2 as _WAProtobufsChatLockSettings_pb2
-from waDeviceCapabilities import WAProtobufsDeviceCapabilities_pb2 as _WAProtobufsDeviceCapabilities_pb2
-from waCommon import WACommon_pb2 as _WACommon_pb2
+from ..waChatLockSettings import WAProtobufsChatLockSettings_pb2 as _WAProtobufsChatLockSettings_pb2
+from ..waDeviceCapabilities import WAProtobufsDeviceCapabilities_pb2 as _WAProtobufsDeviceCapabilities_pb2
+from ..waCommon import WACommon_pb2 as _WACommon_pb2
 from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor

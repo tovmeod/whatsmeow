@@ -45,13 +45,13 @@ async def event_handler(event: Any) -> None:
     Handle events from the WhatsApp client.
     This is a generic handler; you can create more specific handlers for different event types.
     """
-    if isinstance(event, Message):
+    if isinstance(event, Message) and event.message:
         # Attempt to get message content, prioritizing conversation then extended_text
         message_text = ""
-        if event.message.get_conversation():
-            message_text = event.message.get_conversation()
-        elif event.message.get_extended_text_message() and event.message.get_extended_text_message().get_text():
-            message_text = event.message.get_extended_text_message().get_text()
+        if event.message.conversation:
+            message_text = event.message.conversation
+        elif event.message.extendedTextMessage and event.message.extendedTextMessage.text:
+            message_text = event.message.extendedTextMessage.text
         else:
             message_text = "No text content (possibly media or other type)"
         logger.info(f"Received a message: '{message_text}' from {event.info.message_source.sender}")
@@ -72,7 +72,7 @@ async def event_handler(event: Any) -> None:
         logger.debug(f"Received event: {type(event).__name__}")
 
 
-async def main():
+async def main() -> None:
     """
     Main example function demonstrating PyMeow client phone pairing.
     """
@@ -134,7 +134,6 @@ async def main():
                 # client_display_name is shown in the "Linked Devices" section of your WhatsApp app.
                 pairing_code = await pair_phone(
                     client=client,
-                    ctx=None,  # Context, can be None for this operation
                     phone=phone_number_input,
                     show_push_notification=True,  # Shows a notification on the primary device
                     client_type=PairClientType.CHROME,

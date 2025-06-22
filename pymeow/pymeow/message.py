@@ -17,6 +17,7 @@ import signal_protocol
 from signal_protocol.group_cipher import process_sender_key_distribution_message
 
 from . import receipt
+from .appstate import fetch_app_state
 from .appstate.keys import ALL_PATCH_NAMES
 from .armadillomessage import handle_decrypted_armadillo
 from .binary.attrs import Attrs
@@ -1166,8 +1167,6 @@ async def handle_app_state_sync_key_share(client: "Client", keys: WAWebProtobufs
     # Fetch app state for all patch names
     for name in ALL_PATCH_NAMES:
         try:
-            from py.pymeow.appstate import fetch_app_state
-
             await fetch_app_state(client, name, False, only_resync_if_not_synced)
         except Exception as err:
             logger.error("Failed to do initial fetch of app state %s: %v", name, err)
@@ -1404,26 +1403,26 @@ async def store_historical_message_secrets(
 
         # Process messages in conversation
         for msg in conv.messages:
-            secret = msg.message.get_message_secret()
+            secret = msg.message.messageSecret
             if secret is not None:
                 sender_jid = JID()
-                msg_key = msg.message.get_key()
+                msg_key = msg.message.key
 
                 # Determine sender JID based on message properties
-                if msg_key.get_from_me():
+                if msg_key.fromMe:
                     sender_jid = own_id
                 elif chat_jid.server == DEFAULT_USER_SERVER:
                     sender_jid = chat_jid
-                elif msg_key.get_participant() != "":
-                    sender_jid = JID.parse_jid(msg_key.get_participant())
-                elif msg.message.get_participant() != "":
-                    sender_jid = JID.parse_jid(msg.message.get_participant())
+                elif msg_key.participant != "":
+                    sender_jid = JID.parse_jid(msg_key.participant)
+                elif msg.message.participant != "":
+                    sender_jid = JID.parse_jid(msg.message.participant)
 
-                if sender_jid.is_empty() or msg_key.get_id() == "":
+                if sender_jid.is_empty() or msg_key.ID == "":
                     continue
 
                 secrets.append(
-                    store.MessageSecretInsert(chat=chat_jid, sender=sender_jid, id=msg_key.get_id(), secret=secret)
+                    store.MessageSecretInsert(chat=chat_jid, sender=sender_jid, id=msg_key.ID, secret=secret)
                 )
 
     # Store message secrets if any were found

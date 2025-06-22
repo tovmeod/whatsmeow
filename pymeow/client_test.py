@@ -98,9 +98,9 @@ async def event_handler(event: Any) -> None:
     Args:
         event: The event object received from WhatsApp
     """
-    if isinstance(event, Message):
+    if isinstance(event, Message) and event.message:
         # Handle incoming messages
-        message_text = event.message.get_conversation() or "No text content"
+        message_text = event.message.conversation or "No text content"
         print(f"Received a message: {message_text}")
         print(f"From: {event.info.message_source.sender}")
         print(f"Chat: {event.info.message_source.chat}")

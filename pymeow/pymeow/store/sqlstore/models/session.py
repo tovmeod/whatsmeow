@@ -1,3 +1,5 @@
+from typing import Optional
+
 from tortoise import fields
 from tortoise.models import Model
 
@@ -5,7 +7,7 @@ from tortoise.models import Model
 class IdentityKeyModel(Model):
     """Identity key storage for Signal protocol"""
 
-    our_jid = fields.ForeignKeyField(
+    our_jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="identity_keys",
         to_field="jid",
@@ -23,7 +25,7 @@ class IdentityKeyModel(Model):
 class SessionModel(Model):
     """Signal protocol sessions"""
 
-    our_jid = fields.ForeignKeyField(
+    our_jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="sessions",
         to_field="jid",
@@ -41,7 +43,7 @@ class SessionModel(Model):
 class PreKeyModel(Model):
     """Pre-keys for Signal protocol"""
 
-    jid = fields.ForeignKeyField(
+    jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="pre_keys",
         to_field="jid",
@@ -60,7 +62,7 @@ class PreKeyModel(Model):
 class SenderKeyModel(Model):
     """Sender keys for group encryption"""
 
-    our_jid = fields.ForeignKeyField(
+    our_jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="sender_keys",
         to_field="jid",

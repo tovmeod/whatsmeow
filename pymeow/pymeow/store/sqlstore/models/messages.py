@@ -1,9 +1,11 @@
+from typing import Optional
+
 from tortoise import fields
 from tortoise.models import Model
 
 
 class MessageSecretModel(Model):
-    our_jid = fields.ForeignKeyField(
+    our_jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="message_secrets",
         to_field="jid",

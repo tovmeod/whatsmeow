@@ -25,7 +25,7 @@ class AppStateSyncKeyModel(Model):
 class AppStateVersionModel(Model):
     """App state versions"""
 
-    jid = fields.ForeignKeyField(
+    jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="app_state_versions",
         to_field="jid",
@@ -46,7 +46,7 @@ class AppStateMutationMACModel(Model):
 
     # Since Tortoise doesn't support composite foreign keys, we store the fields separately
     # but reference the device for the main cascade relationship
-    jid = fields.ForeignKeyField(
+    jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="mutation_macs",
         to_field="jid",

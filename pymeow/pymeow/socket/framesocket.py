@@ -132,7 +132,7 @@ class FrameSocket:
             # Start read pump
             self.read_task = asyncio.create_task(self.read_pump(self.conn))
 
-    async def send_frame(self, data: bytes) -> Optional[Exception]:
+    async def send_frame(self, data: bytes) -> None:
         """
         Port of Go method SendFrame from FrameSocket.
 
@@ -141,15 +141,15 @@ class FrameSocket:
         Args:
             data: The frame data to send
 
-        Returns:
-            Optional[Exception]: None if successful, Exception if failed
+        Raises:
+            Exception
         """
         if self.conn is None:
-            return SocketClosedError()
+            raise SocketClosedError()
 
         data_length = len(data)
         if data_length >= FRAME_MAX_SIZE:
-            return FrameTooLargeError(f"got {len(data)} bytes, max {FRAME_MAX_SIZE} bytes")
+            raise FrameTooLargeError(f"got {len(data)} bytes, max {FRAME_MAX_SIZE} bytes")
 
         header_length = len(self.header) if self.header is not None else 0
         # Whole frame is header + 3 bytes for length + data
@@ -170,20 +170,9 @@ class FrameSocket:
         whole_frame[header_length + FRAME_LENGTH_SIZE :] = data
 
         if self.write_timeout > 0:
-            try:
-                await asyncio.wait_for(self.conn.send_bytes(whole_frame), timeout=self.write_timeout)
-                return None
-            except asyncio.TimeoutError as e:
-                logger.warning(f"Failed to set write deadline: {e}")
-                return e
-            except Exception as e:
-                return e
+            await asyncio.wait_for(self.conn.send_bytes(whole_frame), timeout=self.write_timeout)
         else:
-            try:
-                await self.conn.send_bytes(whole_frame)
-                return None
-            except Exception as e:
-                return e
+            await self.conn.send_bytes(whole_frame)
 
     async def _frame_complete(self) -> None:
         """Handle a complete frame."""
@@ -233,16 +222,15 @@ class FrameSocket:
                     logger.warning("Got partial header")
                     self.partial_header = msg
                     msg = b""
-            else:
-                if self.received_length + len(msg) >= self.incoming_length:
+            elif self.received_length + len(msg) >= self.incoming_length:
                     bytes_needed = self.incoming_length - self.received_length
                     self.incoming[self.received_length : self.received_length + bytes_needed] = msg[:bytes_needed]
                     msg = msg[bytes_needed:]
                     await self._frame_complete()
-                else:
-                    self.incoming[self.received_length : self.received_length + len(msg)] = msg
-                    self.received_length += len(msg)
-                    msg = b""
+            else:
+                self.incoming[self.received_length : self.received_length + len(msg)] = msg
+                self.received_length += len(msg)
+                msg = b""
 
     async def read_pump(self, conn: "ClientWebSocketResponse") -> None:
         """
