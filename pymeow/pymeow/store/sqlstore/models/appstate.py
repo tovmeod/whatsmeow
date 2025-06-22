@@ -1,11 +1,12 @@
 from tortoise import fields
 from tortoise.models import Model
+from typing import Optional
 
 
 class AppStateSyncKeyModel(Model):
     """App state sync keys"""
 
-    jid = fields.ForeignKeyField(
+    jid: Optional[str] = fields.ForeignKeyField(  # type: ignore[assignment]
         "models.DeviceModel",
         related_name="app_state_sync_keys",
         to_field="jid",

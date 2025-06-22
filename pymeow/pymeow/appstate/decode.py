@@ -380,7 +380,7 @@ async def decode_patches(
         version = patch.version.version
         current_state.version = version
 
-        async def get_prev_set_value_mac(index_mac: bytes, max_index: int, current_patch=patch) -> Optional[bytes]:
+        async def get_prev_set_value_mac(index_mac: bytes, max_index: int, current_patch: WAServerSync_pb2.SyncdPatch=patch) -> Optional[bytes]:
             for i in range(max_index - 1, -1, -1):
                 if current_patch.mutations[i].record.index.blob == index_mac:
                     value = current_patch.mutations[i].record.value.blob

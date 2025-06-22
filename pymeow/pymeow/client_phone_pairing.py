@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from pymeow.client import Client
-from pymeow.datatypes.events import Connected, Disconnected, LoggedIn, Message, PairError, PairSuccess
+from pymeow.datatypes.events import Connected, Disconnected, Message, PairError, PairSuccess
 
 # Make sure pair_phone and PairClientType are correctly imported
 from pymeow.pair_code import PairClientType, pair_phone
@@ -56,9 +56,7 @@ async def event_handler(event: Any) -> None:
             message_text = "No text content (possibly media or other type)"
         logger.info(f"Received a message: '{message_text}' from {event.info.message_source.sender}")
     elif isinstance(event, Connected):
-        logger.info("✅ Successfully connected to WhatsApp (WebSocket connection established).")
-    elif isinstance(event, LoggedIn):
-        logger.info("🔑 Successfully logged in! Device is authenticated.")
+        logger.info("✅ Successfully connected to WhatsApp (and is authenticated).")
     elif isinstance(event, PairSuccess):
         logger.info(
             f"📱 Device successfully paired: JID {event.id}, LID {event.lid}, Platform: {event.platform}, Business Name: '{event.business_name}'"
@@ -84,7 +82,7 @@ async def main() -> None:
     shutdown_event = asyncio.Event()
 
     # Setup signal handlers for graceful shutdown
-    def signal_handler_fn(sig, frame):
+    def signal_handler_fn(sig: int, frame: Any) -> None:
         logger.info(f"Signal {sig} received, initiating shutdown...")
         shutdown_event.set()
 

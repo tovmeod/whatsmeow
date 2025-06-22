@@ -321,6 +321,7 @@ async def encrypt_poll_vote(
 ) -> WAWebProtobufsE2E_pb2.PollUpdateMessage:
     """Encrypt a poll vote message."""
     from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
+    from .generated.waCommon import WACommon_pb2 as waCommon_pb2
 
     plaintext = vote.SerializeToString()
 
@@ -332,8 +333,17 @@ async def encrypt_poll_vote(
     poll_enc_value.encPayload = ciphertext
     poll_enc_value.encIV = iv
 
+    # Create a MessageKey object from the dictionary
+    key_dict = get_key_from_info(poll_info)
+    message_key = waCommon_pb2.MessageKey()
+    message_key.remoteJID = key_dict["remote_jid"]
+    message_key.fromMe = key_dict["from_me"]
+    message_key.ID = key_dict["id"]
+    if "participant" in key_dict:
+        message_key.participant = key_dict["participant"]
+
     poll_update = waE2E_pb2.PollUpdateMessage()
-    poll_update.pollCreationMessageKey.CopyFrom(get_key_from_info(poll_info))
+    poll_update.pollCreationMessageKey.CopyFrom(message_key)
     poll_update.vote.CopyFrom(poll_enc_value)
     poll_update.senderTimestampMS = int(time.time() * 1000)
 
@@ -377,6 +387,7 @@ async def encrypt_comment(
     return msg
 
 
+
 async def encrypt_reaction(
     client: "Client", root_msg_info: Any, reaction: WAWebProtobufsE2E_pb2.ReactionMessage
 ) -> WAWebProtobufsE2E_pb2.EncReactionMessage:
@@ -384,7 +395,7 @@ async def encrypt_reaction(
     from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 
     reaction_key = reaction.key
-    reaction.key = None
+    reaction.ClearField("key")  # Use ClearField instead of setting to None
 
     plaintext = reaction.SerializeToString()
 

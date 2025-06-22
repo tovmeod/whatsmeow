@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
-from warnings import deprecated
+import warnings
 
 from signal_protocol import session, session_cipher
 from signal_protocol.error import SignalProtocolException
@@ -499,20 +499,6 @@ async def send_message(client: "Client", to: JID, message: waE2E_pb2.Message, *e
 
     return resp
 
-
-@deprecated("This method is deprecated in favor of build_revoke")
-async def revoke_message(client: "Client", chat: JID, id: MessageID) -> SendResponse:
-    """
-    Delete the given message from everyone in the chat.
-
-    This method will wait for the server to acknowledge the revocation message before returning.
-    The return value is the timestamp of the message from the server.
-
-    Deprecated: This method is deprecated in favor of build_revoke
-    """
-    revoke_msg = build_revoke(client, chat, JID(), id)
-    send_response = await send_message(client, chat, revoke_msg)
-    return send_response
 
 
 def build_message_key(client: "Client", chat: JID, sender: JID, id: MessageID) -> WACommon_pb2.MessageKey:
