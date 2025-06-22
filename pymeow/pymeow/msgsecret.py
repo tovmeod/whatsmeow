@@ -320,8 +320,8 @@ async def encrypt_poll_vote(
     client: "Client", poll_info: Any, vote: WAWebProtobufsE2E_pb2.PollVoteMessage
 ) -> WAWebProtobufsE2E_pb2.PollUpdateMessage:
     """Encrypt a poll vote message."""
-    from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
     from .generated.waCommon import WACommon_pb2 as waCommon_pb2
+    from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 
     plaintext = vote.SerializeToString()
 

@@ -1,6 +1,7 @@
+from typing import Optional
+
 from tortoise import fields
 from tortoise.models import Model
-from typing import Optional
 
 
 class AppStateSyncKeyModel(Model):

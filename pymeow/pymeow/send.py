@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
-import warnings
 
 from signal_protocol import session, session_cipher
 from signal_protocol.error import SignalProtocolException
