@@ -3,6 +3,7 @@ WhatsApp Web connection handshake implementation.
 
 Port of whatsmeow/handshake.go
 """
+
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Optional
@@ -21,15 +22,47 @@ if TYPE_CHECKING:
 # Constants
 NOISE_HANDSHAKE_RESPONSE_TIMEOUT = 20  # seconds
 WA_CERT_ISSUER_SERIAL = 0
-WA_CERT_PUB_KEY = bytes([
-    0x14, 0x23, 0x75, 0x57, 0x4d, 0xa, 0x58, 0x71, 0x66, 0xaa, 0xe7, 0x1e,
-    0xbe, 0x51, 0x64, 0x37, 0xc4, 0xa2, 0x8b, 0x73, 0xe3, 0x69, 0x5c, 0x6c,
-    0xe1, 0xf7, 0xf9, 0x54, 0x5d, 0xa8, 0xee, 0x6b
-])
+WA_CERT_PUB_KEY = bytes(
+    [
+        0x14,
+        0x23,
+        0x75,
+        0x57,
+        0x4D,
+        0xA,
+        0x58,
+        0x71,
+        0x66,
+        0xAA,
+        0xE7,
+        0x1E,
+        0xBE,
+        0x51,
+        0x64,
+        0x37,
+        0xC4,
+        0xA2,
+        0x8B,
+        0x73,
+        0xE3,
+        0x69,
+        0x5C,
+        0x6C,
+        0xE1,
+        0xF7,
+        0xF9,
+        0x54,
+        0x5D,
+        0xA8,
+        0xEE,
+        0x6B,
+    ]
+)
 
 logger = logging.getLogger(__name__)
 
-async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair) -> None:
+
+async def do_handshake(client: "Client", fs: FrameSocket, ephemeral_kp: KeyPair) -> None:
     """
     Port of Go method doHandshake from handshake.go.
 
@@ -49,17 +82,12 @@ async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair)
 
     # Create and marshal client hello
     data = WAWebProtobufsWa6_pb2.HandshakeMessage(
-        clientHello=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientHello(
-            ephemeral=ephemeral_kp.pub
-        )
+        clientHello=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientHello(ephemeral=ephemeral_kp.pub)
     ).SerializeToString()
     # Send handshake message
     await fs.send_frame(data)
     # Wait for response with timeout
-    resp = await asyncio.wait_for(
-        fs.frames.get(),
-        timeout=NOISE_HANDSHAKE_RESPONSE_TIMEOUT
-    )
+    resp = await asyncio.wait_for(fs.frames.get(), timeout=NOISE_HANDSHAKE_RESPONSE_TIMEOUT)
     # Unmarshal handshake response
     handshake_response = WAWebProtobufsWa6_pb2.HandshakeMessage()
     handshake_response.ParseFromString(bytes(resp))
@@ -67,9 +95,7 @@ async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair)
     server_static_ciphertext = handshake_response.serverHello.static
     certificate_ciphertext = handshake_response.serverHello.payload
 
-    if (len(server_ephemeral) != 32 or
-        not server_static_ciphertext or
-        not certificate_ciphertext):
+    if len(server_ephemeral) != 32 or not server_static_ciphertext or not certificate_ciphertext:
         raise Exception("missing parts of handshake response")
 
     # Process server ephemeral key
@@ -96,7 +122,9 @@ async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair)
 
     client_payload = get_client_payload(client.store)
     # Get client payload
-    if clientpayload.get_client_payload is not None:  # todo: check what this does, it seems this always evaluates to true
+    if (
+        clientpayload.get_client_payload is not None
+    ):  # todo: check what this does, it seems this always evaluates to true
         client_payload = clientpayload.get_client_payload(client.store)
     else:
         client_payload = get_client_payload(client.store)
@@ -108,8 +136,7 @@ async def do_handshake(client: 'Client', fs: FrameSocket, ephemeral_kp: KeyPair)
     # Create and send client finish message
     data = WAWebProtobufsWa6_pb2.HandshakeMessage(
         clientFinish=WAWebProtobufsWa6_pb2.HandshakeMessage.ClientFinish(
-            static=encrypted_pubkey,
-            payload=encrypted_client_finish_payload
+            static=encrypted_pubkey, payload=encrypted_client_finish_payload
         )
     ).SerializeToString()
     await fs.send_frame(data)
@@ -143,10 +170,12 @@ def verify_server_cert(cert_decrypted: bytes, static_decrypted: bytes) -> Option
         leaf_cert_signature = cert_chain.leaf.signature
 
         # Basic validation (matching Go implementation checks)
-        if (intermediate_cert_details_raw is None or
-            intermediate_cert_signature is None or
-            leaf_cert_details_raw is None or
-            leaf_cert_signature is None):
+        if (
+            intermediate_cert_details_raw is None
+            or intermediate_cert_signature is None
+            or leaf_cert_details_raw is None
+            or leaf_cert_signature is None
+        ):
             return "missing parts of noise certificate"
 
         if len(intermediate_cert_signature) != 64:

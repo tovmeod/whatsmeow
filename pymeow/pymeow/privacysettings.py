@@ -3,6 +3,7 @@ WhatsApp privacy settings handling.
 
 Port of whatsmeow/privacysettings.go
 """
+
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -17,8 +18,10 @@ if TYPE_CHECKING:
     from .client import Client
     from .datatypes.events import PrivacySettingsEvent
 
+
 class PrivacySettingType(str, Enum):
     """Types of WhatsApp privacy settings."""
+
     GROUP_ADD = "groupadd"
     LAST_SEEN = "last"
     STATUS = "status"
@@ -27,17 +30,21 @@ class PrivacySettingType(str, Enum):
     ONLINE = "online"
     CALL_ADD = "calladd"
 
+
 class PrivacySetting(str, Enum):
     """Values for privacy settings."""
+
     ALL = "all"
     CONTACTS = "contacts"
     CONTACT_BLACKLIST = "contact-blacklist"
     NONE = "none"
     MATCH_LAST_SEEN = "match-last-seen"
 
+
 @dataclass
 class PrivacySettings:
     """Represents the privacy settings for an account."""
+
     group_add: PrivacySetting = PrivacySetting.ALL
     last_seen: PrivacySetting = PrivacySetting.ALL
     status: PrivacySetting = PrivacySetting.ALL
@@ -46,12 +53,11 @@ class PrivacySettings:
     online: PrivacySetting = PrivacySetting.ALL
     call_add: PrivacySetting = PrivacySetting.ALL
 
+
 logger = logging.getLogger(__name__)
 
-async def try_fetch_privacy_settings(
-    client: 'Client',
-    ignore_cache: bool
-) -> PrivacySettings:
+
+async def try_fetch_privacy_settings(client: "Client", ignore_cache: bool) -> PrivacySettings:
     """
     Port of Go method TryFetchPrivacySettings from privacy.go.
 
@@ -87,18 +93,12 @@ async def try_fetch_privacy_settings(
         if val is not None:
             return val
 
-    resp = await request.send_iq(client, InfoQuery(
-        namespace="privacy",
-        type=InfoQueryType.GET,
-        to=SERVER_JID,
-        content=[Node(tag="privacy")]
-    ))
+    resp = await request.send_iq(
+        client, InfoQuery(namespace="privacy", type=InfoQueryType.GET, to=SERVER_JID, content=[Node(tag="privacy")])
+    )
     privacy_node, ok = resp.get_optional_child_by_tag("privacy")
     if not ok:
-        raise ElementMissingError(
-            tag="privacy",
-            in_location="response to privacy settings query"
-        )
+        raise ElementMissingError(tag="privacy", in_location="response to privacy settings query")
 
     settings = PrivacySettings()
     parse_privacy_settings(client, privacy_node, settings)
@@ -106,7 +106,7 @@ async def try_fetch_privacy_settings(
     return settings
 
 
-async def get_privacy_settings(client: 'Client') -> PrivacySettings:
+async def get_privacy_settings(client: "Client") -> PrivacySettings:
     """
     Port of Go method GetPrivacySettings from privacy.go.
 
@@ -250,11 +250,8 @@ async def get_privacy_settings(client: 'Client') -> PrivacySettings:
 #         )]
 #     ))
 
-def parse_privacy_settings(
-    client: 'Client',
-    privacy_node: 'Node',
-    settings: PrivacySettings
-) -> 'PrivacySettingsEvent':
+
+def parse_privacy_settings(client: "Client", privacy_node: "Node", settings: PrivacySettings) -> "PrivacySettingsEvent":
     """
     Port of Go method parsePrivacySettings from privacy.go.
 
@@ -277,6 +274,7 @@ def parse_privacy_settings(
     # TODO: Review PrivacySetting implementation
     # TODO: Review PRIVACY_SETTING_TYPE_* constants implementation
     from .datatypes.events import PrivacySettingsEvent
+
     evt = PrivacySettingsEvent()
 
     for child in privacy_node.get_children():

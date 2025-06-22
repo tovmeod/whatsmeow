@@ -3,6 +3,7 @@ Keepalive mechanism for WhatsApp Web connection.
 
 Port of whatsmeow/keepalive.go
 """
+
 import asyncio
 import logging
 import random
@@ -30,7 +31,8 @@ KEEP_ALIVE_MAX_FAIL_TIME = timedelta(minutes=3)
 
 logger = logging.getLogger(__name__)
 
-async def keep_alive_loop(client: 'Client') -> None:
+
+async def keep_alive_loop(client: "Client") -> None:
     """
     Port of Go method keepAliveLoop from keepalive.go.
 
@@ -50,8 +52,7 @@ async def keep_alive_loop(client: 'Client') -> None:
         while True:
             # Calculate random interval between min and max (in milliseconds)
             interval_ms = random.randint(
-                int(KEEP_ALIVE_INTERVAL_MIN.total_seconds() * 1000),
-                int(KEEP_ALIVE_INTERVAL_MAX.total_seconds() * 1000)
+                int(KEEP_ALIVE_INTERVAL_MIN.total_seconds() * 1000), int(KEEP_ALIVE_INTERVAL_MAX.total_seconds() * 1000)
             )
 
             # Wait for the calculated interval
@@ -66,15 +67,10 @@ async def keep_alive_loop(client: 'Client') -> None:
             elif not is_success:
                 error_count += 1
 
-                await client.dispatch_event(KeepAliveTimeout(
-                    error_count=error_count,
-                    last_success=last_success
-                ))
+                await client.dispatch_event(KeepAliveTimeout(error_count=error_count, last_success=last_success))
 
                 # Check if we should force reconnect
-                if (client.enable_auto_reconnect and
-                    datetime.now() - last_success > KEEP_ALIVE_MAX_FAIL_TIME):
-
+                if client.enable_auto_reconnect and datetime.now() - last_success > KEEP_ALIVE_MAX_FAIL_TIME:
                     logger.debug("Forcing reconnect due to keepalive failure")
                     await client.disconnect()
                     client.create_task(client.auto_reconnect())
@@ -93,7 +89,7 @@ async def keep_alive_loop(client: 'Client') -> None:
         logger.error(f"Unexpected error in keepalive loop: {e}", exc_info=True)
 
 
-async def send_keep_alive(client: 'Client') -> Tuple[bool, bool]:
+async def send_keep_alive(client: "Client") -> Tuple[bool, bool]:
     """
     Send a keepalive ping to the server.
 
@@ -112,7 +108,7 @@ async def send_keep_alive(client: 'Client') -> Tuple[bool, bool]:
             namespace="w:p",
             type=InfoQueryType.GET,
             to=JID.server_jid(),
-            content=[]  # Empty content for ping
+            content=[],  # Empty content for ping
         )
 
         # Send info query for keepalive using the actual client API
@@ -122,7 +118,7 @@ async def send_keep_alive(client: 'Client') -> Tuple[bool, bool]:
         try:
             _ = await asyncio.wait_for(
                 response_queue.get(),  # Get response from the queue
-                timeout=KEEP_ALIVE_RESPONSE_DEADLINE.total_seconds()
+                timeout=KEEP_ALIVE_RESPONSE_DEADLINE.total_seconds(),
             )
             # Response received successfully
             return True, True

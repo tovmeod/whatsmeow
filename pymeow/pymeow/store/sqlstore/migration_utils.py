@@ -4,6 +4,7 @@
 aerich init -t pymeow.store.sqlstore.config.TORTOISE_ORM
 aerich init-db
 """
+
 from ..sqlstore import Container
 
 

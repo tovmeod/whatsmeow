@@ -3,6 +3,7 @@ WhatsApp broadcast list handling.
 
 Port of whatsmeow/broadcast.go
 """
+
 from typing import TYPE_CHECKING, Dict, List
 
 from . import request
@@ -18,26 +19,25 @@ if TYPE_CHECKING:
 # Error constants - these match the Go implementation
 class BroadcastListUnsupportedError(PymeowError):
     """Raised when trying to send to non-status broadcast lists."""
+
     pass
 
 
 class NotLoggedInError(PymeowError):
     """Raised when the store doesn't contain a device JID."""
+
     pass
 
 
 # Error instances for compatibility
-ErrBroadcastListUnsupported = BroadcastListUnsupportedError("sending to non-status broadcast lists is not yet supported")
+ErrBroadcastListUnsupported = BroadcastListUnsupportedError(
+    "sending to non-status broadcast lists is not yet supported"
+)
 ErrNotLoggedIn = NotLoggedInError("the store doesn't contain a device JID")
 
 
 # Default status privacy settings
-DEFAULT_STATUS_PRIVACY: List[StatusPrivacy] = [
-    StatusPrivacy(
-        type=StatusPrivacyType.CONTACTS,
-        is_default=True
-    )
-]
+DEFAULT_STATUS_PRIVACY: List[StatusPrivacy] = [StatusPrivacy(type=StatusPrivacyType.CONTACTS, is_default=True)]
 
 
 async def get_broadcast_list_participants(client: "Client", jid: JID) -> List[JID]:
@@ -138,11 +138,9 @@ async def get_status_privacy(client: "Client") -> List[StatusPrivacy]:
         Exception: If there's an error getting the status privacy settings
     """
     from .request import InfoQuery, InfoQueryType
+
     query = InfoQuery(
-        namespace="status",
-        type=InfoQueryType.GET,
-        to=SERVER_JID,
-        content=[binary_node.Node(tag="privacy")]
+        namespace="status", type=InfoQueryType.GET, to=SERVER_JID, content=[binary_node.Node(tag="privacy")]
     )
 
     response = await request.send_iq(client, query)

@@ -20,34 +20,39 @@ from pymeow.store.sqlstore.container import Container
 
 logger = logging.getLogger(__name__)
 
+
 class ColoredFormatter(logging.Formatter):
     """
     A custom formatter that adds colors to the terminal output based on the log level.
     """
+
     COLORS = {
-        'DEBUG': '\033[94m',  # Blue
-        'INFO': '\033[92m',   # Green
-        'WARNING': '\033[93m', # Yellow
-        'ERROR': '\033[91m',   # Red
-        'CRITICAL': '\033[91m\033[1m',  # Bold Red
+        "DEBUG": "\033[94m",  # Blue
+        "INFO": "\033[92m",  # Green
+        "WARNING": "\033[93m",  # Yellow
+        "ERROR": "\033[91m",  # Red
+        "CRITICAL": "\033[91m\033[1m",  # Bold Red
     }
-    RESET = '\033[0m'  # Reset color
+    RESET = "\033[0m"  # Reset color
 
     def format(self, record: logging.LogRecord) -> str:
         log_message = super().format(record)
         color = self.COLORS.get(record.levelname, self.RESET)
         return f"{color}{log_message}{self.RESET}"
 
+
 APP_ROOT = Path(__file__).resolve().parent
+
 
 class ShortPathFormatter(ColoredFormatter):
     """
     A custom formatter that replaces {pathname} with {shortpathname} by trimming
     everything before the project root.
     """
+
     def format(self, record: logging.LogRecord) -> str:
         # Add shortpathname attribute to the record
-        if hasattr(record, 'pathname'):
+        if hasattr(record, "pathname"):
             try:
                 # Convert pathname to a Path object
                 path = Path(record.pathname)
@@ -60,22 +65,22 @@ class ShortPathFormatter(ColoredFormatter):
                 record.shortpathname = record.pathname
 
         return super().format(record)
+
+
 def setup_logging() -> None:
     """Set up logging for the client."""
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)
     console_formatter = ShortPathFormatter(
-        '{levelname} {asctime} {name} {module} {message} ({shortpathname}:{lineno})',
-        style='{'
+        "{levelname} {asctime} {name} {module} {message} ({shortpathname}:{lineno})", style="{"
     )
     console_handler.setFormatter(console_formatter)
 
     # Create file handler with plain formatter (no colors in file)
-    file_handler = logging.FileHandler('whatsapp_client.log')
+    file_handler = logging.FileHandler("whatsapp_client.log")
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter(
-        '{levelname} {asctime} {name} {module} {message} ({pathname}:{lineno})',
-        style='{'
+        "{levelname} {asctime} {name} {module} {message} ({pathname}:{lineno})", style="{"
     )
     file_handler.setFormatter(file_formatter)
 
@@ -105,7 +110,7 @@ async def event_handler(event: Any) -> None:
         if event.codes:
             print("QR Codes for pairing:")
             for i, code in enumerate(event.codes):
-                print(f"QR {i+1}: {code}")
+                print(f"QR {i + 1}: {code}")
                 # You can render these QR codes using a library like qrcode:
                 # import qrcode
                 # qr = qrcode.QRCode()

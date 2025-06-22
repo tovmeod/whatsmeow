@@ -3,6 +3,7 @@ LTHash implementation for WhatsApp app state.
 
 Port of whatsmeow/appstate/lthash/lthash.go
 """
+
 import struct
 from dataclasses import dataclass
 from typing import List
@@ -18,6 +19,7 @@ class LTHash:
     mutations, and it'll return a hash equal to if the same series of mutations
     was made sequentially.
     """
+
     hkdf_info: bytes
     hkdf_size: int
 
@@ -76,15 +78,15 @@ def _perform_pointwise_with_overflow(base: bytearray, input_data: bytes, subtrac
         The modified base hash
     """
     for i in range(0, len(base), 2):
-        x = struct.unpack("<H", base[i:i+2])[0]
-        y = struct.unpack("<H", input_data[i:i+2])[0]
+        x = struct.unpack("<H", base[i : i + 2])[0]
+        y = struct.unpack("<H", input_data[i : i + 2])[0]
 
         if subtract:
             result = (x - y) & 0xFFFF  # Ensure result is 16-bit
         else:
             result = (x + y) & 0xFFFF  # Ensure result is 16-bit
 
-        base[i:i+2] = struct.pack("<H", result)
+        base[i : i + 2] = struct.pack("<H", result)
 
     return base
 

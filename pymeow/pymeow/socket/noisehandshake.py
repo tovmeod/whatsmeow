@@ -3,6 +3,7 @@ Noise protocol handshake implementation for WhatsApp Web.
 
 Port of whatsmeow/socket/noisehandshake.go
 """
+
 import hashlib
 import struct
 import threading
@@ -30,8 +31,8 @@ class NoiseHandshake:
 
     def __init__(self) -> None:
         """Initialize a new NoiseHandshake instance."""
-        self.hash: bytes = b''
-        self.salt: bytes = b''
+        self.hash: bytes = b""
+        self.salt: bytes = b""
         self.key: Optional[AESGCM] = None
         self.counter: int = 0
         self._counter_lock = threading.Lock()
@@ -112,7 +113,7 @@ class NoiseHandshake:
         iv = bytearray(12)
         # Pack the counter into the last 4 bytes in big-endian format
         # This matches the Go implementation in generateIV function
-        struct.pack_into('>I', iv, 8, count)
+        struct.pack_into(">I", iv, 8, count)
         return bytes(iv)
 
     def encrypt(self, plaintext: bytes) -> bytes:
@@ -176,9 +177,12 @@ class NoiseHandshake:
             # Provide more detailed error message
             raise ValueError(f"Decryption failed: {e}")
 
-    async def finish(self, fs: FrameSocket,
-                    frame_handler: Callable[[bytes], Awaitable[None]],
-                    disconnect_handler: Callable[["NoiseSocket", bool], Awaitable[None]]) -> NoiseSocket:
+    async def finish(
+        self,
+        fs: FrameSocket,
+        frame_handler: Callable[[bytes], Awaitable[None]],
+        disconnect_handler: Callable[["NoiseSocket", bool], Awaitable[None]],
+    ) -> NoiseSocket:
         """
         Finish the handshake and create a NoiseSocket.
 
@@ -264,7 +268,7 @@ class NoiseHandshake:
         """
         try:
             if data is None:
-                data = b''
+                data = b""
 
             # Use a more direct approach to match the Go implementation
             # In Go: h := hkdf.New(sha256.New, data, salt, nil)
@@ -280,9 +284,9 @@ class NoiseHandshake:
 
             # Step 2: Expand
             # Create an expandable output function
-            info = b''
-            t = b''
-            okm = b''
+            info = b""
+            t = b""
+            okm = b""
             for i in range(1, 3):  # We need 2 blocks (64 bytes total)
                 t = hmac.new(prk, t + info + bytes([i]), hashlib.sha256).digest()
                 okm += t

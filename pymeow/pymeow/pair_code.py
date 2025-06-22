@@ -3,6 +3,7 @@ WhatsApp Web pairing with phone number and code.
 
 Port of whatsmeow/pair-code.go
 """
+
 import base64
 import logging
 import os
@@ -31,27 +32,32 @@ logger = logging.getLogger(__name__)
 
 class PairCodeError(Exception):
     """Base exception for pair code operations."""
+
     pass
 
 
 class PhoneNumberError(PairCodeError):
     """Invalid phone number format."""
+
     pass
 
 
 class PairingRefMismatchError(PairCodeError):
     """Pairing reference mismatch."""
+
     pass
 
 
 class CryptographicError(PairCodeError):
     """Cryptographic operation failed."""
+
     pass
 
 
 # PairClientType is the type of client to use with PairCode
 class PairClientType(int):
     """Type of client to use with PairCode."""
+
     UNKNOWN = 0
     CHROME = 1
     EDGE = 2
@@ -67,16 +73,15 @@ class PairClientType(int):
 # Regular expression to remove non-numeric characters from phone numbers
 NOT_NUMBERS = re.compile(r"[^0-9]")
 
+
 def encode_linking_base32(data: bytes) -> str:
     """Custom base32 encoding matching Go's linkingBase32."""
     # Standard base32 encode
     standard_encoded = base64.b32encode(data).decode()
     # Translate alphabet: standard -> WhatsApp custom
-    translation = str.maketrans(
-        'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567',
-        '123456789ABCDEFGHJKLMNPQRSTVWXYZ'
-    )
-    return standard_encoded.translate(translation).rstrip('=')
+    translation = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "123456789ABCDEFGHJKLMNPQRSTVWXYZ")
+    return standard_encoded.translate(translation).rstrip("=")
+
 
 # Phone validation constants
 MIN_PHONE_LENGTH = 6
@@ -94,6 +99,7 @@ ADV_SECRET_SIZE = 32
 @dataclass
 class PhoneLinkingCache:
     """Cache for phone linking information."""
+
     jid: JID
     key_pair: KeyPair
     linking_code: str
@@ -122,7 +128,7 @@ def generate_companion_ephemeral_key() -> Tuple[KeyPair, bytes, str]:
     """
     ephemeral_key_pair = KeyPair.generate()
     salt = os.urandom(32)  # 32 bytes salt
-    iv = os.urandom(16)    # 16 bytes IV
+    iv = os.urandom(16)  # 16 bytes IV
     linking_code = os.urandom(5)  # 5 bytes linking code
 
     # Use the same base32 encoding as Go (custom alphabet)
@@ -154,7 +160,9 @@ def generate_companion_ephemeral_key() -> Tuple[KeyPair, bytes, str]:
     return ephemeral_key_pair, bytes(ephemeral_key), encoded_linking_code
 
 
-async def pair_phone(client: 'Client', phone: str, show_push_notification: bool, client_type: PairClientType, client_display_name: str) -> str:
+async def pair_phone(
+    client: "Client", phone: str, show_push_notification: bool, client_type: PairClientType, client_display_name: str
+) -> str:
     """
     Generate a pairing code that can be used to link to a phone without scanning a QR code.
 
@@ -182,26 +190,31 @@ async def pair_phone(client: 'Client', phone: str, show_push_notification: bool,
     jid = JID.new_user_jid(phone)
 
     # Create IQ request
-    resp = await request.send_iq(client, InfoQuery(
-        namespace="md",
-        type=InfoQueryType.SET,
-        to=JID.new_server(),
-        content=Node(
-            tag="link_code_companion_reg",
-            attrs=Attrs({
-                "jid": jid,
-                "stage": "companion_hello",
-                "should_show_push_notification": str(show_push_notification).lower(),
-            }),
-            content=[
-                Node(tag="link_code_pairing_wrapped_companion_ephemeral_pub", content=ephemeral_key),
-                Node(tag="companion_server_auth_key_pub", content=client.store.noise_key.pub),
-                Node(tag="companion_platform_id", content=str(int(client_type)).encode()),
-                Node(tag="companion_platform_display", content=client_display_name.encode()),
-                Node(tag="link_code_pairing_nonce", content=bytes([0])),
-            ]
-        )
-    ))
+    resp = await request.send_iq(
+        client,
+        InfoQuery(
+            namespace="md",
+            type=InfoQueryType.SET,
+            to=JID.new_server(),
+            content=Node(
+                tag="link_code_companion_reg",
+                attrs=Attrs(
+                    {
+                        "jid": jid,
+                        "stage": "companion_hello",
+                        "should_show_push_notification": str(show_push_notification).lower(),
+                    }
+                ),
+                content=[
+                    Node(tag="link_code_pairing_wrapped_companion_ephemeral_pub", content=ephemeral_key),
+                    Node(tag="companion_server_auth_key_pub", content=client.store.noise_key.pub),
+                    Node(tag="companion_platform_id", content=str(int(client_type)).encode()),
+                    Node(tag="companion_platform_display", content=client_display_name.encode()),
+                    Node(tag="link_code_pairing_nonce", content=bytes([0])),
+                ],
+            ),
+        ),
+    )
 
     # Extract pairing reference
     pairing_ref_node, ok = resp.get_optional_child_by_tag("link_code_companion_reg", "link_code_pairing_ref")
@@ -224,7 +237,7 @@ async def pair_phone(client: 'Client', phone: str, show_push_notification: bool,
     return f"{encoded_linking_code[0:4]}-{encoded_linking_code[4:]}"
 
 
-async def handle_code_pair_notification(client: 'Client', parent_node: Node) -> None:
+async def handle_code_pair_notification(client: "Client", parent_node: Node) -> None:
     """
     Handle a code pair notification from the server.
 
@@ -241,7 +254,7 @@ async def handle_code_pair_notification(client: 'Client', parent_node: Node) -> 
         logger.error(f"Failed to handle code pair notification: {e}")
 
 
-async def _handle_code_pair_notification(client: 'Client', parent_node: Node) -> None:
+async def _handle_code_pair_notification(client: "Client", parent_node: Node) -> None:
     """
     Internal implementation of handle_code_pair_notification.
 
@@ -279,8 +292,8 @@ async def _handle_code_pair_notification(client: 'Client', parent_node: Node) ->
 
     # Decrypt the primary device's ephemeral public key
     primary_salt = wrapped_primary_ephemeral_pub[0:SALT_SIZE]
-    primary_iv = wrapped_primary_ephemeral_pub[SALT_SIZE:SALT_SIZE+IV_SIZE]
-    primary_encrypted_pubkey = wrapped_primary_ephemeral_pub[SALT_SIZE+IV_SIZE:EPHEMERAL_KEY_SIZE]
+    primary_iv = wrapped_primary_ephemeral_pub[SALT_SIZE : SALT_SIZE + IV_SIZE]
+    primary_encrypted_pubkey = wrapped_primary_ephemeral_pub[SALT_SIZE + IV_SIZE : EPHEMERAL_KEY_SIZE]
 
     # Generate link code key using PBKDF2
     kdf = PBKDF2HMAC(
@@ -311,10 +324,7 @@ async def _handle_code_pair_notification(client: 'Client', parent_node: Node) ->
     # Encrypt and wrap key bundle
     try:
         key_bundle_encryption_key = hkdf_sha256(
-            ephemeral_shared_secret,
-            key_bundle_salt,
-            b"link_code_pairing_key_bundle_encryption_key",
-            SALT_SIZE
+            ephemeral_shared_secret, key_bundle_salt, b"link_code_pairing_key_bundle_encryption_key", SALT_SIZE
         )
     except Exception as e:
         raise CryptographicError(f"Failed to derive key bundle encryption key: {e}")
@@ -345,29 +355,34 @@ async def _handle_code_pair_notification(client: 'Client', parent_node: Node) ->
 
     adv_secret_input = ephemeral_shared_secret + identity_shared_key + adv_secret_random
     try:
-        adv_secret = hkdf_sha256(adv_secret_input, b'', b"adv_secret", ADV_SECRET_SIZE)
+        adv_secret = hkdf_sha256(adv_secret_input, b"", b"adv_secret", ADV_SECRET_SIZE)
     except Exception as e:
         raise CryptographicError(f"Failed to derive ADV secret key: {e}")
     client.store.adv_secret_key = adv_secret
 
     # Send the final pairing message
-    await request.send_iq(client, InfoQuery(
-        namespace="md",
-        type=InfoQueryType.SET,
-        to=JID.new_server(),
-        content=Node(
-            tag="link_code_companion_reg",
-            attrs=Attrs({
-                "jid": link_cache.jid,
-                "stage": "companion_finish",
-            }),
-            content=[
-                Node(tag="link_code_pairing_wrapped_key_bundle", content=wrapped_key_bundle),
-                Node(tag="companion_identity_public", content=client.store.identity_key.pub),
-                Node(tag="link_code_pairing_ref", content=link_code_pairing_ref),
-            ]
-        )
-    ))
+    await request.send_iq(
+        client,
+        InfoQuery(
+            namespace="md",
+            type=InfoQueryType.SET,
+            to=JID.new_server(),
+            content=Node(
+                tag="link_code_companion_reg",
+                attrs=Attrs(
+                    {
+                        "jid": link_cache.jid,
+                        "stage": "companion_finish",
+                    }
+                ),
+                content=[
+                    Node(tag="link_code_pairing_wrapped_key_bundle", content=wrapped_key_bundle),
+                    Node(tag="companion_identity_public", content=client.store.identity_key.pub),
+                    Node(tag="link_code_pairing_ref", content=link_code_pairing_ref),
+                ],
+            ),
+        ),
+    )
 
 
 def concat_bytes(*data: bytes) -> bytes:
@@ -380,4 +395,4 @@ def concat_bytes(*data: bytes) -> bytes:
     Returns:
         The concatenated byte array
     """
-    return b''.join(data)
+    return b"".join(data)

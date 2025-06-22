@@ -3,6 +3,7 @@ Events for WhatsApp client.
 
 Port of whatsmeow/types/events/events.go
 """
+
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -30,8 +31,10 @@ ReceiptTypePlayed = ReceiptType.PLAYED
 if TYPE_CHECKING:
     from ...binary.node import Node
 
+
 class BaseEvent:
     pass
+
 
 # QR is emitted after connecting when there's no session data in the device store.
 @dataclass
@@ -47,7 +50,9 @@ class QR(BaseEvent):
     run out of codes before scanning, the server will close the websocket, and you will have to
     reconnect to get more codes.
     """
+
     codes: List[str]
+
 
 # PairSuccess is emitted after the QR code has been scanned with the phone and the handshake has
 # been completed.
@@ -59,10 +64,12 @@ class PairSuccess(BaseEvent):
     Note that this is generally followed by a websocket reconnection, so you should
     wait for the Connected before trying to send anything.
     """
+
     id: JID
     lid: JID
     business_name: str
     platform: str
+
 
 # PairError is emitted when a pair-success event is received from the server, but finishing the pairing locally fails.
 @dataclass
@@ -70,11 +77,13 @@ class PairError(BaseEvent):
     """
     Emitted when a pair-success event is received from the server, but finishing the pairing locally fails.
     """
+
     id: JID
     lid: JID
     business_name: str
     platform: str
     error: Exception
+
 
 # QRScannedWithoutMultidevice is emitted when the pairing QR code is scanned, but the phone didn't have multidevice enabled.
 @dataclass
@@ -84,7 +93,9 @@ class QRScannedWithoutMultidevice(BaseEvent):
 
     The same QR code can still be scanned after this event, which means the user can just be told to enable multidevice and re-scan the code.
     """
+
     pass
+
 
 # Connected is emitted when the client has successfully connected to the WhatsApp servers
 # and is authenticated.
@@ -96,7 +107,9 @@ class Connected(BaseEvent):
     The user who the client is authenticated as will be in the device store
     at this point, which is why this event doesn't contain any data.
     """
+
     pass
+
 
 # KeepAliveTimeout is emitted when the keepalive ping request to WhatsApp web servers times out.
 @dataclass
@@ -108,8 +121,10 @@ class KeepAliveTimeout(BaseEvent):
     either start working again or notice it's dead on its own eventually. Clients may use this event to
     decide to force a disconnect+reconnect faster.
     """
+
     error_count: int
     last_success: datetime
+
 
 # KeepAliveRestored is emitted if the keepalive pings start working again after some KeepAliveTimeout events.
 @dataclass
@@ -119,20 +134,25 @@ class KeepAliveRestored(BaseEvent):
 
     Note that if the websocket disconnects before the pings start working, this event will not be emitted.
     """
+
     pass
+
 
 # PermanentDisconnect is a class of events emitted when the client will not auto-reconnect by default.
 class PermanentDisconnect(Protocol):
     """
     A class of events emitted when the client will not auto-reconnect by default.
     """
+
     def permanent_disconnect_description(self) -> str:
         """Returns a description of the permanent disconnect reason."""
         pass
 
+
 # TempBanReason is an error code included in temp ban error events.
 class TempBanReason(Enum):
     """Error code included in temp ban error events."""
+
     SENT_TO_TOO_MANY_PEOPLE = 101
     BLOCKED_BY_USERS = 102
     CREATED_TOO_MANY_GROUPS = 103
@@ -151,9 +171,11 @@ class TempBanReason(Enum):
         msg = messages.get(self, "you may have violated the terms of service (unknown error)")
         return f"{self.value}: {msg}"
 
+
 # ConnectFailureReason is an error code included in connection failure events.
 class ConnectFailureReason(Enum):
     """Error code included in connection failure events."""
+
     GENERIC = 400
     LOGGED_OUT = 401
     TEMP_BANNED = 402
@@ -174,7 +196,7 @@ class ConnectFailureReason(Enum):
         return self in [
             ConnectFailureReason.LOGGED_OUT,
             ConnectFailureReason.MAIN_DEVICE_GONE,
-            ConnectFailureReason.UNKNOWN_LOGOUT
+            ConnectFailureReason.UNKNOWN_LOGOUT,
         ]
 
     def number_string(self) -> str:
@@ -196,6 +218,7 @@ class ConnectFailureReason(Enum):
         msg = messages.get(self, "unknown error")
         return f"{self.value}: {msg}"
 
+
 # LoggedOut is emitted when the client has been unpaired from the phone.
 @dataclass
 class LoggedOut(BaseEvent):
@@ -206,6 +229,7 @@ class LoggedOut(BaseEvent):
 
     This will not be emitted when the logout is initiated by this client (using Client.LogOut()).
     """
+
     on_connect: bool = False  # True if the event was triggered by a connect failure message
     reason: Optional[ConnectFailureReason] = None  # If on_connect is true, then this field contains the reason code
 
@@ -214,6 +238,7 @@ class LoggedOut(BaseEvent):
         if self.reason:
             return str(self.reason)
         return "logged out"
+
 
 # StreamReplaced is emitted when the client is disconnected by another client connecting with the same keys.
 @dataclass
@@ -224,9 +249,11 @@ class StreamReplaced(BaseEvent):
     This can happen if you accidentally start another process with the same session
     or otherwise try to connect twice with the same session.
     """
+
     def permanent_disconnect_description(self) -> str:
         """Returns a description of the permanent disconnect reason."""
         return "stream replaced"
+
 
 # ManualLoginReconnect is emitted after login if DisableLoginAutoReconnect is set.
 @dataclass
@@ -234,7 +261,9 @@ class ManualLoginReconnect(BaseEvent):
     """
     Emitted after login if DisableLoginAutoReconnect is set.
     """
+
     pass
+
 
 # TemporaryBan is emitted when there's a connection failure with the ConnectFailureTempBanned reason code.
 @dataclass
@@ -242,6 +271,7 @@ class TemporaryBan(BaseEvent):
     """
     Emitted when there's a connection failure with the ConnectFailureTempBanned reason code.
     """
+
     code: TempBanReason
     expire: Optional[timedelta] = None
 
@@ -255,6 +285,7 @@ class TemporaryBan(BaseEvent):
         """Returns a description of the permanent disconnect reason."""
         return f"temporarily banned: {self}"
 
+
 # ConnectFailure is emitted when the WhatsApp server sends a <failure> node with an unknown reason.
 @dataclass
 class ConnectFailure(BaseEvent):
@@ -263,13 +294,15 @@ class ConnectFailure(BaseEvent):
 
     Known reasons are handled internally and emitted as different events (e.g. LoggedOut and TemporaryBan).
     """
+
     reason: ConnectFailureReason
     message: str
-    raw: Optional['Node'] = None
+    raw: Optional["Node"] = None
 
     def permanent_disconnect_description(self) -> str:
         """Returns a description of the permanent disconnect reason."""
         return f"connect failure: {self.reason}"
+
 
 # ClientOutdated is emitted when the WhatsApp server rejects the connection with the ConnectFailureClientOutdated code.
 @dataclass
@@ -277,9 +310,11 @@ class ClientOutdated(BaseEvent):
     """
     Emitted when the WhatsApp server rejects the connection with the ConnectFailureClientOutdated code.
     """
+
     def permanent_disconnect_description(self) -> str:
         """Returns a description of the permanent disconnect reason."""
         return "client outdated"
+
 
 # CATRefreshError is emitted when refreshing the CAT fails.
 @dataclass
@@ -287,11 +322,13 @@ class CATRefreshError:
     """
     Emitted when refreshing the CAT fails.
     """
+
     error: Exception
 
     def permanent_disconnect_description(self) -> str:
         """Returns a description of the permanent disconnect reason."""
         return "CAT refresh failed"
+
 
 # StreamError is emitted when the WhatsApp server sends a <stream:error> node with an unknown code.
 @dataclass
@@ -301,8 +338,10 @@ class StreamError(BaseEvent):
 
     Known codes are handled internally and emitted as different events (e.g. LoggedOut).
     """
+
     code: str
-    raw: Optional['Node'] = None
+    raw: Optional["Node"] = None
+
 
 # Disconnected is emitted when the websocket is closed by the server.
 @dataclass
@@ -310,7 +349,9 @@ class Disconnected(BaseEvent):
     """
     Emitted when the websocket is closed by the server.
     """
+
     pass
+
 
 # HistorySync is emitted when the phone has sent a blob of historical messages.
 @dataclass
@@ -318,17 +359,23 @@ class HistorySync(BaseEvent):
     """
     Emitted when the phone has sent a blob of historical messages.
     """
+
     data: WAHistorySync_pb2.HistorySync
+
 
 class DecryptFailMode(Enum):
     """Mode for handling decryption failures."""
+
     SHOW = ""
     HIDE = "hide"
 
+
 class UnavailableType(Enum):
     """Type of unavailable message."""
+
     UNKNOWN = ""
     VIEW_ONCE = "view_once"
+
 
 # UndecryptableMessage is emitted when receiving a new message that failed to decrypt.
 @dataclass
@@ -341,10 +388,12 @@ class UndecryptableMessage(BaseEvent):
 
     The UndecryptableMessage event may also be repeated if the resent message is also undecryptable.
     """
+
     info: MessageInfo
     is_unavailable: bool = False  # True if the recipient device didn't send a ciphertext to this device at all
     unavailable_type: UnavailableType = UnavailableType.UNKNOWN  # Some message types are intentionally unavailable
     decrypt_fail_mode: DecryptFailMode = DecryptFailMode.SHOW
+
 
 # NewsletterMessageMeta contains metadata for newsletter messages.
 @dataclass
@@ -355,6 +404,7 @@ class NewsletterMessageMeta:
     When a newsletter message is edited, the message isn't wrapped in an EditedMessage like normal messages.
     Instead, the message is the new content, the ID is the original message ID, and the edit timestamp is here.
     """
+
     edit_ts: Optional[datetime] = None  # The edit timestamp for edited messages
     original_ts: Optional[datetime] = None  # The timestamp of the original message for edits
 
@@ -365,22 +415,29 @@ class Message(BaseEvent):
     """
     Emitted when receiving a new message.
     """
+
     info: MessageInfo  # Information about the message like the chat and sender IDs
     raw_message: WAWebProtobufsE2E_pb2.Message  # The raw message struct
     message: Optional[WAWebProtobufsE2E_pb2.Message] = None  # The actual message struct
     is_ephemeral: bool = False  # True if the message was unwrapped from an EphemeralMessage
     is_view_once: bool = False  # True if the message was unwrapped from a ViewOnceMessage, ViewOnceMessageV2 or ViewOnceMessageV2Extension
-    is_view_once_v2: bool = False  # True if the message was unwrapped from a ViewOnceMessageV2 or ViewOnceMessageV2Extension
+    is_view_once_v2: bool = (
+        False  # True if the message was unwrapped from a ViewOnceMessageV2 or ViewOnceMessageV2Extension
+    )
     is_view_once_v2_extension: bool = False  # True if the message was unwrapped from a ViewOnceMessageV2Extension
     is_document_with_caption: bool = False  # True if the message was unwrapped from a DocumentWithCaptionMessage
     is_lottie_sticker: bool = False  # True if the message was unwrapped from a LottieStickerMessage
     is_edit: bool = False  # True if the message was unwrapped from an EditedMessage
-    source_web_msg: Optional[WAWeb_pb2.WebMessageInfo] = None  # If this event was parsed from a WebMessageInfo, the source data is here
-    unavailable_request_id: Optional[MessageID] = None  # If this event is a response to an unavailable message request, the request ID is here
+    source_web_msg: Optional[WAWeb_pb2.WebMessageInfo] = (
+        None  # If this event was parsed from a WebMessageInfo, the source data is here
+    )
+    unavailable_request_id: Optional[MessageID] = (
+        None  # If this event is a response to an unavailable message request, the request ID is here
+    )
     retry_count: int = 0  # If the message was re-requested from the sender, this is the number of retries it took
     newsletter_meta: Optional[NewsletterMessageMeta] = None
 
-    def unwrap_raw(self) -> 'Message':
+    def unwrap_raw(self) -> "Message":
         """
         Fills the Message, IsEphemeral, and IsViewOnce fields based on the raw message in the RawMessage field.
         """
@@ -445,17 +502,21 @@ class Message(BaseEvent):
 
         return self
 
+
 # FBMessage is emitted when receiving a new Facebook message.
 @dataclass
 class FBMessage(BaseEvent):
     """
     Emitted when receiving a new Facebook message.
     """
+
     info: MessageInfo  # Information about the message like the chat and sender IDs
     message: Any  # The actual message struct (armadillo.MessageApplicationSub)
     retry_count: int = 0  # If the message was re-requested from the sender, this is the number of retries it took
     transport: Optional[WAMsgTransport_pb2.MessageTransport] = None  # The first level of wrapping the message was in
-    application: Optional[WAMsgApplication_pb2.MessageApplication] = None  # The second level of wrapping the message was in
+    application: Optional[WAMsgApplication_pb2.MessageApplication] = (
+        None  # The second level of wrapping the message was in
+    )
 
     def get_consumer_application(self) -> Optional[WAConsumerApplication_pb2.ConsumerApplication]:
         """
@@ -473,6 +534,7 @@ class FBMessage(BaseEvent):
             return self.message
         return None
 
+
 # Receipt is emitted when an outgoing message is delivered to or read by another user, or when another device reads an incoming message.
 @dataclass
 class Receipt(BaseEvent):
@@ -481,12 +543,16 @@ class Receipt(BaseEvent):
 
     N.B. WhatsApp on Android sends message IDs from newest message to oldest, but WhatsApp on iOS sends them in the opposite order (oldest first).
     """
+
     message_source: MessageSource
     timestamp: datetime
     type: ReceiptType  # Type of receipt (delivered, read, etc.)
     message_ids: List[MessageID] = field(default_factory=list)
-    message_sender: Optional[JID] = None  # When you read the message of another user in a group, this field contains the sender of the message.
-                                          # For receipts from other users, the message sender is always you.
+    message_sender: Optional[JID] = (
+        None  # When you read the message of another user in a group, this field contains the sender of the message.
+    )
+    # For receipts from other users, the message sender is always you.
+
 
 # ChatPresence is emitted when a chat state update (also known as typing notification) is received.
 @dataclass
@@ -498,9 +564,11 @@ class ChatPresenceEvent(BaseEvent):
 
         client.send_presence(types.PresenceAvailable)
     """
+
     message_source: MessageSource
     state: ChatPresence  # The current state, either composing or paused
     media: ChatPresenceMedia  # When composing, the type of message
+
 
 # Presence is emitted when a presence update is received.
 @dataclass
@@ -512,9 +580,11 @@ class PresenceEvent(BaseEvent):
 
         client.subscribe_presence(user_jid)
     """
+
     from_jid: JID  # The user whose presence event this is
     unavailable: bool = False  # True if the user is now offline
     last_seen: Optional[datetime] = None  # The time when the user was last online
+
 
 # JoinedGroup is emitted when you join or are added to a group.
 @dataclass
@@ -522,9 +592,12 @@ class JoinedGroup:
     """
     Emitted when you join or are added to a group.
     """
+
     reason: str  # If the event was triggered by you using an invite link, this will be "invite"
     type: str  # "new" if it's a newly created group
-    create_key: Optional[MessageID] = None  # If you created the group, this is the same message ID you passed to CreateGroup
+    create_key: Optional[MessageID] = (
+        None  # If you created the group, this is the same message ID you passed to CreateGroup
+    )
     sender: Optional[JID] = None  # For type new, the user who created the group and added you to it
     sender_pn: Optional[JID] = None
     notify: str = ""
@@ -534,12 +607,14 @@ class JoinedGroup:
     creation_time: Optional[datetime] = None
     participants: List[Dict[str, Any]] = field(default_factory=list)
 
+
 # GroupInfo is emitted when the metadata of a group changes.
 @dataclass
 class GroupInfo:
     """
     Emitted when the metadata of a group changes.
     """
+
     jid: JID  # The group ID in question
     notify: str = ""  # Seems like a top-level type for the invite
     sender: Optional[JID] = None  # The user who made the change
@@ -549,10 +624,14 @@ class GroupInfo:
     name: Optional[Any] = None  # Group name change (types.GroupName)
     topic: Optional[Any] = None  # Group topic (description) change (types.GroupTopic)
     locked: Optional[Any] = None  # Group locked status change (can only admins edit group info?) (types.GroupLocked)
-    announce: Optional[Any] = None  # Group announce status change (can only admins send messages?) (types.GroupAnnounce)
+    announce: Optional[Any] = (
+        None  # Group announce status change (can only admins send messages?) (types.GroupAnnounce)
+    )
     ephemeral: Optional[Any] = None  # Disappearing messages change (types.GroupEphemeral)
 
-    membership_approval_mode: Optional[Any] = None  # Membership approval mode change (types.GroupMembershipApprovalMode)
+    membership_approval_mode: Optional[Any] = (
+        None  # Membership approval mode change (types.GroupMembershipApprovalMode)
+    )
 
     delete: Optional[Any] = None  # Group delete information (types.GroupDelete)
 
@@ -572,7 +651,8 @@ class GroupInfo:
     promote: List[JID] = field(default_factory=list)  # Users who were promoted to admins
     demote: List[JID] = field(default_factory=list)  # Users who were demoted to normal users
 
-    unknown_changes: List['Node'] = field(default_factory=list)
+    unknown_changes: List["Node"] = field(default_factory=list)
+
 
 # Picture is emitted when a user's profile picture or group's photo is changed.
 @dataclass
@@ -582,11 +662,13 @@ class Picture(BaseEvent):
 
     You can use Client.get_profile_picture_info to get the actual image URL after this event.
     """
+
     jid: JID  # The user or group ID where the picture was changed
     author: JID  # The user who changed the picture
     timestamp: datetime  # The timestamp when the picture was changed
     remove: bool = False  # True if the picture was removed
     picture_id: str = ""  # The new picture ID if it was not removed
+
 
 # UserAbout is emitted when a user's about status is changed.
 @dataclass
@@ -594,9 +676,11 @@ class UserAbout(BaseEvent):
     """
     Emitted when a user's about status is changed.
     """
+
     jid: JID  # The user whose status was changed
     status: str  # The new status
     timestamp: datetime  # The timestamp when the status was changed
+
 
 # IdentityChange is emitted when another user changes their primary device.
 @dataclass
@@ -604,9 +688,11 @@ class IdentityChange(BaseEvent):
     """
     Emitted when another user changes their primary device.
     """
+
     jid: JID
     timestamp: datetime
     implicit: bool = False  # True if the event was triggered by an untrusted identity error, rather than an identity change notification from the server
+
 
 # PrivacySettings is emitted when the user changes their privacy settings.
 @dataclass
@@ -614,6 +700,7 @@ class PrivacySettingsEvent(BaseEvent):
     """
     Emitted when the user changes their privacy settings.
     """
+
     new_settings: Dict[str, Any] = field(default_factory=dict)  # types.PrivacySettings
     group_add_changed: bool = False
     last_seen_changed: bool = False
@@ -630,11 +717,13 @@ class OfflineSyncPreview(BaseEvent):
     """
     Emitted right after connecting if the server is going to send events that the client missed during downtime.
     """
+
     total: int
     app_data_changes: int = 0
     messages: int = 0
     notifications: int = 0
     receipts: int = 0
+
 
 # OfflineSyncCompleted is emitted after the server has finished sending missed events.
 @dataclass
@@ -642,7 +731,9 @@ class OfflineSyncCompleted(BaseEvent):
     """
     Emitted after the server has finished sending missed events.
     """
+
     count: int
+
 
 # MediaRetryError is emitted when there's an error in a media retry response.
 @dataclass
@@ -650,7 +741,9 @@ class MediaRetryError:
     """
     Error in a media retry response.
     """
+
     code: int
+
 
 # MediaRetry is emitted when the phone sends a response to a media retry request.
 @dataclass
@@ -658,8 +751,9 @@ class MediaRetry(BaseEvent):
     """
     Emitted when the phone sends a response to a media retry request.
     """
-    ciphertext: bytes = b''
-    iv: bytes = b''
+
+    ciphertext: bytes = b""
+    iv: bytes = b""
     error: Optional[MediaRetryError] = None  # Sometimes there's an unencrypted media retry error
     timestamp: Optional[datetime] = None  # The time of the response
     message_id: Optional[MessageID] = None  # The ID of the message
@@ -667,15 +761,20 @@ class MediaRetry(BaseEvent):
     sender_id: Optional[JID] = None  # The user who sent the message. Only present in groups
     from_me: bool = False  # Whether the message was sent by the current user or someone else
 
+
 class BlocklistAction(Enum):
     """Action for blocklist events."""
+
     DEFAULT = ""
     MODIFY = "modify"
 
+
 class BlocklistChangeAction(Enum):
     """Action for blocklist change events."""
+
     BLOCK = "block"
     UNBLOCK = "unblock"
+
 
 # BlocklistChange represents a change in the blocklist.
 @dataclass
@@ -683,8 +782,10 @@ class BlocklistChange:
     """
     Represents a change in the blocklist.
     """
+
     jid: JID
     action: BlocklistChangeAction
+
 
 # Blocklist is emitted when the user's blocked user list is changed.
 @dataclass
@@ -692,10 +793,14 @@ class Blocklist(BaseEvent):
     """
     Emitted when the user's blocked user list is changed.
     """
-    action: BlocklistAction = BlocklistAction.DEFAULT  # If it's empty, there should be a list of changes in the Changes list
+
+    action: BlocklistAction = (
+        BlocklistAction.DEFAULT
+    )  # If it's empty, there should be a list of changes in the Changes list
     d_hash: str = ""
     prev_d_hash: str = ""
     changes: List[BlocklistChange] = field(default_factory=list)
+
 
 # NewsletterJoin is emitted when the user joins a newsletter.
 @dataclass
@@ -703,6 +808,7 @@ class NewsletterJoin(BaseEvent):
     """
     Emitted when the user joins a newsletter.
     """
+
     id: JID
     name: str
     picture: Optional[str] = None
@@ -711,14 +817,17 @@ class NewsletterJoin(BaseEvent):
     linked_group_jid: Optional[JID] = None
     role: Optional[str] = None  # types.NewsletterRole
 
+
 # NewsletterLeave is emitted when the user leaves a newsletter.
 @dataclass
 class NewsletterLeave(BaseEvent):
     """
     Emitted when the user leaves a newsletter.
     """
+
     id: JID
     role: str  # types.NewsletterRole
+
 
 # NewsletterMuteChange is emitted when the user changes the mute state of a newsletter.
 @dataclass
@@ -726,8 +835,10 @@ class NewsletterMuteChange(BaseEvent):
     """
     Emitted when the user changes the mute state of a newsletter.
     """
+
     id: JID
     mute: str  # types.NewsletterMuteState
+
 
 # NewsletterLiveUpdate is emitted when there's a live update to a newsletter.
 @dataclass
@@ -735,6 +846,7 @@ class NewsletterLiveUpdate(BaseEvent):
     """
     Emitted when there's a live update to a newsletter.
     """
+
     jid: JID
     time: datetime
     messages: List[Dict[str, Any]] = field(default_factory=list)  # List[*types.NewsletterMessage]

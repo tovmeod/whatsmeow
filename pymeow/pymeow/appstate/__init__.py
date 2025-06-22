@@ -3,6 +3,7 @@ App state management for WhatsApp.
 
 Port of whatsmeow/appstate.go
 """
+
 import logging
 import time
 from datetime import datetime
@@ -23,17 +24,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def fetch_app_state(
-    client: "Client",
-    name: WAPatchName,
-    full_sync: bool,
-    only_if_not_synced: bool
-) -> None:
+async def fetch_app_state(client: "Client", name: WAPatchName, full_sync: bool, only_if_not_synced: bool) -> None:
     """
     Fetch updates to the given type of app state. If full_sync is true, the current
     cached state will be removed and all app state patches will be re-fetched from the server.
     """
     from ..datatypes import events
+
     if client is None:
         raise ValueError("Client is None")
 
@@ -48,6 +45,7 @@ async def fetch_app_state(
             return
 
         from .hash import HashState
+
         state = HashState(version=version, hash=hash_value)
 
         has_more = True
@@ -69,7 +67,11 @@ async def fetch_app_state(
             was_full_sync = state.version == 0 and patches.snapshot is not None
             state = new_state
 
-            if name == WAPatchName.CRITICAL_UNBLOCK_LOW and was_full_sync and not client.emit_app_state_events_on_full_sync:
+            if (
+                name == WAPatchName.CRITICAL_UNBLOCK_LOW
+                and was_full_sync
+                and not client.emit_app_state_events_on_full_sync
+            ):
                 mutations, contacts = filter_contacts(mutations)
                 logger.debug(f"Mass inserting app state snapshot with {len(contacts)} contacts into the store")
                 try:
@@ -91,44 +93,40 @@ def filter_contacts(mutations: List[Any]) -> tuple[List[Any], List[Any]]:
     """Filter contact mutations from the list and return them separately."""
     from ..datatypes import JID
     from ..store.store import ContactEntry
+
     filtered_mutations = []
     contacts = []
 
     for mutation in mutations:
         if len(mutation.index) > 1 and mutation.index[0] == "contact":
             jid = JID.parse_jid(mutation.index[1]) if len(mutation.index) > 1 else None
-            if jid and mutation.action and hasattr(mutation.action, 'contact_action'):
+            if jid and mutation.action and hasattr(mutation.action, "contact_action"):
                 act = mutation.action.contact_action
-                contacts.append(ContactEntry(
-                    jid=jid,
-                    first_name=getattr(act, 'first_name', '') if act else '',
-                    full_name=getattr(act, 'full_name', '') if act else ''
-                ))
+                contacts.append(
+                    ContactEntry(
+                        jid=jid,
+                        first_name=getattr(act, "first_name", "") if act else "",
+                        full_name=getattr(act, "full_name", "") if act else "",
+                    )
+                )
         else:
             filtered_mutations.append(mutation)
 
     return filtered_mutations, contacts
 
 
-async def dispatch_app_state(
-    client: "Client",
-    mutation: Mutation,
-    full_sync: bool,
-    emit_on_full_sync: bool
-) -> None:
+async def dispatch_app_state(client: "Client", mutation: Mutation, full_sync: bool, emit_on_full_sync: bool) -> None:
     """Dispatch app state mutation as events."""
     from ..datatypes import JID, events
+
     dispatch_evts = not full_sync or emit_on_full_sync
 
     # Only handle SET operations
-    if mutation.operation != 'SET':
+    if mutation.operation != "SET":
         return
 
     if dispatch_evts:
-        await client.dispatch_event(events.AppState(
-            index=mutation.index,
-            sync_action_value=mutation.action
-        ))
+        await client.dispatch_event(events.AppState(index=mutation.index, sync_action_value=mutation.action))
 
     if len(mutation.index) > 1:
         jid = JID.parse_jid(mutation.index[1])
@@ -142,12 +140,7 @@ async def dispatch_app_state(
 
     if index_type == "mute":
         act = mutation.action.muteAction
-        event_to_dispatch = events.Mute(
-            jid=jid,
-            timestamp=timestamp,
-            action=act,
-            from_full_sync=full_sync
-        )
+        event_to_dispatch = events.Mute(jid=jid, timestamp=timestamp, action=act, from_full_sync=full_sync)
 
         muted_until = None
         if act.muted and act.muteEndTimestamp > 0:
@@ -160,76 +153,49 @@ async def dispatch_app_state(
                     store_update_error = err
 
     elif index_type == "pin":
-        if hasattr(mutation.action, 'pin_action'):
+        if hasattr(mutation.action, "pin_action"):
             act = mutation.action.pin_action
-            event_to_dispatch = events.Pin(
-                jid=jid,
-                timestamp=timestamp,
-                action=act,
-                from_full_sync=full_sync
-            )
+            event_to_dispatch = events.Pin(jid=jid, timestamp=timestamp, action=act, from_full_sync=full_sync)
 
             if client.store.chat_settings:
                 try:
-                    await client.store.chat_settings.put_pinned(jid, getattr(act, 'pinned', False))
+                    await client.store.chat_settings.put_pinned(jid, getattr(act, "pinned", False))
                 except Exception as err:
                     store_update_error = err
 
     elif index_type == "archive":
-        if hasattr(mutation.action, 'archive_chat_action'):
+        if hasattr(mutation.action, "archive_chat_action"):
             act = mutation.action.archive_chat_action
-            event_to_dispatch = events.Archive(
-                jid=jid,
-                timestamp=timestamp,
-                action=act,
-                from_full_sync=full_sync
-            )
+            event_to_dispatch = events.Archive(jid=jid, timestamp=timestamp, action=act, from_full_sync=full_sync)
 
             if client.store.chat_settings:
                 try:
-                    await client.store.chat_settings.put_archived(jid, getattr(act, 'archived', False))
+                    await client.store.chat_settings.put_archived(jid, getattr(act, "archived", False))
                 except Exception as err:
                     store_update_error = err
 
     elif index_type == "contact":
-        if hasattr(mutation.action, 'contact_action'):
+        if hasattr(mutation.action, "contact_action"):
             act = mutation.action.contact_action
-            event_to_dispatch = events.Contact(
-                jid=jid,
-                timestamp=timestamp,
-                action=act,
-                from_full_sync=full_sync
-            )
+            event_to_dispatch = events.Contact(jid=jid, timestamp=timestamp, action=act, from_full_sync=full_sync)
 
             if client.store.contacts:
                 try:
                     await client.store.contacts.put_contact_name(
-                        jid,
-                        getattr(act, 'first_name', ''),
-                        getattr(act, 'full_name', '')
+                        jid, getattr(act, "first_name", ""), getattr(act, "full_name", "")
                     )
                 except Exception as err:
                     store_update_error = err
 
     elif index_type == "clearChat":
-        if hasattr(mutation.action, 'clear_chat_action'):
+        if hasattr(mutation.action, "clear_chat_action"):
             act = mutation.action.clear_chat_action
-            event_to_dispatch = events.ClearChat(
-                jid=jid,
-                timestamp=timestamp,
-                action=act,
-                from_full_sync=full_sync
-            )
+            event_to_dispatch = events.ClearChat(jid=jid, timestamp=timestamp, action=act, from_full_sync=full_sync)
 
     elif index_type == "deleteChat":
-        if hasattr(mutation.action, 'delete_chat_action'):
+        if hasattr(mutation.action, "delete_chat_action"):
             act = mutation.action.delete_chat_action
-            event_to_dispatch = events.DeleteChat(
-                jid=jid,
-                timestamp=timestamp,
-                action=act,
-                from_full_sync=full_sync
-            )
+            event_to_dispatch = events.DeleteChat(jid=jid, timestamp=timestamp, action=act, from_full_sync=full_sync)
 
     elif index_type == "star":
         if len(mutation.index) >= 5:
@@ -237,9 +203,9 @@ async def dispatch_app_state(
                 chat_jid=jid,
                 message_id=mutation.index[2],
                 timestamp=timestamp,
-                action=getattr(mutation.action, 'star_action', None),
+                action=getattr(mutation.action, "star_action", None),
                 is_from_me=mutation.index[3] == "1",
-                from_full_sync=full_sync
+                from_full_sync=full_sync,
             )
             if mutation.index[4] != "0":
                 event_to_dispatch.sender_jid = JID.parse_jid(mutation.index[4])
@@ -249,9 +215,9 @@ async def dispatch_app_state(
                 chat_jid=jid,
                 message_id=mutation.index[2],
                 timestamp=timestamp,
-                action=getattr(mutation.action, 'delete_message_for_me_action', None),
+                action=getattr(mutation.action, "delete_message_for_me_action", None),
                 is_from_me=mutation.index[3] == "1",
-                from_full_sync=full_sync
+                from_full_sync=full_sync,
             )
             if mutation.index[4] != "0":
                 evt.sender_jid = JID.parse_jid(mutation.index[4])
@@ -261,18 +227,16 @@ async def dispatch_app_state(
         event_to_dispatch = events.MarkChatAsRead(
             jid=jid,
             timestamp=timestamp,
-            action=getattr(mutation.action, 'mark_chat_as_read_action', None),
-            from_full_sync=full_sync
+            action=getattr(mutation.action, "mark_chat_as_read_action", None),
+            from_full_sync=full_sync,
         )
 
     elif index_type == "setting_pushName":
         event_to_dispatch = events.PushNameSetting(
-            timestamp=timestamp,
-            action=getattr(mutation.action, 'push_name_setting', None),
-            from_full_sync=full_sync
+            timestamp=timestamp, action=getattr(mutation.action, "push_name_setting", None), from_full_sync=full_sync
         )
 
-        if hasattr(mutation.action, 'push_name_setting') and hasattr(mutation.action.push_name_setting, 'name'):
+        if hasattr(mutation.action, "push_name_setting") and hasattr(mutation.action.push_name_setting, "name"):
             client.store.push_name = mutation.action.push_name_setting.name
             try:
                 await client.store.save()
@@ -282,24 +246,24 @@ async def dispatch_app_state(
     elif index_type == "setting_unarchiveChats":
         event_to_dispatch = events.UnarchiveChatsSetting(
             timestamp=timestamp,
-            action=getattr(mutation.action, 'unarchive_chats_setting', None),
-            from_full_sync=full_sync
+            action=getattr(mutation.action, "unarchive_chats_setting", None),
+            from_full_sync=full_sync,
         )
 
     elif index_type == "userStatusMute":
         event_to_dispatch = events.UserStatusMute(
             jid=jid,
             timestamp=timestamp,
-            action=getattr(mutation.action, 'user_status_mute_action', None),
-            from_full_sync=full_sync
+            action=getattr(mutation.action, "user_status_mute_action", None),
+            from_full_sync=full_sync,
         )
 
     elif index_type == "labelEdit":
         event_to_dispatch = events.LabelEdit(
             timestamp=timestamp,
             label_id=mutation.index[1] if len(mutation.index) > 1 else "",
-            action=getattr(mutation.action, 'label_edit_action', None),
-            from_full_sync=full_sync
+            action=getattr(mutation.action, "label_edit_action", None),
+            from_full_sync=full_sync,
         )
 
     elif index_type == "labelAssociationChat":
@@ -309,8 +273,8 @@ async def dispatch_app_state(
                 jid=jid,
                 timestamp=timestamp,
                 label_id=mutation.index[1],
-                action=getattr(mutation.action, 'label_association_action', None),
-                from_full_sync=full_sync
+                action=getattr(mutation.action, "label_association_action", None),
+                from_full_sync=full_sync,
             )
 
     elif index_type == "labelAssociationMessage":
@@ -321,8 +285,8 @@ async def dispatch_app_state(
                 timestamp=timestamp,
                 label_id=mutation.index[1],
                 message_id=mutation.index[3],
-                action=getattr(mutation.action, 'label_association_action', None),
-                from_full_sync=full_sync
+                action=getattr(mutation.action, "label_association_action", None),
+                from_full_sync=full_sync,
             )
 
     if store_update_error:
@@ -337,15 +301,11 @@ async def download_external_app_state_blob(client: "Client", ref: Any) -> Option
     return await download.download(client, ref)
 
 
-async def fetch_app_state_patches(
-    client: "Client",
-    name: str,
-    from_version: int,
-    snapshot: bool
-) -> Any:
+async def fetch_app_state_patches(client: "Client", name: str, from_version: int, snapshot: bool) -> Any:
     """Fetch app state patches from the server."""
     from ..datatypes import JID
     from ..request import InfoQuery, InfoQueryType
+
     attrs = {
         "name": name,
         "return_snapshot": snapshot,
@@ -353,20 +313,18 @@ async def fetch_app_state_patches(
     if not snapshot:
         attrs["version"] = from_version
 
-    resp = await request.send_iq(client, InfoQuery(
-        namespace="w:sync:app:state",
-        type=InfoQueryType.SET,
-        to=JID.server_jid(),
-        content=[binary_node.Node(
-            tag="sync",
-            content=[binary_node.Node(
-                tag="collection",
-                attrs=attrs
-            )]
-        )]
-    ))
+    resp = await request.send_iq(
+        client,
+        InfoQuery(
+            namespace="w:sync:app:state",
+            type=InfoQueryType.SET,
+            to=JID.server_jid(),
+            content=[binary_node.Node(tag="sync", content=[binary_node.Node(tag="collection", attrs=attrs)])],
+        ),
+    )
 
     from .decode import parse_patch_list
+
     return await parse_patch_list(resp, lambda ref: download_external_app_state_blob(client, ref))
 
 
@@ -391,6 +349,7 @@ async def request_missing_app_state_keys(client: "Client", patches: Any) -> None
 async def request_app_state_keys(client: "Client", raw_key_ids: List[bytes]) -> None:
     """Request app state keys from the server."""
     from ..send import SendRequestExtra
+
     if not raw_key_ids:
         return
 
@@ -404,9 +363,7 @@ async def request_app_state_keys(client: "Client", raw_key_ids: List[bytes]) -> 
     msg = waE2E_pb2.Message(
         protocolMessage=waE2E_pb2.ProtocolMessage(
             type=waE2E_pb2.ProtocolMessage.APP_STATE_SYNC_KEY_REQUEST,
-            appStateSyncKeyRequest=waE2E_pb2.AppStateSyncKeyRequest(
-                keyIDs=key_ids
-            )
+            appStateSyncKeyRequest=waE2E_pb2.AppStateSyncKeyRequest(keyIDs=key_ids),
         )
     )
 
@@ -428,6 +385,7 @@ async def send_app_state(client: "Client", patch: Any) -> None:
     """
     from ..datatypes import JID
     from ..request import InfoQuery, InfoQueryType
+
     if client is None:
         raise ValueError("Client is None")
 
@@ -449,26 +407,30 @@ async def send_app_state(client: "Client", patch: Any) -> None:
 
     encoded_patch = await encode.encode_patch(client.app_state_proc, latest_key_id, state, patch)
 
-    resp = await request.send_iq(client, InfoQuery(
-        namespace="w:sync:app:state",
-        type=InfoQueryType.SET,
-        to=JID.server_jid(),
-        content=[binary_node.Node(
-            tag="sync",
-            content=[binary_node.Node(
-                tag="collection",
-                attrs={
-                    "name": patch.type,
-                    "version": version,
-                    "return_snapshot": False,
-                },
-                content=[binary_node.Node(
-                    tag="patch",
-                    content=encoded_patch
-                )]
-            )]
-        )]
-    ))
+    resp = await request.send_iq(
+        client,
+        InfoQuery(
+            namespace="w:sync:app:state",
+            type=InfoQueryType.SET,
+            to=JID.server_jid(),
+            content=[
+                binary_node.Node(
+                    tag="sync",
+                    content=[
+                        binary_node.Node(
+                            tag="collection",
+                            attrs={
+                                "name": patch.type,
+                                "version": version,
+                                "return_snapshot": False,
+                            },
+                            content=[binary_node.Node(tag="patch", content=encoded_patch)],
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
 
     resp_collection = resp.get_child_by_tag("sync").get_child_by_tag("collection")
     resp_collection_attr = resp_collection.attr_getter()

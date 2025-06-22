@@ -21,9 +21,9 @@ class WAVersionContainer:
         self._version = [major, minor, patch]
 
     @classmethod
-    def parse_version(cls, version: str) -> 'WAVersionContainer':
+    def parse_version(cls, version: str) -> "WAVersionContainer":
         """Parse version string into WAVersionContainer - matches Go's ParseVersion."""
-        parts = version.split('.')
+        parts = version.split(".")
         if len(parts) != 3:
             raise ValueError(f"'{version}' doesn't contain three dot-separated parts")
 
@@ -36,11 +36,17 @@ class WAVersionContainer:
 
         return cls(major, minor, patch)
 
-    def less_than(self, other: 'WAVersionContainer') -> bool:
+    def less_than(self, other: "WAVersionContainer") -> bool:
         """Compare versions - matches Go's LessThan."""
-        return (self._version[0] < other._version[0] or
-                (self._version[0] == other._version[0] and self._version[1] < other._version[1]) or
-                (self._version[0] == other._version[0] and self._version[1] == other._version[1] and self._version[2] < other._version[2]))
+        return (
+            self._version[0] < other._version[0]
+            or (self._version[0] == other._version[0] and self._version[1] < other._version[1])
+            or (
+                self._version[0] == other._version[0]
+                and self._version[1] == other._version[1]
+                and self._version[2] < other._version[2]
+            )
+        )
 
     def is_zero(self) -> bool:
         """Check if version is zero - matches Go's IsZero."""
@@ -48,7 +54,7 @@ class WAVersionContainer:
 
     def __str__(self) -> str:
         """String representation - matches Go's String."""
-        return '.'.join(str(part) for part in self._version)
+        return ".".join(str(part) for part in self._version)
 
     def hash(self) -> bytes:
         """MD5 hash of string representation - matches Go's Hash."""
@@ -159,7 +165,7 @@ def set_os_info(name: str, version: Tuple[int, int, int]) -> None:
     BASE_CLIENT_PAYLOAD.userAgent.osBuildNumber = version_str
 
 
-def get_registration_payload(device: 'Device') -> WAWebProtobufsWa6_pb2.ClientPayload:
+def get_registration_payload(device: "Device") -> WAWebProtobufsWa6_pb2.ClientPayload:
     """Get client payload for device registration - matches Go's getRegistrationPayload."""
     # Clone the base payload - matches Go's proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
     payload = WAWebProtobufsWa6_pb2.ClientPayload()
@@ -198,7 +204,7 @@ def get_registration_payload(device: 'Device') -> WAWebProtobufsWa6_pb2.ClientPa
     return payload
 
 
-def get_login_payload(device: 'Device') -> WAWebProtobufsWa6_pb2.ClientPayload:
+def get_login_payload(device: "Device") -> WAWebProtobufsWa6_pb2.ClientPayload:
     """Get client payload for login - matches Go's getLoginPayload."""
     # Clone the base payload - matches Go's proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
     payload = WAWebProtobufsWa6_pb2.ClientPayload()
@@ -216,7 +222,7 @@ def get_login_payload(device: 'Device') -> WAWebProtobufsWa6_pb2.ClientPayload:
     return payload
 
 
-def get_client_payload(device: 'Device') -> WAWebProtobufsWa6_pb2.ClientPayload:
+def get_client_payload(device: "Device") -> WAWebProtobufsWa6_pb2.ClientPayload:
     """Get appropriate client payload based on device state - matches Go's GetClientPayload."""
     if device.id is not None:
         if device.id == EMPTY_JID:

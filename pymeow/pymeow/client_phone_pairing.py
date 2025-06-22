@@ -34,7 +34,7 @@ from pymeow.pair_code import PairClientType, pair_phone
 from pymeow.store.sqlstore.container import Container
 
 # Basic logging setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 APP_ROOT = Path(__file__).resolve().parent  # Used for potential relative path calculations if needed
@@ -61,7 +61,8 @@ async def event_handler(event: Any) -> None:
         logger.info("🔑 Successfully logged in! Device is authenticated.")
     elif isinstance(event, PairSuccess):
         logger.info(
-            f"📱 Device successfully paired: JID {event.id}, LID {event.lid}, Platform: {event.platform}, Business Name: '{event.business_name}'")
+            f"📱 Device successfully paired: JID {event.id}, LID {event.lid}, Platform: {event.platform}, Business Name: '{event.business_name}'"
+        )
     elif isinstance(event, PairError):
         logger.error(f"❌ Pairing failed: {event.error}")
     elif isinstance(event, Disconnected):
@@ -137,7 +138,7 @@ async def main():
                     phone=phone_number_input,
                     show_push_notification=True,  # Shows a notification on the primary device
                     client_type=PairClientType.CHROME,
-                    client_display_name="PyMeow Phone Example"
+                    client_display_name="PyMeow Phone Example",
                 )
                 logger.info(f"PAIRING CODE: {pairing_code}")
                 logger.info("Go to WhatsApp on your phone -> Settings -> Linked Devices -> Link with phone number.")
@@ -172,7 +173,8 @@ async def main():
                 #    await send_message(client, own_jid.to_non_ad(), waE2E_pb2.Message(conversation="Hello from PyMeow (Phone Pairing Example)!"))
             else:
                 logger.info(
-                    "Client is connected, but not yet logged in. Waiting for pairing confirmation or login events.")
+                    "Client is connected, but not yet logged in. Waiting for pairing confirmation or login events."
+                )
         else:
             logger.error("Failed to connect to WhatsApp.")
             # If new pairing failed to complete and connect didn't make it logged_in, exit.

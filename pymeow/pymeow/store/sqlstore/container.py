@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 class Container:
     """Database container managing WhatsApp store operations"""
 
@@ -23,7 +24,7 @@ class Container:
         self.db_url = db_url
         self._initialized = False
 
-    async def ainit(self) -> 'Container':
+    async def ainit(self) -> "Container":
         """Initialize Tortoise ORM connection"""
         if self._initialized:
             return self
@@ -42,12 +43,12 @@ class Container:
             self._initialized = False
             logger.info("Database connections closed")
 
-    async def get_all_devices(self) -> List['Device']:
+    async def get_all_devices(self) -> List["Device"]:
         """Get all registered devices"""
         devices = await DeviceModel.all()
         return [self._device_to_store(device) for device in devices]
 
-    async def get_first_device(self) -> Optional['Device']:
+    async def get_first_device(self) -> Optional["Device"]:
         """Get the first available device, create one if none exist"""
         try:
             device = await DeviceModel.first()
@@ -59,7 +60,7 @@ class Container:
             # Create a new device if none exist (like Go implementation)
             return await self.new_device("new_device@temp.com")
 
-    async def get_device(self, jid: str) -> Optional['Device']:
+    async def get_device(self, jid: str) -> Optional["Device"]:
         """Get device by JID"""
         try:
             device = await DeviceModel.get(id=jid)
@@ -67,7 +68,7 @@ class Container:
         except DoesNotExist:
             return None
 
-    async def new_device(self, jid: str) -> 'Device':
+    async def new_device(self, jid: str) -> "Device":
         """Create a new device with proper default values"""
         # Generate noise key
         noise_key = KeyPair.generate()
@@ -96,16 +97,16 @@ class Container:
             signed_pre_key_sig=signed_pre_key.signature,  # Changed from 'signed_pre_key_signature'
             # ADV fields
             adv_key=adv_key,
-            adv_details=b'',  # Empty for now
-            adv_account_sig=b'',  # Empty for now
-            adv_account_sig_key=b'',  # Empty for now
-            adv_device_sig=b'',  # Empty for now
+            adv_details=b"",  # Empty for now
+            adv_account_sig=b"",  # Empty for now
+            adv_account_sig_key=b"",  # Empty for now
+            adv_device_sig=b"",  # Empty for now
             # Optional fields with defaults
             lid=None,
             facebook_uuid=None,
             platform="android",
             business_name="",
-            push_name=""
+            push_name="",
         )
 
         store = self._device_to_store(device)
@@ -116,7 +117,7 @@ class Container:
 
         return store
 
-    async def put_device(self, store: 'Device') -> None:
+    async def put_device(self, store: "Device") -> None:
         """Save device to database"""
         await self._store_to_device(store).update_or_create()
 
@@ -138,10 +139,11 @@ class Container:
             await AppStateSyncKeyModel.filter(jid=jid).delete()
             await AppStateVersionModel.filter(jid=jid).delete()
 
-    def _device_to_store(self, device: DeviceModel) -> 'Device':
+    def _device_to_store(self, device: DeviceModel) -> "Device":
         """Convert Device model to DeviceStore"""
         from ...datatypes import JID
         from ...store.store import Device
+
         store = Device(self, device.jid)
         store.lid = JID(device.lid) if device.lid else EMPTY_JID
         store.registration_id = device.registration_id
@@ -161,13 +163,11 @@ class Container:
             # Create KeyPair from the stored private key
             key_pair = KeyPair.from_private_key(device.signed_pre_key)
             store.signed_pre_key = PreKey(
-                key_pair=key_pair,
-                key_id=device.signed_pre_key_id,
-                signature=device.signed_pre_key_sig
+                key_pair=key_pair, key_id=device.signed_pre_key_id, signature=device.signed_pre_key_sig
             )
 
         # ADV (Account Device Verification) fields
-        store.adv_secret_key = device.adv_key if device.adv_key else b''
+        store.adv_secret_key = device.adv_key if device.adv_key else b""
         # Note: You might need to add more ADV fields to your Device class:
         # store.adv_details = device.adv_details
         # store.adv_account_sig = device.adv_account_sig
@@ -181,7 +181,7 @@ class Container:
 
         return store
 
-    def _store_to_device(self, store: 'Device') -> DeviceModel:
+    def _store_to_device(self, store: "Device") -> DeviceModel:
         """Convert DeviceStore to Device model"""
         device = DeviceModel()
 
@@ -194,7 +194,7 @@ class Container:
         device.registration_id = store.registration_id
 
         # Facebook UUID
-        if hasattr(store, 'facebook_uuid'):
+        if hasattr(store, "facebook_uuid"):
             device.facebook_uuid = store.facebook_uuid
 
         # Store noise key private key bytes
@@ -216,7 +216,7 @@ class Container:
             device.signed_pre_key_sig = store.signed_pre_key.signature
 
         # ADV fields
-        if hasattr(store, 'adv_secret_key'):
+        if hasattr(store, "adv_secret_key"):
             device.adv_key = store.adv_secret_key
         # Add other ADV fields as needed based on your Device class
 

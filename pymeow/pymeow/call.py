@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def handle_call_event(client: 'Client', node: Node) -> None:
+async def handle_call_event(client: "Client", node: Node) -> None:
     """
     Handle a call event node from the WhatsApp server.
 
@@ -52,68 +52,63 @@ async def handle_call_event(client: 'Client', node: Node) -> None:
             from_jid=ag.jid("from"),
             timestamp=ag.unix_time("t"),
             call_creator=cag.jid("call-creator"),
-            call_id=cag.string("call-id")
+            call_id=cag.string("call-id"),
         )
 
         if child.tag == "offer":
-            await client.dispatch_event(CallOffer(
-                basic_call_meta=basic_meta,
-                call_remote_meta=CallRemoteMeta(
-                    remote_platform=ag.string("platform"),
-                    remote_version=ag.string("version")
-                ),
-                data=child
-            ))
+            await client.dispatch_event(
+                CallOffer(
+                    basic_call_meta=basic_meta,
+                    call_remote_meta=CallRemoteMeta(
+                        remote_platform=ag.string("platform"), remote_version=ag.string("version")
+                    ),
+                    data=child,
+                )
+            )
         elif child.tag == "offer_notice":
-            await client.dispatch_event(CallOfferNotice(
-                basic_call_meta=basic_meta,
-                media=cag.string("media"),
-                type_=cag.string("type"),
-                data=child
-            ))
+            await client.dispatch_event(
+                CallOfferNotice(
+                    basic_call_meta=basic_meta, media=cag.string("media"), type_=cag.string("type"), data=child
+                )
+            )
         elif child.tag == "relaylatency":
-            await client.dispatch_event(CallRelayLatency(
-                basic_call_meta=basic_meta,
-                data=child
-            ))
+            await client.dispatch_event(CallRelayLatency(basic_call_meta=basic_meta, data=child))
         elif child.tag == "accept":
-            await client.dispatch_event(CallAccept(
-                basic_call_meta=basic_meta,
-                call_remote_meta=CallRemoteMeta(
-                    remote_platform=ag.string("platform"),
-                    remote_version=ag.string("version")
-                ),
-                data=child
-            ))
+            await client.dispatch_event(
+                CallAccept(
+                    basic_call_meta=basic_meta,
+                    call_remote_meta=CallRemoteMeta(
+                        remote_platform=ag.string("platform"), remote_version=ag.string("version")
+                    ),
+                    data=child,
+                )
+            )
         elif child.tag == "preaccept":
-            await client.dispatch_event(CallPreAccept(
-                basic_call_meta=basic_meta,
-                call_remote_meta=CallRemoteMeta(
-                    remote_platform=ag.string("platform"),
-                    remote_version=ag.string("version")
-                ),
-                data=child
-            ))
+            await client.dispatch_event(
+                CallPreAccept(
+                    basic_call_meta=basic_meta,
+                    call_remote_meta=CallRemoteMeta(
+                        remote_platform=ag.string("platform"), remote_version=ag.string("version")
+                    ),
+                    data=child,
+                )
+            )
         elif child.tag == "transport":
-            await client.dispatch_event(CallTransport(
-                basic_call_meta=basic_meta,
-                call_remote_meta=CallRemoteMeta(
-                    remote_platform=ag.string("platform"),
-                    remote_version=ag.string("version")
-                ),
-                data=child
-            ))
+            await client.dispatch_event(
+                CallTransport(
+                    basic_call_meta=basic_meta,
+                    call_remote_meta=CallRemoteMeta(
+                        remote_platform=ag.string("platform"), remote_version=ag.string("version")
+                    ),
+                    data=child,
+                )
+            )
         elif child.tag == "terminate":
-            await client.dispatch_event(CallTerminate(
-                basic_call_meta=basic_meta,
-                reason=cag.string("reason"),
-                data=child
-            ))
+            await client.dispatch_event(
+                CallTerminate(basic_call_meta=basic_meta, reason=cag.string("reason"), data=child)
+            )
         elif child.tag == "reject":
-            await client.dispatch_event(CallReject(
-                basic_call_meta=basic_meta,
-                data=child
-            ))
+            await client.dispatch_event(CallReject(basic_call_meta=basic_meta, data=child))
         else:
             await client.dispatch_event(UnknownCallEvent(node=node))
 
@@ -123,7 +118,7 @@ async def handle_call_event(client: 'Client', node: Node) -> None:
         client.create_task(receipt.send_ack(client, node))
 
 
-async def reject_call(client: 'Client', call_from: JID, call_id: str) -> None:
+async def reject_call(client: "Client", call_from: JID, call_id: str) -> None:
     """
     Reject an incoming call.
 
@@ -142,20 +137,16 @@ async def reject_call(client: 'Client', call_from: JID, call_id: str) -> None:
     own_id = own_id.to_non_ad()
     call_from = call_from.to_non_ad()
 
-    await client.send_node(Node(
-        tag="call",
-        attrs=Attrs({
-            "id": send.generate_message_id(client),
-            "from": own_id,
-            "to": call_from
-        }),
-        content=[Node(
-            tag="reject",
-            attrs=Attrs({
-                "call-id": call_id,
-                "call-creator": call_from,
-                "count": "0"
-            }),
-            content=None
-        )]
-    ))
+    await client.send_node(
+        Node(
+            tag="call",
+            attrs=Attrs({"id": send.generate_message_id(client), "from": own_id, "to": call_from}),
+            content=[
+                Node(
+                    tag="reject",
+                    attrs=Attrs({"call-id": call_id, "call-creator": call_from, "count": "0"}),
+                    content=None,
+                )
+            ],
+        )
+    )

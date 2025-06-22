@@ -3,6 +3,7 @@ Store interfaces for WhatsApp data needed for multidevice functionality.
 
 Port of whatsmeow/store/store.go
 """
+
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from .sqlstore.container import Container
 
 if TYPE_CHECKING:
     from ..datatypes import ContactInfo
+
 
 class IdentityStore(ABC):
     """Interface for storing identity keys."""
@@ -231,12 +233,12 @@ class ContactStore(ABC):
         pass
 
     @abstractmethod
-    async def get_contact(self, user: JID) -> 'ContactInfo':
+    async def get_contact(self, user: JID) -> "ContactInfo":
         """Get contact info for a user."""
         pass
 
     @abstractmethod
-    async def get_all_contacts(self) -> Dict[JID, 'ContactInfo']:
+    async def get_all_contacts(self) -> Dict[JID, "ContactInfo"]:
         """Get contact info for all users."""
         pass
 
@@ -269,12 +271,12 @@ class DeviceContainer(ABC):
     """Interface for storing devices."""
 
     @abstractmethod
-    async def put_device(self, device: 'Device') -> None:
+    async def put_device(self, device: "Device") -> None:
         """Store a device."""
         pass
 
     @abstractmethod
-    async def delete_device(self, device: 'Device') -> None:
+    async def delete_device(self, device: "Device") -> None:
         """Delete a device."""
         pass
 
@@ -356,12 +358,12 @@ class EventBuffer(ABC):
     @abstractmethod
     async def do_decryption_txn(self, fn: Awaitable[None]) -> None:
         """Execute a function within a decryption transaction."""
-        raise NotImplementedError # todo implement in sqlstore
+        raise NotImplementedError  # todo implement in sqlstore
 
     @abstractmethod
     async def clear_buffered_event_plaintext(self, ciphertext_hash: bytes) -> None:
         """Clear the plaintext of a buffered event."""
-        raise NotImplementedError # todo implement this in sqlstore
+        raise NotImplementedError  # todo implement this in sqlstore
 
     @abstractmethod
     async def delete_old_buffered_hashes(self) -> None:
@@ -401,11 +403,23 @@ class LIDStore(ABC):
         pass
 
 
-class AllSessionSpecificStores(IdentityStore, SessionStore, PreKeyStore, SenderKeyStore,
-                              AppStateSyncKeyStore, AppStateStore, ContactStore,
-                              ChatSettingsStore, MsgSecretStore, PrivacyTokenStore,
-                              EventBuffer, LIDStore, DeviceContainer):
+class AllSessionSpecificStores(
+    IdentityStore,
+    SessionStore,
+    PreKeyStore,
+    SenderKeyStore,
+    AppStateSyncKeyStore,
+    AppStateStore,
+    ContactStore,
+    ChatSettingsStore,
+    MsgSecretStore,
+    PrivacyTokenStore,
+    EventBuffer,
+    LIDStore,
+    DeviceContainer,
+):
     """Interface combining all session-specific stores."""
+
     pass
 
 
@@ -422,6 +436,7 @@ class AllSessionSpecificStores(IdentityStore, SessionStore, PreKeyStore, SenderK
 @dataclass
 class Device:
     """Device data and associated stores."""
+
     noise_key: KeyPair
     identity_key: KeyPair
     signed_pre_key: PreKey
@@ -459,6 +474,7 @@ class Device:
 
     def __init__(self, container: Container, jid: str):
         from .sqlstore.store import SQLStore
+
         # Create ONE SQLStore instance that implements ALL interfaces
         sql_store = SQLStore(container, jid)
 

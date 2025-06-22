@@ -3,6 +3,7 @@ SQL-backed store implementation using Tortoise ORM.
 
 Port of whatsmeow/store/sqlstore/store.go
 """
+
 import asyncio
 import logging
 from datetime import datetime
@@ -34,6 +35,7 @@ from .models.messages import MessageSecretModel
 from .models.session import IdentityKeyModel, PreKeyModel, SenderKeyModel, SessionModel
 
 logger = logging.getLogger(__name__)
+
 
 class ChatSettings:
     def __init__(self, muted_until: Optional[int] = None, pinned: bool = False, archived: bool = False):
@@ -77,25 +79,15 @@ class SQLStore(AllSessionSpecificStores):
     # Identity Key methods
     async def put_identity(self, address: str, key: bytes) -> None:
         """Put an identity key in the store."""
-        await IdentityKeyModel.update_or_create(
-            our_jid=self.jid,
-            their_id=address,
-            defaults={'identity': key}
-        )
+        await IdentityKeyModel.update_or_create(our_jid=self.jid, their_id=address, defaults={"identity": key})
 
     async def delete_all_identities(self, phone: str) -> None:
         """Delete all identity keys for a phone number."""
-        await IdentityKeyModel.filter(
-            our_jid=self.jid,
-            their_id__startswith=f"{phone}:"
-        ).delete()
+        await IdentityKeyModel.filter(our_jid=self.jid, their_id__startswith=f"{phone}:").delete()
 
     async def delete_identity(self, address: str) -> None:
         """Delete a specific identity key."""
-        await IdentityKeyModel.filter(
-            our_jid=self.jid,
-            their_id=address
-        ).delete()
+        await IdentityKeyModel.filter(our_jid=self.jid, their_id=address).delete()
 
     async def is_trusted_identity(self, address: str, key: bytes) -> bool:
         """Check if an identity key is trusted."""
@@ -122,11 +114,7 @@ class SQLStore(AllSessionSpecificStores):
 
     async def put_session(self, address: str, session: bytes) -> None:
         """Put a session in the store."""
-        await SessionModel.update_or_create(
-            our_jid=self.jid,
-            their_id=address,
-            defaults={'session': session}
-        )
+        await SessionModel.update_or_create(our_jid=self.jid, their_id=address, defaults={"session": session})
 
     async def delete_session(self, address: str) -> None:
         """Delete a specific session."""
@@ -134,10 +122,7 @@ class SQLStore(AllSessionSpecificStores):
 
     async def delete_all_sessions(self, phone: str) -> None:
         """Delete all sessions for a phone number."""
-        await SessionModel.filter(
-            our_jid=self.jid,
-            their_id__startswith=f"{phone}:"
-        ).delete()
+        await SessionModel.filter(our_jid=self.jid, their_id__startswith=f"{phone}:").delete()
 
     async def migrate_pn_to_lid(self, pn: JID, lid: JID) -> None:
         """
@@ -160,89 +145,82 @@ class SQLStore(AllSessionSpecificStores):
         async with in_transaction() as connection:
             # Migrate sessions
             sessions_updated = 0
-            sessions = await SessionModel.filter(
-                our_jid=self.jid,
-                their_id__startswith=f"{pn_signal}:"
-            ).using_db(connection).all()
+            sessions = (
+                await SessionModel.filter(our_jid=self.jid, their_id__startswith=f"{pn_signal}:")
+                .using_db(connection)
+                .all()
+            )
             for session in sessions:
                 new_id = session.their_id.replace(pn_signal, lid_signal, 1)
                 await SessionModel.update_or_create(
-                    our_jid=self.jid,
-                    their_id=new_id,
-                    defaults={'session': session.session},
-                    using_db=connection
+                    our_jid=self.jid, their_id=new_id, defaults={"session": session.session}, using_db=connection
                 )
                 sessions_updated += 1
 
             # Delete old sessions
-            await SessionModel.filter(
-                our_jid=self.jid,
-                their_id__startswith=f"{pn_signal}:"
-            ).using_db(connection).delete()
+            await (
+                SessionModel.filter(our_jid=self.jid, their_id__startswith=f"{pn_signal}:")
+                .using_db(connection)
+                .delete()
+            )
 
             # Migrate identity keys
             identity_keys_updated = 0
-            identities = await IdentityKeyModel.filter(
-                our_jid=self.jid,
-                their_id__startswith=f"{pn_signal}:"
-            ).using_db(connection)
+            identities = await IdentityKeyModel.filter(our_jid=self.jid, their_id__startswith=f"{pn_signal}:").using_db(
+                connection
+            )
             for identity in identities:
                 new_id = identity.their_id.replace(pn_signal, lid_signal, 1)
                 await IdentityKeyModel.update_or_create(
-                    our_jid=self.jid,
-                    their_id=new_id,
-                    defaults={'identity': identity.identity},
-                    using_db=connection
+                    our_jid=self.jid, their_id=new_id, defaults={"identity": identity.identity}, using_db=connection
                 )
                 identity_keys_updated += 1
 
             # Delete old identity keys
-            await IdentityKeyModel.filter(
-                our_jid=self.jid,
-                their_id__startswith=f"{pn_signal}:"
-            ).using_db(connection).delete()
+            await (
+                IdentityKeyModel.filter(our_jid=self.jid, their_id__startswith=f"{pn_signal}:")
+                .using_db(connection)
+                .delete()
+            )
 
             # Migrate sender keys
             sender_keys_updated = 0
-            sender_keys = await SenderKeyModel.filter(
-                our_jid=self.jid,
-                sender_id__startswith=f"{pn_signal}:"
-            ).using_db(connection)
+            sender_keys = await SenderKeyModel.filter(our_jid=self.jid, sender_id__startswith=f"{pn_signal}:").using_db(
+                connection
+            )
             for sender_key in sender_keys:
                 new_id = sender_key.sender_id.replace(pn_signal, lid_signal, 1)
                 await SenderKeyModel.update_or_create(
                     our_jid=self.jid,
                     chat_id=sender_key.chat_id,
                     sender_id=new_id,
-                    defaults={'sender_key': sender_key.sender_key},
-                    using_db=connection
+                    defaults={"sender_key": sender_key.sender_key},
+                    using_db=connection,
                 )
                 sender_keys_updated += 1
 
             # Delete old sender keys
-            await SenderKeyModel.filter(
-                our_jid=self.jid,
-                sender_id__startswith=f"{pn_signal}:"
-            ).using_db(connection).delete()
+            await (
+                SenderKeyModel.filter(our_jid=self.jid, sender_id__startswith=f"{pn_signal}:")
+                .using_db(connection)
+                .delete()
+            )
 
         if sessions_updated > 0 or sender_keys_updated > 0 or identity_keys_updated > 0:
-            print(f"Migrated {sessions_updated} sessions, {identity_keys_updated} identity keys and {sender_keys_updated} sender keys from {pn_signal} to {lid_signal}")
+            print(
+                f"Migrated {sessions_updated} sessions, {identity_keys_updated} identity keys and {sender_keys_updated} sender keys from {pn_signal} to {lid_signal}"
+            )
 
     # Pre-key methods
     async def _get_next_pre_key_id(self) -> int:
         """Get the next available pre-key ID."""
-        max_key = await PreKeyModel.filter(jid=self.jid).only('key_id').order_by('-key_id').first()
+        max_key = await PreKeyModel.filter(jid=self.jid).only("key_id").order_by("-key_id").first()
         return (max_key.key_id + 1) if max_key else 1
 
     async def _gen_one_pre_key(self, key_id: int, mark_uploaded: bool = False) -> PreKey:
         """Generate and store one pre-key."""
         key = PreKey.generate(key_id)
-        await PreKeyModel.create(
-            jid=self.jid,
-            key_id=key.key_id,
-            key=key.priv,
-            uploaded=mark_uploaded
-        )
+        await PreKeyModel.create(jid=self.jid, key_id=key.key_id, key=key.priv, uploaded=mark_uploaded)
         return key
 
     async def gen_one_pre_key(self) -> PreKey:
@@ -256,10 +234,7 @@ class SQLStore(AllSessionSpecificStores):
         async with self.pre_key_lock:
             # Get existing unuploaded keys
             existing_keys = []
-            prekeys = await PreKeyModel.filter(
-                jid=self.jid,
-                uploaded=False
-            ).order_by('key_id').limit(count)
+            prekeys = await PreKeyModel.filter(jid=self.jid, uploaded=False).order_by("key_id").limit(count)
             for pre_key_model in prekeys:
                 key_pair = KeyPair.from_private_key(pre_key_model.key)
                 pre_key = PreKey(key_pair, pre_key_model.key_id)
@@ -289,10 +264,7 @@ class SQLStore(AllSessionSpecificStores):
 
     async def mark_pre_keys_as_uploaded(self, up_to_id: int) -> None:
         """Mark pre-keys as uploaded up to the given ID."""
-        await PreKeyModel.filter(
-            jid=self.jid,
-            key_id__lte=up_to_id
-        ).update(uploaded=True)
+        await PreKeyModel.filter(jid=self.jid, key_id__lte=up_to_id).update(uploaded=True)
 
     async def uploaded_prekey_count(self) -> int:
         """Get the count of uploaded pre-keys."""
@@ -302,20 +274,13 @@ class SQLStore(AllSessionSpecificStores):
     async def put_sender_key(self, group: str, user: str, session: bytes) -> None:
         """Put a sender key in the store."""
         await SenderKeyModel.update_or_create(
-            our_jid=self.jid,
-            chat_id=group,
-            sender_id=user,
-            defaults={'sender_key': session}
+            our_jid=self.jid, chat_id=group, sender_id=user, defaults={"sender_key": session}
         )
 
     async def get_sender_key(self, group: str, user: str) -> Optional[bytes]:
         """Get a sender key from the store."""
         try:
-            sender_key = await SenderKeyModel.get(
-                our_jid=self.jid,
-                chat_id=group,
-                sender_id=user
-            )
+            sender_key = await SenderKeyModel.get(our_jid=self.jid, chat_id=group, sender_id=user)
             return sender_key.sender_key
         except Exception as e:
             logger.exception(e)
@@ -327,11 +292,7 @@ class SQLStore(AllSessionSpecificStores):
         await AppStateSyncKeyModel.update_or_create(
             jid=self.jid,
             key_id=key_id,
-            defaults={
-                'key_data': key.data,
-                'timestamp': key.timestamp,
-                'fingerprint': key.fingerprint
-            }
+            defaults={"key_data": key.data, "timestamp": key.timestamp, "fingerprint": key.fingerprint},
         )
 
     async def get_app_state_sync_key(self, key_id: bytes) -> Optional[AppStateSyncKey]:
@@ -339,30 +300,21 @@ class SQLStore(AllSessionSpecificStores):
         try:
             key_model = await AppStateSyncKeyModel.get(jid=self.jid, key_id=key_id)
             return AppStateSyncKey(
-                data=key_model.key_data,
-                timestamp=key_model.timestamp,
-                fingerprint=key_model.fingerprint
+                data=key_model.key_data, timestamp=key_model.timestamp, fingerprint=key_model.fingerprint
             )
         except Exception:
             return None
 
     async def get_latest_app_state_sync_key_id(self) -> Optional[bytes]:
         """Get the latest app state sync key ID."""
-        latest = await AppStateSyncKeyModel.filter(
-            jid=self.jid
-        ).order_by('-timestamp').first()
+        latest = await AppStateSyncKeyModel.filter(jid=self.jid).order_by("-timestamp").first()
         return latest.key_id if latest else None
 
     # App state version methods
     async def put_app_state_version(self, name: str, version: int, hash_value: bytes) -> None:
         """Put an app state version."""
         await AppStateVersionModel.update_or_create(
-            jid=self.jid,
-            name=name,
-            defaults={
-                'version': version,
-                'hash': hash_value
-            }
+            jid=self.jid, name=name, defaults={"version": version, "hash": hash_value}
         )
 
     async def get_app_state_version(self, name: str) -> Tuple[int, bytearray]:
@@ -372,19 +324,14 @@ class SQLStore(AllSessionSpecificStores):
             return version_model.version, bytearray(version_model.hash)
         except Exception as e:
             logger.exception(e)
-            return 0, bytearray(b'\x00' * 128)
+            return 0, bytearray(b"\x00" * 128)
 
     async def delete_app_state_version(self, name: str) -> None:
         """Delete an app state version."""
         await AppStateVersionModel.filter(jid=self.jid, name=name).delete()
 
     # App state mutation MAC methods
-    async def put_app_state_mutation_macs(
-        self,
-        name: str,
-        version: int,
-        mutations: List[AppStateMutationMAC]
-    ) -> None:
+    async def put_app_state_mutation_macs(self, name: str, version: int, mutations: List[AppStateMutationMAC]) -> None:
         """Put app state mutation MACs."""
         if not mutations:
             return
@@ -398,7 +345,7 @@ class SQLStore(AllSessionSpecificStores):
                     version=version,
                     index_mac=mutation.index_mac,
                     value_mac=mutation.value_mac,
-                    using_db=connection
+                    using_db=connection,
                 )
 
     async def delete_app_state_mutation_macs(self, name: str, index_macs: List[bytes]) -> None:
@@ -406,19 +353,15 @@ class SQLStore(AllSessionSpecificStores):
         if not index_macs:
             return
 
-        await AppStateMutationMACModel.filter(
-            jid=self.jid,
-            name=name,
-            index_mac__in=index_macs
-        ).delete()
+        await AppStateMutationMACModel.filter(jid=self.jid, name=name, index_mac__in=index_macs).delete()
 
     async def get_app_state_mutation_mac(self, name: str, index_mac: bytes) -> Optional[bytes]:
         """Get an app state mutation MAC."""
-        mac_model = await AppStateMutationMACModel.filter(
-            jid=self.jid,
-            name=name,
-            index_mac=index_mac
-        ).order_by('-version').first()
+        mac_model = (
+            await AppStateMutationMACModel.filter(jid=self.jid, name=name, index_mac=index_mac)
+            .order_by("-version")
+            .first()
+        )
 
         return mac_model.value_mac if mac_model else None
 
@@ -435,7 +378,7 @@ class SQLStore(AllSessionSpecificStores):
                 full_name=contact.full_name or "",
                 push_name=contact.push_name or "",
                 business_name=contact.business_name or "",
-                found=True
+                found=True,
             )
         except Exception as e:
             logger.exception(e)
@@ -450,12 +393,7 @@ class SQLStore(AllSessionSpecificStores):
             cached = await self._get_contact(user)
             if cached.first_name != first_name or cached.full_name != full_name:
                 await ContactModel.update_or_create(
-                    our_jid=self.jid,
-                    their_jid=str(user),
-                    defaults={
-                        'first_name': first_name,
-                        'full_name': full_name
-                    }
+                    our_jid=self.jid, their_jid=str(user), defaults={"first_name": first_name, "full_name": full_name}
                 )
                 cached.first_name = first_name
                 cached.full_name = full_name
@@ -479,11 +417,8 @@ class SQLStore(AllSessionSpecificStores):
                 await ContactModel.update_or_create(
                     our_jid=self.jid,
                     their_jid=str(contact.jid),
-                    defaults={
-                        'first_name': contact.first_name,
-                        'full_name': contact.full_name
-                    },
-                    using_db=connection
+                    defaults={"first_name": contact.first_name, "full_name": contact.full_name},
+                    using_db=connection,
                 )
 
     async def put_push_name(self, user: JID, push_name: str) -> Tuple[bool, str]:
@@ -492,9 +427,7 @@ class SQLStore(AllSessionSpecificStores):
             cached = await self._get_contact(user)
             if cached.push_name != push_name:
                 await ContactModel.update_or_create(
-                    our_jid=self.jid,
-                    their_jid=str(user),
-                    defaults={'push_name': push_name}
+                    our_jid=self.jid, their_jid=str(user), defaults={"push_name": push_name}
                 )
                 previous_name = cached.push_name
                 cached.push_name = push_name
@@ -508,9 +441,7 @@ class SQLStore(AllSessionSpecificStores):
             cached = await self._get_contact(user)
             if cached.business_name != business_name:
                 await ContactModel.update_or_create(
-                    our_jid=self.jid,
-                    their_jid=str(user),
-                    defaults={'business_name': business_name}
+                    our_jid=self.jid, their_jid=str(user), defaults={"business_name": business_name}
                 )
                 previous_name = cached.business_name
                 cached.business_name = business_name
@@ -535,7 +466,7 @@ class SQLStore(AllSessionSpecificStores):
                 full_name=contact.full_name or "",
                 push_name=contact.push_name or "",
                 business_name=contact.business_name or "",
-                found=True
+                found=True,
             )
         return contacts_result
 
@@ -548,46 +479,32 @@ class SQLStore(AllSessionSpecificStores):
     async def put_muted_until(self, chat: JID, muted_until: datetime) -> None:
         """Set chat muted until timestamp in database."""
         await ChatSettingsModel.update_or_create(
-            our_jid=self.jid,
-            chat_jid=str(chat),
-            defaults={'muted_until': muted_until}
+            our_jid=self.jid, chat_jid=str(chat), defaults={"muted_until": muted_until}
         )
 
     async def put_pinned(self, chat: JID, pinned: bool) -> None:
         """Set chat pinned status in database."""
-        await ChatSettingsModel.update_or_create(
-            our_jid=self.jid,
-            chat_jid=str(chat),
-            defaults={'pinned': pinned}
-        )
+        await ChatSettingsModel.update_or_create(our_jid=self.jid, chat_jid=str(chat), defaults={"pinned": pinned})
 
     async def put_archived(self, chat: JID, archived: bool) -> None:
         """Set chat archived status in database."""
-        await ChatSettingsModel.update_or_create(
-            our_jid=self.jid,
-            chat_jid=str(chat),
-            defaults={'archived': archived}
-        )
+        await ChatSettingsModel.update_or_create(our_jid=self.jid, chat_jid=str(chat), defaults={"archived": archived})
 
     async def get_chat_settings(self, chat: JID) -> Any:
         """Get chat settings from database."""
         try:
             settings = await ChatSettingsModel.get(our_jid=self.jid, chat_jid=str(chat))
-            return ChatSettings(
-                muted_until=settings.muted_until,
-                pinned=settings.pinned,
-                archived=settings.archived
-            )
+            return ChatSettings(muted_until=settings.muted_until, pinned=settings.pinned, archived=settings.archived)
         except Exception as e:
             logger.exception(e)
             return None
 
     # Device Container methods
-    async def put_device(self, device: 'Device') -> None:
+    async def put_device(self, device: "Device") -> None:
         """Save device to database."""
         await self.container.put_device(device)
 
-    async def delete_device(self, device: 'Device') -> None:
+    async def delete_device(self, device: "Device") -> None:
         """Delete device."""
         if device.id:
             await self.container.delete_device(str(device.id))
@@ -601,26 +518,19 @@ class SQLStore(AllSessionSpecificStores):
                 chat_jid=str(insert.chat),
                 sender_jid=str(insert.sender),
                 message_id=insert.id,
-                defaults={'key': insert.secret}
+                defaults={"key": insert.secret},
             )
 
     async def put_message_secret(self, chat: JID, sender: JID, id: str, secret: bytes) -> None:
         """Put a single message secret in database."""
         await MessageSecretModel.update_or_create(
-            our_jid=self.jid,
-            chat_jid=str(chat),
-            sender_jid=str(sender),
-            message_id=id,
-            defaults={'key': secret}
+            our_jid=self.jid, chat_jid=str(chat), sender_jid=str(sender), message_id=id, defaults={"key": secret}
         )
 
     async def get_message_secret(self, chat: JID, sender: JID, id: str) -> bytes:
         """Get message secret from database."""
         secret = await MessageSecretModel.get(
-            our_jid=self.jid,
-            chat_jid=str(chat),
-            sender_jid=str(sender),
-            message_id=id
+            our_jid=self.jid, chat_jid=str(chat), sender_jid=str(sender), message_id=id
         )
         return secret.key
 
@@ -644,11 +554,7 @@ class SQLStore(AllSessionSpecificStores):
     async def put_buffered_event(self, ciphertext_hash: bytes, plaintext: bytes, server_timestamp: datetime) -> None:
         """Stub: Put buffered event."""
         key = ciphertext_hash.hex()
-        event = BufferedEvent(
-            plaintext=plaintext,
-            insert_time=datetime.now(),
-            server_time=server_timestamp
-        )
+        event = BufferedEvent(plaintext=plaintext, insert_time=datetime.now(), server_time=server_timestamp)
         self.buffered_events_cache[key] = event
 
     async def do_decryption_txn(self, fn: Awaitable[None]) -> None:
@@ -662,7 +568,7 @@ class SQLStore(AllSessionSpecificStores):
         key = ciphertext_hash.hex()
         if key in self.buffered_events_cache:
             event = self.buffered_events_cache[key]
-            event.plaintext = b''
+            event.plaintext = b""
 
     async def delete_old_buffered_hashes(self) -> None:
         """Stub: Delete old buffered events."""
@@ -690,9 +596,7 @@ class SQLStore(AllSessionSpecificStores):
                     continue
 
                 await LIDMappingModel.update_or_create(
-                    lid=mapping.lid.user,
-                    defaults={'pn': mapping.pn.user},
-                    using_db=connection
+                    lid=mapping.lid.user, defaults={"pn": mapping.pn.user}, using_db=connection
                 )
 
                 # Update cache
@@ -704,10 +608,7 @@ class SQLStore(AllSessionSpecificStores):
         if lid.server != "lid.whatsapp.net" or pn.server != "s.whatsapp.net":
             raise Exception(f"invalid PutLIDMapping call {lid}/{pn}")
 
-        await LIDMappingModel.update_or_create(
-            lid=lid.user,
-            defaults={'pn': pn.user}
-        )
+        await LIDMappingModel.update_or_create(lid=lid.user, defaults={"pn": pn.user})
 
         # Update cache
         self.lid_mappings_cache[str(lid)] = str(pn)

@@ -3,6 +3,7 @@ Newsletter types for PyMeow.
 
 Port of types/newsletter.go
 """
+
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -23,11 +24,12 @@ class NewsletterVerificationState(str, Enum):
 
     Port of NewsletterVerificationState in Go.
     """
+
     VERIFIED = "verified"
     UNVERIFIED = "unverified"
 
     @classmethod
-    def from_text(cls, text: str) -> 'NewsletterVerificationState':
+    def from_text(cls, text: str) -> "NewsletterVerificationState":
         """Case-insensitive parsing like Go's UnmarshalText."""
         return cls(text.lower())
 
@@ -38,11 +40,12 @@ class NewsletterPrivacy(str, Enum):
 
     Port of NewsletterPrivacy in Go.
     """
+
     PRIVATE = "private"
     PUBLIC = "public"
 
     @classmethod
-    def from_text(cls, text: str) -> 'NewsletterPrivacy':
+    def from_text(cls, text: str) -> "NewsletterPrivacy":
         """Case-insensitive parsing like Go's UnmarshalText."""
         return cls(text.lower())
 
@@ -53,6 +56,7 @@ class NewsletterReactionsMode(str, Enum):
 
     Port of NewsletterReactionsMode in Go.
     """
+
     ALL = "all"
     BASIC = "basic"
     NONE = "none"
@@ -65,12 +69,13 @@ class NewsletterState(str, Enum):
 
     Port of NewsletterState in Go.
     """
+
     ACTIVE = "active"
     SUSPENDED = "suspended"
     GEO_SUSPENDED = "geosuspended"
 
     @classmethod
-    def from_text(cls, text: str) -> 'NewsletterState':
+    def from_text(cls, text: str) -> "NewsletterState":
         """Case-insensitive parsing like Go's UnmarshalText."""
         return cls(text.lower())
 
@@ -82,6 +87,7 @@ class NewsletterMuted:
 
     Port of NewsletterMuted in Go.
     """
+
     muted: bool
 
 
@@ -92,6 +98,7 @@ class WrappedNewsletterState:
 
     Port of WrappedNewsletterState in Go.
     """
+
     type: NewsletterState
 
 
@@ -101,11 +108,12 @@ class NewsletterMuteState(str, Enum):
 
     Port of NewsletterMuteState in Go.
     """
+
     ON = "on"
     OFF = "off"
 
     @classmethod
-    def from_text(cls, text: str) -> 'NewsletterMuteState':
+    def from_text(cls, text: str) -> "NewsletterMuteState":
         """Case-insensitive parsing like Go's UnmarshalText."""
         return cls(text.lower())
 
@@ -116,13 +124,14 @@ class NewsletterRole(str, Enum):
 
     Port of NewsletterRole in Go.
     """
+
     SUBSCRIBER = "subscriber"
     GUEST = "guest"
     ADMIN = "admin"
     OWNER = "owner"
 
     @classmethod
-    def from_text(cls, text: str) -> 'NewsletterRole':
+    def from_text(cls, text: str) -> "NewsletterRole":
         """Case-insensitive parsing like Go's UnmarshalText."""
         return cls(text.lower())
 
@@ -134,6 +143,7 @@ class NewsletterText:
 
     Port of NewsletterText in Go.
     """
+
     text: str
     id: str
     update_time: datetime  # In Go: jsontime.UnixMicroString
@@ -146,6 +156,7 @@ class NewsletterReactionSettings:
 
     Port of NewsletterReactionSettings in Go.
     """
+
     value: NewsletterReactionsMode
 
 
@@ -156,6 +167,7 @@ class NewsletterSettings:
 
     Port of NewsletterSettings in Go.
     """
+
     reaction_codes: NewsletterReactionSettings
 
 
@@ -166,6 +178,7 @@ class NewsletterThreadMetadata:
 
     Port of NewsletterThreadMetadata in Go.
     """
+
     creation_time: datetime  # In Go: jsontime.UnixString
     invite_code: str
     name: NewsletterText
@@ -177,11 +190,11 @@ class NewsletterThreadMetadata:
     picture: Optional[ProfilePictureInfo] = None  # In Go: *ProfilePictureInfo
 
     @classmethod
-    def from_json(cls, data: dict) -> 'NewsletterThreadMetadata':
+    def from_json(cls, data: dict) -> "NewsletterThreadMetadata":
         """Handle JSON parsing with proper field mapping."""
         # Handle subscribers_count as string -> int conversion
-        if 'subscribers_count' in data:
-            data['subscriber_count'] = int(data.pop('subscribers_count'))
+        if "subscribers_count" in data:
+            data["subscriber_count"] = int(data.pop("subscribers_count"))
         return cls(**data)
 
 
@@ -192,6 +205,7 @@ class NewsletterViewerMetadata:
 
     Port of NewsletterViewerMetadata in Go.
     """
+
     mute: NewsletterMuteState
     role: NewsletterRole
 
@@ -203,6 +217,7 @@ class NewsletterMetadata:
 
     Port of NewsletterMetadata in Go.
     """
+
     id: JID
     state: WrappedNewsletterState
     thread_meta: NewsletterThreadMetadata
@@ -215,6 +230,7 @@ class NewsletterKeyType(str, Enum):
 
     Port of NewsletterKeyType in Go.
     """
+
     JID = "JID"
     INVITE = "INVITE"
 
@@ -226,6 +242,7 @@ class NewsletterMessage:
 
     Port of NewsletterMessage in Go.
     """
+
     message_server_id: MessageServerID
     message_id: MessageID
     type: str
@@ -242,6 +259,7 @@ class GraphQLErrorExtensions:
 
     Port of GraphQLErrorExtensions in Go.
     """
+
     error_code: int
     is_retryable: bool
     severity: str
@@ -254,6 +272,7 @@ class GraphQLError:
 
     Port of GraphQLError in Go.
     """
+
     extensions: GraphQLErrorExtensions
     message: str
     path: List[str]
@@ -298,7 +317,7 @@ class GraphQLErrors(Exception):
         elif len(self.errors) == 1:
             return str(self.errors[0])
         else:
-            return f"{self.errors[0]} (and {len(self.errors)-1} other errors)"
+            return f"{self.errors[0]} (and {len(self.errors) - 1} other errors)"
 
     def __len__(self) -> int:
         """Return the number of errors."""
@@ -320,5 +339,6 @@ class GraphQLResponse:
 
     Port of GraphQLResponse in Go.
     """
+
     data: Any  # In Go: json.RawMessage
     errors: GraphQLErrors

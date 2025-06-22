@@ -27,9 +27,10 @@ class AttrUtility:
         self.attrs = attrs
         self.errors: List[Exception] = []  # todo: just raise instead of collecting
 
-    def get_jid(self, key: str, require: bool) -> Tuple['JID', bool]:
+    def get_jid(self, key: str, require: bool) -> Tuple["JID", bool]:
         """Get JID attribute with error handling."""
         from ..datatypes import JID
+
         if key not in self.attrs:
             if require:
                 self.errors.append(ValueError(f"didn't find required JID attribute '{key}'"))
@@ -51,7 +52,7 @@ class AttrUtility:
         self.errors.append(TypeError(f"expected attribute '{key}' to be JID, but was {type(val).__name__}"))
         return JID(), False
 
-    def optional_jid(self, key: str) -> Optional['JID']:
+    def optional_jid(self, key: str) -> Optional["JID"]:
         """
         OptionalJID returns the JID under the given key. If there's no valid JID under the given key, this will return None.
         However, if the attribute is completely missing, this will not store an error.
@@ -61,7 +62,7 @@ class AttrUtility:
             return jid
         return None
 
-    def optional_jid_or_empty(self, key: str) -> 'JID':
+    def optional_jid_or_empty(self, key: str) -> "JID":
         """
         OptionalJIDOrEmpty returns the JID under the given key. If there's no valid JID under the given key, this will return an empty JID.
         However, if the attribute is completely missing, this will not store an error.
@@ -71,7 +72,7 @@ class AttrUtility:
             return jid
         return JID()
 
-    def jid(self, key: str) -> 'JID':
+    def jid(self, key: str) -> "JID":
         """
         JID returns the JID under the given key.
         If there's no valid JID under the given key, an error will be stored and a blank JID struct will be returned.
@@ -129,9 +130,9 @@ class AttrUtility:
             return False, False
 
         # Parse bool similar to Go's strconv.ParseBool
-        if str_val.lower() in ('1', 'true', 't'):
+        if str_val.lower() in ("1", "true", "t"):
             return True, True
-        elif str_val.lower() in ('0', 'false', 'f'):
+        elif str_val.lower() in ("0", "false", "f"):
             return False, True
         else:
             self.errors.append(ValueError(f"failed to parse bool in attribute '{key}': invalid syntax"))
@@ -244,6 +245,6 @@ class ErrorList(Exception):
 
 
 # This would be added to the Node class in node.py:
-def attr_getter(node: 'Node') -> AttrUtility:
+def attr_getter(node: "Node") -> AttrUtility:
     """AttrGetter returns the AttrUtility for this Node."""
     return AttrUtility(node.attrs)

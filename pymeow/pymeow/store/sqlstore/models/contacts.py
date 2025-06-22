@@ -4,8 +4,14 @@ from tortoise.models import Model
 
 class ContactModel(Model):
     """Contact information"""
-    our_jid = fields.ForeignKeyField('models.DeviceModel', related_name='contacts', to_field='jid',
-                                     on_delete=fields.CASCADE, on_update=fields.CASCADE)
+
+    our_jid = fields.ForeignKeyField(
+        "models.DeviceModel",
+        related_name="contacts",
+        to_field="jid",
+        on_delete=fields.CASCADE,
+        on_update=fields.CASCADE,
+    )
     their_jid = fields.CharField(max_length=255)
     first_name = fields.CharField(max_length=255, null=True)
     full_name = fields.CharField(max_length=255, null=True)

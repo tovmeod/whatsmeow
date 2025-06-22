@@ -3,6 +3,7 @@ Armadillo message handling functionality.
 
 Port of whatsmeow/armadillomessage.go
 """
+
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -21,12 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-async def handle_decrypted_armadillo(
-    client: 'Client',
-    info: 'MessageInfo',
-    decrypted: bytes,
-    retry_count: int
-) -> bool:
+
+async def handle_decrypted_armadillo(client: "Client", info: "MessageInfo", decrypted: bytes, retry_count: int) -> bool:
     """
     Port of Go method handleDecryptedArmadillo from armadillomessage.go.
 
@@ -52,21 +49,19 @@ async def handle_decrypted_armadillo(
 
     # Handle sender key distribution message if present
     # Go: if dec.Transport.GetProtocol().GetAncillary().GetSkdm() != nil
-    if (dec.transport and
-        dec.transport.HasField("protocol") and
-        dec.transport.protocol.HasField("ancillary") and
-        dec.transport.protocol.ancillary.HasField("skdm")):
-
+    if (
+        dec.transport
+        and dec.transport.HasField("protocol")
+        and dec.transport.protocol.HasField("ancillary")
+        and dec.transport.protocol.ancillary.HasField("skdm")
+    ):
         # Go: if !info.IsGroup
         if not info.message_source.is_group:
             logger.warning(f"Got sender key distribution message in non-group chat from {info.sender}")
         else:
             skdm = dec.transport.protocol.ancillary.skdm
             await message.handle_sender_key_distribution_message(
-                client,
-                info.chat,
-                info.sender,
-                skdm.axolotlSenderKeyDistributionMessage
+                client, info.chat, info.sender, skdm.axolotlSenderKeyDistributionMessage
             )
 
     # Dispatch event if there's a message
@@ -77,7 +72,7 @@ async def handle_decrypted_armadillo(
     return True
 
 
-def decode_armadillo(data: bytes) -> Tuple['FBMessage', Optional[Exception]]:
+def decode_armadillo(data: bytes) -> Tuple["FBMessage", Optional[Exception]]:
     """
     Port of Go method decodeArmadillo from armadillomessage.go.
 
@@ -91,11 +86,12 @@ def decode_armadillo(data: bytes) -> Tuple['FBMessage', Optional[Exception]]:
     """
     from .datatypes import MessageInfo
     from .datatypes.events import FBMessage
+
     # Fixed: FBMessage requires info and message parameters
     # Use placeholder values that will be overwritten
     dec = FBMessage(
         info=MessageInfo(id=MessageID()),  # This will be overwritten with actual info
-        message=None         # This will be set if we decode a message
+        message=None,  # This will be set if we decode a message
     )
 
     # Unmarshal the transport layer

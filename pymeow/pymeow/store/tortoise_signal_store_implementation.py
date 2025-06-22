@@ -65,7 +65,7 @@ class SignalSenderKeyModel(Model):
         unique_together = (("group_id", "sender_name", "sender_device_id"),)
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 def run_async_in_sync_context(coro: Coroutine[Any, Any, T]) -> T:
@@ -119,14 +119,14 @@ class TortoiseSignalStore:
         """Get our registration ID."""
         return self.registration_id
 
-    def save_identity(self, protocol_address: address.ProtocolAddress,
-                            identity_key: signal_protocol.identity_key.IdentityKey) -> bool:
+    def save_identity(
+        self, protocol_address: address.ProtocolAddress, identity_key: signal_protocol.identity_key.IdentityKey
+    ) -> bool:
         """Save identity key for a contact."""
 
         async def _save() -> bool:
             existing = await SignalIdentityKeyModel.filter(
-                name=protocol_address.name,
-                device_id=protocol_address.device_id
+                name=protocol_address.name, device_id=protocol_address.device_id
             ).first()
 
             key_data = identity_key.serialize()
@@ -138,20 +138,20 @@ class TortoiseSignalStore:
                 return key_changed
             else:
                 await SignalIdentityKeyModel.create(
-                    name=protocol_address.name,
-                    device_id=protocol_address.device_id,
-                    identity_key=key_data
+                    name=protocol_address.name, device_id=protocol_address.device_id, identity_key=key_data
                 )
                 return True
 
         return run_async_in_sync_context(_save())
 
-    def get_identity(self, protocol_address: address.ProtocolAddress) -> Optional[signal_protocol.identity_key.IdentityKey]:
+    def get_identity(
+        self, protocol_address: address.ProtocolAddress
+    ) -> Optional[signal_protocol.identity_key.IdentityKey]:
         """Get stored identity key for a contact."""
+
         async def _get() -> Optional[signal_protocol.identity_key.IdentityKey]:
             stored = await SignalIdentityKeyModel.filter(
-                name=protocol_address.name,
-                device_id=protocol_address.device_id
+                name=protocol_address.name, device_id=protocol_address.device_id
             ).first()
 
             if stored:
@@ -177,31 +177,34 @@ class TortoiseSignalStore:
     # SessionStore methods
     def load_session(self, protocol_address: address.ProtocolAddress) -> Optional[state.SessionRecord]:
         """Load session from database."""
+
         async def _load() -> Optional[state.SessionRecord]:
             session = await SignalSessionModel.filter(
-                name=protocol_address.name,
-                device_id=protocol_address.device_id
+                name=protocol_address.name, device_id=protocol_address.device_id
             ).first()
 
             if session:
                 return state.SessionRecord.deserialize(session.session_data)
             return None
+
         return run_async_in_sync_context(_load())
 
     def store_session(self, protocol_address: address.ProtocolAddress, record: state.SessionRecord) -> None:
         """Store session to database."""
+
         async def _store() -> None:
             session_data = record.serialize()
 
             session, created = await SignalSessionModel.get_or_create(
                 name=protocol_address.name,
                 device_id=protocol_address.device_id,
-                defaults={'session_data': session_data}
+                defaults={"session_data": session_data},
             )
 
             if not created:
                 session.session_data = session_data
                 await session.save()
+
         run_async_in_sync_context(_store())
 
     # async def contains_session(self, protocol_address: address.ProtocolAddress) -> bool:
@@ -230,11 +233,13 @@ class TortoiseSignalStore:
     # PreKeyStore methods
     def load_pre_key(self, pre_key_id: int) -> Optional[state.PreKeyRecord]:
         """Load prekey from database."""
+
         async def _get() -> Optional[state.PreKeyRecord]:
             prekey = await SignalPreKeyModel.filter(key_id=pre_key_id).first()
             if prekey:
                 return state.PreKeyRecord.deserialize(prekey.key_data)
             return None
+
         return run_async_in_sync_context(_get())
 
     def save_pre_key(self, pre_key_id: int, record: state.PreKeyRecord) -> None:
@@ -247,6 +252,7 @@ class TortoiseSignalStore:
 
     def remove_pre_key(self, pre_key_id: int) -> None:
         """Remove prekey."""
+
         async def _delete() -> None:
             await SignalPreKeyModel.filter(key_id=pre_key_id).delete()
 
@@ -257,62 +263,59 @@ class TortoiseSignalStore:
         """Load signed prekey from database."""
 
         async def _get() -> state.SignedPreKeyRecord:
-            signed_prekey = await SignalSignedPreKeyModel.filter(
-                key_id=int(signed_pre_key_id)
-            ).first()
+            signed_prekey = await SignalSignedPreKeyModel.filter(key_id=int(signed_pre_key_id)).first()
             if signed_prekey:
                 return state.SignedPreKeyRecord.deserialize(signed_prekey.key_data)
             raise Exception(f"SignedPreKey {signed_pre_key_id} not found")
 
         return run_async_in_sync_context(_get())
 
-    def save_signed_pre_key(self, signed_pre_key_id: int,
-                           record: state.SignedPreKeyRecord) -> None:
+    def save_signed_pre_key(self, signed_pre_key_id: int, record: state.SignedPreKeyRecord) -> None:
         """Load all signed prekeys."""
 
         async def _save() -> None:
             key_data = record.serialize()
             await SignalSignedPreKeyModel.update_or_create(
-                key_id=int(signed_pre_key_id),
-                defaults={'key_data': key_data}
+                key_id=int(signed_pre_key_id), defaults={"key_data": key_data}
             )
 
         run_async_in_sync_context(_save())
 
-    def store_sender_key(self, sender_key_name: SenderKeyName,
-                        record: SenderKeyRecord) -> None:
+    def store_sender_key(self, sender_key_name: SenderKeyName, record: SenderKeyRecord) -> None:
         """Store sender key."""
+
         async def _store() -> None:
             key_data = record.serialize()
             await SignalSenderKeyModel.update_or_create(
                 group_id=sender_key_name.group_id(),
                 sender_name=sender_key_name.sender_name(),
                 sender_device_id=sender_key_name.sender_device_id(),
-                defaults={'key_data': key_data}
+                defaults={"key_data": key_data},
             )
+
         run_async_in_sync_context(_store())
 
     def load_sender_key(self, sender_key_name: SenderKeyName) -> Optional[SenderKeyRecord]:
         """Load sender key."""
+
         async def _load() -> Optional[SenderKeyRecord]:
             try:
                 sender_key = await SignalSenderKeyModel.get(
                     group_id=sender_key_name.group_id(),
                     sender_name=sender_key_name.sender_name(),
-                    sender_device_id=sender_key_name.sender_device_id()
+                    sender_device_id=sender_key_name.sender_device_id(),
                 )
                 return SenderKeyRecord.deserialize(sender_key.key_data)
             except DoesNotExist:
                 return None
+
         return run_async_in_sync_context(_load())
 
     async def contains_session(self, protocol_address: address.ProtocolAddress) -> bool:
         """Check if session exists."""
         return await SignalSessionModel.filter(
-            name=protocol_address.name,
-            device_id=protocol_address.device_id
+            name=protocol_address.name, device_id=protocol_address.device_id
         ).exists()
-
 
 
 # Helper functions for key generation
@@ -326,8 +329,9 @@ def generate_identity_keys() -> signal_protocol.identity_key.IdentityKeyPair:
 
     return signal_protocol.identity_key.IdentityKeyPair(
         signal_protocol.identity_key.IdentityKey(public_key_bytes),  # IdentityKey expects bytes directly
-        private_key  # IdentityKeyPair expects PrivateKey object
+        private_key,  # IdentityKeyPair expects PrivateKey object
     )
+
 
 def generate_prekeys(start_id: int, count: int) -> List[state.PreKeyRecord]:
     """Generate multiple prekeys."""

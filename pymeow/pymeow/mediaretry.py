@@ -3,6 +3,7 @@ Media retry handling for WhatsApp.
 
 Port of whatsmeow/mediaretry.go
 """
+
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -120,10 +121,12 @@ async def send_media_retry_receipt(client: "Client", message: MessageInfo, media
     if own_id.is_empty():
         raise ErrNotLoggedIn()
 
-    rmr_attrs = Attrs({
-        "jid": str(message.chat),
-        "from_me": str(message.message_source.is_from_me).lower(),
-    })
+    rmr_attrs = Attrs(
+        {
+            "jid": str(message.chat),
+            "from_me": str(message.message_source.is_from_me).lower(),
+        }
+    )
     if message.message_source.is_group:
         rmr_attrs["participant"] = str(message.sender)
 
@@ -132,21 +135,27 @@ async def send_media_retry_receipt(client: "Client", message: MessageInfo, media
         Node(tag="enc_iv", content=iv),
     ]
 
-    await client.send_node(Node(
-        tag="receipt",
-        attrs=Attrs({
-            "id": str(message.id),
-            "to": str(own_id),
-            "type": "server-error",
-        }),
-        content=[
-            Node(tag="encrypt", content=encrypted_request),
-            Node(tag="rmr", attrs=rmr_attrs),
-        ]
-    ))
+    await client.send_node(
+        Node(
+            tag="receipt",
+            attrs=Attrs(
+                {
+                    "id": str(message.id),
+                    "to": str(own_id),
+                    "type": "server-error",
+                }
+            ),
+            content=[
+                Node(tag="encrypt", content=encrypted_request),
+                Node(tag="rmr", attrs=rmr_attrs),
+            ],
+        )
+    )
 
 
-def decrypt_media_retry_notification(evt: events.MediaRetry, media_key: bytes) -> Optional[WAMmsRetry_pb2.MediaRetryNotification]:
+def decrypt_media_retry_notification(
+    evt: events.MediaRetry, media_key: bytes
+) -> Optional[WAMmsRetry_pb2.MediaRetryNotification]:
     """Decrypt a media retry notification using the media key.
 
     See send_media_retry_receipt for more info on how to use this.
@@ -170,10 +179,7 @@ def decrypt_media_retry_notification(evt: events.MediaRetry, media_key: bytes) -
 
     try:
         plaintext = gcmutil.decrypt(
-            get_media_retry_key(media_key),
-            evt.iv,
-            evt.ciphertext,
-            str(evt.message_id).encode()
+            get_media_retry_key(media_key), evt.iv, evt.ciphertext, str(evt.message_id).encode()
         )
     except Exception as e:
         raise Exception(f"failed to decrypt notification: {e}")
@@ -222,9 +228,7 @@ def parse_media_retry_notification(node: Node) -> events.MediaRetry:
 
     error_node, found = node.get_optional_child_by_tag("error")
     if error_node:
-        evt.error = events.MediaRetryError(
-            code=error_node.attr_getter().int("code")
-        )
+        evt.error = events.MediaRetryError(code=error_node.attr_getter().int("code"))
         return evt
 
     enc_p = node.get_child_by_tag("encrypt", "enc_p")

@@ -3,6 +3,7 @@ Notification handling for WhatsApp.
 
 Port of whatsmeow/notification.go
 """
+
 import json
 import logging
 from typing import TYPE_CHECKING, Any, List
@@ -39,7 +40,9 @@ async def handle_encrypt_notification(client: "Client", node: Node) -> None:
         if otks_left < MIN_PREKEY_COUNT:
             await upload_prekeys(client)
     elif node.get_optional_child_by_tag("identity")[0] is not None:
-        logger.debug(f"Got identity change for {from_jid}: {node.xml_string()}, deleting all identities/sessions for that number")
+        logger.debug(
+            f"Got identity change for {from_jid}: {node.xml_string()}, deleting all identities/sessions for that number"
+        )
         try:
             await client.store.identities.delete_all_identities(from_jid.user)
         except Exception as err:
@@ -83,11 +86,7 @@ async def handle_picture_notification(client: "Client", node: Node) -> None:
         jid = ag.jid("jid")
         author = ag.optional_jid_or_empty("author")
 
-        evt = events.Picture(
-            timestamp=ts,
-            jid=jid,
-            author=author
-        )
+        evt = events.Picture(timestamp=ts, jid=jid, author=author)
 
         if child.tag == "delete":
             evt.remove = True
@@ -153,19 +152,27 @@ async def handle_device_notification(client: "Client", node: Node) -> None:
 
             new_participant_hash = participant_list_hash_v2(cached.devices)
             if new_participant_hash == device_hash:
-                logger.debug(f"{from_jid}'s device list hash changed from {cached_participant_hash} to {device_hash} ({child.tag}). New hash matches")
+                logger.debug(
+                    f"{from_jid}'s device list hash changed from {cached_participant_hash} to {device_hash} ({child.tag}). New hash matches"
+                )
                 client.user_devices_cache[from_jid] = cached
             else:
-                logger.warning(f"{from_jid}'s device list hash changed from {cached_participant_hash} to {device_hash} ({child.tag}). New hash doesn't match ({new_participant_hash})")
+                logger.warning(
+                    f"{from_jid}'s device list hash changed from {cached_participant_hash} to {device_hash} ({child.tag}). New hash doesn't match ({new_participant_hash})"
+                )
                 client.user_devices_cache.pop(from_jid, None)
 
             if from_lid is not None and changed_device_lid is not None and device_lid_hash and cached_lid is not None:
                 new_lid_participant_hash = participant_list_hash_v2(cached_lid.devices)
                 if new_lid_participant_hash == device_lid_hash:
-                    logger.debug(f"{from_lid}'s device list hash changed from {cached_lid_hash} to {device_lid_hash} ({child.tag}). New hash matches")
+                    logger.debug(
+                        f"{from_lid}'s device list hash changed from {cached_lid_hash} to {device_lid_hash} ({child.tag}). New hash matches"
+                    )
                     client.user_devices_cache[from_lid] = cached_lid
                 else:
-                    logger.warning(f"{from_lid}'s device list hash changed from {cached_lid_hash} to {device_lid_hash} ({child.tag}). New hash doesn't match ({new_lid_participant_hash})")
+                    logger.warning(
+                        f"{from_lid}'s device list hash changed from {cached_lid_hash} to {device_lid_hash} ({child.tag}). New hash doesn't match ({new_lid_participant_hash})"
+                    )
                     client.user_devices_cache.pop(from_lid, None)
 
 
@@ -201,11 +208,14 @@ async def handle_own_devices_notification(client: "Client", node: Node) -> None:
 
         new_hash = participant_list_hash_v2(new_device_list)
         if new_hash != expected_new_hash:
-            logger.debug(f"Received own device list change notification {old_hash} -> {new_hash}, but expected hash was {expected_new_hash}")
+            logger.debug(
+                f"Received own device list change notification {old_hash} -> {new_hash}, but expected hash was {expected_new_hash}"
+            )
             client.user_devices_cache.pop(own_id, None)
         else:
             logger.debug(f"Received own device list change notification {old_hash} -> {new_hash}")
             from .client import DeviceCache
+
             client.user_devices_cache[own_id] = DeviceCache(devices=new_device_list, dhash=expected_new_hash)
 
 
@@ -215,15 +225,12 @@ async def handle_blocklist(client: "Client", node: Node) -> None:
     evt = events.Blocklist(
         action=events.BlocklistAction(ag.optional_string("action") or ""),
         d_hash=ag.string("dhash"),
-        prev_d_hash=ag.optional_string("prev_dhash")
+        prev_d_hash=ag.optional_string("prev_dhash"),
     )
 
     for child in node.get_children():
         ag = child.attr_getter()
-        change = events.BlocklistChange(
-            jid=ag.jid("jid"),
-            action=events.BlocklistChangeAction(ag.string("action"))
-        )
+        change = events.BlocklistChange(jid=ag.jid("jid"), action=events.BlocklistChangeAction(ag.string("action")))
         if not ag.ok():
             logger.warning(f"Unexpected data in blocklist event child {child.xml_string()}: {ag.error()}")
             continue
@@ -240,11 +247,13 @@ async def handle_account_sync_notification(client: "Client", node: Node) -> None
         elif child.tag == "devices":
             await handle_own_devices_notification(client, child)
         elif child.tag == "picture":
-            await client.dispatch_event(events.Picture(
-                jid=get_own_id(client).to_non_ad(),
-                author=get_own_id(client).to_non_ad(),
-                timestamp=node.attr_getter().unix_time("t"),
-            ))
+            await client.dispatch_event(
+                events.Picture(
+                    jid=get_own_id(client).to_non_ad(),
+                    author=get_own_id(client).to_non_ad(),
+                    timestamp=node.attr_getter().unix_time("t"),
+                )
+            )
         elif child.tag == "blocklist":
             await handle_blocklist(client, child)
         else:
@@ -294,11 +303,10 @@ async def handle_privacy_token_notification(client: "Client", node: Node) -> Non
 
             try:
                 from .store.store import PrivacyToken
-                await client.store.privacy_tokens.put_privacy_tokens([PrivacyToken(
-                    user=sender,
-                    token=child.content,
-                    timestamp=timestamp
-                )])
+
+                await client.store.privacy_tokens.put_privacy_tokens(
+                    [PrivacyToken(user=sender, token=child.content, timestamp=timestamp)]
+                )
                 logger.debug(f"Stored privacy token from {sender} (ts: {timestamp})")
             except Exception as err:
                 logger.error(f"Failed to save privacy token from {sender}: {err}")
@@ -315,20 +323,21 @@ def parse_newsletter_messages(client: "Client", node: Node) -> List[Any]:
 
         ag = child.attr_getter()
         from .datatypes.newsletter import NewsletterMessage
+
         msg = NewsletterMessage(
             message_server_id=MessageServerID(ag.int("server_id")),
             message_id=MessageID(ag.string("id")),
             type=ag.string("type"),
             timestamp=ag.unix_time("t"),
             views_count=0,
-            reaction_counts={}
+            reaction_counts={},
         )
 
         for subchild in child.get_children():
             if subchild.tag == "plaintext":
                 if isinstance(subchild.content, bytes):
                     try:
-                        msg.message = WAWebProtobufsE2E_pb2.Message() # type: ignore[attr-defined]
+                        msg.message = WAWebProtobufsE2E_pb2.Message()  # type: ignore[attr-defined]
                         msg.message.ParseFromString(subchild.content)
                     except Exception as err:
                         logger.warning(f"Failed to unmarshal newsletter message: {err}")
@@ -350,11 +359,11 @@ async def handle_newsletter_notification(client: "Client", node: Node) -> None:
     ag = node.attr_getter()
     live_updates = node.get_child_by_tag("live_updates")
 
-    await client.dispatch_event(events.NewsletterLiveUpdate(
-        jid=ag.jid("from"),
-        time=ag.unix_time("t"),
-        messages=parse_newsletter_messages(client, live_updates)
-    ))
+    await client.dispatch_event(
+        events.NewsletterLiveUpdate(
+            jid=ag.jid("from"), time=ag.unix_time("t"), messages=parse_newsletter_messages(client, live_updates)
+        )
+    )
 
 
 async def handle_mex_notification(client: "Client", node: Node) -> None:
@@ -367,7 +376,7 @@ async def handle_mex_notification(client: "Client", node: Node) -> None:
             continue
 
         try:
-            data = json.loads(child.content.decode('utf-8'))
+            data = json.loads(child.content.decode("utf-8"))
             wrapper_data = data.get("data", {})
 
             if "xwa2_notify_newsletter_on_join" in wrapper_data:
@@ -395,11 +404,9 @@ async def handle_status_notification(client: "Client", node: Node) -> None:
         logger.warning(f"Set status notification has unexpected content ({type(child.content)})")
         return
 
-    await client.dispatch_event(events.UserAbout(
-        jid=ag.jid("from"),
-        timestamp=ag.unix_time("t"),
-        status=child.content.decode('utf-8')
-    ))
+    await client.dispatch_event(
+        events.UserAbout(jid=ag.jid("from"), timestamp=ag.unix_time("t"), status=child.content.decode("utf-8"))
+    )
 
 
 async def handle_notification(client: "Client", node: Node) -> None:
@@ -464,6 +471,7 @@ def parse_fb_device_list(jid: JID, node: Node) -> Any:
     # This should be implemented based on the Go version
     # Placeholder implementation
     from .client import DeviceCache
+
     return DeviceCache(devices=[], dhash="")
 
 

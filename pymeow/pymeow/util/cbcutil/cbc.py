@@ -9,6 +9,7 @@ This package simplifies the usage of AES-256-CBC.
 
 Port of util/cbcutil/cbc.go
 """
+
 import hashlib
 import hmac
 import os
@@ -91,7 +92,7 @@ def decrypt_file(key: bytes, iv: bytes, file: File) -> None:
 
     while write_ptr < file_size:
         if write_ptr + buf_size > file_size:
-            buf = buf[:file_size - write_ptr]
+            buf = buf[: file_size - write_ptr]
 
         data = file.read(len(buf))
         if len(data) != len(buf):
@@ -140,11 +141,7 @@ def encrypt(key: bytes, iv: Optional[bytes], plaintext: bytes) -> bytes:
 
 
 def encrypt_stream(
-    key: bytes,
-    iv: bytes,
-    mac_key: bytes,
-    plaintext: IO[bytes],
-    ciphertext: IO[bytes]
+    key: bytes, iv: bytes, mac_key: bytes, plaintext: IO[bytes], ciphertext: IO[bytes]
 ) -> Tuple[bytes, bytes, int, int]:
     """
     Encrypt a stream with key, IV, and MAC key.
@@ -215,9 +212,4 @@ def encrypt_stream(
     else:
         ciphertext.write(mac)
 
-    return (
-        plain_hasher.digest(),
-        cipher_hasher.digest(),
-        size,
-        size + extra_size
-    )
+    return (plain_hasher.digest(), cipher_hasher.digest(), size, size + extra_size)

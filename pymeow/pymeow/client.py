@@ -3,6 +3,7 @@ WhatsApp Web client implementation.
 
 Port of whatsmeow/client.go
 """
+
 import asyncio
 import datetime
 import logging
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
 @dataclass
 class WrappedEventHandler:
     """Wrapper for event handlers with unique IDs."""
+
     fn: EventHandler
     id: int
 
@@ -68,6 +70,7 @@ class WrappedEventHandler:
 @dataclass
 class DeviceCache:
     """Cache for device information."""
+
     devices: List[JID] = field(default_factory=list)
     dhash: str = ""
 
@@ -75,6 +78,7 @@ class DeviceCache:
 @dataclass
 class GroupMetaCache:
     """Cache for group metadata."""
+
     addressing_mode: Optional[AddressingMode] = None
     community_announcement_group: bool = False
     members: List[JID] = field(default_factory=list)
@@ -83,11 +87,14 @@ class GroupMetaCache:
 @dataclass
 class MessengerConfig:
     """Configuration for Messenger (non-WhatsApp) clients."""
+
     user_agent: str
     base_url: str
     websocket_url: str
 
+
 logger = logging.getLogger(__name__)
+
 
 # todo: port sendNodeAndGetData in client.go to send_node_and_get_data
 class Client:
@@ -158,6 +165,7 @@ class Client:
 
         # Import JID here to avoid circular imports
         from .datatypes import JID
+
         self.server_jid = JID.server_jid()
 
         self.media_conn_cache: MediaConn
@@ -259,8 +267,9 @@ class Client:
         self.http: aiohttp.ClientSession = aiohttp.ClientSession(trust_env=True)
 
         # Messenger config (for non-WhatsApp clients)
-        self.messenger_config: Optional[
-            MessengerConfig] = None  # Go: *MessengerConfig -> Python: Optional[MessengerConfig] (OK)
+        self.messenger_config: Optional[MessengerConfig] = (
+            None  # Go: *MessengerConfig -> Python: Optional[MessengerConfig] (OK)
+        )
 
         # These are extra attributes in Python, likely for managing async tasks.
         self._keepalive_task: Optional[asyncio.Task] = None
@@ -273,7 +282,7 @@ class Client:
         # self.session_ciphers = {}  # Cache for session ciphers
         # self.group_ciphers = {}  # Cache for group ciphers
 
-    async def ainit(self) -> 'Client':
+    async def ainit(self) -> "Client":
         await self.initialize_signal_protocol()
         return self
 
@@ -374,8 +383,7 @@ class Client:
                 while True:  # Loop until connected or timed out by the context manager
                     async with self.socket_lock:  # Acquire lock to check state
                         # Go: cli.socket == nil || !cli.socket.IsConnected() || !cli.IsLoggedIn()
-                        if (self.socket is not None and self.socket.is_connected() and
-                            self.is_logged_in()):
+                        if self.socket is not None and self.socket.is_connected() and self.is_logged_in():
                             # Condition met, successfully connected and logged in
                             return True
 
@@ -408,14 +416,15 @@ class Client:
         """
         try:
             await self._connect()
-        except (aiohttp.ClientConnectionError,
-                aiohttp.ClientError,
-                ConnectionError,
-                OSError,
-                socket.error,
-                asyncio.TimeoutError,
-                aiohttp.ServerTimeoutError,
-                ):
+        except (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientError,
+            ConnectionError,
+            OSError,
+            socket.error,
+            asyncio.TimeoutError,
+            aiohttp.ServerTimeoutError,
+        ):
             if self.initial_auto_reconnect and self.enable_auto_reconnect:
                 logger.error("Initial connection failed but reconnecting in background")
 
@@ -471,8 +480,8 @@ class Client:
             # Go: else if err = cli.doHandshake(fs, *keys.NewKeyPair()); err != nil { ... }
             # Python: Perform handshake
             ephemeral_kp = KeyPair.generate()
-                # In Go, cli.doHandshake assigns the resulting NoiseSocket to cli.socket.
-                # The Python _do_handshake should do something similar, e.g., assign to self.socket.
+            # In Go, cli.doHandshake assigns the resulting NoiseSocket to cli.socket.
+            # The Python _do_handshake should do something similar, e.g., assign to self.socket.
             try:
                 await handshake.do_handshake(self, fs, ephemeral_kp)
             except:
@@ -541,8 +550,7 @@ class Client:
                     logger.debug("OnDisconnect() called after manual disconnection")
             # Go: else
             else:
-                logger.debug(
-                    f"Ignoring OnDisconnect on different socket (current: {self.socket}, disconnected: {ns})")
+                logger.debug(f"Ignoring OnDisconnect on different socket (current: {self.socket}, disconnected: {ns})")
 
     def _expect_disconnect(self) -> None:
         """Mark that a disconnection is expected."""
@@ -720,13 +728,13 @@ class Client:
             attrs={
                 "jid": str(own_id),  # Ensure own_id is stringified if Attrs expects strings
                 "reason": "user_initiated",
-            }
+            },
         )
         logout_iq = InfoQuery(
             namespace="md",
             type=InfoQueryType.SET,
             to=JID.server_jid(),  # Use the defined ServerJID equivalent
-            content=[iq_content_node]
+            content=[iq_content_node],
         )
 
         _ = await request.send_iq(self, logout_iq)
@@ -866,7 +874,7 @@ class Client:
                 done, pending = await asyncio.wait(
                     [process_node_task],
                     timeout=300.0,  # 5 minutes
-                    return_when=asyncio.FIRST_COMPLETED
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
 
                 if process_node_task in done:
@@ -875,10 +883,8 @@ class Client:
                     pass
                 else:
                     # Go: case <-timer.C:
-                    logger.warning(
-                        f"Node handling is taking long for {node.xml_string()} - continuing in background")
+                    logger.warning(f"Node handling is taking long for {node.xml_string()} - continuing in background")
                     # The processing task continues in background (like Go goroutine)
-
 
             except asyncio.CancelledError:
                 # Go: case <-ctx.Done():
@@ -913,7 +919,6 @@ class Client:
         # or pattern would be needed (e.g., from `asyncio_rlock` library or custom).
         # For just getting the reference, this is okay.
         async with self.socket_lock:
-
             # Go: if sock == nil { return nil, ErrNotConnected }
             if self.socket is None:
                 raise ErrNotConnected("Not connected")
@@ -983,16 +988,14 @@ class Client:
 
         # Go: info := types.MessageInfo{...}
         message_source = MessageSource(
-            chat=chat_jid,
-            is_from_me=web_msg.key.fromMe,
-            is_group=(chat_jid.server == GROUP_SERVER)
+            chat=chat_jid, is_from_me=web_msg.key.fromMe, is_group=(chat_jid.server == GROUP_SERVER)
         )
         info = MessageInfo(
             message_source=message_source,
             id=MessageID(web_msg.key.ID),
             push_name=web_msg.pushName,
             # Go: time.Unix(int64(webMsg.GetMessageTimestamp()), 0)
-            timestamp=datetime.datetime.fromtimestamp(web_msg.messageTimestamp, tz=datetime.timezone.utc)
+            timestamp=datetime.datetime.fromtimestamp(web_msg.messageTimestamp, tz=datetime.timezone.utc),
         )
 
         # Determine sender
@@ -1026,11 +1029,7 @@ class Client:
             info.msg_meta_info.thread_message_sender_jid = parsed_thread_sender_jid
 
         # Go: evt := &events.Message{...}
-        evt = events.Message(
-            raw_message=web_msg.message,
-            source_web_msg=web_msg,
-            info=info
-        )
+        evt = events.Message(raw_message=web_msg.message, source_web_msg=web_msg, info=info)
 
         # Go: evt.UnwrapRaw()
         evt.unwrap_raw()

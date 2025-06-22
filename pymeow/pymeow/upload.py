@@ -3,6 +3,7 @@ Media upload handling for WhatsApp.
 
 Port of whatsmeow/upload.go
 """
+
 import base64
 import hashlib
 import hmac
@@ -26,12 +27,14 @@ if TYPE_CHECKING:
 
 class UploadError(PymeowError):
     """Raised when there is an error uploading media."""
+
     pass
 
 
 @dataclass
 class UploadResponse:
     """Contains the data from the attachment upload, which can be put into a message to send the attachment."""
+
     url: str
     direct_path: str
     handle: str
@@ -44,7 +47,7 @@ class UploadResponse:
     file_length: int = 0
 
 
-async def upload(client: 'Client', plaintext: bytes, app_info: MediaType) -> UploadResponse:
+async def upload(client: "Client", plaintext: bytes, app_info: MediaType) -> UploadResponse:
     """
     Upload the given attachment to WhatsApp servers.
 
@@ -110,14 +113,16 @@ async def upload(client: 'Client', plaintext: bytes, app_info: MediaType) -> Upl
     resp.file_enc_sha256 = data_hash
 
     # Upload the data
-    await _raw_upload(client, io.BytesIO(data_to_upload), len(data_to_upload),
-                      resp.file_enc_sha256, app_info, False, resp)
+    await _raw_upload(
+        client, io.BytesIO(data_to_upload), len(data_to_upload), resp.file_enc_sha256, app_info, False, resp
+    )
 
     return resp
 
 
-async def upload_reader(client: 'Client', plaintext: BinaryIO, temp_file: Optional[IO[bytes]],
-                       app_info: MediaType) -> UploadResponse:
+async def upload_reader(
+    client: "Client", plaintext: BinaryIO, temp_file: Optional[IO[bytes]], app_info: MediaType
+) -> UploadResponse:
     """
     Upload the given attachment to WhatsApp servers.
 
@@ -165,8 +170,7 @@ async def upload_reader(client: 'Client', plaintext: BinaryIO, temp_file: Option
         actual_temp_file.seek(0)
 
         # Upload the data
-        await _raw_upload(client, actual_temp_file, upload_size, resp.file_enc_sha256,
-                          app_info, False, resp)
+        await _raw_upload(client, actual_temp_file, upload_size, resp.file_enc_sha256, app_info, False, resp)
 
         return resp
 
@@ -175,11 +179,11 @@ async def upload_reader(client: 'Client', plaintext: BinaryIO, temp_file: Option
             actual_temp_file.close()
             # Type narrowing: we know it's a NamedTemporaryFile if temp_file_created is True
             temp_file_obj = actual_temp_file  # type: ignore
-            if hasattr(temp_file_obj, 'name'):
+            if hasattr(temp_file_obj, "name"):
                 os.unlink(temp_file_obj.name)
 
 
-async def upload_newsletter(client: 'Client', data: bytes, app_info: MediaType) -> UploadResponse:
+async def upload_newsletter(client: "Client", data: bytes, app_info: MediaType) -> UploadResponse:
     """
     Upload the given attachment to WhatsApp servers without encrypting it first.
 
@@ -227,13 +231,12 @@ async def upload_newsletter(client: 'Client', data: bytes, app_info: MediaType) 
     resp.file_sha256 = hash_obj.digest()
 
     # Upload the data
-    await _raw_upload(client, io.BytesIO(data), resp.file_length,
-                      resp.file_sha256, app_info, True, resp)
+    await _raw_upload(client, io.BytesIO(data), resp.file_length, resp.file_sha256, app_info, True, resp)
 
     return resp
 
 
-async def upload_newsletter_reader(client: 'Client', data: BinaryIO, app_info: MediaType) -> UploadResponse:
+async def upload_newsletter_reader(client: "Client", data: BinaryIO, app_info: MediaType) -> UploadResponse:
     """
     Upload the given attachment to WhatsApp servers without encrypting it first.
 
@@ -274,15 +277,20 @@ async def upload_newsletter_reader(client: 'Client', data: BinaryIO, app_info: M
     data.seek(0)
 
     # Upload the data
-    await _raw_upload(client, data, resp.file_length,
-                      resp.file_sha256, app_info, True, resp)
+    await _raw_upload(client, data, resp.file_length, resp.file_sha256, app_info, True, resp)
 
     return resp
 
 
-async def _raw_upload(client: 'Client', data_to_upload: IO[bytes], upload_size: int,
-                     file_hash: bytes, app_info: MediaType, newsletter: bool,
-                     resp: UploadResponse) -> None:
+async def _raw_upload(
+    client: "Client",
+    data_to_upload: IO[bytes],
+    upload_size: int,
+    file_hash: bytes,
+    app_info: MediaType,
+    newsletter: bool,
+    resp: UploadResponse,
+) -> None:
     """
     Internal function to handle the actual upload process.
 
@@ -305,13 +313,10 @@ async def _raw_upload(client: 'Client', data_to_upload: IO[bytes], upload_size: 
         raise UploadError(f"Failed to refresh media connections: {e}")
 
     # Encode file hash for URL
-    token = base64.urlsafe_b64encode(file_hash).decode().rstrip('=')
+    token = base64.urlsafe_b64encode(file_hash).decode().rstrip("=")
 
     # Build query parameters
-    query_params = {
-        "auth": media_conn.auth,
-        "token": token
-    }
+    query_params = {"auth": media_conn.auth, "token": token}
 
     # Get MMS type
     mms_type = MEDIA_TYPE_TO_MMS_TYPE[app_info]
@@ -346,7 +351,7 @@ async def _raw_upload(client: 'Client', data_to_upload: IO[bytes], upload_size: 
     headers = {
         "Origin": "https://web.whatsapp.com",
         "Referer": "https://web.whatsapp.com/",
-        "Content-Length": str(upload_size)
+        "Content-Length": str(upload_size),
     }
 
     try:
@@ -387,9 +392,4 @@ def _get_media_keys(media_key: bytes, app_info: MediaType) -> Tuple[bytes, bytes
     from .util.hkdfutil import sha256 as hkdf_sha256
 
     media_key_expanded = hkdf_sha256(media_key, b"", str(app_info).encode(), 112)
-    return (
-        media_key_expanded[:16],
-        media_key_expanded[16:48],
-        media_key_expanded[48:80],
-        media_key_expanded[80:]
-    )
+    return (media_key_expanded[:16], media_key_expanded[16:48], media_key_expanded[48:80], media_key_expanded[80:])

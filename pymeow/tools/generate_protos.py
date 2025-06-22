@@ -6,22 +6,22 @@ from pathlib import Path
 
 def generate_protos():
     project_root = Path(__file__).parent.parent.parent
-    proto_dir = project_root / 'proto'
-    output_dir = project_root / 'pymeow' / 'pymeow' / 'generated'
+    proto_dir = project_root / "proto"
+    output_dir = project_root / "pymeow" / "pymeow" / "generated"
 
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Simple protoc command
     cmd = [
-        'protoc',
-        f'--proto_path={proto_dir}',
-        f'--python_out={output_dir}',
-        f'--pyi_out={output_dir}',  # This generates proper mypy stubs
+        "protoc",
+        f"--proto_path={proto_dir}",
+        f"--python_out={output_dir}",
+        f"--pyi_out={output_dir}",  # This generates proper mypy stubs
     ]
 
     # Add all proto files
-    proto_files = list(proto_dir.rglob('*.proto'))
+    proto_files = list(proto_dir.rglob("*.proto"))
     cmd.extend(str(f) for f in proto_files)
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -43,36 +43,24 @@ def fix_imports(output_dir):
     fixed_count = 0
     for pb2_file in output_dir.rglob("*_pb2.py"):
         try:
-            with open(pb2_file, 'r', encoding='utf-8') as f:
+            with open(pb2_file, "r", encoding="utf-8") as f:
                 content = f.read()
 
             original_content = content
 
             # Fix imports from waXXX modules to relative imports
             # Pattern: from waXXX import YYY_pb2 as zzz
-            content = re.sub(
-                r'from (wa\w+) import (\w+_pb2) as (\w+)',
-                r'from ..\1 import \2 as \3',
-                content
-            )
+            content = re.sub(r"from (wa\w+) import (\w+_pb2) as (\w+)", r"from ..\1 import \2 as \3", content)
 
             # Pattern: from waXXX import YYY_pb2
-            content = re.sub(
-                r'from (wa\w+) import (\w+_pb2)',
-                r'from ..\1 import \2',
-                content
-            )
+            content = re.sub(r"from (wa\w+) import (\w+_pb2)", r"from ..\1 import \2", content)
 
             # Also fix any import waXXX.YYY patterns
-            content = re.sub(
-                r'import (wa\w+)\.(\w+_pb2)',
-                r'from .. import \1.\2',
-                content
-            )
+            content = re.sub(r"import (wa\w+)\.(\w+_pb2)", r"from .. import \1.\2", content)
 
             if content != original_content:
                 print(f"  Fixed imports in {pb2_file.relative_to(output_dir.parent.parent.parent)}")
-                with open(pb2_file, 'w', encoding='utf-8') as f:
+                with open(pb2_file, "w", encoding="utf-8") as f:
                     f.write(content)
                 fixed_count += 1
 
@@ -82,5 +70,5 @@ def fix_imports(output_dir):
     print(f"✓ Fixed imports in {fixed_count} files")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     generate_protos()

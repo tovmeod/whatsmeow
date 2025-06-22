@@ -3,6 +3,7 @@ App state events for WhatsApp.
 
 Port of whatsmeow/types/events/appstate.go
 """
+
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
@@ -21,6 +22,7 @@ class Contact(BaseEvent):
 
     Port of Contact in Go.
     """
+
     jid: JID  # The contact who was modified
     timestamp: datetime  # The time when the modification happened
 
@@ -35,6 +37,7 @@ class PushName(BaseEvent):
 
     Port of PushName in Go.
     """
+
     jid: JID  # The user whose push name changed
     message: Optional[MessageInfo] = None  # The message where this change was first noticed
     old_push_name: str = ""  # The previous push name from the local cache
@@ -48,6 +51,7 @@ class BusinessName(BaseEvent):
 
     Port of BusinessName in Go.
     """
+
     jid: JID
     message: Optional[MessageInfo] = None  # This is only present if the change was detected in a message
     old_business_name: str = ""
@@ -61,6 +65,7 @@ class Pin(BaseEvent):
 
     Port of Pin in Go.
     """
+
     jid: JID  # The chat which was pinned or unpinned
     timestamp: datetime  # The time when the (un)pinning happened
 
@@ -75,11 +80,14 @@ class Star(BaseEvent):
 
     Port of Star in Go.
     """
+
     chat_jid: JID  # The chat where the message was pinned
     is_from_me: bool  # Whether the message was sent by the user
     message_id: str  # The message which was starred or unstarred
     timestamp: datetime  # The time when the (un)starring happened
-    sender_jid: Optional[JID] = None  # In group chats, the user who sent the message (except if the message was sent by the user)
+    sender_jid: Optional[JID] = (
+        None  # In group chats, the user who sent the message (except if the message was sent by the user)
+    )
 
     action: Optional[WASyncAction_pb2.StarAction] = None  # Whether the message is now starred or not
     from_full_sync: bool = False  # Whether the action is emitted because of a fullSync
@@ -92,11 +100,14 @@ class DeleteForMe(BaseEvent):
 
     Port of DeleteForMe in Go.
     """
+
     chat_jid: JID  # The chat where the message was deleted
     is_from_me: bool  # Whether the message was sent by the user
     message_id: str  # The message which was deleted
     timestamp: datetime  # The time when the deletion happened
-    sender_jid: Optional[JID] = None  # In group chats, the user who sent the message (except if the message was sent by the user)
+    sender_jid: Optional[JID] = (
+        None  # In group chats, the user who sent the message (except if the message was sent by the user)
+    )
 
     action: Optional[WASyncAction_pb2.DeleteMessageForMeAction] = None  # Additional information for the deletion
     from_full_sync: bool = False  # Whether the action is emitted because of a fullSync
@@ -109,6 +120,7 @@ class Mute(BaseEvent):
 
     Port of Mute in Go.
     """
+
     jid: JID  # The chat which was muted or unmuted
     timestamp: datetime  # The time when the (un)muting happened
 
@@ -123,6 +135,7 @@ class Archive(BaseEvent):
 
     Port of Archive in Go.
     """
+
     jid: JID  # The chat which was archived or unarchived
     timestamp: datetime  # The time when the (un)archiving happened
 
@@ -137,10 +150,13 @@ class MarkChatAsRead(BaseEvent):
 
     Port of MarkChatAsRead in Go.
     """
+
     jid: JID  # The chat which was marked as read or unread
     timestamp: datetime  # The time when the marking happened
 
-    action: Optional[WASyncAction_pb2.MarkChatAsReadAction] = None  # Whether the chat was marked as read or unread, and info about the most recent messages
+    action: Optional[WASyncAction_pb2.MarkChatAsReadAction] = (
+        None  # Whether the chat was marked as read or unread, and info about the most recent messages
+    )
     from_full_sync: bool = False  # Whether the action is emitted because of a fullSync
 
 
@@ -151,6 +167,7 @@ class ClearChat(BaseEvent):
 
     Port of ClearChat in Go.
     """
+
     jid: JID  # The chat which was cleared
     timestamp: datetime  # The time when the clear happened
 
@@ -165,6 +182,7 @@ class DeleteChat(BaseEvent):
 
     Port of DeleteChat in Go.
     """
+
     jid: JID  # The chat which was deleted
     timestamp: datetime  # The time when the deletion happened
 
@@ -179,6 +197,7 @@ class PushNameSetting(BaseEvent):
 
     Port of PushNameSetting in Go.
     """
+
     timestamp: datetime  # The time when the push name was changed
 
     action: Optional[WASyncAction_pb2.PushNameSetting] = None  # The new push name for the user
@@ -192,6 +211,7 @@ class UnarchiveChatsSetting(BaseEvent):
 
     Port of UnarchiveChatsSetting in Go.
     """
+
     timestamp: datetime  # The time when the setting was changed
 
     action: Optional[WASyncAction_pb2.UnarchiveChatsSetting] = None  # The new settings
@@ -205,6 +225,7 @@ class UserStatusMute(BaseEvent):
 
     Port of UserStatusMute in Go.
     """
+
     jid: JID  # The user who was muted or unmuted
     timestamp: datetime  # The timestamp when the action happened
 
@@ -219,6 +240,7 @@ class LabelEdit(BaseEvent):
 
     Port of LabelEdit in Go.
     """
+
     timestamp: datetime  # The time when the label was edited
     label_id: str  # The label id which was edited
 
@@ -233,6 +255,7 @@ class LabelAssociationChat(BaseEvent):
 
     Port of LabelAssociationChat in Go.
     """
+
     jid: JID  # The chat which was labeled or unlabeled
     timestamp: datetime  # The time when the (un)labeling happened
     label_id: str  # The label id which was added or removed
@@ -248,6 +271,7 @@ class LabelAssociationMessage(BaseEvent):
 
     Port of LabelAssociationMessage in Go.
     """
+
     jid: JID  # The chat which was labeled or unlabeled
     timestamp: datetime  # The time when the (un)labeling happened
     label_id: str  # The label id which was added or removed
@@ -265,6 +289,7 @@ class AppState(BaseEvent):
 
     Port of AppState in Go.
     """
+
     index: List[str]
     sync_action_value: Optional[WASyncAction_pb2.SyncActionValue] = None
 
@@ -276,4 +301,5 @@ class AppStateSyncComplete(BaseEvent):
 
     Port of AppStateSyncComplete in Go.
     """
+
     name: WAPatchName

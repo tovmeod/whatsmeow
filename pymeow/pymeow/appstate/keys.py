@@ -3,6 +3,7 @@ App state keys management for WhatsApp.
 
 Port of whatsmeow/appstate/keys.go
 """
+
 import asyncio
 import base64
 import logging
@@ -16,6 +17,7 @@ from .errors import KeyNotFoundError
 if TYPE_CHECKING:
     from ..store.store import Device
 
+
 # WAPatchName represents a type of app state patch.
 class WAPatchName(str, Enum):
     """
@@ -23,11 +25,13 @@ class WAPatchName(str, Enum):
 
     Port of WAPatchName in Go.
     """
+
     CRITICAL_BLOCK = "critical_block"  # Contains the user's settings like push name and locale
     CRITICAL_UNBLOCK_LOW = "critical_unblock_low"  # Contains the user's contact list
     REGULAR_LOW = "regular_low"  # Contains some local chat settings like pin, archive status
     REGULAR_HIGH = "regular_high"  # Contains more local chat settings like mute status and starred messages
     REGULAR = "regular"  # Contains protocol info about app state patches like key expiration
+
 
 # AllPatchNames contains all currently known patch state names.
 ALL_PATCH_NAMES = [
@@ -35,7 +39,7 @@ ALL_PATCH_NAMES = [
     WAPatchName.CRITICAL_UNBLOCK_LOW,
     WAPatchName.REGULAR_HIGH,
     WAPatchName.REGULAR,
-    WAPatchName.REGULAR_LOW
+    WAPatchName.REGULAR_LOW,
 ]
 
 # Constants for the first part of app state indexes.
@@ -57,6 +61,7 @@ INDEX_LABEL_ASSOCIATION_MESSAGE = "label_message"
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class ExpandedAppStateKeys:
     """Expanded app state keys derived from the original key data."""
@@ -67,10 +72,11 @@ class ExpandedAppStateKeys:
     snapshot_mac: bytes
     patch_mac: bytes
 
+
 class Processor:
     """Processor for app state patches."""
 
-    def __init__(self, store: 'Device'):
+    def __init__(self, store: "Device"):
         """
         Initialize a new app state processor.
 
@@ -98,7 +104,7 @@ class Processor:
             value_encryption=app_state_key_expanded[32:64],
             value_mac=app_state_key_expanded[64:96],
             snapshot_mac=app_state_key_expanded[96:128],
-            patch_mac=app_state_key_expanded[128:160]
+            patch_mac=app_state_key_expanded[128:160],
         )
 
     async def get_app_state_key(self, key_id: bytes) -> ExpandedAppStateKeys:
@@ -113,7 +119,7 @@ class Processor:
         Raises:
             ErrKeyNotFound
         """
-        key_cache_id = base64.b64encode(key_id).decode('ascii')
+        key_cache_id = base64.b64encode(key_id).decode("ascii")
 
         async with self.key_cache_lock:
             keys = self.key_cache.get(key_cache_id)
@@ -144,7 +150,7 @@ class Processor:
             if key_id is None:
                 return
 
-            string_key_id = base64.b64encode(key_id).decode('ascii')
+            string_key_id = base64.b64encode(key_id).decode("ascii")
             if string_key_id in cache:
                 return
 

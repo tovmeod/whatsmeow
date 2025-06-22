@@ -3,6 +3,7 @@ Node handling for WhatsApp binary protocol.
 
 Port of whatsmeow/binary/node.go
 """
+
 import json
 import logging
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from .attrs import Attrs, AttrUtility
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class Node:
     """
@@ -21,9 +23,10 @@ class Node:
     This class is the core data structure for WhatsApp's binary XML format,
     containing a tag, attributes, and optional content.
     """
+
     tag: str
     attrs: Attrs = field(default_factory=dict)
-    content: Optional[Union[List['Node'], bytes]] = None
+    content: Optional[Union[List["Node"], bytes]] = None
 
     def attr_getter(self) -> AttrUtility:
         """
@@ -62,7 +65,7 @@ class Node:
         else:
             return f"<{self.tag}{attrs_str}>{self.content}</{self.tag}>"
 
-    def get_children(self) -> List['Node']:
+    def get_children(self) -> List["Node"]:
         """
         Returns the Content of the node as a list of nodes.
 
@@ -79,7 +82,7 @@ class Node:
 
         return []
 
-    def get_children_by_tag(self, tag: str) -> List['Node']:
+    def get_children_by_tag(self, tag: str) -> List["Node"]:
         """
         Returns the same list as get_children, but filters it by tag first.
 
@@ -91,7 +94,7 @@ class Node:
         """
         return [node for node in self.get_children() if node.tag == tag]
 
-    def get_optional_child_by_tag(self, *tags: str) -> tuple['Node', bool]:
+    def get_optional_child_by_tag(self, *tags: str) -> tuple["Node", bool]:
         """
         Finds the first child with the given tag and returns it.
 
@@ -121,7 +124,7 @@ class Node:
         # All iterations of loop found a matching child, return it
         return val, True
 
-    def get_child_by_tag(self, *tags: str) -> 'Node':
+    def get_child_by_tag(self, *tags: str) -> "Node":
         """
         Does the same thing as get_optional_child_by_tag, but returns the Node directly.
 
@@ -147,16 +150,18 @@ class Node:
         mn = json.loads(data)
 
         # Process attributes
-        attrs = mn.get('attrs', {})
+        attrs = mn.get("attrs", {})
         for key, val in attrs.items():
             if isinstance(val, str):
                 # Try to parse JIDs
                 try:
                     parsed = JID.from_string(val)
-                    if (parsed and (parsed.server == DEFAULT_USER_SERVER or
-                                   parsed.server == NEWSLETTER_SERVER or
-                                   parsed.server == GROUP_SERVER or
-                                   parsed.server == BROADCAST_SERVER)):
+                    if parsed and (
+                        parsed.server == DEFAULT_USER_SERVER
+                        or parsed.server == NEWSLETTER_SERVER
+                        or parsed.server == GROUP_SERVER
+                        or parsed.server == BROADCAST_SERVER
+                    ):
                         attrs[key] = parsed
                 except Exception as e:
                     logger.exception(e)
@@ -165,24 +170,22 @@ class Node:
                 # Convert floats to ints
                 attrs[key] = int(val)
 
-        self.tag = mn.get('tag', '')
+        self.tag = mn.get("tag", "")
         self.attrs = attrs
 
         # Process content
-        content = mn.get('content')
+        content = mn.get("content")
         if content:
             if isinstance(content, list):
                 # Content is a list of nodes
                 nodes = []
                 for n in content:
-                    node = Node(tag=n.get('tag', ''),
-                               attrs=n.get('attrs', {}),
-                               content=n.get('content'))
+                    node = Node(tag=n.get("tag", ""), attrs=n.get("attrs", {}), content=n.get("content"))
                     nodes.append(node)
                 self.content = nodes
             elif isinstance(content, str):
                 # Content is a binary string
-                self.content = content.encode('utf-8')
+                self.content = content.encode("utf-8")
             else:
                 raise ValueError("node content must be an array of nodes or a base64 string")
 

@@ -3,6 +3,7 @@ WhatsApp group management functionality.
 
 Port of whatsmeow/group.go
 """
+
 import logging
 from typing import TYPE_CHECKING, List, Optional
 
@@ -60,7 +61,7 @@ class ReqCreateGroup:
         create_key: Optional[str] = None,
         is_parent: bool = False,
         default_membership_approval_mode: str = "",
-        linked_parent_jid: Optional[JID] = None
+        linked_parent_jid: Optional[JID] = None,
     ):
         self.name = name
         self.participants = participants
@@ -82,20 +83,11 @@ class ParticipantRequestChange:
     REJECT = "reject"
 
 
-async def send_group_iq(
-    client: "Client",
-    iq_type: 'InfoQueryType',
-    jid: JID,
-    content: 'Node'
-) -> 'Node':
+async def send_group_iq(client: "Client", iq_type: "InfoQueryType", jid: JID, content: "Node") -> "Node":
     """Send a group IQ request."""
     from .request import InfoQuery
-    res = await request.send_iq(client, InfoQuery(
-        namespace="w:g2",
-        type=iq_type,
-        to=jid,
-        content=[content]
-    ))
+
+    res = await request.send_iq(client, InfoQuery(namespace="w:g2", type=iq_type, to=jid, content=[content]))
     return res
 
 
@@ -115,12 +107,10 @@ async def create_group(client: "Client", req: ReqCreateGroup) -> GroupInfo:
     from .binary.node import Node
     from .request import InfoQueryType
     from .send import generate_message_id
+
     participant_nodes = []
     for participant in req.participants:
-        participant_nodes.append(Node(
-            tag="participant",
-            attrs={"jid": participant}
-        ))
+        participant_nodes.append(Node(tag="participant", attrs={"jid": participant}))
 
     if not req.create_key:
         req.create_key = generate_message_id(client)
@@ -128,15 +118,11 @@ async def create_group(client: "Client", req: ReqCreateGroup) -> GroupInfo:
     if req.is_parent:
         if not req.default_membership_approval_mode:
             req.default_membership_approval_mode = "request_required"
-        participant_nodes.append(Node(
-            tag="parent",
-            attrs={"default_membership_approval_mode": req.default_membership_approval_mode}
-        ))
+        participant_nodes.append(
+            Node(tag="parent", attrs={"default_membership_approval_mode": req.default_membership_approval_mode})
+        )
     elif req.linked_parent_jid and not req.linked_parent_jid.is_empty():
-        participant_nodes.append(Node(
-            tag="linked_parent",
-            attrs={"jid": req.linked_parent_jid}
-        ))
+        participant_nodes.append(Node(tag="linked_parent", attrs={"jid": req.linked_parent_jid}))
 
     # WhatsApp web doesn't seem to include the static prefix for these
     key = req.create_key
@@ -147,11 +133,7 @@ async def create_group(client: "Client", req: ReqCreateGroup) -> GroupInfo:
         client,
         InfoQueryType.SET,
         GROUP_SERVER_JID,
-        Node(
-            tag="create",
-            attrs={"subject": req.name, "key": key},
-            content=participant_nodes
-        )
+        Node(tag="create", attrs={"subject": req.name, "key": key}, content=participant_nodes),
     )
 
     group_node, found = resp.get_optional_child_by_tag("group")
@@ -165,6 +147,7 @@ async def unlink_group(client: "Client", parent: JID, child: JID) -> None:
     """Removes a child group from a parent community."""
     from .binary.node import Node
     from .request import InfoQueryType
+
     await send_group_iq(
         client,
         InfoQueryType.SET,
@@ -172,11 +155,8 @@ async def unlink_group(client: "Client", parent: JID, child: JID) -> None:
         Node(
             tag="unlink",
             attrs={"unlink_type": str(GroupLinkChangeType.SUB)},
-            content=[Node(
-                tag="group",
-                attrs={"jid": child}
-            )]
-        )
+            content=[Node(tag="group", attrs={"jid": child})],
+        ),
     )
 
 
@@ -187,21 +167,21 @@ async def link_group(client: "Client", parent: JID, child: JID) -> None:
     """
     from .binary.node import Node
     from .request import InfoQueryType
+
     await send_group_iq(
         client,
         InfoQueryType.SET,
         parent,
         Node(
             tag="links",
-            content=[Node(
-                tag="link",
-                attrs={"link_type": str(GroupLinkChangeType.SUB)},
-                content=[Node(
-                    tag="group",
-                    attrs={"jid": child}
-                )]
-            )]
-        )
+            content=[
+                Node(
+                    tag="link",
+                    attrs={"link_type": str(GroupLinkChangeType.SUB)},
+                    content=[Node(tag="group", attrs={"jid": child})],
+                )
+            ],
+        ),
     )
 
 
@@ -209,45 +189,24 @@ async def leave_group(client: "Client", jid: JID) -> None:
     """Leaves the specified group on WhatsApp."""
     from .binary.node import Node
     from .request import InfoQueryType
+
     await send_group_iq(
-        client,
-        InfoQueryType.SET,
-        GROUP_SERVER_JID,
-        Node(
-            tag="leave",
-            content=[Node(
-                tag="group",
-                attrs={"id": jid}
-            )]
-        )
+        client, InfoQueryType.SET, GROUP_SERVER_JID, Node(tag="leave", content=[Node(tag="group", attrs={"id": jid})])
     )
 
 
 async def update_group_participants(
-    client: "Client",
-    jid: JID,
-    participant_changes: List[JID],
-    action: str
+    client: "Client", jid: JID, participant_changes: List[JID], action: str
 ) -> List[GroupParticipant]:
     """Can be used to add, remove, promote and demote members in a WhatsApp group."""
     from .binary.node import Node
     from .request import InfoQueryType
+
     content = []
     for participant_jid in participant_changes:
-        content.append(Node(
-            tag="participant",
-            attrs={"jid": participant_jid}
-        ))
+        content.append(Node(tag="participant", attrs={"jid": participant_jid}))
 
-    resp = await send_group_iq(
-        client,
-        InfoQueryType.SET,
-        jid,
-        Node(
-            tag=action,
-            content=content
-        )
-    )
+    resp = await send_group_iq(client, InfoQueryType.SET, jid, Node(tag=action, content=content))
 
     request_action, found = resp.get_optional_child_by_tag(action)
     if not request_action:
@@ -265,60 +224,50 @@ async def get_group_request_participants(client: "Client", jid: JID) -> List[Gro
     """Gets the list of participants that have requested to join the group."""
     from .binary.node import Node
     from .request import InfoQueryType
-    resp = await send_group_iq(
-        client,
-        InfoQueryType.SET,
-        jid,
-        Node(tag="membership_approval_requests")
-    )
+
+    resp = await send_group_iq(client, InfoQueryType.SET, jid, Node(tag="membership_approval_requests"))
 
     request, found = resp.get_optional_child_by_tag("membership_approval_requests")
     if not request:
-        raise ElementMissingError(tag="membership_approval_requests", in_location="response to group request participants query")
+        raise ElementMissingError(
+            tag="membership_approval_requests", in_location="response to group request participants query"
+        )
 
     request_participants = request.get_children_by_tag("membership_approval_request")
     participants = []
     for req in request_participants:
-        participants.append(GroupParticipantRequest(
-            jid=req.attr_getter().jid("jid"),
-            requested_at=req.attr_getter().unix_time("request_time")
-        ))
+        participants.append(
+            GroupParticipantRequest(
+                jid=req.attr_getter().jid("jid"), requested_at=req.attr_getter().unix_time("request_time")
+            )
+        )
 
     return participants
 
 
 async def update_group_request_participants(
-    client: "Client",
-    jid: JID,
-    participant_changes: List[JID],
-    action: str
+    client: "Client", jid: JID, participant_changes: List[JID], action: str
 ) -> List[GroupParticipant]:
     """Can be used to approve or reject requests to join the group."""
     from .binary.node import Node
     from .request import InfoQueryType
+
     content = []
     for participant_jid in participant_changes:
-        content.append(Node(
-            tag="participant",
-            attrs={"jid": participant_jid}
-        ))
+        content.append(Node(tag="participant", attrs={"jid": participant_jid}))
 
     resp = await send_group_iq(
         client,
         InfoQueryType.SET,
         jid,
-        Node(
-            tag="membership_requests_action",
-            content=[Node(
-                tag=action,
-                content=content
-            )]
-        )
+        Node(tag="membership_requests_action", content=[Node(tag=action, content=content)]),
     )
 
     request, found = resp.get_optional_child_by_tag("membership_requests_action")
     if not request:
-        raise ElementMissingError(tag="membership_requests_action", in_location="response to group request participants update")
+        raise ElementMissingError(
+            tag="membership_requests_action", in_location="response to group request participants update"
+        )
 
     request_action, found = request.get_optional_child_by_tag(action)
     if not request_action:
@@ -340,22 +289,18 @@ async def set_group_photo(client: "Client", jid: JID, avatar: Optional[bytes]) -
     """
     from .binary.node import Node
     from .request import InfoQuery, InfoQueryType
+
     content = None
     if avatar is not None:
-        content = [Node(
-            tag="picture",
-            attrs={"type": "image"},
-            content=avatar
-        )]
+        content = [Node(tag="picture", attrs={"type": "image"}, content=avatar)]
 
     try:
-        resp = await request.send_iq(client, InfoQuery(
-            namespace="w:profile:picture",
-            type=InfoQueryType.SET,
-            to=SERVER_JID,
-            target=jid,
-            content=content
-        ))
+        resp = await request.send_iq(
+            client,
+            InfoQuery(
+                namespace="w:profile:picture", type=InfoQueryType.SET, to=SERVER_JID, target=jid, content=content
+            ),
+        )
     except IQError as e:
         if e.code == 406:  # Not acceptable
             raise ErrInvalidImageFormat() from e
@@ -375,24 +320,11 @@ async def set_group_name(client: "Client", jid: JID, name: str) -> None:
     """Updates the name (subject) of the given group on WhatsApp."""
     from .binary.node import Node
     from .request import InfoQueryType
-    await send_group_iq(
-        client,
-        InfoQueryType.SET,
-        jid,
-        Node(
-            tag="subject",
-            content=name.encode()
-        )
-    )
+
+    await send_group_iq(client, InfoQueryType.SET, jid, Node(tag="subject", content=name.encode()))
 
 
-async def set_group_topic(
-    client: "Client",
-    jid: JID,
-    previous_id: str = "",
-    new_id: str = "",
-    topic: str = ""
-) -> None:
+async def set_group_topic(client: "Client", jid: JID, previous_id: str = "", new_id: str = "", topic: str = "") -> None:
     """Updates the topic (description) of the given group on WhatsApp.
 
     The previous_id and new_id fields are optional. If the previous ID is not specified, this will
@@ -402,6 +334,7 @@ async def set_group_topic(
     from .binary.node import Node
     from .request import InfoQueryType
     from .send import generate_message_id
+
     if not previous_id:
         old_info = await get_group_info(client, jid)
         previous_id = old_info.group_topic.topic_id
@@ -415,49 +348,29 @@ async def set_group_topic(
 
     content = None
     if topic:
-        content = [Node(
-            tag="body",
-            content=topic.encode()
-        )]
+        content = [Node(tag="body", content=topic.encode())]
     else:
         attrs["delete"] = "true"
 
-    await send_group_iq(
-        client,
-        InfoQueryType.SET,
-        jid,
-        Node(
-            tag="description",
-            attrs=attrs,
-            content=content
-        )
-    )
+    await send_group_iq(client, InfoQueryType.SET, jid, Node(tag="description", attrs=attrs, content=content))
 
 
 async def set_group_locked(client: "Client", jid: JID, locked: bool) -> None:
     """Changes whether the group is locked (i.e. whether only admins can modify group info)."""
     from .binary.node import Node
     from .request import InfoQueryType
+
     tag = "locked" if locked else "unlocked"
-    await send_group_iq(
-        client,
-        InfoQueryType.SET,
-        jid,
-        Node(tag=tag)
-    )
+    await send_group_iq(client, InfoQueryType.SET, jid, Node(tag=tag))
 
 
 async def set_group_announce(client: "Client", jid: JID, announce: bool) -> None:
     """Changes whether the group is in announce mode (i.e. whether only admins can send messages)."""
     from .binary.node import Node
     from .request import InfoQueryType
+
     tag = "announcement" if announce else "not_announcement"
-    await send_group_iq(
-        client,
-        InfoQueryType.SET,
-        jid,
-        Node(tag=tag)
-    )
+    await send_group_iq(client, InfoQueryType.SET, jid, Node(tag=tag))
 
 
 async def get_group_invite_link(client: "Client", jid: JID, reset: bool = False) -> str:
@@ -467,6 +380,7 @@ async def get_group_invite_link(client: "Client", jid: JID, reset: bool = False)
     """
     from .binary.node import Node
     from .request import InfoQueryType
+
     iq_type = InfoQueryType.SET if reset else InfoQueryType.GET
 
     try:
@@ -487,13 +401,7 @@ async def get_group_invite_link(client: "Client", jid: JID, reset: bool = False)
     return INVITE_LINK_PREFIX + str(code)
 
 
-async def get_group_info_from_invite(
-    client: "Client",
-    jid: JID,
-    inviter: JID,
-    code: str,
-    expiration: int
-) -> GroupInfo:
+async def get_group_info_from_invite(client: "Client", jid: JID, inviter: JID, code: str, expiration: int) -> GroupInfo:
     """Gets the group info from an invite message.
 
     Note that this is specifically for invite messages, not invite links.
@@ -501,21 +409,15 @@ async def get_group_info_from_invite(
     """
     from .binary.node import Node
     from .request import InfoQueryType
+
     resp = await send_group_iq(
         client,
         InfoQueryType.GET,
         jid,
         Node(
             tag="query",
-            content=[Node(
-                tag="add_request",
-                attrs={
-                    "code": code,
-                    "expiration": str(expiration),
-                    "admin": inviter
-                }
-            )]
-        )
+            content=[Node(tag="add_request", attrs={"code": code, "expiration": str(expiration), "admin": inviter})],
+        ),
     )
 
     group_node, found = resp.get_optional_child_by_tag("group")
@@ -525,13 +427,7 @@ async def get_group_info_from_invite(
     return await parse_group_node(client, group_node)
 
 
-async def join_group_with_invite(
-    client: "Client",
-    jid: JID,
-    inviter: JID,
-    code: str,
-    expiration: int
-) -> None:
+async def join_group_with_invite(client: "Client", jid: JID, inviter: JID, code: str, expiration: int) -> None:
     """Joins a group using an invite message.
 
     Note that this is specifically for invite messages, not invite links.
@@ -539,21 +435,15 @@ async def join_group_with_invite(
     """
     from .binary.node import Node
     from .request import InfoQueryType
+
     await send_group_iq(
         client,
         InfoQueryType.SET,
         jid,
         Node(
             tag="add",
-            content=[Node(
-                tag="participant",
-                attrs={
-                    "code": code,
-                    "expiration": str(expiration),
-                    "admin": inviter
-                }
-            )]
-        )
+            content=[Node(tag="participant", attrs={"code": code, "expiration": str(expiration), "admin": inviter})],
+        ),
     )
 
 
@@ -564,15 +454,8 @@ async def get_group_info_from_link(client: "Client", code: str) -> GroupInfo:
     """
     from .binary.node import Node
     from .request import InfoQueryType
-    resp = await send_group_iq(
-        client,
-        InfoQueryType.GET,
-        GROUP_SERVER_JID,
-        Node(
-            tag="invite",
-            attrs={"code": code}
-        )
-    )
+
+    resp = await send_group_iq(client, InfoQueryType.GET, GROUP_SERVER_JID, Node(tag="invite", attrs={"code": code}))
 
     group_node, found = resp.get_optional_child_by_tag("group")
     if not group_node:
@@ -588,15 +471,8 @@ async def join_group_with_link(client: "Client", code: str) -> Optional[JID]:
     """
     from .binary.node import Node
     from .request import InfoQueryType
-    resp = await send_group_iq(
-        client,
-        InfoQueryType.SET,
-        GROUP_SERVER_JID,
-        Node(
-            tag="accept",
-            attrs={"code": code}
-        )
-    )
+
+    resp = await send_group_iq(client, InfoQueryType.SET, GROUP_SERVER_JID, Node(tag="accept", attrs={"code": code}))
 
     group_node, found = resp.get_optional_child_by_tag("group")
     if not group_node:
@@ -613,12 +489,8 @@ async def get_joined_groups(client: "Client") -> List[GroupInfo]:
     """Gets the list of groups the user has joined."""
     from .binary.node import Node
     from .request import InfoQueryType
-    resp = await send_group_iq(
-        client,
-        InfoQueryType.GET,
-        GROUP_SERVER_JID,
-        Node(tag="participating")
-    )
+
+    resp = await send_group_iq(client, InfoQueryType.GET, GROUP_SERVER_JID, Node(tag="participating"))
 
     participating, found = resp.get_optional_child_by_tag("participating")
     if not participating:
@@ -636,12 +508,8 @@ async def get_sub_groups(client: "Client", jid: JID) -> List[GroupLinkTarget]:
     """Gets the subgroups of a community."""
     from .binary.node import Node
     from .request import InfoQueryType
-    resp = await send_group_iq(
-        client,
-        InfoQueryType.GET,
-        jid,
-        Node(tag="linked_groups")
-    )
+
+    resp = await send_group_iq(client, InfoQueryType.GET, jid, Node(tag="linked_groups"))
 
     linked_groups, found = resp.get_optional_child_by_tag("linked_groups")
     if not linked_groups:
@@ -659,12 +527,8 @@ async def get_linked_groups_participants(client: "Client", jid: JID) -> List[Gro
     """Gets participants from linked groups."""
     from .binary.node import Node
     from .request import InfoQueryType
-    resp = await send_group_iq(
-        client,
-        InfoQueryType.GET,
-        jid,
-        Node(tag="linked_groups_participants")
-    )
+
+    resp = await send_group_iq(client, InfoQueryType.GET, jid, Node(tag="linked_groups_participants"))
 
     participants_node, found = resp.get_optional_child_by_tag("linked_groups_participants")
     if not participants_node:
@@ -688,15 +552,8 @@ async def get_group_info_internal(client: "Client", jid: JID, lock_participant_c
     from .binary.node import Node
     from .client import GroupMetaCache
     from .request import InfoQueryType
-    resp = await send_group_iq(
-        client,
-        InfoQueryType.GET,
-        jid,
-        Node(
-            tag="query",
-            attrs={"request": "interactive"}
-        )
-    )
+
+    resp = await send_group_iq(client, InfoQueryType.GET, jid, Node(tag="query", attrs={"request": "interactive"}))
 
     group_node, found = resp.get_optional_child_by_tag("group")
     if not found:
@@ -712,17 +569,19 @@ async def get_group_info_internal(client: "Client", jid: JID, lock_participant_c
             participants = [participant.jid for participant in group_info.participants]
             lid_pairs = []
             for participant in group_info.participants:
-                if (participant.phone_number and not participant.phone_number.is_empty() and
-                    participant.lid and not participant.lid.is_empty()):
-                    lid_pairs.append({
-                        'lid': participant.lid,
-                        'phone_number': participant.phone_number
-                    })
+                if (
+                    participant.phone_number
+                    and not participant.phone_number.is_empty()
+                    and participant.lid
+                    and not participant.lid.is_empty()
+                ):
+                    lid_pairs.append({"lid": participant.lid, "phone_number": participant.phone_number})
 
             client.group_cache[jid] = GroupMetaCache(
                 addressing_mode=group_info.addressing_mode,
-                community_announcement_group=group_info.group_announce.is_announce and group_info.group_is_default_sub.is_default_sub_group,
-                members=participants
+                community_announcement_group=group_info.group_announce.is_announce
+                and group_info.group_is_default_sub.is_default_sub_group,
+                members=participants,
             )
 
             # Store LID mappings if available
@@ -734,17 +593,19 @@ async def get_group_info_internal(client: "Client", jid: JID, lock_participant_c
         participants = [participant.jid for participant in group_info.participants]
         lid_pairs = []
         for participant in group_info.participants:
-            if (participant.phone_number and not participant.phone_number.is_empty() and
-                participant.lid and not participant.lid.is_empty()):
-                lid_pairs.append({
-                    'lid': participant.lid,
-                    'phone_number': participant.phone_number
-                })
+            if (
+                participant.phone_number
+                and not participant.phone_number.is_empty()
+                and participant.lid
+                and not participant.lid.is_empty()
+            ):
+                lid_pairs.append({"lid": participant.lid, "phone_number": participant.phone_number})
 
         client.group_cache[jid] = GroupMetaCache(
             addressing_mode=group_info.addressing_mode,
-            community_announcement_group=group_info.group_announce.is_announce and group_info.group_is_default_sub.is_default_sub_group,
-            members=participants
+            community_announcement_group=group_info.group_announce.is_announce
+            and group_info.group_is_default_sub.is_default_sub_group,
+            members=participants,
         )
 
         if lid_pairs:
@@ -754,7 +615,7 @@ async def get_group_info_internal(client: "Client", jid: JID, lock_participant_c
     return group_info
 
 
-async def get_cached_group_data(client: "Client", jid: JID) -> 'GroupMetaCache':
+async def get_cached_group_data(client: "Client", jid: JID) -> "GroupMetaCache":
     """Gets cached group data if available, fetches it if not."""
     async with client.group_cache_lock:
         if jid in client.group_cache:
@@ -767,7 +628,7 @@ async def get_cached_group_data(client: "Client", jid: JID) -> 'GroupMetaCache':
     return group_meta_cache
 
 
-def parse_participant(child_ag: AttrUtility, child: 'Node') -> GroupParticipant:
+def parse_participant(child_ag: AttrUtility, child: "Node") -> GroupParticipant:
     """
     Parse a participant node into a GroupParticipant object.
 
@@ -783,7 +644,7 @@ def parse_participant(child_ag: AttrUtility, child: 'Node') -> GroupParticipant:
         is_admin=(pcp_type == "admin" or pcp_type == "superadmin"),
         is_super_admin=(pcp_type == "superadmin"),
         jid=child_ag.jid("jid"),
-        display_name=child_ag.optional_string("display_name")
+        display_name=child_ag.optional_string("display_name"),
     )
 
     if participant.jid.server == HIDDEN_USER_SERVER:
@@ -800,14 +661,13 @@ def parse_participant(child_ag: AttrUtility, child: 'Node') -> GroupParticipant:
         if found:
             add_ag = add_request_node.attr_getter()
             participant.add_request = GroupParticipantAddRequest(
-                code=add_ag.string("code"),
-                expiration=add_ag.unix_time("expiration")
+                code=add_ag.string("code"), expiration=add_ag.unix_time("expiration")
             )
 
     return participant
 
 
-async def parse_group_node(client: "Client", group_node: 'Node') -> GroupInfo:
+async def parse_group_node(client: "Client", group_node: "Node") -> GroupInfo:
     """Parse a group node into GroupInfo.
 
     Args:
@@ -825,7 +685,6 @@ async def parse_group_node(client: "Client", group_node: 'Node') -> GroupInfo:
         # Basic group information
         jid=JID.new_jid(ag.string("id"), GROUP_SERVER)
     )
-
 
     group.owner_jid = ag.optional_jid_or_empty("creator")
     group.owner_pn = ag.optional_jid_or_empty("creator_pn")
@@ -852,7 +711,7 @@ async def parse_group_node(client: "Client", group_node: 'Node') -> GroupInfo:
             body, found = child.get_optional_child_by_tag("body")
             if body:
                 if isinstance(body.content, bytes):
-                    group.group_topic.topic = body.content.decode('utf-8')
+                    group.group_topic.topic = body.content.decode("utf-8")
                 else:
                     group.group_topic.topic = str(body.content) if body.content else ""
                 group.group_topic.topic_id = child_ag.string("id")
@@ -865,7 +724,9 @@ async def parse_group_node(client: "Client", group_node: 'Node') -> GroupInfo:
             group.group_locked.is_locked = True
         elif child.tag == "ephemeral":
             group.group_ephemeral.is_ephemeral = True
-            group.group_ephemeral.disappearing_timer = int(child_ag.uint64("expiration"))  # Cast to int (Python equivalent of uint32)
+            group.group_ephemeral.disappearing_timer = int(
+                child_ag.uint64("expiration")
+            )  # Cast to int (Python equivalent of uint32)
         elif child.tag == "member_add_mode":
             if isinstance(child.content, bytes):
                 group.member_add_mode = GroupMemberAddMode(child.content)
@@ -877,7 +738,9 @@ async def parse_group_node(client: "Client", group_node: 'Node') -> GroupInfo:
             group.group_is_default_sub.is_default_sub_group = True
         elif child.tag == "parent":
             group.group_parent.is_parent = True
-            group.group_parent.default_membership_approval_mode = child_ag.optional_string("default_membership_approval_mode")
+            group.group_parent.default_membership_approval_mode = child_ag.optional_string(
+                "default_membership_approval_mode"
+            )
         elif child.tag == "incognito":
             group.group_incognito.is_incognito = True
         elif child.tag == "membership_approval_mode":
@@ -896,16 +759,13 @@ async def parse_group_node(client: "Client", group_node: 'Node') -> GroupInfo:
     return group
 
 
-def parse_group_link_target_node(client: "Client", node: 'Node') -> GroupLinkTarget:
+def parse_group_link_target_node(client: "Client", node: "Node") -> GroupLinkTarget:
     """Parses a group link target node."""
     ag = node.attr_getter()
-    return GroupLinkTarget(
-        jid=ag.jid("jid"),
-        group_name=GroupName(name=ag.optional_string("subject"))
-    )
+    return GroupLinkTarget(jid=ag.jid("jid"), group_name=GroupName(name=ag.optional_string("subject")))
 
 
-def parse_participant_list(node: 'Node') -> List[GroupParticipant]:
+def parse_participant_list(node: "Node") -> List[GroupParticipant]:
     """Parses a list of participants from a group node."""
     participants = []
     for participant_node in node.get_children_by_tag("participant"):

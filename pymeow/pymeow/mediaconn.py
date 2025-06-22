@@ -4,6 +4,7 @@ Media connection management for WhatsApp Web.
 This module handles querying and caching media server connection information.
 Port of whatsmeow/mediaconn.go
 """
+
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MediaConnHost:
     """Represents a single host to download media from."""
+
     hostname: str
     # Note: IPs field commented out in Go version
     # ips: List[MediaConnIP] = field(default_factory=list)
@@ -29,6 +31,7 @@ class MediaConnHost:
 @dataclass
 class MediaConn:
     """Contains a list of WhatsApp servers from which attachments can be downloaded."""
+
     auth: str
     auth_ttl: int
     ttl: int
@@ -41,7 +44,7 @@ class MediaConn:
         return self.fetched_at + timedelta(seconds=self.ttl)
 
 
-async def refresh_media_conn(client: 'Client', force: bool = False) -> MediaConn:
+async def refresh_media_conn(client: "Client", force: bool = False) -> MediaConn:
     """
     Refresh the media connection cache if needed.
 
@@ -60,16 +63,13 @@ async def refresh_media_conn(client: 'Client', force: bool = False) -> MediaConn
         raise ErrClientIsNil()
 
     async with client.media_conn_lock:
-        if (client.media_conn_cache is None or
-            force or
-            datetime.now() >= client.media_conn_cache.expiry()):
-
+        if client.media_conn_cache is None or force or datetime.now() >= client.media_conn_cache.expiry():
             client.media_conn_cache = await query_media_conn(client)
 
     return client.media_conn_cache
 
 
-async def query_media_conn(client: 'Client') -> MediaConn:
+async def query_media_conn(client: "Client") -> MediaConn:
     """
     Query WhatsApp servers for media connection information.
 
@@ -84,13 +84,9 @@ async def query_media_conn(client: 'Client') -> MediaConn:
     """
     from .binary.node import Node
     from .request import InfoQuery, InfoQueryType, send_iq
+
     # Create info query for media connections
-    query = InfoQuery(
-        namespace="w:m",
-        type=InfoQueryType.SET,
-        to=JID.server_jid(),
-        content=[Node(tag="media_conn")]
-    )
+    query = InfoQuery(namespace="w:m", type=InfoQueryType.SET, to=JID.server_jid(), content=[Node(tag="media_conn")])
 
     resp = await send_iq(client, query)
 
@@ -130,10 +126,5 @@ async def query_media_conn(client: 'Client') -> MediaConn:
         raise ValueError("No media hosts received from server")
 
     return MediaConn(
-        auth=auth,
-        auth_ttl=auth_ttl,
-        ttl=ttl,
-        max_buckets=max_buckets,
-        fetched_at=datetime.now(),
-        hosts=hosts
+        auth=auth, auth_ttl=auth_ttl, ttl=ttl, max_buckets=max_buckets, fetched_at=datetime.now(), hosts=hosts
     )

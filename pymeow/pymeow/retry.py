@@ -3,6 +3,7 @@ Retry logic for WhatsApp operations.
 
 Port of whatsmeow/retry.go
 """
+
 import asyncio
 import logging
 import struct
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RecentMessageKey:
     """Key for identifying a recent message in the cache."""
+
     to: JID
     id: MessageID
 
@@ -49,7 +51,9 @@ class RecentMessageKey:
 class RecentMessage:
     """Recent message data for retry handling."""
 
-    def __init__(self, wa: Optional[WAE2E_pb2.Message] = None, fb: Optional[WAMsgApplication_pb2.MessageApplication] = None):
+    def __init__(
+        self, wa: Optional[WAE2E_pb2.Message] = None, fb: Optional[WAMsgApplication_pb2.MessageApplication] = None
+    ):
         self.wa = wa
         self.fb = fb
 
@@ -61,6 +65,7 @@ class RecentMessage:
 @dataclass
 class IncomingRetryKey:
     """Key for tracking incoming retry requests."""
+
     jid: JID
     message_id: MessageID
 
@@ -70,7 +75,7 @@ async def add_recent_message(
     to: JID,
     message_id: MessageID,
     wa: Optional[WAE2E_pb2.Message],
-    fb: Optional[WAMsgApplication_pb2.MessageApplication]
+    fb: Optional[WAMsgApplication_pb2.MessageApplication],
 ) -> None:
     """
     Port of Go method addRecentMessage from retry.go.
@@ -104,6 +109,7 @@ async def add_recent_message(
         if client.recent_messages_ptr >= len(client.recent_messages_list):
             client.recent_messages_ptr = 0
 
+
 async def get_recent_message(client: "Client", to: JID, message_id: MessageID) -> RecentMessage:
     """
     Port of Go method getRecentMessage from retry.go.
@@ -128,11 +134,7 @@ async def get_recent_message(client: "Client", to: JID, message_id: MessageID) -
     return msg
 
 
-async def get_message_for_retry(
-    client: "Client",
-    receipt: 'Receipt',
-    message_id: MessageID
-) -> RecentMessage:
+async def get_message_for_retry(client: "Client", receipt: "Receipt", message_id: MessageID) -> RecentMessage:
     """
     Port of Go method getMessageForRetry from retry.go.
 
@@ -151,29 +153,31 @@ async def get_message_for_retry(
     """
     msg = await get_recent_message(client, receipt.message_source.chat, message_id)
     if msg.is_empty():
-        wa_msg = await client.my_get_message_for_retry(receipt.message_source.sender, receipt.message_source.chat, message_id)
+        wa_msg = await client.my_get_message_for_retry(
+            receipt.message_source.sender, receipt.message_source.chat, message_id
+        )
         if wa_msg is None:
             raise Exception(f"couldn't find message {message_id}")
         else:
             logger.debug(
                 "Found message in GetMessageForRetry to accept retry receipt for %s/%s from %s",
-                receipt.message_source.chat, message_id, receipt.message_source.sender
+                receipt.message_source.chat,
+                message_id,
+                receipt.message_source.sender,
             )
         msg = RecentMessage(wa=wa_msg)
     else:
         logger.debug(
             "Found message in local cache to accept retry receipt for %s/%s from %s",
-            receipt.message_source.chat, message_id, receipt.message_source.sender
+            receipt.message_source.chat,
+            message_id,
+            receipt.message_source.sender,
         )
 
     return msg
 
 
-async def should_recreate_session(
-    client: "Client",
-    retry_count: int,
-    jid: JID
-) -> Tuple[str, bool]:
+async def should_recreate_session(client: "Client", retry_count: int, jid: JID) -> Tuple[str, bool]:
     """
     Port of Go method shouldRecreateSession from retry.go.
 
@@ -203,11 +207,8 @@ async def should_recreate_session(
 
         return "", False
 
-async def handle_retry_receipt(
-    client: "Client",
-    receipt: "Receipt",
-    node: "Node"
-) -> None:
+
+async def handle_retry_receipt(client: "Client", receipt: "Receipt", node: "Node") -> None:
     """
     Port of Go method handleRetryReceipt from retry.go.
 
@@ -224,6 +225,7 @@ async def handle_retry_receipt(
         Exception: Various encryption/session errors
     """
     from .binary.node import Node
+
     retry_child, ok = node.get_optional_child_by_tag("retry")
     if not ok:
         raise ElementMissingError(tag="retry", in_location="retry receipt")
@@ -246,27 +248,29 @@ async def handle_retry_receipt(
         internal_counter = client.incoming_retry_request_counter[retry_key]
 
     if internal_counter >= 10:
-        logger.warning("Dropping retry request from %s for %s: internal retry counter is %d", message_id,
-                         receipt.message_source.sender, internal_counter)
+        logger.warning(
+            "Dropping retry request from %s for %s: internal retry counter is %d",
+            message_id,
+            receipt.message_source.sender,
+            internal_counter,
+        )
         return None
 
     # Handle group messages - add sender key distribution
     if receipt.message_source.is_group:
         try:
             sender_key_name = SenderKeyName(
-                group_id=str(receipt.message_source.chat),
-                sender=client.get_own_lid().signal_address()
+                group_id=str(receipt.message_source.chat), sender=client.get_own_lid().signal_address()
             )
             signal_skd_message = create_sender_key_distribution_message(
-                sender_key_name=sender_key_name,
-                protocol_store=client.signal_store
+                sender_key_name=sender_key_name, protocol_store=client.signal_store
             )
 
             if msg.wa is not None:
                 # Create sender key distribution message for WhatsApp protocol
                 skd_message = WAE2E_pb2.SenderKeyDistributionMessage(
                     groupID=str(receipt.message_source.chat),
-                    axolotlSenderKeyDistributionMessage=signal_skd_message.serialize()
+                    axolotlSenderKeyDistributionMessage=signal_skd_message.serialize(),
                 )
                 msg.wa.senderKeyDistributionMessage.CopyFrom(skd_message)
         except Exception as e:
@@ -279,8 +283,7 @@ async def handle_retry_receipt(
             original_msg = msg.wa
             msg.wa = WAE2E_pb2.Message(
                 deviceSentMessage=WAE2E_pb2.DeviceSentMessage(
-                    destinationJID=str(receipt.message_source.chat),
-                    message=original_msg
+                    destinationJID=str(receipt.message_source.chat), message=original_msg
                 )
             )
 
@@ -304,9 +307,14 @@ async def handle_retry_receipt(
     else:
         reason, recreate = await should_recreate_session(client, retry_count, receipt.message_source.sender)
         if recreate:
-            logger.debug("Fetching prekeys for %s for handling retry receipt with no prekey bundle because %s",
-                              receipt.message_source.sender, reason)
-            keys = await prekeys.fetch_pre_keys(client, [receipt.message_source.sender])  # TODO: Review fetch_pre_keys implementation
+            logger.debug(
+                "Fetching prekeys for %s for handling retry receipt with no prekey bundle because %s",
+                receipt.message_source.sender,
+                reason,
+            )
+            keys = await prekeys.fetch_pre_keys(
+                client, [receipt.message_source.sender]
+            )  # TODO: Review fetch_pre_keys implementation
             pre_key_resp = keys[receipt.message_source.sender]
             bundle, err = pre_key_resp.bundle, pre_key_resp.error
             if err is not None:
@@ -316,7 +324,9 @@ async def handle_retry_receipt(
                     len_keys = len(keys)
                 else:
                     len_keys = None
-                raise Exception(f"didn't get prekey bundle for {receipt.message_source.sender} (response size: {len_keys})")
+                raise Exception(
+                    f"didn't get prekey bundle for {receipt.message_source.sender} (response size: {len_keys})"
+                )
 
     # Set up encryption attributes - simplified without MessageAttrs
     enc_attrs = {}
@@ -343,7 +353,8 @@ async def handle_retry_receipt(
                 logger.warning("Failed to get LID for %s: %v", receipt.message_source.sender, e)
 
         encrypted, include_device_identity = await send.encrypt_message_for_device(
-            client, plaintext, encryption_identity, bundle, enc_attrs)
+            client, plaintext, encryption_identity, bundle, enc_attrs
+        )
     else:
         raise Exception("FB retry not yet implemented")
 
@@ -370,19 +381,17 @@ async def handle_retry_receipt(
             client, encrypted, msg.wa, attrs, include_device_identity, send.NodeExtraParams()
         )
     else:
-        content = [
-            encrypted,
-            Node(tag="franking", content=[Node(tag="franking_tag", content=franking_tag)])
-        ]
+        content = [encrypted, Node(tag="franking", content=[Node(tag="franking_tag", content=franking_tag)])]
 
     # Send the retry message
-    await client.send_node(Node(
-        tag="message",
-        attrs=attrs,
-        content=content
-    ))
-    logger.debug("Sent retry #%d for %s/%s to %s", retry_count, receipt.message_source.chat,
-                 message_id, receipt.message_source.sender)
+    await client.send_node(Node(tag="message", attrs=attrs, content=content))
+    logger.debug(
+        "Sent retry #%d for %s/%s to %s",
+        retry_count,
+        receipt.message_source.chat,
+        message_id,
+        receipt.message_source.sender,
+    )
     return None
 
 
@@ -406,6 +415,7 @@ async def cancel_delayed_request_from_phone(client: "Client", msg_id: MessageID)
         cancel_pending_request = client.pending_phone_rerequests.get(msg_id)
         if cancel_pending_request is not None:
             cancel_pending_request()
+
 
 async def delayed_request_message_from_phone(client: "Client", info: "MessageInfo") -> None:
     """
@@ -449,6 +459,7 @@ async def delayed_request_message_from_phone(client: "Client", info: "MessageInf
         try:
             # This mimics Go's select case <-time.After vs <-ctx.Done()
             import time
+
             start_time = time.time()
             while time.time() - start_time < REQUEST_FROM_PHONE_DELAY.total_seconds():
                 if cancel_event.is_set():
@@ -465,7 +476,7 @@ async def delayed_request_message_from_phone(client: "Client", info: "MessageInf
                 client,
                 client.get_own_id().to_non_ad(),
                 send.build_unavailable_message_request(client, info.chat, info.sender, info.id),
-                send.SendRequestExtra(id=send.generate_message_id(client), peer=True)
+                send.SendRequestExtra(id=send.generate_message_id(client), peer=True),
             )
             logger.debug("Requested message %s from phone", info.id)
         except Exception as e:
@@ -492,12 +503,7 @@ async def clear_delayed_message_requests(client: "Client") -> None:
         client.pending_phone_rerequests_lock.release()
 
 
-async def send_retry_receipt(
-    client: "Client",
-    node: "Node",
-    info: "MessageInfo",
-    force_include_identity: bool
-) -> None:
+async def send_retry_receipt(client: "Client", node: "Node", info: "MessageInfo", force_include_identity: bool) -> None:
     """
     Port of Go method sendRetryReceipt from retry.go.
 
@@ -511,6 +517,7 @@ async def send_retry_receipt(
         force_include_identity: Whether to force including identity information
     """
     from .binary.node import Node
+
     id_str = node.attrs.get("id", "")
     children = node.get_children()
     retry_count_in_msg = 0
@@ -536,11 +543,7 @@ async def send_retry_receipt(
     # Prepare registration ID bytes (4 bytes, big endian)
     registration_id_bytes = struct.pack(">I", client.store.registration_id)
 
-    attrs = {
-        "id": id_str,
-        "type": "retry",
-        "to": node.attrs["from"]
-    }
+    attrs = {"id": id_str, "type": "retry", "to": node.attrs["from"]}
 
     if "recipient" in node.attrs:
         attrs["recipient"] = node.attrs["recipient"]
@@ -551,14 +554,9 @@ async def send_retry_receipt(
         tag="receipt",
         attrs=attrs,
         content=[
-            Node(tag="retry", attrs={
-                "count": retry_count,
-                "id": id_str,
-                "t": node.attrs["t"],
-                "v": 1
-            }),
-            Node(tag="registration", content=registration_id_bytes)
-        ]
+            Node(tag="retry", attrs={"count": retry_count, "id": id_str, "t": node.attrs["t"], "v": 1}),
+            Node(tag="registration", content=registration_id_bytes),
+        ],
     )
 
     if retry_count > 1 or force_include_identity:
@@ -570,16 +568,18 @@ async def send_retry_receipt(
                 logger.error("Failed to marshal account info: %v", e)
                 return
 
-            payload.content = payload.get_children() + [Node(
-                tag="keys",
-                content=[
-                    Node(tag="type", content=bytes([ECC_DJB_TYPE])),
-                    Node(tag="identity", content=client.store.identity_key.pub[:]),
-                    prekeys.pre_key_to_node(key),  # TODO: Review pre_key_to_node implementation
-                    prekeys.pre_key_to_node(client.store.signed_pre_key),
-                    Node(tag="device-identity", content=device_identity)
-                ]
-            )]
+            payload.content = payload.get_children() + [
+                Node(
+                    tag="keys",
+                    content=[
+                        Node(tag="type", content=bytes([ECC_DJB_TYPE])),
+                        Node(tag="identity", content=client.store.identity_key.pub[:]),
+                        prekeys.pre_key_to_node(key),  # TODO: Review pre_key_to_node implementation
+                        prekeys.pre_key_to_node(client.store.signed_pre_key),
+                        Node(tag="device-identity", content=device_identity),
+                    ],
+                )
+            ]
         except Exception as e:
             logger.error("Failed to get prekey for retry receipt: %v", e)
 

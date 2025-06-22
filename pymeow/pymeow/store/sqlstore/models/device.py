@@ -6,6 +6,7 @@ from tortoise.models import Model
 
 class DeviceModel(Model):
     """Device information storage"""
+
     jid = fields.CharField(max_length=255, pk=True)
     lid: Optional[str] = fields.CharField(max_length=255, null=True)
     facebook_uuid = fields.UUIDField(null=True)

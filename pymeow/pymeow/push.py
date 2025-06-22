@@ -3,6 +3,7 @@ WhatsApp push notification handling.
 
 Port of whatsmeow/push.go
 """
+
 import base64
 import logging
 import secrets
@@ -26,9 +27,11 @@ class PushConfig(ABC):
         """Returns attributes for push notification configuration."""
         pass
 
+
 @dataclass
 class FCMPushConfig(PushConfig):
     """Firebase Cloud Messaging configuration."""
+
     token: str
 
     def get_push_config_attrs(self) -> Dict[str, Any]:
@@ -39,12 +42,14 @@ class FCMPushConfig(PushConfig):
             "platform": "gcm",
         }
 
+
 @dataclass
 class APNsPushConfig(PushConfig):
     """Apple Push Notification service configuration."""
+
     token: str
     voip_token: str = ""
-    msg_id_enc_key: bytes = b''
+    msg_id_enc_key: bytes = b""
 
     def __post_init__(self) -> None:
         if self.msg_id_enc_key is None or len(self.msg_id_enc_key) != 32:
@@ -74,9 +79,11 @@ class APNsPushConfig(PushConfig):
             attrs["voip"] = self.voip_token
         return attrs
 
+
 @dataclass
 class WebPushConfig(PushConfig):
     """Web Push configuration."""
+
     endpoint: str
     auth: bytes
     p256dh: bytes
@@ -91,17 +98,21 @@ class WebPushConfig(PushConfig):
         }
 
 
-async def get_server_push_notification_config(client: 'Client') -> Optional[Node]:
+async def get_server_push_notification_config(client: "Client") -> Optional[Node]:
     """Retrieves server push notification settings."""
-    resp = await request.send_iq(client, InfoQuery(
-        namespace="urn:xmpp:whatsapp:push",
-        type=InfoQueryType.GET,
-        to=client.server_jid,
-        content=[Node(tag="settings")]
-    ))
+    resp = await request.send_iq(
+        client,
+        InfoQuery(
+            namespace="urn:xmpp:whatsapp:push",
+            type=InfoQueryType.GET,
+            to=client.server_jid,
+            content=[Node(tag="settings")],
+        ),
+    )
     return resp
 
-async def register_for_push_notifications(client: 'Client', pc: PushConfig) -> None:
+
+async def register_for_push_notifications(client: "Client", pc: PushConfig) -> None:
     """
     Registers a device for push notifications.
 
@@ -115,9 +126,12 @@ async def register_for_push_notifications(client: 'Client', pc: PushConfig) -> N
         ElementMissingError: If the client is nil
         Exception: If there's an error registering for push notifications
     """
-    _ = await request.send_iq(client, InfoQuery(
-        namespace="urn:xmpp:whatsapp:push",
-        type=InfoQueryType.SET,
-        to=client.server_jid,
-        content=[Node(tag="config", attrs=pc.get_push_config_attrs())]
-    ))
+    _ = await request.send_iq(
+        client,
+        InfoQuery(
+            namespace="urn:xmpp:whatsapp:push",
+            type=InfoQueryType.SET,
+            to=client.server_jid,
+            content=[Node(tag="config", attrs=pc.get_push_config_attrs())],
+        ),
+    )

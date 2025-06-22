@@ -3,6 +3,7 @@ Frame-based WebSocket implementation for WhatsApp.
 
 Port of whatsmeow/socket/framesocket.go
 """
+
 import asyncio
 import logging
 from typing import Any, Callable, Coroutine, Dict, Optional
@@ -22,6 +23,7 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
+
 class FrameSocket:
     """
     Handles frame-based WebSocket communication with WhatsApp servers.
@@ -29,6 +31,7 @@ class FrameSocket:
     This class provides a frame-based abstraction over WebSocket connections,
     handling the framing protocol used by WhatsApp Web.
     """
+
     url: str = URL
 
     def __init__(self, dialer: ClientSession):
@@ -125,10 +128,7 @@ class FrameSocket:
                 raise SocketAlreadyOpenError()
 
             logger.debug(f"Dialing {self.url}")
-            self.conn = await self.dialer.ws_connect(
-                self.url,
-                headers=self.http_headers
-            )
+            self.conn = await self.dialer.ws_connect(self.url, headers=self.http_headers)
             # Start read pump
             self.read_task = asyncio.create_task(self.read_pump(self.conn))
 
@@ -144,7 +144,7 @@ class FrameSocket:
         Returns:
             Optional[Exception]: None if successful, Exception if failed
         """
-        if  self.conn is None:
+        if self.conn is None:
             return SocketClosedError()
 
         data_length = len(data)
@@ -159,7 +159,7 @@ class FrameSocket:
         if self.header is not None:
             whole_frame[:header_length] = self.header
             # We only want to send the header once
-            self.header = b''
+            self.header = b""
 
         # Encode length of frame
         whole_frame[header_length] = (data_length >> 16) & 0xFF
@@ -167,14 +167,11 @@ class FrameSocket:
         whole_frame[header_length + 2] = data_length & 0xFF
 
         # Copy actual frame data
-        whole_frame[header_length + FRAME_LENGTH_SIZE:] = data
+        whole_frame[header_length + FRAME_LENGTH_SIZE :] = data
 
         if self.write_timeout > 0:
             try:
-                await asyncio.wait_for(
-                    self.conn.send_bytes(whole_frame),
-                    timeout=self.write_timeout
-                )
+                await asyncio.wait_for(self.conn.send_bytes(whole_frame), timeout=self.write_timeout)
                 return None
             except asyncio.TimeoutError as e:
                 logger.warning(f"Failed to set write deadline: {e}")
@@ -230,24 +227,24 @@ class FrameSocket:
                         await self._frame_complete()
                     else:
                         self.incoming = bytearray(length)
-                        self.incoming[:len(msg)] = msg
-                        msg = b''
+                        self.incoming[: len(msg)] = msg
+                        msg = b""
                 else:
                     logger.warning("Got partial header")
                     self.partial_header = msg
-                    msg = b''
+                    msg = b""
             else:
                 if self.received_length + len(msg) >= self.incoming_length:
                     bytes_needed = self.incoming_length - self.received_length
-                    self.incoming[self.received_length:self.received_length + bytes_needed] = msg[:bytes_needed]
+                    self.incoming[self.received_length : self.received_length + bytes_needed] = msg[:bytes_needed]
                     msg = msg[bytes_needed:]
                     await self._frame_complete()
                 else:
-                    self.incoming[self.received_length:self.received_length + len(msg)] = msg
+                    self.incoming[self.received_length : self.received_length + len(msg)] = msg
                     self.received_length += len(msg)
-                    msg = b''
+                    msg = b""
 
-    async def read_pump(self, conn: 'ClientWebSocketResponse') -> None:
+    async def read_pump(self, conn: "ClientWebSocketResponse") -> None:
         """
         Port of Go method readPump from FrameSocket.
 

@@ -3,6 +3,7 @@ WhatsApp user management functions.
 
 Port of whatsmeow/user.go
 """
+
 import dataclasses
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -61,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 class GetProfilePictureParams:
     """Parameters for getting profile pictures."""
+
     def __init__(self, preview: bool = False, existing_id: str = "", is_community: bool = False):
         self.preview = preview
         self.existing_id = existing_id
@@ -69,11 +71,12 @@ class GetProfilePictureParams:
 
 class UsyncQueryExtras:
     """Extra parameters for usync queries."""
+
     def __init__(self, bot_list_info: Optional[List[BotListInfo]] = None):
         self.bot_list_info = bot_list_info or []
 
 
-async def resolve_business_message_link(client: 'Client', code: str) -> Optional[BusinessMessageLinkTarget]:
+async def resolve_business_message_link(client: "Client", code: str) -> Optional[BusinessMessageLinkTarget]:
     """
     Resolves a business message short link and returns the target JID, business name and
     text to prefill in the input field (if any).
@@ -83,18 +86,15 @@ async def resolve_business_message_link(client: 'Client', code: str) -> Optional
     """
     from .binary.node import Attrs, Node
     from .request import InfoQuery, InfoQueryType, send_iq
+
     code = code.removeprefix(BUSINESS_MESSAGE_LINK_PREFIX)
     code = code.removeprefix(BUSINESS_MESSAGE_LINK_DIRECT_PREFIX)
 
     try:
-        resp = await send_iq(client, InfoQuery(
-            namespace="w:qr",
-            type=InfoQueryType.GET,
-            content=[Node(
-                tag="qr",
-                attrs=Attrs({"code": code})
-            )]
-        ))
+        resp = await send_iq(
+            client,
+            InfoQuery(namespace="w:qr", type=InfoQueryType.GET, content=[Node(tag="qr", attrs=Attrs({"code": code}))]),
+        )
     except ErrIQNotFound as e:
         raise ErrBusinessMessageLinkNotFound() from e
 
@@ -109,7 +109,7 @@ async def resolve_business_message_link(client: 'Client', code: str) -> Optional
 
     message_child, found = qr_child.get_optional_child_by_tag("message")
     if found and isinstance(message_child.content, bytes):
-        target.message = message_child.content.decode('utf-8')
+        target.message = message_child.content.decode("utf-8")
 
     business_child, found = qr_child.get_optional_child_by_tag("business")
     if found:
@@ -125,7 +125,7 @@ async def resolve_business_message_link(client: 'Client', code: str) -> Optional
     return target
 
 
-async def resolve_contact_qr_link(client: 'Client', code: str) -> Optional[ContactQRLinkTarget]:
+async def resolve_contact_qr_link(client: "Client", code: str) -> Optional[ContactQRLinkTarget]:
     """
     Resolves a link from a contact share QR code and returns the target JID and push name.
 
@@ -134,18 +134,15 @@ async def resolve_contact_qr_link(client: 'Client', code: str) -> Optional[Conta
     """
     from .binary.node import Attrs, Node
     from .request import InfoQuery, InfoQueryType, send_iq
+
     code = code.removeprefix(CONTACT_QR_LINK_PREFIX)
     code = code.removeprefix(CONTACT_QR_LINK_DIRECT_PREFIX)
 
     try:
-        resp = await send_iq(client, InfoQuery(
-            namespace="w:qr",
-            type=InfoQueryType.GET,
-            content=[Node(
-                tag="qr",
-                attrs=Attrs({"code": code})
-            )]
-        ))
+        resp = await send_iq(
+            client,
+            InfoQuery(namespace="w:qr", type=InfoQueryType.GET, content=[Node(tag="qr", attrs=Attrs({"code": code}))]),
+        )
     except ErrIQNotFound as e:
         raise ErrContactQRLinkNotFound() from e
 
@@ -166,7 +163,7 @@ async def resolve_contact_qr_link(client: 'Client', code: str) -> Optional[Conta
     return target
 
 
-async def get_contact_qr_link(client: 'Client', revoke: bool = False) -> str:
+async def get_contact_qr_link(client: "Client", revoke: bool = False) -> str:
     """
     Get your own contact share QR link that can be resolved using resolve_contact_qr_link
     (or scanned with the official apps when encoded as a QR code).
@@ -176,19 +173,17 @@ async def get_contact_qr_link(client: 'Client', revoke: bool = False) -> str:
     """
     from .binary.node import Attrs, Node
     from .request import InfoQuery, InfoQueryType, send_iq
+
     action = "revoke" if revoke else "get"
 
-    resp = await send_iq(client, InfoQuery(
-        namespace="w:qr",
-        type=InfoQueryType.SET,
-        content=[Node(
-            tag="qr",
-            attrs=Attrs({
-                "type": "contact",
-                "action": action
-            })
-        )]
-    ))
+    resp = await send_iq(
+        client,
+        InfoQuery(
+            namespace="w:qr",
+            type=InfoQueryType.SET,
+            content=[Node(tag="qr", attrs=Attrs({"type": "contact", "action": action}))],
+        ),
+    )
 
     qr_child, found = resp.get_optional_child_by_tag("qr")
     if not found:
@@ -204,7 +199,7 @@ async def get_contact_qr_link(client: 'Client', revoke: bool = False) -> str:
     return code
 
 
-async def set_status_message(client: 'Client', msg: str) -> None:
+async def set_status_message(client: "Client", msg: str) -> None:
     """
     Update the current user's status text, which is shown in the "About" section in the user profile.
 
@@ -213,29 +208,37 @@ async def set_status_message(client: 'Client', msg: str) -> None:
     """
     from .binary.node import Node
     from .request import InfoQuery, InfoQueryType, send_iq
-    await send_iq(client, InfoQuery(
-        namespace="status",
-        type=InfoQueryType.SET,
-        to=SERVER_JID,
-        content=[Node(
-            tag="status",
-            content=msg.encode('utf-8')
-        )]
-    ))
+
+    await send_iq(
+        client,
+        InfoQuery(
+            namespace="status",
+            type=InfoQueryType.SET,
+            to=SERVER_JID,
+            content=[Node(tag="status", content=msg.encode("utf-8"))],
+        ),
+    )
 
 
-async def is_on_whatsapp(client: 'Client', phones: List[str]) -> List[IsOnWhatsAppResponse]:
+async def is_on_whatsapp(client: "Client", phones: List[str]) -> List[IsOnWhatsAppResponse]:
     """
     Check if the given phone numbers are registered on WhatsApp.
     The phone numbers should be in international format, including the `+` prefix.
     """
     from .binary.node import Node
+
     jids = [JID(user=phone, server=LEGACY_USER_SERVER) for phone in phones]
 
-    list_node = await usync(client, jids, "query", "interactive", [
-        Node(tag="business", content=[Node(tag="verified_name")]),
-        Node(tag="contact"),
-    ])
+    list_node = await usync(
+        client,
+        jids,
+        "query",
+        "interactive",
+        [
+            Node(tag="business", content=[Node(tag="verified_name")]),
+            Node(tag="contact"),
+        ],
+    )
 
     output = []
     query_suffix = f"@{LEGACY_USER_SERVER}"
@@ -260,7 +263,7 @@ async def is_on_whatsapp(client: 'Client', phones: List[str]) -> List[IsOnWhatsA
         info.is_in = contact_node.attr_getter().string("type") == "in"
 
         if isinstance(contact_node.content, bytes):
-            contact_query = contact_node.content.decode('utf-8')
+            contact_query = contact_node.content.decode("utf-8")
             info.query = contact_query.removesuffix(query_suffix)
 
         output.append(info)
@@ -268,15 +271,22 @@ async def is_on_whatsapp(client: 'Client', phones: List[str]) -> List[IsOnWhatsA
     return output
 
 
-async def get_user_info(client: 'Client', jids: List[JID]) -> Dict[JID, UserInfo]:
+async def get_user_info(client: "Client", jids: List[JID]) -> Dict[JID, UserInfo]:
     """Get basic user info (avatar, status, verified business name, device list)."""
     from .binary.node import Attrs, Node
-    list_node = await usync(client, jids, "full", "background", [
-        Node(tag="business", content=[Node(tag="verified_name")]),
-        Node(tag="status"),
-        Node(tag="picture"),
-        Node(tag="devices", attrs=Attrs({"version": "2"})),
-    ])
+
+    list_node = await usync(
+        client,
+        jids,
+        "full",
+        "background",
+        [
+            Node(tag="business", content=[Node(tag="verified_name")]),
+            Node(tag="status"),
+            Node(tag="picture"),
+            Node(tag="devices", attrs=Attrs({"version": "2"})),
+        ],
+    )
 
     resp_data = {}
 
@@ -298,7 +308,7 @@ async def get_user_info(client: 'Client', jids: List[JID]) -> Dict[JID, UserInfo
 
         status_node = child.get_child_by_tag("status")
         if isinstance(status_node.content, bytes):
-            info.status = status_node.content.decode('utf-8')
+            info.status = status_node.content.decode("utf-8")
 
         picture_node = child.get_child_by_tag("picture")
         info.picture_id = picture_node.attrs.get("id", "")
@@ -315,16 +325,17 @@ async def get_user_info(client: 'Client', jids: List[JID]) -> Dict[JID, UserInfo
     return resp_data
 
 
-async def get_bot_list_v2(client: 'Client') -> List[BotListInfo]:
+async def get_bot_list_v2(client: "Client") -> List[BotListInfo]:
     """Get the list of available bots."""
     from .binary.node import Attrs, Node
     from .request import InfoQuery, InfoQueryType, send_iq
-    resp = await send_iq(client, InfoQuery(
-        to=SERVER_JID,
-        namespace="bot",
-        type=InfoQueryType.GET,
-        content=[Node(tag="bot", attrs=Attrs({"v": "2"}))]
-    ))
+
+    resp = await send_iq(
+        client,
+        InfoQuery(
+            to=SERVER_JID, namespace="bot", type=InfoQueryType.GET, content=[Node(tag="bot", attrs=Attrs({"v": "2"}))]
+        ),
+    )
 
     bot_node, found = resp.get_optional_child_by_tag("bot")
     if not found:
@@ -336,22 +347,25 @@ async def get_bot_list_v2(client: 'Client') -> List[BotListInfo]:
         if section.attr_getter().string("type") == "all":
             for bot in section.get_children_by_tag("bot"):
                 ag = bot.attr_getter()
-                bot_list.append(BotListInfo(
-                    persona_id=ag.string("persona_id"),
-                    bot_jid=ag.jid("jid")
-                ))
+                bot_list.append(BotListInfo(persona_id=ag.string("persona_id"), bot_jid=ag.jid("jid")))
 
     return bot_list
 
 
-async def get_bot_profiles(client: 'Client', bot_info: List[BotListInfo]) -> List[BotProfileInfo]:
+async def get_bot_profiles(client: "Client", bot_info: List[BotListInfo]) -> List[BotProfileInfo]:
     """Get detailed profile information for bots."""
     from .binary.node import Attrs, Node
+
     jids = [bot.bot_jid for bot in bot_info]
 
-    list_node = await usync(client, jids, "query", "interactive", [
-        Node(tag="bot", content=[Node(tag="profile", attrs=Attrs({"v": "1"}))])
-    ], UsyncQueryExtras(bot_list_info=bot_info))
+    list_node = await usync(
+        client,
+        jids,
+        "query",
+        "interactive",
+        [Node(tag="bot", content=[Node(tag="profile", attrs=Attrs({"v": "1"}))])],
+        UsyncQueryExtras(bot_list_info=bot_info),
+    )
 
     profiles = []
     for user in list_node.get_children():
@@ -362,28 +376,28 @@ async def get_bot_profiles(client: 'Client', bot_info: List[BotListInfo]) -> Lis
         # Extract name
         name_content = profile.get_child_by_tag("name").content
         if isinstance(name_content, bytes):
-            name = name_content.decode('utf-8')
+            name = name_content.decode("utf-8")
         else:
             name = ""
 
         # Extract attributes
         attributes_content = profile.get_child_by_tag("attributes").content
         if isinstance(attributes_content, bytes):
-            attributes = attributes_content.decode('utf-8')
+            attributes = attributes_content.decode("utf-8")
         else:
             attributes = ""
 
         # Extract description
         description_content = profile.get_child_by_tag("description").content
         if isinstance(description_content, bytes):
-            description = description_content.decode('utf-8')
+            description = description_content.decode("utf-8")
         else:
             description = ""
 
         # Extract category
         category_content = profile.get_child_by_tag("category").content
         if isinstance(category_content, bytes):
-            category = category_content.decode('utf-8')
+            category = category_content.decode("utf-8")
         else:
             category = ""
 
@@ -395,7 +409,7 @@ async def get_bot_profiles(client: 'Client', bot_info: List[BotListInfo]) -> Lis
         # Extract command description
         commands_desc_content = commands_node.get_child_by_tag("description").content
         if isinstance(commands_desc_content, bytes):
-            command_description = commands_desc_content.decode('utf-8')
+            command_description = commands_desc_content.decode("utf-8")
         else:
             command_description = ""
 
@@ -404,14 +418,14 @@ async def get_bot_profiles(client: 'Client', bot_info: List[BotListInfo]) -> Lis
             # Extract command name
             cmd_name_content = command_node.get_child_by_tag("name").content
             if isinstance(cmd_name_content, bytes):
-                cmd_name = cmd_name_content.decode('utf-8')
+                cmd_name = cmd_name_content.decode("utf-8")
             else:
                 cmd_name = ""
 
             # Extract command description
             cmd_desc_content = command_node.get_child_by_tag("description").content
             if isinstance(cmd_desc_content, bytes):
-                cmd_desc = cmd_desc_content.decode('utf-8')
+                cmd_desc = cmd_desc_content.decode("utf-8")
             else:
                 cmd_desc = ""
 
@@ -423,35 +437,37 @@ async def get_bot_profiles(client: 'Client', bot_info: List[BotListInfo]) -> Lis
             # Extract emoji
             emoji_content = prompt_node.get_child_by_tag("emoji").content
             if isinstance(emoji_content, bytes):
-                emoji = emoji_content.decode('utf-8')
+                emoji = emoji_content.decode("utf-8")
             else:
                 emoji = ""
 
             # Extract text
             text_content = prompt_node.get_child_by_tag("text").content
             if isinstance(text_content, bytes):
-                text = text_content.decode('utf-8')
+                text = text_content.decode("utf-8")
             else:
                 text = ""
             prompts.append(f"{emoji} {text}")
 
-        profiles.append(BotProfileInfo(
-            jid=jid,
-            name=name,
-            attributes=attributes,
-            description=description,
-            category=category,
-            is_default=is_default,
-            prompts=prompts,
-            persona_id=persona_id,
-            commands=commands,
-            commands_description=command_description,
-        ))
+        profiles.append(
+            BotProfileInfo(
+                jid=jid,
+                name=name,
+                attributes=attributes,
+                description=description,
+                category=category,
+                is_default=is_default,
+                prompts=prompts,
+                persona_id=persona_id,
+                commands=commands,
+                commands_description=command_description,
+            )
+        )
 
     return profiles
 
 
-def parse_business_profile(node: 'Node') -> BusinessProfile:
+def parse_business_profile(node: "Node") -> BusinessProfile:
     """Parse a business profile from a node."""
     profile_node = node.get_child_by_tag("profile")
 
@@ -462,14 +478,14 @@ def parse_business_profile(node: 'Node') -> BusinessProfile:
     # Extract address
     address_content = profile_node.get_child_by_tag("address").content
     if isinstance(address_content, bytes):
-        address = address_content.decode('utf-8')
+        address = address_content.decode("utf-8")
     else:
         address = ""
 
     # Extract email
     email_content = profile_node.get_child_by_tag("email").content
     if isinstance(email_content, bytes):
-        email = email_content.decode('utf-8')
+        email = email_content.decode("utf-8")
     else:
         email = ""
 
@@ -482,12 +498,14 @@ def parse_business_profile(node: 'Node') -> BusinessProfile:
             continue
 
         ag = config.attr_getter()
-        business_hours.append(BusinessHoursConfig(
-            day_of_week=ag.string("dow"),
-            mode=ag.string("mode"),
-            open_time=ag.string("open_time"),
-            close_time=ag.string("close_time")
-        ))
+        business_hours.append(
+            BusinessHoursConfig(
+                day_of_week=ag.string("dow"),
+                mode=ag.string("mode"),
+                open_time=ag.string("open_time"),
+                close_time=ag.string("close_time"),
+            )
+        )
 
     categories_node = profile_node.get_child_by_tag("categories")
     categories = []
@@ -500,7 +518,7 @@ def parse_business_profile(node: 'Node') -> BusinessProfile:
         # Extract category name
         category_name_content = category.content
         if isinstance(category_name_content, bytes):
-            name = category_name_content.decode('utf-8')
+            name = category_name_content.decode("utf-8")
         else:
             name = ""
 
@@ -512,7 +530,7 @@ def parse_business_profile(node: 'Node') -> BusinessProfile:
         # Extract option content
         option_content = option.content
         if isinstance(option_content, bytes):
-            content = option_content.decode('utf-8')
+            content = option_content.decode("utf-8")
         else:
             content = ""
 
@@ -525,27 +543,30 @@ def parse_business_profile(node: 'Node') -> BusinessProfile:
         categories=categories,
         profile_options=profile_options,
         business_hours_time_zone=business_hour_timezone,
-        business_hours=business_hours
+        business_hours=business_hours,
     )
 
 
-async def get_business_profile(client: 'Client', jid: JID) -> BusinessProfile:
+async def get_business_profile(client: "Client", jid: JID) -> BusinessProfile:
     """Get the profile info of a WhatsApp business account."""
     from .binary.node import Attrs, Node
     from .request import InfoQuery, InfoQueryType, send_iq
-    resp = await send_iq(client, InfoQuery(
-        type=InfoQueryType.GET,
-        to=SERVER_JID,
-        namespace="w:biz",
-        content=[Node(
-            tag="business_profile",
-            attrs=Attrs({"v": "244"}),
-            content=[Node(
-                tag="profile",
-                attrs=Attrs({"jid": jid})
-            )]
-        )]
-    ))
+
+    resp = await send_iq(
+        client,
+        InfoQuery(
+            type=InfoQueryType.GET,
+            to=SERVER_JID,
+            namespace="w:biz",
+            content=[
+                Node(
+                    tag="business_profile",
+                    attrs=Attrs({"v": "244"}),
+                    content=[Node(tag="profile", attrs=Attrs({"jid": jid}))],
+                )
+            ],
+        ),
+    )
 
     node, found = resp.get_optional_child_by_tag("business_profile")
     if not found:
@@ -554,7 +575,7 @@ async def get_business_profile(client: 'Client', jid: JID) -> BusinessProfile:
     return parse_business_profile(node)
 
 
-async def get_user_devices(client: 'Client', jids: List[JID]) -> List[JID]:
+async def get_user_devices(client: "Client", jids: List[JID]) -> List[JID]:
     """
     Get the list of devices that the given user has. The input should be a list of
     regular JIDs, and the output will be a list of AD JIDs. The local device will not be included in
@@ -565,9 +586,10 @@ async def get_user_devices(client: 'Client', jids: List[JID]) -> List[JID]:
     return await get_user_devices_context(client, jids)
 
 
-async def get_user_devices_context(client: 'Client', jids: List[JID]) -> List[JID]:
+async def get_user_devices_context(client: "Client", jids: List[JID]) -> List[JID]:
     """Get user devices with context support."""
     from .binary.node import Attrs, Node
+
     if client is None:
         raise ErrClientIsNil()
 
@@ -587,9 +609,9 @@ async def get_user_devices_context(client: 'Client', jids: List[JID]) -> List[JI
             jids_to_sync.append(jid)
 
     if jids_to_sync:
-        list_node = await usync(client, jids_to_sync, "query", "message", [
-            Node(tag="devices", attrs=Attrs({"version": "2"}))
-        ])
+        list_node = await usync(
+            client, jids_to_sync, "query", "message", [Node(tag="devices", attrs=Attrs({"version": "2"}))]
+        )
 
         for user in list_node.get_children():
             if user.tag != "user":
@@ -609,7 +631,9 @@ async def get_user_devices_context(client: 'Client', jids: List[JID]) -> List[JI
     return devices
 
 
-async def get_profile_picture_info(client: 'Client', jid: JID, params: Optional[GetProfilePictureParams] = None) -> Optional[ProfilePictureInfo]:
+async def get_profile_picture_info(
+    client: "Client", jid: JID, params: Optional[GetProfilePictureParams] = None
+) -> Optional[ProfilePictureInfo]:
     """
     Get the URL where you can download a WhatsApp user's profile picture or group's photo.
 
@@ -620,6 +644,7 @@ async def get_profile_picture_info(client: 'Client', jid: JID, params: Optional[
     """
     from .binary.node import Attrs, Node
     from .request import InfoQuery, InfoQueryType, send_iq
+
     attrs = Attrs({"query": "url"})
 
     if params is None:
@@ -642,23 +667,16 @@ async def get_profile_picture_info(client: 'Client', jid: JID, params: Optional[
         to = jid
         attrs["parent_group_jid"] = jid
         expect_wrapped = True
-        content = [Node(
-            tag="pictures",
-            content=[Node(tag="picture", attrs=attrs)]
-        )]
+        content = [Node(tag="pictures", content=[Node(tag="picture", attrs=attrs)])]
     else:
         to = SERVER_JID
         target = jid
         content = [Node(tag="picture", attrs=attrs)]
 
     try:
-        resp = await send_iq(client, InfoQuery(
-            namespace=namespace,
-            type=InfoQueryType.GET,
-            to=to,
-            target=target,
-            content=content
-        ))
+        resp = await send_iq(
+            client, InfoQuery(namespace=namespace, type=InfoQueryType.GET, to=to, target=target, content=content)
+        )
     except ErrIQNotAuthorized as e:
         raise ErrProfilePictureUnauthorized() from e
     except ErrIQNotFound as e:
@@ -692,7 +710,9 @@ async def get_profile_picture_info(client: 'Client', jid: JID, params: Optional[
     return info
 
 
-async def handle_historical_push_names(client: 'Client', names: RepeatedCompositeFieldContainer[WAWebProtobufsHistorySync_pb2.Pushname]) -> None:
+async def handle_historical_push_names(
+    client: "Client", names: RepeatedCompositeFieldContainer[WAWebProtobufsHistorySync_pb2.Pushname]
+) -> None:
     """
     Handle historical push names from history sync.
 
@@ -724,7 +744,7 @@ async def handle_historical_push_names(client: 'Client', names: RepeatedComposit
             continue
 
 
-async def update_push_name(client: 'Client', user: JID, message_info: 'MessageInfo', name: str) -> None:
+async def update_push_name(client: "Client", user: JID, message_info: "MessageInfo", name: str) -> None:
     """
     Update push name for a user and dispatch event if changed.
 
@@ -735,6 +755,7 @@ async def update_push_name(client: 'Client', user: JID, message_info: 'MessageIn
         name: The new push name
     """
     from .datatypes.events import PushName
+
     # Convert to non-AD JID for storage
     user = user.to_non_ad()
 
@@ -746,12 +767,7 @@ async def update_push_name(client: 'Client', user: JID, message_info: 'MessageIn
             logger.debug(f"Push name of {user} changed from {previous_name} to {name}, dispatching event")
 
             # Dispatch PushName event
-            event = PushName(
-                jid=user,
-                message=message_info,
-                old_push_name=previous_name,
-                new_push_name=name
-            )
+            event = PushName(jid=user, message=message_info, old_push_name=previous_name, new_push_name=name)
 
             # Dispatch the event through the client's event system
             await client.dispatch_event(event)
@@ -760,7 +776,7 @@ async def update_push_name(client: 'Client', user: JID, message_info: 'MessageIn
         logger.error(f"Failed to save push name of {user} in device store: {e}")
 
 
-async def update_business_name(client: 'Client', user: JID, message_info: 'MessageInfo', name: str) -> None:
+async def update_business_name(client: "Client", user: JID, message_info: "MessageInfo", name: str) -> None:
     """
     Update business name for a user and dispatch event if changed.
 
@@ -771,6 +787,7 @@ async def update_business_name(client: 'Client', user: JID, message_info: 'Messa
         name: The new business name
     """
     from .datatypes.events import BusinessName
+
     try:
         # Store the business name and check if it changed
         changed, previous_name = await client.store.contacts.put_business_name(user, name)
@@ -780,10 +797,7 @@ async def update_business_name(client: 'Client', user: JID, message_info: 'Messa
 
             # Dispatch BusinessName event
             event = BusinessName(
-                jid=user,
-                message=message_info,
-                old_business_name=previous_name,
-                new_business_name=name
+                jid=user, message=message_info, old_business_name=previous_name, new_business_name=name
             )
             # Dispatch the event through the client's event system
             await client.dispatch_event(event)
@@ -792,7 +806,7 @@ async def update_business_name(client: 'Client', user: JID, message_info: 'Messa
         logger.error(f"Failed to save business name of {user} in device store: {e}")
 
 
-def parse_verified_name(business_node: 'Node') -> Optional[VerifiedName]:
+def parse_verified_name(business_node: "Node") -> Optional[VerifiedName]:
     """Parse verified name from business node."""
     if business_node.tag != "business":
         return None
@@ -804,7 +818,7 @@ def parse_verified_name(business_node: 'Node') -> Optional[VerifiedName]:
     return parse_verified_name_content(verified_name_node)
 
 
-def parse_verified_name_content(verified_name_node: 'Node') -> Optional[VerifiedName]:
+def parse_verified_name_content(verified_name_node: "Node") -> Optional[VerifiedName]:
     """Parse verified name content."""
     if not isinstance(verified_name_node.content, bytes):
         return None
@@ -815,7 +829,7 @@ def parse_verified_name_content(verified_name_node: 'Node') -> Optional[Verified
     return VerifiedName()
 
 
-def parse_device_list(user: JID, device_node: 'Node') -> List[JID]:
+def parse_device_list(user: JID, device_node: "Node") -> List[JID]:
     """Parse device list from node."""
     device_list = device_node.get_child_by_tag("device-list")
     if device_node.tag != "devices" or device_list.tag != "device-list":
@@ -834,7 +848,7 @@ def parse_device_list(user: JID, device_node: 'Node') -> List[JID]:
     return devices
 
 
-def parse_fb_device_list(user: JID, device_list: 'Node') -> Dict[str, Any]:
+def parse_fb_device_list(user: JID, device_list: "Node") -> Dict[str, Any]:
     """Parse Facebook device list."""
     devices: List[JID] = []
     for device in device_list.get_children():
@@ -846,29 +860,24 @@ def parse_fb_device_list(user: JID, device_list: 'Node') -> Dict[str, Any]:
             device_jid = dataclasses.replace(user, device=device_id)
             devices.append(device_jid)
 
-    return {
-        "devices": devices,
-        "dhash": device_list.attr_getter().string("dhash")
-    }
+    return {"devices": devices, "dhash": device_list.attr_getter().string("dhash")}
 
 
-async def get_fbid_devices_internal(client: 'Client', jids: List[JID]) -> 'Node':
+async def get_fbid_devices_internal(client: "Client", jids: List[JID]) -> "Node":
     """Get Facebook ID devices internal."""
     from .binary.node import Attrs, Node
     from .request import InfoQuery, InfoQueryType, send_iq
+
     users = []
     for jid in jids:
-        users.append(Node(
-            tag="user",
-            attrs=Attrs({"jid": jid})
-        ))
+        users.append(Node(tag="user", attrs=Attrs({"jid": jid})))
 
-    resp = await send_iq(client, InfoQuery(
-        namespace="fbid:devices",
-        type=InfoQueryType.GET,
-        to=SERVER_JID,
-        content=[Node(tag="users", content=users)]
-    ))
+    resp = await send_iq(
+        client,
+        InfoQuery(
+            namespace="fbid:devices", type=InfoQueryType.GET, to=SERVER_JID, content=[Node(tag="users", content=users)]
+        ),
+    )
 
     list_node, found = resp.get_optional_child_by_tag("users")
     if not found:
@@ -877,13 +886,13 @@ async def get_fbid_devices_internal(client: 'Client', jids: List[JID]) -> 'Node'
     return list_node
 
 
-async def get_fbid_devices(client: 'Client', jids: List[JID]) -> List[JID]:
+async def get_fbid_devices(client: "Client", jids: List[JID]) -> List[JID]:
     """Get Facebook ID devices."""
     devices = []
 
     # Process in chunks of 15
     for i in range(0, len(jids), 15):
-        chunk = jids[i:i+15]
+        chunk = jids[i : i + 15]
         list_node = await get_fbid_devices_internal(client, chunk)
 
         for user in list_node.get_children():
@@ -900,12 +909,20 @@ async def get_fbid_devices(client: 'Client', jids: List[JID]) -> List[JID]:
     return devices
 
 
-async def usync(client: 'Client', jids: List[JID], mode: str, context: str, query: List['Node'], extras: Optional[UsyncQueryExtras] = None) -> 'Node':
+async def usync(
+    client: "Client",
+    jids: List[JID],
+    mode: str,
+    context: str,
+    query: List["Node"],
+    extras: Optional[UsyncQueryExtras] = None,
+) -> "Node":
     """
     Perform a usync operation.
     """
     from .binary.node import Attrs, Node
     from .request import InfoQuery, InfoQueryType, send_iq
+
     if client is None:
         raise ErrClientIsNil()
 
@@ -918,10 +935,7 @@ async def usync(client: 'Client', jids: List[JID], mode: str, context: str, quer
         jid = jid.to_non_ad()
 
         if jid.server == LEGACY_USER_SERVER:
-            user_node.content = [Node(
-                tag="contact",
-                content=str(jid).encode('utf-8')
-            )]
+            user_node.content = [Node(tag="contact", content=str(jid).encode("utf-8"))]
         elif jid.server in [DEFAULT_USER_SERVER, HIDDEN_USER_SERVER]:
             user_node.attrs = Attrs({"jid": jid})
             if jid.is_bot():
@@ -931,37 +945,40 @@ async def usync(client: 'Client', jids: List[JID], mode: str, context: str, quer
                         persona_id = bot.persona_id
                         break
 
-                user_node.content = [Node(
-                    tag="bot",
-                    content=[Node(
-                        tag="profile",
-                        attrs=Attrs({"persona_id": persona_id})
-                    )]
-                )]
+                user_node.content = [
+                    Node(tag="bot", content=[Node(tag="profile", attrs=Attrs({"persona_id": persona_id}))])
+                ]
         else:
             raise ValueError(f"unknown user server '{jid.server}'")
 
         user_list.append(user_node)
 
-    resp = await send_iq(client, InfoQuery(
-        namespace="usync",
-        type=InfoQueryType.GET,
-        to=SERVER_JID,
-        content=[Node(
-            tag="usync",
-            attrs=Attrs({
-                "sid": request.generate_request_id(client),
-                "mode": mode,
-                "last": "true",
-                "index": "0",
-                "context": context,
-            }),
+    resp = await send_iq(
+        client,
+        InfoQuery(
+            namespace="usync",
+            type=InfoQueryType.GET,
+            to=SERVER_JID,
             content=[
-                Node(tag="query", content=query),
-                Node(tag="list", content=user_list),
-            ]
-        )]
-    ))
+                Node(
+                    tag="usync",
+                    attrs=Attrs(
+                        {
+                            "sid": request.generate_request_id(client),
+                            "mode": mode,
+                            "last": "true",
+                            "index": "0",
+                            "context": context,
+                        }
+                    ),
+                    content=[
+                        Node(tag="query", content=query),
+                        Node(tag="list", content=user_list),
+                    ],
+                )
+            ],
+        ),
+    )
 
     list_node, found = resp.get_optional_child_by_tag("usync", "list")
     if not found:

@@ -3,6 +3,6 @@
 from .disappearing_messages import DisappearingMessageHandler, ExpirationInfo
 
 __all__ = [
-    'DisappearingMessageHandler',
-    'ExpirationInfo',
+    "DisappearingMessageHandler",
+    "ExpirationInfo",
 ]

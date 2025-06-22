@@ -3,6 +3,7 @@ Noise protocol socket implementation for WhatsApp Web.
 
 Port of whatsmeow/socket/noisesocket.go
 """
+
 import asyncio
 import contextlib
 import logging
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 class NoiseSocket:
     """
     Implements a secure socket using the Noise Protocol for WhatsApp Web.
@@ -25,8 +27,14 @@ class NoiseSocket:
     using AEAD ciphers.
     """
 
-    def __init__(self, fs: 'FrameSocket', write_key: AESGCM, read_key: AESGCM,
-                 on_frame: Callable[[bytes], Awaitable[None]], disconnect_handler: Callable[["NoiseSocket", bool], Awaitable[None]]):
+    def __init__(
+        self,
+        fs: "FrameSocket",
+        write_key: AESGCM,
+        read_key: AESGCM,
+        on_frame: Callable[[bytes], Awaitable[None]],
+        disconnect_handler: Callable[["NoiseSocket", bool], Awaitable[None]],
+    ):
         """
         Initialize a new NoiseSocket.
 
@@ -69,10 +77,7 @@ class NoiseSocket:
                 stop_task = asyncio.create_task(self.stop_consumer.wait())
 
                 # Wait for either a frame or cancellation
-                done, pending = await asyncio.wait(
-                    [frame_task, stop_task],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
+                done, pending = await asyncio.wait([frame_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
 
                 # Cancel any pending tasks to avoid warnings
                 for task in pending:
@@ -112,7 +117,7 @@ class NoiseSocket:
             A 12-byte IV with the counter in the last 4 bytes
         """
         iv = bytearray(12)
-        struct.pack_into('>I', iv, 8, count)
+        struct.pack_into(">I", iv, 8, count)
         return bytes(iv)
 
     async def stop(self, disconnect: bool = True) -> None:

@@ -3,6 +3,7 @@ Connection events handling for WhatsApp client.
 
 Port of whatsmeow/connectionevents.go
 """
+
 import logging
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 MIN_PREKEY_COUNT = 5  # Threshold for when to upload new prekeys
 
 logger = logging.getLogger(__name__)
+
 
 async def handle_stream_error(client: "Client", node: Node) -> None:
     """
@@ -79,17 +81,17 @@ async def handle_ib(cli: "Client", node: Node) -> None:
         if child.tag == "downgrade_webclient":
             await cli.dispatch_event(events.QRScannedWithoutMultidevice())
         elif child.tag == "offline_preview":
-            await cli.dispatch_event(events.OfflineSyncPreview(
-                total=int(child.attrs.get("count", 0)),
-                app_data_changes=int(child.attrs.get("appdata", 0)),
-                messages=int(child.attrs.get("message", 0)),
-                notifications=int(child.attrs.get("notification", 0)),
-                receipts=int(child.attrs.get("receipt", 0))
-            ))
+            await cli.dispatch_event(
+                events.OfflineSyncPreview(
+                    total=int(child.attrs.get("count", 0)),
+                    app_data_changes=int(child.attrs.get("appdata", 0)),
+                    messages=int(child.attrs.get("message", 0)),
+                    notifications=int(child.attrs.get("notification", 0)),
+                    receipts=int(child.attrs.get("receipt", 0)),
+                )
+            )
         elif child.tag == "offline":
-            await cli.dispatch_event(events.OfflineSyncCompleted(
-                count=int(child.attrs.get("count", 0))
-            ))
+            await cli.dispatch_event(events.OfflineSyncCompleted(count=int(child.attrs.get("count", 0))))
 
 
 async def handle_connect_failure(client: "Client", node: Node) -> None:
@@ -105,7 +107,10 @@ async def handle_connect_failure(client: "Client", node: Node) -> None:
     will_auto_reconnect = True
 
     # Handle different failure reasons - use switch-like logic from Go
-    if reason == events.ConnectFailureReason.SERVICE_UNAVAILABLE or reason == events.ConnectFailureReason.INTERNAL_SERVER_ERROR:
+    if (
+        reason == events.ConnectFailureReason.SERVICE_UNAVAILABLE
+        or reason == events.ConnectFailureReason.INTERNAL_SERVER_ERROR
+    ):
         # Auto-reconnect for 503s
         pass
     elif reason == events.ConnectFailureReason.CAT_INVALID or reason == events.ConnectFailureReason.CAT_EXPIRED:
@@ -133,10 +138,12 @@ async def handle_connect_failure(client: "Client", node: Node) -> None:
             logger.warning(f"Failed to delete store after {reason.value} failure: {e}")
     elif reason == events.ConnectFailureReason.TEMP_BANNED:
         logger.warning(f"Temporary ban connect failure: {node.xml_string()}")
-        await client.dispatch_event(events.TemporaryBan(
-            code=events.TempBanReason(int(node.attrs.get("code", 0))),
-            expire=timedelta(seconds=int(node.attrs.get("expire", 0)))
-        ))
+        await client.dispatch_event(
+            events.TemporaryBan(
+                code=events.TempBanReason(int(node.attrs.get("code", 0))),
+                expire=timedelta(seconds=int(node.attrs.get("expire", 0))),
+            )
+        )
     elif reason == events.ConnectFailureReason.CLIENT_OUTDATED:
         logger.error(f"Client outdated (405) connect failure (client version: {get_wa_version()})")
         await client.dispatch_event(events.ClientOutdated())
@@ -220,7 +227,7 @@ async def _post_connect_setup(cli: "Client") -> None:
 
     # Set passive mode to false
     try:
-        await set_passive(cli,False)
+        await set_passive(cli, False)
     except Exception as e:
         logger.warning(f"Failed to send post-connect passive IQ: {e}")
 
@@ -262,9 +269,12 @@ async def set_passive(client: "Client", passive: bool) -> None:
     """
     tag = "passive" if passive else "active"
 
-    _ = await request.send_iq(client, InfoQuery(
-        namespace="passive",
-        type=InfoQueryType.SET,  # Fixed: Use enum value instead of string
-        to=jid.SERVER_JID,
-        content=[Node(tag=tag)]
-    ))
+    _ = await request.send_iq(
+        client,
+        InfoQuery(
+            namespace="passive",
+            type=InfoQueryType.SET,  # Fixed: Use enum value instead of string
+            to=jid.SERVER_JID,
+            content=[Node(tag=tag)],
+        ),
+    )

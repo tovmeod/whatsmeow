@@ -3,6 +3,7 @@ Binary encoder for WhatsApp protocol.
 
 Port of whatsmeow/binary/encoder.go
 """
+
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Union
@@ -41,6 +42,7 @@ TAG_SIZE = 1
 @dataclass
 class BinaryEncoder:
     """Binary encoder for WhatsApp protocol."""
+
     data: bytearray = field(default_factory=bytearray)
 
     def get_data(self) -> bytearray:
@@ -66,11 +68,7 @@ class BinaryEncoder:
 
     def push_int20(self, value: int) -> None:
         """Push a 20-bit integer to the data."""
-        self.push_bytes(bytes([
-            (value >> 16) & 0x0F,
-            (value >> 8) & 0xFF,
-            value & 0xFF
-        ]))
+        self.push_bytes(bytes([(value >> 16) & 0x0F, (value >> 8) & 0xFF, value & 0xFF]))
 
     def push_int8(self, value: int) -> None:
         """Push an 8-bit integer to the data."""
@@ -86,7 +84,7 @@ class BinaryEncoder:
 
     def push_string(self, value: str) -> None:
         """Push a string to the data."""
-        self.push_bytes(value.encode('utf-8'))
+        self.push_bytes(value.encode("utf-8"))
 
     def write_byte_length(self, length: int) -> None:
         """Write the length of a byte array with the appropriate token."""
@@ -174,9 +172,11 @@ class BinaryEncoder:
 
     def write_jid(self, jid: JID) -> None:
         """Write a JID to the data."""
-        if ((jid.server == DEFAULT_USER_SERVER and jid.device > 0) or
-                jid.server == HIDDEN_USER_SERVER or
-                jid.server == HOSTED_SERVER):
+        if (
+            (jid.server == DEFAULT_USER_SERVER and jid.device > 0)
+            or jid.server == HIDDEN_USER_SERVER
+            or jid.server == HOSTED_SERVER
+        ):
             self.push_byte(AD_JID)
             self.push_byte(jid.actual_agent())
             self.push_byte(jid.device)
@@ -247,7 +247,7 @@ class BinaryEncoder:
             raise ValueError(f"invalid packed byte data type {data_type}")
 
         for i in range(len(value) // 2):
-            self.push_byte(self.pack_byte_pair(packer, ord(value[2*i]), ord(value[2*i+1])))
+            self.push_byte(self.pack_byte_pair(packer, ord(value[2 * i]), ord(value[2 * i + 1])))
 
         if len(value) % 2 != 0:
             self.push_byte(self.pack_byte_pair(packer, ord(value[-1]), 0))
@@ -267,21 +267,21 @@ def validate_nibble(value: str) -> bool:
     if len(value) > PACKED_MAX:
         return False
     for char in value:
-        if not ('0' <= char <= '9') and char != '-' and char != '.':
+        if not ("0" <= char <= "9") and char != "-" and char != ".":
             return False
     return True
 
 
 def pack_nibble(value: int) -> int:
     """Pack a nibble value."""
-    if value == ord('-'):
+    if value == ord("-"):
         return 10
-    elif value == ord('.'):
+    elif value == ord("."):
         return 11
     elif value == 0:
         return 15
-    elif ord('0') <= value <= ord('9'):
-        return value - ord('0')
+    elif ord("0") <= value <= ord("9"):
+        return value - ord("0")
     else:
         raise ValueError(f"invalid string to pack as nibble: {value} / '{chr(value)}'")
 
@@ -291,17 +291,17 @@ def validate_hex(value: str) -> bool:
     if len(value) > PACKED_MAX:
         return False
     for char in value:
-        if not ('0' <= char <= '9') and not ('A' <= char <= 'F'):
+        if not ("0" <= char <= "9") and not ("A" <= char <= "F"):
             return False
     return True
 
 
 def pack_hex(value: int) -> int:
     """Pack a hex value."""
-    if ord('0') <= value <= ord('9'):
-        return value - ord('0')
-    elif ord('A') <= value <= ord('F'):
-        return 10 + value - ord('A')
+    if ord("0") <= value <= ord("9"):
+        return value - ord("0")
+    elif ord("A") <= value <= ord("F"):
+        return 10 + value - ord("A")
     elif value == 0:
         return 15
     else:

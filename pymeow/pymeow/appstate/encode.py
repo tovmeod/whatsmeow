@@ -3,6 +3,7 @@ App state encoding for WhatsApp.
 
 Port of whatsmeow/appstate/encode.go
 """
+
 import hashlib
 import json
 import logging
@@ -31,6 +32,7 @@ from .keys import (
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class MutationInfo:
     """
@@ -41,6 +43,7 @@ class MutationInfo:
         version: A static number that depends on the thing being mutated.
         value: Contains the data for the mutation.
     """
+
     index: List[str]
     version: int
     value: WASyncAction_pb2.SyncActionValue
@@ -57,6 +60,7 @@ class PatchInfo:
         type: The app state type being mutated.
         mutations: Contains the individual mutations to apply to the app state in this patch.
     """
+
     type: WAPatchName
     mutations: List[MutationInfo]
     timestamp: Optional[float] = None
@@ -85,13 +89,10 @@ def build_mute(target: jid.JID, mute: bool, mute_duration: Optional[float] = Non
                 index=[INDEX_MUTE, str(target)],
                 version=2,
                 value=WASyncAction_pb2.SyncActionValue(
-                    muteAction=WASyncAction_pb2.MuteAction(
-                        muted=mute,
-                        muteEndTimestamp=mute_end_timestamp
-                    )
-                )
+                    muteAction=WASyncAction_pb2.MuteAction(muted=mute, muteEndTimestamp=mute_end_timestamp)
+                ),
             )
-        ]
+        ],
     )
 
 
@@ -109,11 +110,7 @@ def _new_pin_mutation_info(target: jid.JID, pin: bool) -> MutationInfo:
     return MutationInfo(
         index=[INDEX_PIN, str(target)],
         version=5,
-        value=WASyncAction_pb2.SyncActionValue(
-            pinAction=WASyncAction_pb2.PinAction(
-                pinned=pin
-            )
-        )
+        value=WASyncAction_pb2.SyncActionValue(pinAction=WASyncAction_pb2.PinAction(pinned=pin)),
     )
 
 
@@ -128,16 +125,15 @@ def build_pin(target: jid.JID, pin: bool) -> PatchInfo:
     Returns:
         A PatchInfo object containing the mutation
     """
-    return PatchInfo(
-        type=WAPatchName.REGULAR_LOW,
-        mutations=[
-            _new_pin_mutation_info(target, pin)
-        ]
-    )
+    return PatchInfo(type=WAPatchName.REGULAR_LOW, mutations=[_new_pin_mutation_info(target, pin)])
 
 
-def build_archive(target: jid.JID, archive: bool, last_message_timestamp: Optional[float] = None,
-                 last_message_key: Optional[WACommon_pb2.MessageKey] = None) -> PatchInfo:
+def build_archive(
+    target: jid.JID,
+    archive: bool,
+    last_message_timestamp: Optional[float] = None,
+    last_message_key: Optional[WACommon_pb2.MessageKey] = None,
+) -> PatchInfo:
     """
     Build an app state patch for archiving or unarchiving a chat.
 
@@ -165,27 +161,21 @@ def build_archive(target: jid.JID, archive: bool, last_message_timestamp: Option
                 messageRange=WASyncAction_pb2.SyncActionMessageRange(
                     lastMessageTimestamp=int(last_message_timestamp)
                     # TODO: set LastSystemMessageTimestamp?
-                )
+                ),
             )
-        )
+        ),
     )
 
     if last_message_key is not None:
         archive_mutation_info.value.archiveChatAction.messageRange.messages.append(
-            WASyncAction_pb2.SyncActionMessage(
-                key=last_message_key,
-                timestamp=int(last_message_timestamp)
-            )
+            WASyncAction_pb2.SyncActionMessage(key=last_message_key, timestamp=int(last_message_timestamp))
         )
 
     mutations = [archive_mutation_info]
     if archive:
         mutations.append(_new_pin_mutation_info(target, False))
 
-    return PatchInfo(
-        type=WAPatchName.REGULAR_LOW,
-        mutations=mutations
-    )
+    return PatchInfo(type=WAPatchName.REGULAR_LOW, mutations=mutations)
 
 
 def _new_label_chat_mutation(target: jid.JID, label_id: str, labeled: bool) -> MutationInfo:
@@ -204,10 +194,8 @@ def _new_label_chat_mutation(target: jid.JID, label_id: str, labeled: bool) -> M
         index=[INDEX_LABEL_ASSOCIATION_CHAT, label_id, str(target)],
         version=3,
         value=WASyncAction_pb2.SyncActionValue(
-            labelAssociationAction=WASyncAction_pb2.LabelAssociationAction(
-                labeled=labeled
-            )
-        )
+            labelAssociationAction=WASyncAction_pb2.LabelAssociationAction(labeled=labeled)
+        ),
     )
 
 
@@ -223,12 +211,7 @@ def build_label_chat(target: jid.JID, label_id: str, labeled: bool) -> PatchInfo
     Returns:
         A PatchInfo object containing the mutation
     """
-    return PatchInfo(
-        type=WAPatchName.REGULAR,
-        mutations=[
-            _new_label_chat_mutation(target, label_id, labeled)
-        ]
-    )
+    return PatchInfo(type=WAPatchName.REGULAR, mutations=[_new_label_chat_mutation(target, label_id, labeled)])
 
 
 def _new_label_message_mutation(target: jid.JID, label_id: str, message_id: str, labeled: bool) -> MutationInfo:
@@ -248,10 +231,8 @@ def _new_label_message_mutation(target: jid.JID, label_id: str, message_id: str,
         index=[INDEX_LABEL_ASSOCIATION_MESSAGE, label_id, str(target), message_id, "0", "0"],
         version=3,
         value=WASyncAction_pb2.SyncActionValue(
-            labelAssociationAction=WASyncAction_pb2.LabelAssociationAction(
-                labeled=labeled
-            )
-        )
+            labelAssociationAction=WASyncAction_pb2.LabelAssociationAction(labeled=labeled)
+        ),
     )
 
 
@@ -269,10 +250,7 @@ def build_label_message(target: jid.JID, label_id: str, message_id: str, labeled
         A PatchInfo object containing the mutation
     """
     return PatchInfo(
-        type=WAPatchName.REGULAR,
-        mutations=[
-            _new_label_message_mutation(target, label_id, message_id, labeled)
-        ]
+        type=WAPatchName.REGULAR, mutations=[_new_label_message_mutation(target, label_id, message_id, labeled)]
     )
 
 
@@ -293,12 +271,8 @@ def _new_label_edit_mutation(label_id: str, label_name: str, label_color: int, d
         index=[INDEX_LABEL_EDIT, label_id],
         version=3,
         value=WASyncAction_pb2.SyncActionValue(
-            labelEditAction=WASyncAction_pb2.LabelEditAction(
-                name=label_name,
-                color=label_color,
-                deleted=deleted
-            )
-        )
+            labelEditAction=WASyncAction_pb2.LabelEditAction(name=label_name, color=label_color, deleted=deleted)
+        ),
     )
 
 
@@ -316,10 +290,7 @@ def build_label_edit(label_id: str, label_name: str, label_color: int, deleted: 
         A PatchInfo object containing the mutation
     """
     return PatchInfo(
-        type=WAPatchName.REGULAR,
-        mutations=[
-            _new_label_edit_mutation(label_id, label_name, label_color, deleted)
-        ]
+        type=WAPatchName.REGULAR, mutations=[_new_label_edit_mutation(label_id, label_name, label_color, deleted)]
     )
 
 
@@ -336,11 +307,7 @@ def _new_setting_push_name_mutation(push_name: str) -> MutationInfo:
     return MutationInfo(
         index=[INDEX_SETTING_PUSH_NAME],
         version=1,
-        value=WASyncAction_pb2.SyncActionValue(
-            pushNameSetting=WASyncAction_pb2.PushNameSetting(
-                name=push_name
-            )
-        )
+        value=WASyncAction_pb2.SyncActionValue(pushNameSetting=WASyncAction_pb2.PushNameSetting(name=push_name)),
     )
 
 
@@ -354,12 +321,7 @@ def build_setting_push_name(push_name: str) -> PatchInfo:
     Returns:
         A PatchInfo object containing the mutation
     """
-    return PatchInfo(
-        type=WAPatchName.CRITICAL_BLOCK,
-        mutations=[
-            _new_setting_push_name_mutation(push_name)
-        ]
-    )
+    return PatchInfo(type=WAPatchName.CRITICAL_BLOCK, mutations=[_new_setting_push_name_mutation(push_name)])
 
 
 def _new_star_mutation(target_jid: str, sender_jid: str, message_id: str, from_me: str, starred: bool) -> MutationInfo:
@@ -379,11 +341,7 @@ def _new_star_mutation(target_jid: str, sender_jid: str, message_id: str, from_m
     return MutationInfo(
         index=[INDEX_STAR, target_jid, message_id, from_me, sender_jid],
         version=2,
-        value=WASyncAction_pb2.SyncActionValue(
-            starAction=WASyncAction_pb2.StarAction(
-                starred=starred
-            )
-        )
+        value=WASyncAction_pb2.SyncActionValue(starAction=WASyncAction_pb2.StarAction(starred=starred)),
     )
 
 
@@ -409,9 +367,7 @@ def build_star(target: jid.JID, sender: jid.JID, message_id: str, from_me: bool,
 
     return PatchInfo(
         type=WAPatchName.REGULAR_HIGH,
-        mutations=[
-            _new_star_mutation(target_jid, sender_jid, message_id, is_from_me, starred)
-        ]
+        mutations=[_new_star_mutation(target_jid, sender_jid, message_id, is_from_me, starred)],
     )
 
 
@@ -440,13 +396,10 @@ async def encode_patch(processor: Processor, key_id: bytes, state: HashState, pa
     for mutation_info in patch_info.mutations:
         mutation_info.value.timestamp = int(patch_info.timestamp * 1000)
 
-        index_bytes = json.dumps(mutation_info.index).encode('utf-8')
+        index_bytes = json.dumps(mutation_info.index).encode("utf-8")
 
         pb_obj = WASyncAction_pb2.SyncActionData(
-            index=index_bytes,
-            value=mutation_info.value,
-            padding=b'',
-            version=mutation_info.version
+            index=index_bytes, value=mutation_info.value, padding=b"", version=mutation_info.version
         )
 
         content = pb_obj.SerializeToString()
@@ -457,26 +410,24 @@ async def encode_patch(processor: Processor, key_id: bytes, state: HashState, pa
         encrypted_content = iv + encrypted_content
 
         value_mac = generate_content_mac(
-            WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
-            encrypted_content,
-            key_id,
-            keys.value_mac
+            WAServerSync_pb2.SyncdMutation.SyncdOperation.SET, encrypted_content, key_id, keys.value_mac
         )
 
         index_mac = concat_and_hmac(hashlib.sha256, keys.index, [index_bytes])
 
-        mutations.append(WAServerSync_pb2.SyncdMutation(
-            operation=WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
-            record=WAServerSync_pb2.SyncdRecord(
-                index=WAServerSync_pb2.SyncdIndex(blob=index_mac),
-                value=WAServerSync_pb2.SyncdValue(blob=encrypted_content + value_mac),
-                keyID=WAServerSync_pb2.KeyId(ID=key_id)
+        mutations.append(
+            WAServerSync_pb2.SyncdMutation(
+                operation=WAServerSync_pb2.SyncdMutation.SyncdOperation.SET,
+                record=WAServerSync_pb2.SyncdRecord(
+                    index=WAServerSync_pb2.SyncdIndex(blob=index_mac),
+                    value=WAServerSync_pb2.SyncdValue(blob=encrypted_content + value_mac),
+                    keyID=WAServerSync_pb2.KeyId(ID=key_id),
+                ),
             )
-        ))
+        )
 
     async def get_prev_set_value_mac(index_mac: bytes, max_index: int) -> Optional[bytes]:
         return await processor.store.app_state.get_app_state_mutation_mac(str(patch_info.type), index_mac)
-
 
     warnings = state.update_hash(mutations, get_prev_set_value_mac)
     if warnings:
@@ -487,7 +438,7 @@ async def encode_patch(processor: Processor, key_id: bytes, state: HashState, pa
     syncd_patch = WAServerSync_pb2.SyncdPatch(
         snapshotMAC=state.generate_snapshot_mac(patch_info.type, keys.snapshot_mac),
         keyID=WAServerSync_pb2.KeyId(ID=key_id),
-        mutations=mutations
+        mutations=mutations,
     )
 
     syncd_patch.patchMAC = generate_patch_mac(syncd_patch, patch_info.type, keys.patch_mac, state.version)

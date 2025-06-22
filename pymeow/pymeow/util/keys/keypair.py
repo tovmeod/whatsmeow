@@ -3,6 +3,7 @@ Utility module for elliptic curve keypairs.
 
 Port of whatsmeow/util/keys/keypair.go
 """
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -16,11 +17,12 @@ class KeyPair:
 
     This class represents a keypair for use with curve25519.
     """
+
     pub: bytes
     priv: Optional[bytes] = None  # Allow None for public-key-only instances
 
     @classmethod
-    def generate(cls) -> 'KeyPair':
+    def generate(cls) -> "KeyPair":
         """
         Generate a new random KeyPair.
 
@@ -49,7 +51,7 @@ class KeyPair:
         return cls(pub=pub, priv=priv)
 
     @classmethod
-    def from_private_key(cls, priv: bytes) -> 'KeyPair':
+    def from_private_key(cls, priv: bytes) -> "KeyPair":
         """
         Create a new KeyPair from a private key.
 
@@ -81,15 +83,12 @@ class KeyPair:
             x25519_priv = x25519.X25519PrivateKey.from_private_bytes(priv)
             x25519_pub = x25519_priv.public_key()
 
-            pub = x25519_pub.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            )
+            pub = x25519_pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
 
             return cls(pub=pub, priv=priv)
 
     @classmethod
-    def from_public_key(cls, pub: bytes) -> 'KeyPair':
+    def from_public_key(cls, pub: bytes) -> "KeyPair":
         """
         Create a new KeyPair from only a public key.
 
@@ -101,7 +100,7 @@ class KeyPair:
         """
         return cls(pub=pub, priv=None)
 
-    def create_signed_pre_key(self, key_id: int) -> 'PreKey':
+    def create_signed_pre_key(self, key_id: int) -> "PreKey":
         """
         Create a signed pre-key from this keypair.
 
@@ -122,7 +121,7 @@ class KeyPair:
         new_key.signature = self.sign(new_key.key_pair)
         return new_key
 
-    def sign(self, key_to_sign: 'KeyPair') -> bytes:
+    def sign(self, key_to_sign: "KeyPair") -> bytes:
         """
         Sign another keypair with this keypair.
 
@@ -160,7 +159,7 @@ class KeyPair:
 
             # Pad to 64 bytes if needed
             if len(signature) < 64:
-                signature += b'\x00' * (64 - len(signature))
+                signature += b"\x00" * (64 - len(signature))
 
             return signature[:64]
 
@@ -172,6 +171,7 @@ class PreKey:
 
     This matches the Go implementation where PreKey embeds KeyPair.
     """
+
     key_pair: KeyPair
     key_id: int
     signature: Optional[bytes] = None
@@ -187,7 +187,7 @@ class PreKey:
         return self.key_pair.priv
 
     @classmethod
-    def generate(cls, key_id: int) -> 'PreKey':
+    def generate(cls, key_id: int) -> "PreKey":
         """
         Generate a new random PreKey with the given ID.
 
@@ -197,7 +197,4 @@ class PreKey:
         Returns:
             A new PreKey instance
         """
-        return cls(
-            key_pair=KeyPair.generate(),
-            key_id=key_id
-        )
+        return cls(key_pair=KeyPair.generate(), key_id=key_id)

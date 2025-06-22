@@ -9,6 +9,7 @@ in the Python implementation. These dataclasses are also defined in events.py
 for compatibility with the Go implementation's event system, but are included here
 for direct use when working with presence-related functionality.
 """
+
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -17,24 +18,28 @@ from typing import Optional
 
 class Presence(str, Enum):
     """User presence status."""
+
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
 
 
 class ChatPresence(str, Enum):
     """Chat presence/typing status."""
+
     COMPOSING = "composing"
     PAUSED = "paused"
 
 
 class ChatPresenceMedia(str, Enum):
     """Media type for chat presence (e.g., when recording audio)."""
+
     TEXT = ""
     AUDIO = "audio"
 
 
 class ReceiptType(str, Enum):
     """Type of receipt event."""
+
     # Message was delivered to the device (but the user might not have noticed)
     DELIVERED = ""
     # Sent by your other devices when a message you sent is delivered to them
@@ -92,6 +97,7 @@ class PresenceEvent:
         unavailable: Whether the user is now unavailable/offline
         last_seen: When the user was last seen online (if available)
     """
+
     from_jid: str
     unavailable: bool
     last_seen: Optional[datetime] = None
@@ -120,6 +126,7 @@ class ChatPresenceEvent:
         state: The new chat presence state
         media: The type of media being composed (if any)
     """
+
     from_jid: str
     to_jid: str
     state: ChatPresence

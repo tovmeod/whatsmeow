@@ -32,6 +32,7 @@ XML_STREAM_END_NODE = Node(tag="xmlstreamend")
 
 class InfoQueryType(Enum):
     """Type of info query."""
+
     SET = "set"
     GET = "get"
 
@@ -43,6 +44,7 @@ class InfoQuery:
 
     This is the Python equivalent of the Go infoQuery struct.
     """
+
     namespace: str
     type: InfoQueryType
     to: Optional[JID] = None
@@ -53,7 +55,7 @@ class InfoQuery:
     no_retry: bool = False
 
 
-def generate_request_id(client: 'Client') -> MessageID:
+def generate_request_id(client: "Client") -> MessageID:
     """
     Generate a unique request ID.
 
@@ -104,7 +106,7 @@ def is_auth_error_disconnect(node: Node) -> bool:
     return code == "401" or conflict_type == "replaced" or conflict_type == "device_removed"
 
 
-async def clear_response_waiters(client: 'Client', node: Node) -> None:
+async def clear_response_waiters(client: "Client", node: Node) -> None:
     """
     Clear all response waiters with the given node.
 
@@ -121,7 +123,7 @@ async def clear_response_waiters(client: 'Client', node: Node) -> None:
         client.response_waiters.clear()
 
 
-async def wait_response(client: 'Client', req_id: str) -> asyncio.Queue[Node]:
+async def wait_response(client: "Client", req_id: str) -> asyncio.Queue[Node]:
     """
     Create a queue to wait for a response with the given request ID.
 
@@ -138,7 +140,7 @@ async def wait_response(client: 'Client', req_id: str) -> asyncio.Queue[Node]:
     return queue
 
 
-async def cancel_response(client: 'Client', req_id: MessageID, queue: asyncio.Queue) -> None:
+async def cancel_response(client: "Client", req_id: MessageID, queue: asyncio.Queue) -> None:
     """
     Cancel waiting for a response.
 
@@ -152,7 +154,7 @@ async def cancel_response(client: 'Client', req_id: MessageID, queue: asyncio.Qu
     # Note: asyncio.Queue doesn't need explicit closing
 
 
-async def receive_response(client: 'Client', data: Node) -> bool:
+async def receive_response(client: "Client", data: Node) -> bool:
     """
     Handle a received response node.
 
@@ -181,7 +183,7 @@ async def receive_response(client: 'Client', data: Node) -> bool:
     return True
 
 
-async def send_iq_async_and_get_data(client: 'Client', query: InfoQuery) -> Tuple[asyncio.Queue[Node], bytes]:
+async def send_iq_async_and_get_data(client: "Client", query: InfoQuery) -> Tuple[asyncio.Queue[Node], bytes]:
     """
     Send an info query asynchronously and return the response queue and raw data.
 
@@ -214,11 +216,7 @@ async def send_iq_async_and_get_data(client: 'Client', query: InfoQuery) -> Tupl
     if query.target and not query.target.is_empty():
         attrs["target"] = str(query.target)
 
-    node = Node(
-        tag="iq",
-        attrs=attrs,
-        content=query.content
-    )
+    node = Node(tag="iq", attrs=attrs, content=query.content)
 
     try:
         data = await client.send_node_and_get_data(node)
@@ -228,7 +226,7 @@ async def send_iq_async_and_get_data(client: 'Client', query: InfoQuery) -> Tupl
         raise
 
 
-async def send_iq_async(client: 'Client', query: InfoQuery) -> asyncio.Queue[Node]:
+async def send_iq_async(client: "Client", query: InfoQuery) -> asyncio.Queue[Node]:
     """
     Send an info query asynchronously.
 
@@ -243,7 +241,7 @@ async def send_iq_async(client: 'Client', query: InfoQuery) -> asyncio.Queue[Nod
     return queue
 
 
-async def send_iq(client: 'Client', query: InfoQuery) -> Node:
+async def send_iq(client: "Client", query: InfoQuery) -> Node:
     """
     Send an info query and wait for the response.
 
@@ -288,7 +286,9 @@ async def send_iq(client: 'Client', query: InfoQuery) -> Node:
         raise
 
 
-async def retry_frame(client: 'Client', req_type: str, req_id: MessageID, data: bytes, orig_resp: Node, timeout_seconds: float) -> Node:
+async def retry_frame(
+    client: "Client", req_type: str, req_id: MessageID, data: bytes, orig_resp: Node, timeout_seconds: float
+) -> Node:
     """
     Retry sending a frame after a disconnection.
 
@@ -309,12 +309,16 @@ async def retry_frame(client: 'Client', req_type: str, req_id: MessageID, data: 
         ErrNotConnected: If not connected
     """
     if is_auth_error_disconnect(orig_resp):
-        logger.debug(f"{req_id} ({req_type}) was interrupted by websocket disconnection "
-                        f"({orig_resp.xml_string()}), not retrying as it looks like an auth error")
+        logger.debug(
+            f"{req_id} ({req_type}) was interrupted by websocket disconnection "
+            f"({orig_resp.xml_string()}), not retrying as it looks like an auth error"
+        )
         raise DisconnectedError(orig_resp, req_type)
 
-    logger.debug(f"{req_id} ({req_type}) was interrupted by websocket disconnection "
-                    f"({orig_resp.xml_string()}), waiting for reconnect to retry...")
+    logger.debug(
+        f"{req_id} ({req_type}) was interrupted by websocket disconnection "
+        f"({orig_resp.xml_string()}), waiting for reconnect to retry..."
+    )
 
     if not await client.wait_for_connection(5.0):
         logger.debug(f"Websocket didn't reconnect within 5 seconds of failed {req_type} ({req_id})")
@@ -346,8 +350,10 @@ async def retry_frame(client: 'Client', req_type: str, req_id: MessageID, data: 
         raise
 
     if is_disconnect_node(resp):
-        logger.debug(f"Retrying {req_type} {req_id} was interrupted by websocket disconnection "
-                        f"({resp.xml_string()}), not retrying anymore")
+        logger.debug(
+            f"Retrying {req_type} {req_id} was interrupted by websocket disconnection "
+            f"({resp.xml_string()}), not retrying anymore"
+        )
         raise DisconnectedError(resp, f"{req_type} (retry)")
 
     return resp

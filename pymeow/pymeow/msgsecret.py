@@ -1,4 +1,3 @@
-
 # Copyright (c) 2022 Tulir Asokan
 #
 # This Source Code Form is subject to the terms of the Mozilla Public
@@ -61,38 +60,39 @@ class MessageEncryptedSecret(ABC):
 
 def apply_bot_message_hkdf(message_secret: bytes) -> bytes:
     """Apply HKDF for bot message encryption."""
-    return hkdf.sha256(message_secret, b'', ENC_SECRET_BOT_MSG.encode('utf-8'), 32)
+    return hkdf.sha256(message_secret, b"", ENC_SECRET_BOT_MSG.encode("utf-8"), 32)
 
 
 def generate_msg_secret_key(
     modification_type: str,
-    modification_sender: 'JID',
+    modification_sender: "JID",
     orig_msg_id: MessageID,
-    orig_msg_sender: 'JID',
-    orig_msg_secret: bytes
+    orig_msg_sender: "JID",
+    orig_msg_secret: bytes,
 ) -> Tuple[bytes, Optional[bytes]]:
     """Generate message secret key for encryption/decryption."""
     orig_msg_sender_str = str(orig_msg_sender.to_non_ad())
     modification_sender_str = str(modification_sender.to_non_ad())
 
     use_case_secret = bytearray()
-    use_case_secret.extend(orig_msg_id.encode('utf-8'))
-    use_case_secret.extend(orig_msg_sender_str.encode('utf-8'))
-    use_case_secret.extend(modification_sender_str.encode('utf-8'))
-    use_case_secret.extend(modification_type.encode('utf-8'))
+    use_case_secret.extend(orig_msg_id.encode("utf-8"))
+    use_case_secret.extend(orig_msg_sender_str.encode("utf-8"))
+    use_case_secret.extend(modification_sender_str.encode("utf-8"))
+    use_case_secret.extend(modification_type.encode("utf-8"))
 
-    secret_key = hkdf.sha256(orig_msg_secret, b'', bytes(use_case_secret), 32)
+    secret_key = hkdf.sha256(orig_msg_secret, b"", bytes(use_case_secret), 32)
 
     additional_data = None
     if modification_type in [ENC_SECRET_POLL_VOTE, ENC_SECRET_EVENT_RESPONSE, ""]:
-        additional_data = f"{orig_msg_id}\x00{modification_sender_str}".encode('utf-8')
+        additional_data = f"{orig_msg_id}\x00{modification_sender_str}".encode("utf-8")
 
     return secret_key, additional_data
 
 
-def get_orig_sender_from_key(msg: 'MessageEvent', key: WACommon_pb2.MessageKey) -> 'JID':
+def get_orig_sender_from_key(msg: "MessageEvent", key: WACommon_pb2.MessageKey) -> "JID":
     """Get original sender from message key."""
     from .datatypes import JID
+
     if key.fromMe:
         # fromMe always means the poll and vote were sent by the same user
         # TODO this is wrong if the message key used @s.whatsapp.net, but the new event is from @lid
@@ -111,15 +111,11 @@ def get_orig_sender_from_key(msg: 'MessageEvent', key: WACommon_pb2.MessageKey) 
         return sender
 
 
-def get_key_from_info(msg_info: 'MessageInfo') -> Dict[str, Any]:
+def get_key_from_info(msg_info: "MessageInfo") -> Dict[str, Any]:
     """Create message key from message info."""
-    creation_key = {
-        'remote_jid': str(msg_info.chat),
-        'from_me': msg_info.is_from_me,
-        'id': msg_info.id
-    }
+    creation_key = {"remote_jid": str(msg_info.chat), "from_me": msg_info.is_from_me, "id": msg_info.id}
     if msg_info.message_source.is_group:
-        creation_key['participant'] = str(msg_info.sender)
+        creation_key["participant"] = str(msg_info.sender)
     return creation_key
 
 
@@ -127,19 +123,20 @@ def hash_poll_options(option_names: List[str]) -> List[bytes]:
     """Hash poll option names using SHA-256 for voting."""
     option_hashes = []
     for option in option_names:
-        option_hash = hashlib.sha256(option.encode('utf-8')).digest()
+        option_hash = hashlib.sha256(option.encode("utf-8")).digest()
         option_hashes.append(option_hash)
     return option_hashes
 
 
 # The following methods would be added to the main Client class in client.py:
 
+
 async def decrypt_msg_secret(
-    client: 'Client',
-    msg: 'MessageEvent',
+    client: "Client",
+    msg: "MessageEvent",
     use_case: str,
     encrypted: MessageEncryptedSecret,
-    orig_msg_key: WACommon_pb2.MessageKey
+    orig_msg_key: WACommon_pb2.MessageKey,
 ) -> bytes:
     """Decrypt a message secret."""
     if client is None:
@@ -147,22 +144,17 @@ async def decrypt_msg_secret(
 
     orig_sender = get_orig_sender_from_key(msg, orig_msg_key)
 
-    base_enc_key = await client.store.msg_secrets.get_message_secret(
-        msg.info.chat, orig_sender, orig_msg_key.ID
-    )
+    base_enc_key = await client.store.msg_secrets.get_message_secret(msg.info.chat, orig_sender, orig_msg_key.ID)
 
     if base_enc_key is None:
         raise ErrOriginalMessageSecretNotFound
 
-    if (base_enc_key is None and orig_msg_key.fromMe and
-        orig_sender.server == "lid"):
+    if base_enc_key is None and orig_msg_key.fromMe and orig_sender.server == "lid":
         orig_sender = await client.store.lids.get_pn_for_lid(orig_sender)
         if orig_sender.is_empty():
             raise ErrOriginalMessageSecretNotFound("PN for LID not found")
 
-        base_enc_key = await client.store.msg_secrets.get_message_secret(
-            msg.info.chat, orig_sender, orig_msg_key.ID
-        )
+        base_enc_key = await client.store.msg_secrets.get_message_secret(msg.info.chat, orig_sender, orig_msg_key.ID)
 
         if base_enc_key is None:
             raise ErrOriginalMessageSecretNotFound
@@ -171,24 +163,19 @@ async def decrypt_msg_secret(
         use_case, msg.info.sender, MessageID(orig_msg_key.ID), orig_sender, base_enc_key
     )
 
-    plaintext = gcm.decrypt(
-        secret_key,
-        encrypted.get_enc_iv(),
-        encrypted.get_enc_payload(),
-        additional_data
-    )
+    plaintext = gcm.decrypt(secret_key, encrypted.get_enc_iv(), encrypted.get_enc_payload(), additional_data)
 
     return plaintext
 
 
 async def encrypt_msg_secret(
-    client: 'Client',
-    own_id: 'JID',
-    chat: 'JID',
-    orig_sender: 'JID',
+    client: "Client",
+    own_id: "JID",
+    chat: "JID",
+    orig_sender: "JID",
     orig_msg_id: MessageID,
     use_case: str,
-    plaintext: bytes
+    plaintext: bytes,
 ) -> Tuple[bytes, bytes]:
     """Encrypt a message secret."""
     if client is None:
@@ -197,16 +184,12 @@ async def encrypt_msg_secret(
     if own_id.is_empty():
         raise ErrNotLoggedIn()
 
-    base_enc_key = await client.store.msg_secrets.get_message_secret(
-        chat, orig_sender, orig_msg_id
-    )
+    base_enc_key = await client.store.msg_secrets.get_message_secret(chat, orig_sender, orig_msg_id)
 
     if base_enc_key is None:
         raise ErrOriginalMessageSecretNotFound
 
-    secret_key, additional_data = generate_msg_secret_key(
-        use_case, own_id, orig_msg_id, orig_sender, base_enc_key
-    )
+    secret_key, additional_data = generate_msg_secret_key(use_case, own_id, orig_msg_id, orig_sender, base_enc_key)
 
     iv = get_random_bytes(12)
     ciphertext = gcm.encrypt(secret_key, iv, plaintext, additional_data)
@@ -218,21 +201,15 @@ async def decrypt_bot_message(
     message_secret: bytes,
     ms_msg: WAWebProtobufsE2E_pb2.MessageSecretMessage,
     message_id: MessageID,
-    target_sender_jid: 'JID',
-    info: 'MessageInfo'
+    target_sender_jid: "JID",
+    info: "MessageInfo",
 ) -> bytes:
     """Decrypt a bot message."""
     new_key, additional_data = generate_msg_secret_key(
-        "", info.sender, message_id, target_sender_jid,
-        apply_bot_message_hkdf(message_secret)
+        "", info.sender, message_id, target_sender_jid, apply_bot_message_hkdf(message_secret)
     )
 
-    plaintext = gcm.decrypt(
-        new_key,
-        ms_msg.encIV,
-        ms_msg.encPayload,
-        additional_data
-    )
+    plaintext = gcm.decrypt(new_key, ms_msg.encIV, ms_msg.encPayload, additional_data)
 
     return plaintext
 
@@ -295,7 +272,7 @@ async def decrypt_bot_message(
 #     return msg
 
 
-async def build_poll_vote(client: 'Client', poll_info: Any, option_names: List[str]) -> WAWebProtobufsE2E_pb2.Message:
+async def build_poll_vote(client: "Client", poll_info: Any, option_names: List[str]) -> WAWebProtobufsE2E_pb2.Message:
     """Build a poll vote message using the given poll message info and option names."""
     from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 
@@ -310,7 +287,9 @@ async def build_poll_vote(client: 'Client', poll_info: Any, option_names: List[s
     return msg
 
 
-def build_poll_creation(name: str, option_names: List[str], selectable_option_count: int) -> WAWebProtobufsE2E_pb2.Message:
+def build_poll_creation(
+    name: str, option_names: List[str], selectable_option_count: int
+) -> WAWebProtobufsE2E_pb2.Message:
     """Build a poll creation message with the given poll name, options and maximum number of selections."""
     msg_secret = get_random_bytes(32)
     if selectable_option_count < 0 or selectable_option_count > len(option_names):
@@ -337,15 +316,16 @@ def build_poll_creation(name: str, option_names: List[str], selectable_option_co
     return msg
 
 
-async def encrypt_poll_vote(client: 'Client', poll_info: Any, vote: WAWebProtobufsE2E_pb2.PollVoteMessage) -> WAWebProtobufsE2E_pb2.PollUpdateMessage:
+async def encrypt_poll_vote(
+    client: "Client", poll_info: Any, vote: WAWebProtobufsE2E_pb2.PollVoteMessage
+) -> WAWebProtobufsE2E_pb2.PollUpdateMessage:
     """Encrypt a poll vote message."""
     from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 
     plaintext = vote.SerializeToString()
 
     ciphertext, iv = await encrypt_msg_secret(
-        client, client.get_own_id(), poll_info.chat, poll_info.sender,
-        poll_info.id, ENC_SECRET_POLL_VOTE, plaintext
+        client, client.get_own_id(), poll_info.chat, poll_info.sender, poll_info.id, ENC_SECRET_POLL_VOTE, plaintext
     )
 
     poll_enc_value = waE2E_pb2.PollEncValue()
@@ -360,7 +340,9 @@ async def encrypt_poll_vote(client: 'Client', poll_info: Any, vote: WAWebProtobu
     return poll_update
 
 
-async def encrypt_comment(client: 'Client', root_msg_info: Any, comment: WAWebProtobufsE2E_pb2.Message) -> WAWebProtobufsE2E_pb2.Message:
+async def encrypt_comment(
+    client: "Client", root_msg_info: Any, comment: WAWebProtobufsE2E_pb2.Message
+) -> WAWebProtobufsE2E_pb2.Message:
     """Encrypt a comment message."""
     from .generated.waCommon import WACommon_pb2 as waCommon_pb2
     from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
@@ -369,8 +351,13 @@ async def encrypt_comment(client: 'Client', root_msg_info: Any, comment: WAWebPr
 
     # TODO is hardcoding LID here correct? What about polls?
     ciphertext, iv = await encrypt_msg_secret(
-        client, client.get_own_lid(), root_msg_info.chat, root_msg_info.sender,
-        root_msg_info.id, ENC_SECRET_COMMENT, plaintext
+        client,
+        client.get_own_lid(),
+        root_msg_info.chat,
+        root_msg_info.sender,
+        root_msg_info.id,
+        ENC_SECRET_COMMENT,
+        plaintext,
     )
 
     target_key = waCommon_pb2.MessageKey()
@@ -390,7 +377,9 @@ async def encrypt_comment(client: 'Client', root_msg_info: Any, comment: WAWebPr
     return msg
 
 
-async def encrypt_reaction(client: 'Client', root_msg_info: Any, reaction: WAWebProtobufsE2E_pb2.ReactionMessage) -> WAWebProtobufsE2E_pb2.EncReactionMessage:
+async def encrypt_reaction(
+    client: "Client", root_msg_info: Any, reaction: WAWebProtobufsE2E_pb2.ReactionMessage
+) -> WAWebProtobufsE2E_pb2.EncReactionMessage:
     """Encrypt a reaction message."""
     from .generated.waE2E import WAWebProtobufsE2E_pb2 as waE2E_pb2
 
@@ -400,8 +389,13 @@ async def encrypt_reaction(client: 'Client', root_msg_info: Any, reaction: WAWeb
     plaintext = reaction.SerializeToString()
 
     ciphertext, iv = await encrypt_msg_secret(
-        client, client.get_own_lid(), root_msg_info.chat, root_msg_info.sender,
-        root_msg_info.id, ENC_SECRET_REACTION, plaintext
+        client,
+        client.get_own_lid(),
+        root_msg_info.chat,
+        root_msg_info.sender,
+        root_msg_info.id,
+        ENC_SECRET_REACTION,
+        plaintext,
     )
 
     enc_reaction = waE2E_pb2.EncReactionMessage()

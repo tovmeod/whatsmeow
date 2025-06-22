@@ -13,6 +13,7 @@ from .jid import JID
 @dataclass
 class BasicCallMeta:
     """Basic metadata for call events."""
+
     from_jid: JID
     timestamp: datetime
     call_creator: JID
@@ -22,5 +23,6 @@ class BasicCallMeta:
 @dataclass
 class CallRemoteMeta:
     """Remote platform metadata for call events."""
+
     remote_platform: str
     remote_version: str

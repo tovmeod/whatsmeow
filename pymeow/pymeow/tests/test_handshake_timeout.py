@@ -1,4 +1,3 @@
-
 """Test handshake timeout scenario using ws_server_vcr fixture."""
 
 import asyncio

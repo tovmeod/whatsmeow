@@ -3,6 +3,7 @@ Message types for PyMeow.
 
 Port of whatsmeow/types/message.go
 """
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -13,6 +14,7 @@ from ..datatypes.jid import JID
 
 class AddressingMode(str, Enum):
     """Addressing modes for messages."""
+
     PN = "pn"
     LID = "lid"
 
@@ -32,6 +34,7 @@ class MessageSource:
         broadcast_list_owner: When sending a read receipt to a broadcast list message, the Chat is the broadcast list
                              and Sender is you, so this field contains the recipient of the read receipt.
     """
+
     chat: JID = field(default_factory=lambda: JID(user="", server=""))
     sender: JID = field(default_factory=lambda: JID(user="", server=""))
     is_from_me: bool = False
@@ -64,12 +67,14 @@ class DeviceSentMeta:
         destination_jid: The destination user. This should match the MessageInfo.Recipient field.
         phash: The phash value.
     """
+
     destination_jid: str = ""
     phash: str = ""
 
 
 class EditAttribute(str, Enum):
     """Edit attributes for messages."""
+
     EMPTY = ""
     MESSAGE_EDIT = "1"
     PIN_IN_CHAT = "2"
@@ -80,6 +85,7 @@ class EditAttribute(str, Enum):
 
 class BotEditType(str, Enum):
     """Bot edit types for messages."""
+
     FIRST = "first"
     INNER = "inner"
     LAST = "last"
@@ -87,11 +93,13 @@ class BotEditType(str, Enum):
 
 class MessageID(str):
     """Message ID type."""
+
     pass
 
 
 class MessageServerID(int):
     """Message server ID type."""
+
     pass
 
 
@@ -104,6 +112,7 @@ class MsgBotInfo:
         edit_target_id: The target message ID for the edit.
         edit_sender_timestamp_ms: The timestamp of the edit.
     """
+
     edit_type: Optional[BotEditType] = None
     edit_target_id: Optional[MessageID] = None
     edit_sender_timestamp_ms: Optional[datetime] = None
@@ -120,6 +129,7 @@ class MsgMetaInfo:
         thread_message_id: The ID of the thread message.
         thread_message_sender_jid: The JID of the thread message sender.
     """
+
     target_id: Optional[MessageID] = None
     target_sender: JID = field(default_factory=lambda: JID(user="", server=""))
     deprecated_lid_session: Optional[bool] = None
@@ -147,6 +157,7 @@ class MessageInfo:
         verified_name: The verified name information.
         device_sent_meta: Metadata for direct messages sent from another one of the user's own devices.
     """
+
     id: MessageID
     message_source: MessageSource = field(default_factory=lambda: MessageSource())
     server_id: Optional[MessageServerID] = None

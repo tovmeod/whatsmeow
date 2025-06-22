@@ -7,6 +7,7 @@ from aiohttp import WSMsgType, web
 
 logger = logging.getLogger(__name__)
 
+
 class WebSocketProxy:
     def __init__(self, target_url):
         self.target_url = target_url
@@ -32,8 +33,7 @@ class WebSocketProxy:
 
                 # Wait for either direction to close
                 done, pending = await asyncio.wait(
-                    [client_to_server_task, server_to_client_task],
-                    return_when=asyncio.FIRST_COMPLETED
+                    [client_to_server_task, server_to_client_task], return_when=asyncio.FIRST_COMPLETED
                 )
 
                 # Cancel remaining tasks
@@ -72,10 +72,11 @@ class WebSocketProxy:
             "timestamp": asyncio.get_event_loop().time(),
             "direction": direction,  # "client_to_server" or "server_to_client"
             "type": msg_type,
-            "payload": payload
+            "payload": payload,
         }
         self.recorded_interactions.append(interaction)
         logger.debug(f"Recorded {direction} {msg_type} message")
+
 
 async def create_ws_server_from_cassette(cassette_file, port, *, record=False):
     """
@@ -109,6 +110,7 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False):
     proxy = None
     if should_record:
         from pymeow.socket.framesocket import FrameSocket
+
         target_url = FrameSocket.url
         proxy = WebSocketProxy(target_url)
         logger.info(f"Auto-detected target URL from FrameSocket: {target_url}")
@@ -146,7 +148,9 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False):
             else:
                 client_messages.append(interaction)
 
-        logger.info(f"Replaying {len(server_messages)} server messages, expecting {len(client_messages)} client messages")
+        logger.info(
+            f"Replaying {len(server_messages)} server messages, expecting {len(client_messages)} client messages"
+        )
 
         # Start background task to send server messages
         server_task = asyncio.create_task(_send_server_messages(ws, server_messages))
@@ -181,13 +185,13 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False):
             if not server_task.done():
                 try:
                     logger.debug("Waiting for server_task to complete...")
-                    await asyncio.wait_for(server_task, timeout=5.0) # Wait for task to complete
+                    await asyncio.wait_for(server_task, timeout=5.0)  # Wait for task to complete
                 except asyncio.TimeoutError:
                     logger.warning("Timeout waiting for server_task to complete, cancelling.")
                     server_task.cancel()
                 except Exception as e:
                     logger.error(f"Error awaiting server_task: {e}")
-                    server_task.cancel() # Ensure cancellation on other errors
+                    server_task.cancel()  # Ensure cancellation on other errors
             else:
                 # If task is done, retrieve exception if any to log it
                 try:
@@ -223,7 +227,7 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False):
             except ConnectionResetError:
                 logger.warning(f"Connection reset while sending server message {i}. Client likely disconnected.")
                 break
-            except Exception as e: # Broad exception to catch errors like sending on closed socket
+            except Exception as e:  # Broad exception to catch errors like sending on closed socket
                 logger.error(f"Error sending server message {i} ('{msg.get('type', 'unknown')}') type: {e}")
                 break
         logger.debug(f"Finished sending all {len(server_messages)} server messages.")

@@ -3,6 +3,7 @@ Decoder for WhatsApp binary protocol.
 
 Port of whatsmeow/binary/decoder.go
 """
+
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
@@ -15,6 +16,7 @@ from .node import Node
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class BinaryDecoder:
     """
@@ -22,11 +24,12 @@ class BinaryDecoder:
 
     This class handles decoding of WhatsApp's binary XML format into Node objects.
     """
+
     data: bytes
     index: int = 0
 
     @classmethod
-    def new_decoder(cls, data: bytes) -> 'BinaryDecoder':
+    def new_decoder(cls, data: bytes) -> "BinaryDecoder":
         """
         Create a new decoder instance.
 
@@ -288,12 +291,7 @@ class BinaryDecoder:
             raise InvalidJIDTypeError(f"expected {INTEROP_SERVER!r}, got {server!r}")
 
         assert isinstance(user, str)
-        return JID(
-            user=user,
-            device=device,
-            integrator=integrator,
-            server=INTEROP_SERVER
-        )
+        return JID(user=user, device=device, integrator=integrator, server=INTEROP_SERVER)
 
     def read_fb_jid(self) -> JID:
         """
@@ -306,18 +304,14 @@ class BinaryDecoder:
             InvalidJIDTypeError: If the JID type is invalid
         """
         user = self.read(True)
-        device= self.read_int16(False)
+        device = self.read_int16(False)
         server = self.read(True)
         if server != MESSENGER_SERVER:
             raise InvalidJIDTypeError(f"expected {MESSENGER_SERVER!r}, got {server!r}")
 
         assert isinstance(user, str)
         assert isinstance(server, str)
-        return JID(
-            user=user,
-            device=device,
-            server=server
-        )
+        return JID(user=user, device=device, server=server)
 
     def read_ad_jid(self) -> JID:
         """
@@ -419,7 +413,7 @@ class BinaryDecoder:
                 # If it's not bytes or list, it shouldn't be used as content
                 # The Go implementation would handle this differently, but for safety we'll convert
                 if isinstance(raw_content, str):
-                    content = raw_content.encode('utf-8')
+                    content = raw_content.encode("utf-8")
                 else:
                     raise InvalidNodeError(f"Invalid content type: {type(raw_content)}")
 
@@ -440,7 +434,7 @@ class BinaryDecoder:
         """
         data = self.read_raw(length)
         if as_string:
-            return data.decode('utf-8', errors='replace')
+            return data.decode("utf-8", errors="replace")
         return data
 
     def read_raw(self, length: int) -> bytes:
@@ -456,7 +450,7 @@ class BinaryDecoder:
             EOFError: If reading would go beyond the end of the data
         """
         self.check_eos(length)
-        ret = self.data[self.index:self.index + length]
+        ret = self.data[self.index : self.index + length]
         self.index += length
         return ret
 
@@ -495,11 +489,11 @@ def unpack_nibble(value: int) -> int:
         InvalidTypeError: If the value is invalid
     """
     if value < 10:
-        return ord('0') + value
+        return ord("0") + value
     elif value == 10:
-        return ord('-')
+        return ord("-")
     elif value == 11:
-        return ord('.')
+        return ord(".")
     elif value == 15:
         return 0
     else:
@@ -519,15 +513,18 @@ def unpack_hex(value: int) -> int:
         InvalidTypeError:
     """
     if value < 10:
-        return ord('0') + value
+        return ord("0") + value
     elif value < 16:
-        return ord('A') + value - 10
+        return ord("A") + value - 10
     else:
         raise InvalidTypeError(f"unpackHex with value {value}")
 
+
 class DecodingError(PymeowError):
     """Error that occurs during binary decoding operations."""
+
     pass
+
 
 def unmarshal(data: bytes) -> Node:
     """

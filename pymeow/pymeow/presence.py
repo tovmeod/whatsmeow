@@ -3,6 +3,7 @@ Presence handling for WhatsApp.
 
 Port of whatsmeow/presence.go
 """
+
 import logging
 import typing
 from typing import Optional
@@ -20,7 +21,7 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def handle_chat_state(client: 'Client', node: Node) -> None:
+async def handle_chat_state(client: "Client", node: Node) -> None:
     """
     Handle a chat state update (typing notification).
 
@@ -36,7 +37,9 @@ async def handle_chat_state(client: 'Client', node: Node) -> None:
 
         children = node.get_children()
         if len(children) != 1:
-            logger.warning(f"Failed to parse chat state update: unexpected number of children in element ({len(children)})")
+            logger.warning(
+                f"Failed to parse chat state update: unexpected number of children in element ({len(children)})"
+            )
             return
 
         child = children[0]
@@ -49,16 +52,12 @@ async def handle_chat_state(client: 'Client', node: Node) -> None:
         ag = child.attr_getter()
         media = ChatPresenceMedia(ag.optional_string("media") or "")
 
-        await client.dispatch_event(ChatPresenceEvent(
-            message_source=source,
-            state=presence,
-            media=media
-        ))
+        await client.dispatch_event(ChatPresenceEvent(message_source=source, state=presence, media=media))
     except Exception as e:
         logger.error(f"Error handling chat state: {e}")
 
 
-async def handle_presence(client: 'Client', node: Node) -> None:
+async def handle_presence(client: "Client", node: Node) -> None:
     """
     Handle a presence update.
 
@@ -70,11 +69,7 @@ async def handle_presence(client: 'Client', node: Node) -> None:
         ag = node.attr_getter()
         from_jid = ag.jid("from")
 
-        evt = PresenceEvent(
-            from_jid=from_jid,
-            unavailable=False,
-            last_seen=None
-        )
+        evt = PresenceEvent(from_jid=from_jid, unavailable=False, last_seen=None)
 
         presence_type = ag.optional_string("type")
         if presence_type == "unavailable":
@@ -94,7 +89,7 @@ async def handle_presence(client: 'Client', node: Node) -> None:
         logger.error(f"Error handling presence: {e}")
 
 
-async def send_presence(client: 'Client', state: Presence) -> None:
+async def send_presence(client: "Client", state: Presence) -> None:
     """
     Update the user's presence status on WhatsApp.
 
@@ -120,17 +115,10 @@ async def send_presence(client: 'Client', state: Presence) -> None:
         if client.send_active_receipts == 1:
             client.send_active_receipts = 0
 
-    await client.send_node(Node(
-        tag="presence",
-        attrs=Attrs({
-            "name": client.store.push_name,
-            "type": str(state)
-        })
-    ))
+    await client.send_node(Node(tag="presence", attrs=Attrs({"name": client.store.push_name, "type": str(state)})))
 
 
-
-async def subscribe_presence(client: 'Client', jid: JID) -> None:
+async def subscribe_presence(client: "Client", jid: JID) -> None:
     """
     Ask the WhatsApp servers to send presence updates of a specific user to this client.
 
@@ -157,24 +145,17 @@ async def subscribe_presence(client: 'Client', jid: JID) -> None:
         else:
             logger.debug(f"Trying to subscribe to presence of {jid} without privacy token")
 
-    req = Node(
-        tag="presence",
-        attrs=Attrs({
-            "type": "subscribe",
-            "to": str(jid)
-        })
-    )
+    req = Node(tag="presence", attrs=Attrs({"type": "subscribe", "to": str(jid)}))
 
     if privacy_token is not None:
-        req.content = [Node(
-            tag="tctoken",
-            content=privacy_token.token
-        )]
+        req.content = [Node(tag="tctoken", content=privacy_token.token)]
 
     await client.send_node(req)
 
 
-async def send_chat_presence(client: 'Client', jid: JID, state: ChatPresence, media: Optional[ChatPresenceMedia] = None) -> None:
+async def send_chat_presence(
+    client: "Client", jid: JID, state: ChatPresence, media: Optional[ChatPresenceMedia] = None
+) -> None:
     """
     Update the user's typing status in a specific chat.
 
@@ -197,15 +178,6 @@ async def send_chat_presence(client: 'Client', jid: JID, state: ChatPresence, me
     content = [Node(tag=str(state))]
 
     if state == ChatPresence.COMPOSING and media and len(str(media)) > 0:
-        content[0].attrs = Attrs({
-            "media": str(media)
-        })
+        content[0].attrs = Attrs({"media": str(media)})
 
-    await client.send_node(Node(
-        tag="chatstate",
-        attrs=Attrs({
-            "from": str(own_id),
-            "to": str(jid)
-        }),
-        content=content
-    ))
+    await client.send_node(Node(tag="chatstate", attrs=Attrs({"from": str(own_id), "to": str(jid)}), content=content))

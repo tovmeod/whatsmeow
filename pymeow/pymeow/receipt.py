@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def handle_receipt(client: 'Client', node: 'Node') -> None:
+async def handle_receipt(client: "Client", node: "Node") -> None:
     """
     Port of Go method handleReceipt from receipt.go.
 
@@ -40,6 +40,7 @@ async def handle_receipt(client: 'Client', node: 'Node') -> None:
     # TODO: Review handle_retry_receipt implementation
     # TODO: Review dispatch_event implementation
     from .datatypes import ReceiptType
+
     try:
         receipt, err = await parse_receipt(client, node)
         if err is not None:
@@ -64,7 +65,7 @@ async def handle_receipt(client: 'Client', node: 'Node') -> None:
         client.create_task(send_ack(client, node))
 
 
-async def handle_grouped_receipt(client: 'Client', partial_receipt: 'Receipt', participants: 'Node') -> None:
+async def handle_grouped_receipt(client: "Client", partial_receipt: "Receipt", participants: "Node") -> None:
     """
     Port of Go method handleGroupedReceipt from receipt.go.
 
@@ -101,7 +102,7 @@ async def handle_grouped_receipt(client: 'Client', partial_receipt: 'Receipt', p
         await client.dispatch_event(receipt)
 
 
-async def parse_receipt(client: 'Client', node: 'Node') -> Tuple[Optional['Receipt'], Optional[Exception]]:
+async def parse_receipt(client: "Client", node: "Node") -> Tuple[Optional["Receipt"], Optional[Exception]]:
     """
     Port of Go method parseReceipt from receipt.go.
 
@@ -122,13 +123,14 @@ async def parse_receipt(client: 'Client', node: 'Node') -> Tuple[Optional['Recei
     # TODO: Review handle_grouped_receipt implementation
     from .datatypes import ReceiptType
     from .datatypes.events import Receipt
+
     ag = node.attr_getter()
     source = await message.parse_message_source(client, node, False)
     receipt = Receipt(
         message_source=source,
         timestamp=ag.unix_time("t"),
         type=ReceiptType(ag.optional_string("type")),
-        message_sender=ag.optional_jid_or_empty("recipient")
+        message_sender=ag.optional_jid_or_empty("recipient"),
     )
 
     if source.is_group and source.sender.is_empty():
@@ -184,7 +186,7 @@ async def parse_receipt(client: 'Client', node: 'Node') -> Tuple[Optional['Recei
 #         return lambda: None
 
 
-async def send_ack(client: 'Client', node: 'Node') -> None:
+async def send_ack(client: "Client", node: "Node") -> None:
     """
     Port of Go method sendAck from receipt.go.
 
@@ -200,10 +202,13 @@ async def send_ack(client: 'Client', node: 'Node') -> None:
     # TODO: Review BotServer constant
     # TODO: Review BotJIDMap implementation
     from .binary.node import Attrs, Node
-    attrs = Attrs({
-        "class": node.tag,
-        "id": node.attrs["id"],
-    })
+
+    attrs = Attrs(
+        {
+            "class": node.tag,
+            "id": node.attrs["id"],
+        }
+    )
 
     attrs["to"] = node.attrs["from"]
 
@@ -222,19 +227,16 @@ async def send_ack(client: 'Client', node: 'Node') -> None:
     if node.tag != "message" and "type" in node.attrs:
         attrs["type"] = node.attrs["type"]
 
-    await client.send_node(Node(
-        tag="ack",
-        attrs=attrs
-    ))
+    await client.send_node(Node(tag="ack", attrs=attrs))
 
 
 async def mark_read(
-    client: 'Client',
+    client: "Client",
     ids: List[MessageID],
     timestamp: datetime,
     chat: JID,
     sender: JID,
-    *receipt_type_extra: 'ReceiptType'
+    *receipt_type_extra: "ReceiptType",
 ) -> None:
     """
     Port of Go method MarkRead from receipt.go.
@@ -269,6 +271,7 @@ async def mark_read(
     # TODO: Review send_node implementation
     from .binary.node import Attrs, Node
     from .datatypes import ReceiptType
+
     if len(ids) == 0:
         raise Exception("no message IDs specified")
 
@@ -280,24 +283,30 @@ async def mark_read(
 
     node = Node(
         tag="receipt",
-        attrs=Attrs({
-            "id": ids[0],
-            "type": str(receipt_type),
-            "to": chat,
-            "t": int(timestamp.timestamp()),
-        })
+        attrs=Attrs(
+            {
+                "id": ids[0],
+                "type": str(receipt_type),
+                "to": chat,
+                "t": int(timestamp.timestamp()),
+            }
+        ),
     )
 
-    if (chat.server == NEWSLETTER_SERVER or
-        (await privacysettings.get_privacy_settings(client)).read_receipts == privacysettings.PrivacySetting.NONE):
+    if (
+        chat.server == NEWSLETTER_SERVER
+        or (await privacysettings.get_privacy_settings(client)).read_receipts == privacysettings.PrivacySetting.NONE
+    ):
         if receipt_type == ReceiptTypeRead:
             node.attrs["type"] = str(ReceiptType.READ_SELF)
             # TODO change played to played-self?
 
-    if (not sender.is_empty() and
-        chat.server != DEFAULT_USER_SERVER and
-        chat.server != HIDDEN_USER_SERVER and
-        chat.server != MESSENGER_SERVER):
+    if (
+        not sender.is_empty()
+        and chat.server != DEFAULT_USER_SERVER
+        and chat.server != HIDDEN_USER_SERVER
+        and chat.server != MESSENGER_SERVER
+    ):
         node.attrs["participant"] = sender.to_non_ad()
 
     if len(ids) > 1:
@@ -306,18 +315,12 @@ async def mark_read(
             child_node = Node(tag="item", attrs=Attrs({"id": ids[i]}))
             children.append(child_node)
 
-        node.content = [Node(
-            tag="list",
-            content=children
-        )]
+        node.content = [Node(tag="list", content=children)]
 
     await client.send_node(node)
 
 
-def set_force_active_delivery_receipts(
-    client: 'Client',
-    active: bool
-) -> None:
+def set_force_active_delivery_receipts(client: "Client", active: bool) -> None:
     """
     Port of Go method SetForceActiveDeliveryReceipts from receipts.go.
 
@@ -353,10 +356,7 @@ def set_force_active_delivery_receipts(
         client.send_active_receipts = 0
 
 
-async def send_message_receipt(
-    client: 'Client',
-    info: MessageInfo
-) -> None:
+async def send_message_receipt(client: "Client", info: MessageInfo) -> None:
     """
     Port of Go method sendMessageReceipt from receipts.go.
 
@@ -377,9 +377,12 @@ async def send_message_receipt(
     # TODO: Review Node implementation
     from .binary.node import Attrs, Node
     from .datatypes import ReceiptType
-    attrs = Attrs({
-        "id": info.id,
-    })
+
+    attrs = Attrs(
+        {
+            "id": info.id,
+        }
+    )
 
     if info.is_from_me:
         attrs["type"] = str(ReceiptType.SENDER)
@@ -396,7 +399,4 @@ async def send_message_receipt(
         # Override the to attribute with the JID version with a device number
         attrs["to"] = info.sender
 
-    await client.send_node(Node(
-        tag="receipt",
-        attrs=attrs
-    ))
+    await client.send_node(Node(tag="receipt", attrs=attrs))

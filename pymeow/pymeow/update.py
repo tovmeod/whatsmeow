@@ -3,6 +3,7 @@ Update handling for WhatsApp.
 
 Port of whatsmeow/update.go
 """
+
 import re
 from typing import Optional
 
@@ -14,9 +15,8 @@ from .store.clientpayload import WAVersionContainer
 # Regex to extract client revision from web.whatsapp.com
 client_version_regex = re.compile(r'"client_revision":(\d+),')
 
-async def get_latest_version(
-    http_client: Optional[aiohttp.ClientSession] = None
-) -> Optional[WAVersionContainer]:
+
+async def get_latest_version(http_client: Optional[aiohttp.ClientSession] = None) -> Optional[WAVersionContainer]:
     """
     Returns the latest version number from web.whatsapp.com.
 
@@ -50,7 +50,7 @@ async def get_latest_version(
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language": "en-US,en;q=0.9"
+            "Accept-Language": "en-US,en;q=0.9",
         }
 
         async with http_client.get(constants.ORIGIN, headers=headers) as resp:

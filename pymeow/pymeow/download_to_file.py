@@ -7,11 +7,9 @@ from .download import DownloadableMessage, download
 if typing.TYPE_CHECKING:
     from .client import Client
 
+
 async def download_to_file(
-    client: 'Client',
-    msg: DownloadableMessage,
-    file_path: Union[str, Path],
-    decrypt: bool = True
+    client: "Client", msg: DownloadableMessage, file_path: Union[str, Path], decrypt: bool = True
 ) -> None:
     """Download media to a file.
 

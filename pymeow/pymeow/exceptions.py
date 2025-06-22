@@ -4,31 +4,37 @@ Exceptions and error handling for the PyMeow WhatsApp Web client.
 This module defines custom exceptions used throughout the library.
 Port of whatsmeow/errors.go
 """
+
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .binary.node import Node
     from .datatypes import JID
 
+
 class PymeowError(Exception):
     """Base exception for all PyMeow errors."""
+
     pass
 
 
 # Protocol-related errors
 class ProtocolError(PymeowError):
     """Base class for protocol-related errors."""
+
     pass
 
 
 class AuthenticationError(PymeowError):
     """Base class for authentication-related errors."""
+
     pass
 
 
 # Pre-key related errors
 class PreKeyError(PymeowError):
     """Raised when there's an error with pre-key operations."""
+
     pass
 
 
@@ -127,7 +133,7 @@ class NoPrivacyTokenError(PymeowError):
     Port of Go's ErrNoPrivacyToken: "no privacy token stored"
     """
 
-    def __init__(self, jid: 'JID') -> None:
+    def __init__(self, jid: "JID") -> None:
         super().__init__(f"no privacy token stored for {jid}")
 
 
@@ -181,6 +187,7 @@ class PairDatabaseError(PymeowError):
 # Profile and group errors
 class ErrProfilePictureUnauthorized(AuthenticationError):
     """Raised when not authorized to access profile picture."""
+
     def __init__(self) -> None:
         super().__init__("unauthorized to view profile picture")
 
@@ -300,6 +307,7 @@ class ErrServerReturnedError(ProtocolError):
 
 class ErrInvalidInlineBotID(PymeowError):
     """Raised when inline bot ID is invalid."""
+
     pass
 
 
@@ -415,13 +423,13 @@ class ErrNotPollUpdateMessage(PymeowError):
 class WrappedIQError(PymeowError):
     """Wrapper for IQ errors with human-readable messages."""
 
-    def __init__(self, human_error: str, iq_error: 'IQError'):
+    def __init__(self, human_error: str, iq_error: "IQError"):
         self.human_error = human_error
         self.iq_error = iq_error
         super().__init__(human_error)
 
 
-def wrap_iq_error(human_error: str, iq_error: 'IQError') -> WrappedIQError:
+def wrap_iq_error(human_error: str, iq_error: "IQError") -> WrappedIQError:
     """Wrap an IQ error with a human-readable message."""
     return WrappedIQError(human_error, iq_error)
 
@@ -429,7 +437,7 @@ def wrap_iq_error(human_error: str, iq_error: 'IQError') -> WrappedIQError:
 class IQError(ProtocolError):
     """Represents an IQ error response."""
 
-    def __init__(self, code: int, text: str, error_node: Optional['Node'], raw_node: Optional['Node']):
+    def __init__(self, code: int, text: str, error_node: Optional["Node"], raw_node: Optional["Node"]):
         self.code = code
         self.text = text
         self.error_node = error_node
@@ -461,10 +469,14 @@ class IQError(ProtocolError):
 class ErrIQNotAuthorized(IQError):
     def __init__(self) -> None:
         super().__init__(401, "not-authorized", None, None)
+
+
 # ErrIQForbidden = IQError(403, "forbidden", None, None)
 class ErrIQNotFound(IQError):
     def __init__(self) -> None:
         super().__init__(404, "not-found", None, None)
+
+
 # ErrIQNotAllowed = IQError(405, "not-allowed", None, None)
 # ErrIQNotAcceptable = IQError(406, "not-acceptable", None, None)
 # ErrIQGone = IQError(410, "gone", None, None)
@@ -476,7 +488,7 @@ class ErrIQNotFound(IQError):
 # ErrIQPartialServerError = IQError(520, "partial-server-error", None, None)
 
 
-def parse_iq_error(error_node: 'Node') -> IQError:
+def parse_iq_error(error_node: "Node") -> IQError:
     """Parse an IQ error from a node."""
     code = 500  # default to server error
     text = ""
@@ -491,9 +503,9 @@ def parse_iq_error(error_node: 'Node') -> IQError:
         text = error_node.attrs.get("text", "")
 
     # Try to get more specific error info from child nodes
-    if hasattr(error_node, 'children') and error_node.children:
+    if hasattr(error_node, "children") and error_node.children:
         for child in error_node.children:
-            if hasattr(child, 'tag'):
+            if hasattr(child, "tag"):
                 if not text:
                     text = child.tag
                 break
@@ -515,7 +527,7 @@ class ElementMissingError(ProtocolError):
 class DisconnectedError(ProtocolError):
     """Raised when connection is lost."""
 
-    def __init__(self, node: 'Node', action: str) -> None:
+    def __init__(self, node: "Node", action: str) -> None:
         self.node = node
         self.action = action
         super().__init__(f"disconnected while {action}")

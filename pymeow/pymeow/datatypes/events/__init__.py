@@ -143,5 +143,5 @@ __all__ = [
     "UndecryptableMessage",
     "UserAbout",
     "UserStatusMute",
-    "WAPatchName"
+    "WAPatchName",
 ]
