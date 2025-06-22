@@ -178,7 +178,7 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                 A `ReplayMismatchError` is raised on any deviation. If False,
                 mismatches are logged as warnings.
         """
-        logger.info(f"Starting replay of {len(interactions)} interactions (strict={strict_replay}).")
+        logger.info(f"Entering _replay_interactions for {len(interactions)} interactions (strict={strict_replay}). WebSocket ID: {id(ws)}")
         last_timestamp = None
         if interactions:
             # Initialize last_timestamp with the timestamp of the first interaction.
@@ -187,6 +187,12 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
 
         try:
             for i, interaction in enumerate(interactions):
+                # Log interaction index and content
+                payload_preview = str(interaction.get("payload", ""))[:50] + "..." if interaction.get("payload") else "N/A"
+                logger.info(
+                    f"Processing interaction {i}: direction={interaction.get('direction')}, type={interaction.get('type')}, payload_preview='{payload_preview}'"
+                )
+
                 current_timestamp = interaction["timestamp"]  # Timestamp of the current interaction
                 if i > 0 and last_timestamp is not None:
                     # Calculate delay based on the difference from the previous interaction's timestamp.
@@ -206,6 +212,7 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                     break
 
                 if direction == "server_to_client":
+                    logger.info(f"Server to client: About to send message {i}: type={msg_type}, payload_preview='{str(payload)[:50] + '...' if payload else 'N/A'}'")
                     logger.debug(f"Replaying server message {i}: type={msg_type}")
                     if msg_type == "text":
                         await ws.send_str(payload)
@@ -225,14 +232,31 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                 elif direction == "client_to_server":
                     expected_msg_type_from_recording = msg_type
                     expected_payload_from_recording = payload
-                    logger.debug(
-                        f"Expecting client message {i}: type={expected_msg_type_from_recording}, "
-                        f"payload={expected_payload_from_recording if len(str(expected_payload_from_recording)) < 50 else str(expected_payload_from_recording)[:50] + '...'}"
+                    logger.info(
+                        f"Client to server: Expecting message {i}: type={expected_msg_type_from_recording}, "
+                        f"payload_preview='{str(expected_payload_from_recording)[:50] + '...' if expected_payload_from_recording else 'N/A'}'"
                     )
                     try:
                         # Expect a message from the client
                         # TODO: Consider making timeout configurable or part of cassette metadata
                         msg_from_client = await ws.receive(timeout=10)
+
+                        actual_payload_preview = None # Initialize with a default
+                        if msg_from_client.type == WSMsgType.TEXT:
+                            actual_payload_preview = msg_from_client.data[:50] + "..." if msg_from_client.data else "N/A"
+                        elif msg_from_client.type == WSMsgType.BINARY:
+                            actual_payload_preview = msg_from_client.data.hex()[:50] + "..." if msg_from_client.data else "N/A"
+                        elif msg_from_client.type == WSMsgType.CLOSE:
+                            actual_payload_preview = "N/A (CLOSE)"
+                        elif msg_from_client.type == WSMsgType.ERROR:
+                            actual_payload_preview = f"N/A (ERROR: {ws.exception()})"
+                        else: # Should ideally not happen with aiohttp's ws.receive()
+                            actual_payload_preview = "N/A (UNKNOWN MSG TYPE)"
+
+
+                        logger.info(
+                            f"Client to server: Received message {i}: type={WSMsgType(msg_from_client.type).name}, payload_preview='{actual_payload_preview}'"
+                        )
 
                         match = False
                         actual_msg_type_str = ""  # String representation of actual message type
@@ -246,7 +270,6 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                                 and expected_payload_from_recording == msg_from_client.data
                             ):
                                 match = True
-                                logger.debug(f"Client message {i} (TEXT) matches recording.")
                         elif msg_from_client.type == WSMsgType.BINARY:
                             actual_msg_type_str = "BINARY"
                             error_payload = msg_from_client.data.hex()
@@ -255,52 +278,63 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                                 and expected_payload_from_recording == msg_from_client.data.hex()
                             ):
                                 match = True
-                                logger.debug(f"Client message {i} (BINARY) matches recording.")
                         elif msg_from_client.type == WSMsgType.CLOSE:
                             actual_msg_type_str = "CLOSE"
-                            # Payload for close is None or not applicable for matching in this context.
-                            error_payload = "Connection closed by client"  # Descriptive payload for error message
+                            error_payload = "Connection closed by client" # More descriptive
                             if expected_msg_type_from_recording == "close":
                                 match = True
-                                logger.debug(f"Client close message {i} was expected and received.")
-                            # Further handling for CLOSE (e.g., breaking loop) is done after the main mismatch check.
                         elif msg_from_client.type == WSMsgType.ERROR:
                             actual_msg_type_str = "ERROR"
-                            error_payload = str(ws.exception())  # Get exception associated with the error
+                            error_payload = str(ws.exception())
                             logger.error(f"Client WebSocket error during replay at interaction {i}: {error_payload}")
-                            # Errors from the client are generally treated as mismatches if not specifically expected.
-                            # Further handling for ERROR is done after the main mismatch check.
                         else:
-                            # Handle other unexpected WSMsgTypes (e.g., PING, PONG if not filtered by receive())
-                            actual_msg_type_str = msg_from_client.type.name
+                            actual_msg_type_str = msg_from_client.type.name # e.g. PING, PONG
                             error_payload = msg_from_client.data if msg_from_client.data else ""
 
-                        if not match:
+
+                        if match:
+                            logger.info(f"Client message {i} ({actual_msg_type_str}) matches recording.")
+                        else:
                             # This block is entered if:
                             # 1. The received message type/payload did not match the expected recording.
                             # 2. The client sent an WSMsgType that was not expected (e.g., TEXT when BINARY was recorded).
-                            error_msg = (
-                                f"Client message {i} mismatch. "
-                                f"Expected: type={expected_msg_type_from_recording}, payload={expected_payload_from_recording}. "
-                                f"Got: type={actual_msg_type_str}, payload={error_payload}"
+                            # 3. A CLOSE was received but not expected.
+                            expected_payload_str = str(expected_payload_from_recording)
+                            error_payload_str = str(error_payload) # error_payload might be None if type is CLOSE and not expected
+                            log_expected_payload = expected_payload_str[:50] + '...' if len(expected_payload_str) > 50 else expected_payload_str
+                            log_error_payload = error_payload_str[:50] + '...' if len(error_payload_str) > 50 else error_payload_str
+
+                            error_msg_detail = (
+                                f"Expected: type={expected_msg_type_from_recording}, payload='{log_expected_payload}'. "
+                                f"Got: type={actual_msg_type_str}, payload='{log_error_payload}'"
                             )
+                            # Specific logging for unexpected CLOSE
+                            if msg_from_client.type == WSMsgType.CLOSE and expected_msg_type_from_recording != 'close':
+                                logger.warning(f"Client message {i}: Unexpected CLOSE. {error_msg_detail}")
+                            # General mismatch logging (excluding expected CLOSE, which is handled by 'match = True' path)
+                            elif msg_from_client.type != WSMsgType.CLOSE or expected_msg_type_from_recording != 'close':
+                                logger.warning(f"Client message {i} mismatch. {error_msg_detail}")
+
                             if strict_replay:
-                                raise ReplayMismatchError(error_msg)
-                            else:
-                                logger.warning(error_msg)
+                                # Raise error for any mismatch in strict mode, including unexpected close
+                                raise ReplayMismatchError(f"Client message {i} mismatch. {error_msg_detail}")
 
                         # Handle connection termination states (CLOSE, ERROR) after the main mismatch check.
                         if msg_from_client.type == WSMsgType.CLOSE:
+                            was_expected = expected_msg_type_from_recording == 'close'
                             logger.info(
-                                f"Client closed WebSocket connection at interaction {i} (expected_was_close={expected_msg_type_from_recording == 'close'})."
+                                f"Client closed WebSocket connection at interaction {i} (expected_was_close={was_expected})."
                             )
-                            # If this close was unexpected and strict_replay is on, ReplayMismatchError was already raised by the '!match' block.
-                            # If not strict, a warning was logged.
-
+                            if not was_expected:
+                                logger.warning(
+                                    f"Client closed connection unexpectedly at interaction {i}. "
+                                    f"Recorded interaction was: type={expected_msg_type_from_recording}, payload_preview='{str(expected_payload_from_recording)[:50] + '...' if expected_payload_from_recording else 'N/A'}'. "
+                                    "VCR will now proceed to send any remaining server_to_client messages."
+                                )
                             # Instead of stopping the replay, we'll continue with server-to-client messages
                             # This allows tests to proceed even if the client closes the connection unexpectedly
                             # during the handshake process
-                            logger.warning("Client closed connection unexpectedly. Continuing with server-to-client messages only.")
+                            # logger.warning("Client closed connection unexpectedly. Continuing with server-to-client messages only.") # This is now part of the more detailed log above
 
                             # Skip to the next server-to-client message
                             continue_from_index = i + 1
@@ -354,11 +388,13 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
 
                     except asyncio.TimeoutError:
                         # Timeout occurred while waiting for the client to send a message.
-                        error_msg = f"Timeout waiting for client message {i} (expected type={expected_msg_type_from_recording}, payload={expected_payload_from_recording})."
+                        expected_payload_preview = str(expected_payload_from_recording)[:50] + "..." if expected_payload_from_recording else "N/A"
+                        error_msg = f"Timeout waiting for client message {i} (expected type={expected_msg_type_from_recording}, payload_preview='{expected_payload_preview}')."
+                        logger.error(f"asyncio.TimeoutError: {error_msg}") # Specific log for TimeoutError
                         if strict_replay:
                             raise ReplayMismatchError(error_msg)
-                        else:
-                            logger.warning(error_msg)
+                        # else: # The generic warning is removed to avoid double logging if strict_replay is false. The logger.error above is sufficient.
+                        #    logger.warning(error_msg)
                         break  # Stop replay as the expected client message was not received.
                     except ReplayMismatchError:
                         # Re-raise if it's our specific error, ensuring it propagates.
@@ -384,8 +420,13 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
             # Fallback for other unexpected errors, ensure ws is closed.
         finally:
             # Ensure the WebSocket is closed cleanly in all scenarios (successful replay, error, or mismatch).
-            if not ws.closed:
-                logger.info("Replay finished or errored, ensuring WebSocket is closed.")
+            ws_closed_status = ws.closed
+            ws_exception_status = ws.exception()
+            logger.info(
+                f"Exiting _replay_interactions. WebSocket ID: {id(ws)}, ws.closed: {ws_closed_status}, ws.exception(): {ws_exception_status}"
+            )
+            if not ws.closed: # Check again, as it might have been closed in except blocks
+                logger.info("Replay finished or errored, ensuring WebSocket is closed now.")
                 await ws.close()
 
     app = web.Application()

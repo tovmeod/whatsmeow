@@ -1,17 +1,39 @@
 """Test handshake timeout scenario using ws_server_vcr fixture."""
 
 import asyncio
+import os
+from pathlib import Path
 
 import pytest
 
 from pymeow.client import Client
 from pymeow.qrchan import get_qr_channel
 from pymeow.store.sqlstore.container import Container
+from pymeow.util.keys.keypair import KeyPair
+
+# Define a fixed 32-byte private key for deterministic ephemeral key generation
+FIXED_EPHEMERAL_PRIVATE_KEY = b'\x11\x22\x33\x44\x55\x66\x77\x88\x99\x00\xaa\xbb\xcc\xdd\xee\xff\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f'
 
 
 @pytest.mark.asyncio
-async def test_handshake_qr_timeout(ws_server_vcr):
+async def test_handshake_qr_timeout(ws_server_vcr, monkeypatch):  # Add monkeypatch fixture
     """Test client creation, connection, QR code generation, and timeout."""
+    # # Delete cassette to force re-recording with the fixed ephemeral key
+    # cassette_path = Path("pymeow/pymeow/tests/ws_cassettes/test_handshake_qr_timeout.yaml")
+    # try:
+    #     if cassette_path.exists():
+    #         os.remove(cassette_path)
+    #         print(f"Deleted cassette: {cassette_path}")
+    # except OSError as e:
+    #     print(f"Error deleting cassette {cassette_path}: {e}")
+    #     # Optionally, re-raise or handle as a fatal test setup error if critical
+    #     # For now, just print and continue; VCR will use existing if deletion fails
+
+    # Setup fixed keypair for KeyPair.generate
+    # This ensures that the client's ephemeral key is deterministic for this test.
+    fixed_kp = KeyPair.from_private_key(FIXED_EPHEMERAL_PRIVATE_KEY)
+    monkeypatch.setattr(KeyPair, 'generate', lambda: fixed_kp)  # Use the imported KeyPair directly
+
     container = None
     client = None
 
