@@ -1,10 +1,9 @@
 """Common utilities for Go wrappers."""
 
 import platform
+import subprocess
 from pathlib import Path
 from typing import Optional
-import subprocess
-import os
 
 
 def get_lib_path(lib_name: Optional[str] = None) -> Path:
@@ -45,15 +44,14 @@ def get_lib_path(lib_name: Optional[str] = None) -> Path:
 
         if not build_script_path.exists():
             raise OSError(
-                f"Build script {build_script_name} not found in {go_helpers_dir}. "
-                f"Cannot build the library {lib_name}."
+                f"Build script {build_script_name} not found in {go_helpers_dir}. Cannot build the library {lib_name}."
             )
 
         try:
             command_to_run = []
             if system == "Windows":
                 command_to_run = [str(build_script_path), "build"]
-            else: # Linux, macOS
+            else:  # Linux, macOS
                 # Ensure the script is executable
                 subprocess.run(["chmod", "+x", str(build_script_path)], check=True, cwd=str(go_helpers_dir))
                 command_to_run = [f"./{build_script_name}", "build"]
@@ -78,15 +76,15 @@ def get_lib_path(lib_name: Optional[str] = None) -> Path:
                 f"Failed to build the Go shared library at {lib_path}. "
                 "Please build it manually using the script in go_test_helpers."
             )
-        except FileNotFoundError: # Should be caught by build_script_path.exists() check, but as a fallback
-            raise OSError(
-                f"Build script {build_script_name} not found in {go_helpers_dir}. Cannot build the library."
-            )
-        except Exception as e: # Catch any other unexpected errors during the build process
+        except FileNotFoundError:  # Should be caught by build_script_path.exists() check, but as a fallback
+            raise OSError(f"Build script {build_script_name} not found in {go_helpers_dir}. Cannot build the library.")
+        except Exception as e:  # Catch any other unexpected errors during the build process
             raise OSError(f"An unexpected error occurred while trying to build {lib_path}: {e}")
 
     # Final check, even if it existed before or was just built
     if not lib_path.exists():
-        raise OSError(f"Go shared library not found at {lib_path} after all attempts. Please check the path and build process.")
+        raise OSError(
+            f"Go shared library not found at {lib_path} after all attempts. Please check the path and build process."
+        )
 
     return lib_path
