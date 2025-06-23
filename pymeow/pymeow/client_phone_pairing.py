@@ -27,8 +27,9 @@ from pathlib import Path
 from typing import Any
 
 from client_test import setup_logging
+
 from pymeow.client import Client
-from pymeow.datatypes.events import Connected, Disconnected, Message, PairError, PairSuccess, QR
+from pymeow.datatypes.events import QR, Connected, Disconnected, Message, PairError, PairSuccess
 
 # Make sure pair_phone and PairClientType are correctly imported
 from pymeow.pair_code import PairClientType, pair_phone

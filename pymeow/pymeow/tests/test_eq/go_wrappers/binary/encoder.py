@@ -5,12 +5,14 @@ This module provides Python bindings for whatsmeow's binary encoding functionali
 
 import ctypes
 import json
-from typing import Dict, Any
+from typing import Any, Dict
+
 from ..utils import get_lib_path
 
 
 class GoLibraryError(Exception):
     """Exception raised when Go library operations fail."""
+
     pass
 
 
@@ -31,9 +33,11 @@ class GoLibrary:
                 lib_path = get_lib_path()
                 self._lib = ctypes.CDLL(str(lib_path))
 
-                if not hasattr(self._lib, 'call_method'):
-                    available_funcs = [name for name in dir(self._lib) if not name.startswith('_')]
-                    raise GoLibraryError(f"Function 'call_method' not found in library. Available functions: {available_funcs}")
+                if not hasattr(self._lib, "call_method"):
+                    available_funcs = [name for name in dir(self._lib) if not name.startswith("_")]
+                    raise GoLibraryError(
+                        f"Function 'call_method' not found in library. Available functions: {available_funcs}"
+                    )
 
                 self._lib.call_method.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
                 self._lib.call_method.restype = ctypes.c_char_p
@@ -47,15 +51,15 @@ class GoLibrary:
             raise GoLibraryError("Go library not initialized")
 
         try:
-            method_bytes = method.encode('utf-8')
-            args_json = json.dumps(args).encode('utf-8')
+            method_bytes = method.encode("utf-8")
+            args_json = json.dumps(args).encode("utf-8")
 
             result_ptr = self._lib.call_method(method_bytes, args_json)
 
             if not result_ptr:
                 raise GoLibraryError("Go function returned null pointer")
 
-            result_str = ctypes.string_at(result_ptr).decode('utf-8')
+            result_str = ctypes.string_at(result_ptr).decode("utf-8")
             return json.loads(result_str)
 
         except Exception as e:
@@ -65,12 +69,12 @@ class GoLibrary:
 def write_node_get_data(node: Dict[str, Any]) -> bytes:
     """Write node and get data using Go's binary.Marshal (equivalent to encoder.writeNode().getData())."""
     go_lib = GoLibrary()
-    result = go_lib.call_method('binary.encoder.writeNodeGetData', {'node': node})
+    result = go_lib.call_method("binary.encoder.writeNodeGetData", {"node": node})
 
-    if 'error' in result:
+    if "error" in result:
         raise GoLibraryError(f"Encode failed: {result['error']}")
 
-    hex_data = result.get('data', '')
+    hex_data = result.get("data", "")
     if not hex_data:
         raise GoLibraryError("No data returned from encode operation")
 

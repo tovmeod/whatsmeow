@@ -920,7 +920,7 @@ async def usync(
     Perform a usync operation.
     """
     from .binary.node import Attrs, Node
-    from .request import InfoQuery, InfoQueryType, send_iq, generate_request_id
+    from .request import InfoQuery, InfoQueryType, generate_request_id, send_iq
 
     if client is None:
         raise ErrClientIsNil()

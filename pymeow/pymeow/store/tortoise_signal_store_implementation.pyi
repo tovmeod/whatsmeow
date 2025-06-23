@@ -1,9 +1,10 @@
-from signal_protocol.storage import InMemSignalProtocolStore
-from signal_protocol import identity_key, address, state
+from typing import List, Optional
+
+from signal_protocol import address, identity_key, state
 from signal_protocol.sender_keys import SenderKeyName, SenderKeyRecord
-from typing import Optional, List
-from tortoise.models import Model
+from signal_protocol.storage import InMemSignalProtocolStore
 from tortoise import fields
+from tortoise.models import Model
 
 # Export all the Tortoise ORM Models
 class SignalSessionModel(Model):

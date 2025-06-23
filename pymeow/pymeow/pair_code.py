@@ -190,7 +190,7 @@ async def pair_phone(
     if client.is_logged_in():
         raise ValueError("Client is already logged in")
 
-    logger.info(f"Starting phone pairing process...")
+    logger.info("Starting phone pairing process...")
     logger.info(f"Phone: {phone}")
     logger.info(f"Client type: {client_type}")
     logger.info(f"Display name: {client_display_name}")
@@ -219,26 +219,28 @@ async def pair_phone(
             namespace="md",
             type=InfoQueryType.SET,
             to=JID.new_server(),  # s.whatsapp.net
-            content=[Node(
-                tag="link_code_companion_reg",
-                attrs={
-                    "jid": jid,  # Use JID object directly, like Go implementation
-                    "stage": "companion_hello",
-                    "should_show_push_notification": str(show_push_notification).lower(),
-                },
-                content=[
-                    Node(tag="link_code_pairing_wrapped_companion_ephemeral_pub", content=ephemeral_key),
-                    Node(tag="companion_server_auth_key_pub", content=client.store.noise_key.pub),
-                    # Platform ID should be a string, not bytes
-                    Node(tag="companion_platform_id", content=str(int(client_type))),
-                    Node(tag="companion_platform_display", content=client_display_name),
-                    # Use a single zero byte for nonce, matching Go implementation
-                    Node(tag="link_code_pairing_nonce", content=bytes([0])),  # Single zero byte
-                ],
-            )],
+            content=[
+                Node(
+                    tag="link_code_companion_reg",
+                    attrs={
+                        "jid": jid,  # Use JID object directly, like Go implementation
+                        "stage": "companion_hello",
+                        "should_show_push_notification": str(show_push_notification).lower(),
+                    },
+                    content=[
+                        Node(tag="link_code_pairing_wrapped_companion_ephemeral_pub", content=ephemeral_key),
+                        Node(tag="companion_server_auth_key_pub", content=client.store.noise_key.pub),
+                        # Platform ID should be a string, not bytes
+                        Node(tag="companion_platform_id", content=str(int(client_type)).encode()),
+                        Node(tag="companion_platform_display", content=client_display_name.encode()),
+                        # Use a single zero byte for nonce, matching Go implementation
+                        Node(tag="link_code_pairing_nonce", content=bytes([0])),  # Single zero byte
+                    ],
+                )
+            ],
         ),
     )
-    logger.debug(f"Successfully received response from server")
+    logger.debug("Successfully received response from server")
     logger.debug(f"Response node: {resp}")
 
     # Extract pairing reference

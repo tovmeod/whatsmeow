@@ -322,7 +322,7 @@ async def create_ws_server_from_cassette(cassette_file, port, *, record=False, s
                                 logger.info(
                                     f"Continuing with {len(remaining_server_messages)} remaining server-to-client messages"
                                 )
-                                for j, (interaction_index, interaction) in enumerate(remaining_server_messages):
+                                for _, (interaction_index, interaction) in enumerate(remaining_server_messages):
                                     if ws.closed:
                                         logger.warning("WebSocket is closed, cannot send more messages")
                                         break

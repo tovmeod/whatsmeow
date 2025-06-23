@@ -500,4 +500,3 @@ async def try_handle_code_pair_notification(client: "Client", node: Node) -> Non
         await handle_code_pair_notification(client, node)
     except Exception as e:
         logger.error(f"Failed to handle code pair notification: {e}")
-

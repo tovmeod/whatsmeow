@@ -1,7 +1,9 @@
 """Common utilities for Go wrappers."""
-from pathlib import Path
+
 import platform
+from pathlib import Path
 from typing import Optional
+
 
 def get_lib_path(lib_name: Optional[str] = None) -> Path:
     """Get the path to the Go shared library.
@@ -20,9 +22,6 @@ def get_lib_path(lib_name: Optional[str] = None) -> Path:
     lib_path = bin_dir / lib_name
 
     if not lib_path.exists():
-        raise FileNotFoundError(
-            f"Go shared library not found at {lib_path}. "
-            f"Please build it first."
-        )
+        raise FileNotFoundError(f"Go shared library not found at {lib_path}. Please build it first.")
 
     return lib_path

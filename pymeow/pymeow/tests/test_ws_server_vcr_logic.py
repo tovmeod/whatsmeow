@@ -1,18 +1,18 @@
 import asyncio
-import yaml
-from pathlib import Path
-import pytest
-import aiohttp
-from aiohttp import web, WSMsgType
-from unittest.mock import patch
 import logging
+from unittest.mock import patch
 
-# Configure logging for tests (optional, but can be helpful for debugging)
-logging.basicConfig(level=logging.DEBUG)
+import aiohttp
+import pytest
+import yaml
+from aiohttp import WSMsgType, web
 
 # Assuming ws_server_vcr is in the same directory or adjust path accordingly
 # For the purpose of this exercise, I'll assume it's importable like this:
-from .ws_server_vcr import create_ws_server_from_cassette, ReplayMismatchError, WebSocketProxy
+from .ws_server_vcr import ReplayMismatchError, create_ws_server_from_cassette
+
+# Configure logging for tests (optional, but can be helpful for debugging)
+logging.basicConfig(level=logging.DEBUG)
 
 
 # Helper for dummy WebSocket server (for Test 1 Recording)
@@ -25,7 +25,7 @@ async def dummy_websocket_handler(request):
             logging.debug(f"Dummy Server: Received TEXT '{msg.data}', echoing.")
             await ws.send_str(f"echo:{msg.data}")
         elif msg.type == WSMsgType.BINARY:
-            logging.debug(f"Dummy Server: Received BINARY data, echoing.")
+            logging.debug("Dummy Server: Received BINARY data, echoing.")
             await ws.send_bytes(b"echo:" + msg.data)
         elif msg.type == WSMsgType.CLOSE:
             logging.debug("Dummy Server: Received CLOSE from client.")
@@ -94,7 +94,7 @@ async def test_basic_record_and_replay(tmp_path, unused_tcp_port_factory):
         await server_vcr["shutdown"]()
         assert cassette_file.exists()
 
-        with open(cassette_file, "r") as f:
+        with open(cassette_file, "r") as f:  # noqa: ASYNC230
             cassette_content = yaml.safe_load(f)
             assert len(cassette_content["interactions"]) > 0
             # Example: check first and last message direction/type if necessary
@@ -141,7 +141,7 @@ async def test_strict_replay_match(tmp_path, unused_tcp_port):
         {"timestamp": 1.0, "direction": "client_to_server", "type": "text", "payload": "ping"},
         {"timestamp": 1.1, "direction": "server_to_client", "type": "text", "payload": "pong"},
     ]
-    with open(cassette_file, "w") as f:
+    with open(cassette_file, "w") as f:  # noqa: ASYNC230
         yaml.dump({"interactions": interactions}, f)
 
     server = None
@@ -167,7 +167,7 @@ async def test_strict_replay_payload_mismatch(tmp_path, unused_tcp_port):
         {"timestamp": 1.0, "direction": "client_to_server", "type": "text", "payload": "ping"},
         {"timestamp": 1.1, "direction": "server_to_client", "type": "text", "payload": "pong"},
     ]
-    with open(cassette_file, "w") as f:
+    with open(cassette_file, "w") as f:  # noqa: ASYNC230
         yaml.dump({"interactions": interactions}, f)
 
     server = None
@@ -201,7 +201,7 @@ async def test_strict_replay_type_mismatch(tmp_path, unused_tcp_port):
         {"timestamp": 1.0, "direction": "client_to_server", "type": "text", "payload": "ping"},
         {"timestamp": 1.1, "direction": "server_to_client", "type": "text", "payload": "pong"},
     ]
-    with open(cassette_file, "w") as f:
+    with open(cassette_file, "w") as f:  # noqa: ASYNC230
         yaml.dump({"interactions": interactions}, f)
 
     server = None
@@ -228,7 +228,7 @@ async def test_strict_replay_timeout(tmp_path, unused_tcp_port):
         {"timestamp": 1.0, "direction": "client_to_server", "type": "text", "payload": "ping"},
         {"timestamp": 1.1, "direction": "server_to_client", "type": "text", "payload": "pong"},
     ]
-    with open(cassette_file, "w") as f:
+    with open(cassette_file, "w") as f:  # noqa: ASYNC230
         yaml.dump({"interactions": interactions}, f)
 
     server = None
@@ -277,7 +277,7 @@ async def test_replay_unsolicited_server_message(tmp_path, unused_tcp_port):
         {"timestamp": 1.1, "direction": "server_to_client", "type": "text", "payload": "ack"},
         {"timestamp": 1.2, "direction": "server_to_client", "type": "text", "payload": "unsolicited_msg"},
     ]
-    with open(cassette_file, "w") as f:
+    with open(cassette_file, "w") as f:  # noqa: ASYNC230
         yaml.dump({"interactions": interactions}, f)
 
     server = None
@@ -309,7 +309,7 @@ async def test_strict_replay_client_closes_unexpectedly(tmp_path, unused_tcp_por
         {"timestamp": 1.2, "direction": "client_to_server", "type": "text", "payload": "another_ping"},
         # Server expects this
     ]
-    with open(cassette_file, "w") as f:
+    with open(cassette_file, "w") as f:  # noqa: ASYNC230
         yaml.dump({"interactions": interactions}, f)
 
     server = None
