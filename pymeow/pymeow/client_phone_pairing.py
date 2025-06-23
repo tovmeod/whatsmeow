@@ -28,14 +28,12 @@ from typing import Any
 
 from client_test import setup_logging
 from pymeow.client import Client
-from pymeow.datatypes.events import Connected, Disconnected, Message, PairError, PairSuccess
+from pymeow.datatypes.events import Connected, Disconnected, Message, PairError, PairSuccess, QR
 
 # Make sure pair_phone and PairClientType are correctly imported
 from pymeow.pair_code import PairClientType, pair_phone
 from pymeow.store.sqlstore.container import Container
 
-# Basic logging setup
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 APP_ROOT = Path(__file__).resolve().parent  # Used for potential relative path calculations if needed
@@ -117,10 +115,37 @@ async def main() -> None:
             # Step 1: Connect to WhatsApp (establishes WebSocket and Noise handshake)
             # This is necessary before pairing functions that send IQ stanzas can be called.
             logger.info("Connecting to WhatsApp for pairing...")
+
+            # Setup QR channel before connecting
+            qr_received = asyncio.Event()
+
+            # Create a temporary event handler just to detect the QR event
+            async def qr_event_handler(event: Any) -> None:
+                if isinstance(event, QR):
+                    logger.debug("QR event received, connection is established")
+                    qr_received.set()
+
+            # Add the temporary handler
+            qr_handler = client.add_event_handler(qr_event_handler)
+
+            # Connect to WhatsApp
             await client.connect()
+
             if not client.is_connected():
                 logger.error("Failed to connect to WhatsApp. Cannot proceed with pairing.")
+                client.remove_event_handler(qr_handler)
                 return
+
+            # Wait for QR event to ensure connection is fully established
+            logger.info("Waiting for connection to be fully established...")
+            try:
+                await asyncio.wait_for(qr_received.wait(), timeout=10.0)
+                logger.info("Connection fully established, ready for pairing")
+            except asyncio.TimeoutError:
+                logger.warning("Timed out waiting for QR event, but continuing anyway")
+            finally:
+                # Remove the temporary handler
+                client.remove_event_handler(qr_handler)
 
             # Step 2: Request pairing code
             phone_number_input = input("Enter your full international phone number (e.g., +1234567890): ").strip()
@@ -132,13 +157,18 @@ async def main() -> None:
                 logger.info("Requesting pairing code from WhatsApp...")
                 # client_type helps WhatsApp identify the type of companion device.
                 # client_display_name is shown in the "Linked Devices" section of your WhatsApp app.
+                # Log key steps for debugging
+                logger.debug(f"Attempting to pair with phone number: {phone_number_input}")
+
                 pairing_code = await pair_phone(
                     client=client,
                     phone=phone_number_input,
                     show_push_notification=True,  # Shows a notification on the primary device
                     client_type=PairClientType.CHROME,
-                    client_display_name="PyMeow Phone Example",
+                    client_display_name="Chrome (Windows)",
                 )
+
+                logger.debug(f"Pairing code successfully generated: {pairing_code}")
                 logger.info(f"PAIRING CODE: {pairing_code}")
                 logger.info("Go to WhatsApp on your phone -> Settings -> Linked Devices -> Link with phone number.")
                 logger.info("Enter the above code on your primary WhatsApp device when prompted.")
@@ -147,7 +177,7 @@ async def main() -> None:
                 # the server will send messages to this client to complete the pairing.
                 # Success will be indicated by LoggedIn and PairSuccess events.
             except Exception as e:
-                logger.error(f"Failed to initiate phone pairing: {e}", exc_info=True)
+                logger.exception(f"Failed to initiate phone pairing: {e}")
                 return
 
         # Register the event handler to process incoming events

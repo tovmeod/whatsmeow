@@ -43,7 +43,7 @@ TAG_SIZE = 1
 class BinaryEncoder:
     """Binary encoder for WhatsApp protocol."""
 
-    data: bytearray = field(default_factory=bytearray)
+    data: bytearray = field(default_factory=lambda: bytearray([0]))
 
     def get_data(self) -> bytearray:
         """Get the encoded data."""
@@ -201,8 +201,10 @@ class BinaryEncoder:
             self.write(jid.server)
 
     def write_attributes(self, attributes: Dict[str, Any]) -> None:
-        """Write attributes to the data."""
-        for key, val in attributes.items():
+        """Write attributes in sorted order for deterministic output."""
+        # Sort keys alphabetically for deterministic output
+        for key in sorted(attributes.keys()):
+            val = attributes[key]
             if val == "" or val is None:
                 continue
             self.write_string(key)

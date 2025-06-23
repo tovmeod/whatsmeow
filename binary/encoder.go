@@ -1,6 +1,7 @@
 package binary
 
 import (
+	"sort"
 	"fmt"
 	"math"
 	"strconv"
@@ -187,14 +188,26 @@ func (w *binaryEncoder) writeJID(jid types.JID) {
 }
 
 func (w *binaryEncoder) writeAttributes(attributes Attrs) {
-	for key, val := range attributes {
-		if val == "" || val == nil {
-			continue
-		}
+    if len(attributes) == 0 {
+        return
+    }
 
-		w.writeString(key)
-		w.write(val)
-	}
+    // Get sorted keys for deterministic output
+    keys := make([]string, 0, len(attributes))
+    for key := range attributes {
+        keys = append(keys, key)
+    }
+    sort.Strings(keys)
+
+    // Write attributes in sorted order
+    for _, key := range keys {
+        val := attributes[key]
+        if val == "" || val == nil {
+            continue
+        }
+        w.writeString(key)
+        w.write(val)
+    }
 }
 
 func (w *binaryEncoder) countAttributes(attributes Attrs) (count int) {

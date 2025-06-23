@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from . import request
 from .datatypes.jid import SERVER_JID
 from .exceptions import ElementMissingError, ErrClientIsNil
 
@@ -83,7 +82,7 @@ async def try_fetch_privacy_settings(client: "Client", ignore_cache: bool) -> Pr
     # TODO: Review ElementMissingError implementation
     # TODO: Review parse_privacy_settings implementation
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQuery, InfoQueryType, send_iq
 
     if client is None:
         raise ErrClientIsNil
@@ -93,7 +92,7 @@ async def try_fetch_privacy_settings(client: "Client", ignore_cache: bool) -> Pr
         if val is not None:
             return val
 
-    resp = await request.send_iq(
+    resp = await send_iq(
         client, InfoQuery(namespace="privacy", type=InfoQueryType.GET, to=SERVER_JID, content=[Node(tag="privacy")])
     )
     privacy_node, ok = resp.get_optional_child_by_tag("privacy")

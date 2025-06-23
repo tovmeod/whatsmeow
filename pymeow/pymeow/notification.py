@@ -15,6 +15,7 @@ from .datatypes import events
 from .datatypes.jid import JID
 from .datatypes.message import MessageID, MessageServerID
 from .generated.waE2E import WAWebProtobufsE2E_pb2
+from .pair_code import handle_code_pair_notification
 from .prekeys import upload_prekeys
 
 if TYPE_CHECKING:
@@ -495,5 +496,8 @@ async def parse_group_notification(client: "Client", node: Node) -> Any:
 
 async def try_handle_code_pair_notification(client: "Client", node: Node) -> None:
     """Handle code pair notifications."""
-    # This should be implemented based on the Go version
-    pass
+    try:
+        await handle_code_pair_notification(client, node)
+    except Exception as e:
+        logger.error(f"Failed to handle code pair notification: {e}")
+

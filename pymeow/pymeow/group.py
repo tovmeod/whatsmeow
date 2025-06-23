@@ -7,7 +7,6 @@ Port of whatsmeow/group.go
 import logging
 from typing import TYPE_CHECKING, List, Optional
 
-from . import request
 from .binary.attrs import AttrUtility
 from .datatypes.group import (
     GroupInfo,
@@ -85,9 +84,9 @@ class ParticipantRequestChange:
 
 async def send_group_iq(client: "Client", iq_type: "InfoQueryType", jid: JID, content: "Node") -> "Node":
     """Send a group IQ request."""
-    from .request import InfoQuery
+    from .request import InfoQuery, send_iq
 
-    res = await request.send_iq(client, InfoQuery(namespace="w:g2", type=iq_type, to=jid, content=[content]))
+    res = await send_iq(client, InfoQuery(namespace="w:g2", type=iq_type, to=jid, content=[content]))
     return res
 
 
@@ -288,14 +287,14 @@ async def set_group_photo(client: "Client", jid: JID, avatar: Optional[bytes]) -
     The bytes can be None to remove the photo. Returns the new picture ID.
     """
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQuery, InfoQueryType, send_iq
 
     content = None
     if avatar is not None:
         content = [Node(tag="picture", attrs={"type": "image"}, content=avatar)]
 
     try:
-        resp = await request.send_iq(
+        resp = await send_iq(
             client,
             InfoQuery(
                 namespace="w:profile:picture", type=InfoQueryType.SET, to=SERVER_JID, target=jid, content=content

@@ -90,6 +90,11 @@ def setup_logging() -> None:
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
 
+    logging.getLogger("pymeow.client.Send").setLevel(logging.DEBUG)
+    logging.getLogger("pymeow.client.Recv").setLevel(logging.DEBUG)
+    logging.getLogger("pymeow.socket.framesocket").setLevel(logging.DEBUG)
+    logging.getLogger("pymeow.client").setLevel(logging.DEBUG)
+
 
 async def event_handler(event: Any) -> None:
     """

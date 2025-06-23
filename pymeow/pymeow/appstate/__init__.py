@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from .. import download, request, send
+from .. import download, send
 from ..binary import node as binary_node
 from ..datatypes.events.events import BaseEvent
 from ..exceptions import ErrAppStateUpdate
@@ -304,7 +304,7 @@ async def download_external_app_state_blob(client: "Client", ref: Any) -> Option
 async def fetch_app_state_patches(client: "Client", name: str, from_version: int, snapshot: bool) -> Any:
     """Fetch app state patches from the server."""
     from ..datatypes import JID
-    from ..request import InfoQuery, InfoQueryType
+    from ..request import InfoQuery, InfoQueryType, send_iq
 
     attrs = {
         "name": name,
@@ -313,7 +313,7 @@ async def fetch_app_state_patches(client: "Client", name: str, from_version: int
     if not snapshot:
         attrs["version"] = from_version
 
-    resp = await request.send_iq(
+    resp = await send_iq(
         client,
         InfoQuery(
             namespace="w:sync:app:state",
@@ -384,7 +384,7 @@ async def send_app_state(client: "Client", patch: Any) -> None:
     to update local caches and send events for the updates.
     """
     from ..datatypes import JID
-    from ..request import InfoQuery, InfoQueryType
+    from ..request import InfoQuery, InfoQueryType, send_iq
 
     if client is None:
         raise ValueError("Client is None")
@@ -407,7 +407,7 @@ async def send_app_state(client: "Client", patch: Any) -> None:
 
     encoded_patch = await encode.encode_patch(client.app_state_proc, latest_key_id, state, patch)
 
-    resp = await request.send_iq(
+    resp = await send_iq(
         client,
         InfoQuery(
             namespace="w:sync:app:state",

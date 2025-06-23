@@ -14,7 +14,6 @@ from signal_protocol.curve import PublicKey
 from signal_protocol.identity_key import IdentityKey
 from signal_protocol.state import PreKeyBundle
 
-from . import request
 from .util.keys.keypair import KeyPair, PreKey
 
 # Constants matching Go implementation
@@ -67,9 +66,9 @@ async def get_server_pre_key_count(client: "Client") -> int:
     # TODO: Review client.server_jid to ensure it's the correct equivalent of types.ServerJID.
     # TODO: Review Node class and its methods like get_child_by_tag and attribute access.
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQuery, InfoQueryType, send_iq
 
-    resp_node = await request.send_iq(
+    resp_node = await send_iq(
         client,
         InfoQuery(namespace="encrypt", type=InfoQueryType.GET, to=client.server_jid, content=[Node(tag="count")]),
     )
@@ -95,7 +94,7 @@ async def upload_prekeys(client: "Client") -> None:
         client: The client instance.
     """
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQuery, InfoQueryType, send_iq
 
     # Go: cli.uploadPreKeysLock.Lock() / defer cli.uploadPreKeysLock.Unlock()
     async with client.upload_prekeys_lock:
@@ -155,7 +154,7 @@ async def upload_prekeys(client: "Client") -> None:
         try:
             # Go: _, err = cli.sendIQ(...)
             # Assuming send_iq in Python raises exceptions on failure, matching the try/except pattern here
-            await request.send_iq(
+            await send_iq(
                 client, InfoQuery(namespace="encrypt", type=InfoQueryType.SET, to=client.server_jid, content=content)
             )
         # Go: if err != nil { cli.Log.Errorf(...); return }
@@ -211,7 +210,7 @@ async def fetch_pre_keys(client: "Client", users: List["JID"]) -> Dict["JID", Pr
     # TODO: Review Node class for attribute naming (e.g., attributes vs. Attrs).
     # TODO: Review JID type for how it's represented as a string in Node attributes.
     from .binary.node import Node
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQuery, InfoQueryType, send_iq
 
     # Go: requests := make([]waBinary.Node, len(users))
     request_nodes: List[Node] = []
@@ -233,7 +232,7 @@ async def fetch_pre_keys(client: "Client", users: List["JID"]) -> Dict["JID", Pr
 
     # Go: resp, err := cli.sendIQ(...)
     # Assuming client.send_iq is adapted to return (response, error_object)
-    resp_node = await request.send_iq(
+    resp_node = await send_iq(
         client,
         InfoQuery(
             namespace="encrypt",

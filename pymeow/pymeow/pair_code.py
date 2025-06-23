@@ -88,7 +88,7 @@ def encode_linking_base32(data: bytes) -> str:
 MIN_PHONE_LENGTH = 6
 
 # Cryptographic constants
-PBKDF2_ITERATIONS = 2 << 16
+PBKDF2_ITERATIONS = 2 << 16  # Should be 131072
 EPHEMERAL_KEY_SIZE = 80
 SALT_SIZE = 32
 IV_SIZE = 16
@@ -183,39 +183,63 @@ async def pair_phone(
     if client is None:
         raise ValueError("Client is nil")
 
+    # Ensure client is connected but not logged in
+    if not client.is_connected():
+        raise ValueError("Client must be connected before pairing")
+
+    if client.is_logged_in():
+        raise ValueError("Client is already logged in")
+
+    logger.info(f"Starting phone pairing process...")
+    logger.info(f"Phone: {phone}")
+    logger.info(f"Client type: {client_type}")
+    logger.info(f"Display name: {client_display_name}")
+    logger.info(f"Show notification: {show_push_notification}")
+
     ephemeral_key_pair, ephemeral_key, encoded_linking_code = generate_companion_ephemeral_key()
 
     # Clean up and validate phone number
     phone = _validate_phone_number(phone)
 
+    # Use user server, not general server
     jid = JID.new_user_jid(phone)
 
-    # Create IQ request
+    logger.debug(f"Generated ephemeral key length: {len(ephemeral_key)}")
+    logger.debug(f"Linking code: {encoded_linking_code}")
+    logger.debug(f"Phone validation result: {phone}")
+    logger.debug(f"Target JID: {jid}")
+    logger.debug(f"Client connected: {client.is_connected()}")
+    logger.debug(f"Client logged in: {client.is_logged_in()}")
+
+    # Fix binary data encoding to match Go implementation
+    # Create IQ request with corrected binary encoding
     resp = await request.send_iq(
         client,
         InfoQuery(
             namespace="md",
             type=InfoQueryType.SET,
-            to=JID.new_server(),
-            content=Node(
+            to=JID.new_server(),  # s.whatsapp.net
+            content=[Node(
                 tag="link_code_companion_reg",
-                attrs=Attrs(
-                    {
-                        "jid": jid,
-                        "stage": "companion_hello",
-                        "should_show_push_notification": str(show_push_notification).lower(),
-                    }
-                ),
+                attrs={
+                    "jid": jid,  # Use JID object directly, like Go implementation
+                    "stage": "companion_hello",
+                    "should_show_push_notification": str(show_push_notification).lower(),
+                },
                 content=[
                     Node(tag="link_code_pairing_wrapped_companion_ephemeral_pub", content=ephemeral_key),
                     Node(tag="companion_server_auth_key_pub", content=client.store.noise_key.pub),
-                    Node(tag="companion_platform_id", content=str(int(client_type)).encode()),
-                    Node(tag="companion_platform_display", content=client_display_name.encode()),
-                    Node(tag="link_code_pairing_nonce", content=bytes([0])),
+                    # Platform ID should be a string, not bytes
+                    Node(tag="companion_platform_id", content=str(int(client_type))),
+                    Node(tag="companion_platform_display", content=client_display_name),
+                    # Use a single zero byte for nonce, matching Go implementation
+                    Node(tag="link_code_pairing_nonce", content=bytes([0])),  # Single zero byte
                 ],
-            ),
+            )],
         ),
     )
+    logger.debug(f"Successfully received response from server")
+    logger.debug(f"Response node: {resp}")
 
     # Extract pairing reference
     pairing_ref_node, ok = resp.get_optional_child_by_tag("link_code_companion_reg", "link_code_pairing_ref")

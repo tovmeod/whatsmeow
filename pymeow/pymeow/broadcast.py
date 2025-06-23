@@ -6,7 +6,6 @@ Port of whatsmeow/broadcast.go
 
 from typing import TYPE_CHECKING, Dict, List
 
-from . import request
 from .binary import node as binary_node
 from .datatypes.jid import JID, SERVER_JID, STATUS_BROADCAST_JID
 from .datatypes.user import StatusPrivacy, StatusPrivacyType
@@ -137,13 +136,13 @@ async def get_status_privacy(client: "Client") -> List[StatusPrivacy]:
     Raises:
         Exception: If there's an error getting the status privacy settings
     """
-    from .request import InfoQuery, InfoQueryType
+    from .request import InfoQuery, InfoQueryType, send_iq
 
     query = InfoQuery(
         namespace="status", type=InfoQueryType.GET, to=SERVER_JID, content=[binary_node.Node(tag="privacy")]
     )
 
-    response = await request.send_iq(client, query)
+    response = await send_iq(client, query)
     privacy_lists = response.get_child_by_tag("privacy")
     outputs: List[StatusPrivacy] = []
 

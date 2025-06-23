@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
 
-from . import request
 from .datatypes.jid import (
     DEFAULT_USER_SERVER,
     HIDDEN_USER_SERVER,
@@ -921,7 +920,7 @@ async def usync(
     Perform a usync operation.
     """
     from .binary.node import Attrs, Node
-    from .request import InfoQuery, InfoQueryType, send_iq
+    from .request import InfoQuery, InfoQueryType, send_iq, generate_request_id
 
     if client is None:
         raise ErrClientIsNil()
@@ -964,7 +963,7 @@ async def usync(
                     tag="usync",
                     attrs=Attrs(
                         {
-                            "sid": request.generate_request_id(client),
+                            "sid": generate_request_id(client),
                             "mode": mode,
                             "last": "true",
                             "index": "0",
