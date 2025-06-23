@@ -154,7 +154,12 @@ The project uses pytest for testing. Run tests with:
 ```bash
 pytest pymeow/tests
 ```
-
+Also run ruff and mypy:
+```bash
+ruff check
+mypy .
+ruff format --check
+```
 ### Code Style
 
 The project follows Python best practices:

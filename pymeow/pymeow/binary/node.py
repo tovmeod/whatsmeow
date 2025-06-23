@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
+from .decoder import BinaryDecoder, DecodingError
 from ..datatypes.jid import BROADCAST_SERVER, DEFAULT_USER_SERVER, GROUP_SERVER, JID, NEWSLETTER_SERVER
 from .attrs import Attrs, AttrUtility
 
@@ -222,6 +223,8 @@ def unmarshal(data: bytes) -> Node:
     Raises:
         DecodingError: if r.index != len(r.data): leftover bytes after decoding
     """
-    from .decoder import unmarshal as decoder_unmarshal
-
-    return decoder_unmarshal(data)
+    r = BinaryDecoder.new_decoder(data)
+    n = r.read_node()
+    if r.index != len(r.data):
+        raise DecodingError(f"{len(r.data) - r.index} leftover bytes after decoding")
+    return n

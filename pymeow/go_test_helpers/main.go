@@ -31,6 +31,20 @@ func call_method(methodPtr *C.char, argsPtr *C.char) *C.char {
 		}
 		return toJson(map[string]interface{}{"data": hex.EncodeToString(data)})
 
+	case "binary.decoder.unmarshal":
+		hexData := args["data"].(string)
+		data, err := hex.DecodeString(hexData)
+		if err != nil {
+			return toJson(map[string]interface{}{"error": "invalid hex data: " + err.Error()})
+		}
+		// Use binary.Unmarshal which internally uses newDecoder().readNode()
+		node, err := binary.Unmarshal(data)
+		if err != nil {
+			return toJson(map[string]interface{}{"error": err.Error()})
+		}
+		// Dereference the pointer to get the Node value
+		return toJson(map[string]interface{}{"node": nodeToJson(*node)})
+
 	default:
 		return toJson(map[string]interface{}{"error": "unknown method"})
 	}
@@ -53,6 +67,26 @@ func jsonToNode(data map[string]interface{}) binary.Node {
 	}
 
 	return node
+}
+
+func nodeToJson(node binary.Node) map[string]interface{} {
+	result := map[string]interface{}{
+		"tag": node.Tag,
+	}
+
+	if node.Attrs != nil && len(node.Attrs) > 0 {
+		result["attrs"] = node.Attrs
+	} else {
+		result["attrs"] = make(map[string]interface{})
+	}
+
+	if node.Content != nil {
+		result["content"] = node.Content
+	} else {
+		result["content"] = nil
+	}
+
+	return result
 }
 
 func toJson(data interface{}) *C.char {

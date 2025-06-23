@@ -6,13 +6,15 @@ Port of whatsmeow/binary/decoder.go
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 
 from ..datatypes.jid import INTEROP_SERVER, JID, MESSENGER_SERVER
 from ..exceptions import PymeowError
 from . import token
 from .errors import InvalidJIDTypeError, InvalidNodeError, InvalidTokenError, InvalidTypeError, NonStringKeyError
-from .node import Node
+
+if TYPE_CHECKING:
+    from .node import Node
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +205,7 @@ class BinaryDecoder:
         else:
             raise InvalidTokenError(f"readListSize with unknown tag {tag} at position {self.index}")
 
-    def read(self, as_string: bool) -> None | List[Node] | bytes | str | JID:
+    def read(self, as_string: bool) -> None | List["Node"] | bytes | str | JID:
         """
         Read a value from the data.
 
@@ -352,7 +354,7 @@ class BinaryDecoder:
             ret[key] = self.read(True)
         return ret
 
-    def read_list(self, tag: int) -> List[Node]:
+    def read_list(self, tag: int) -> List["Node"]:
         """
         Read a list of nodes from the data.
 
@@ -372,7 +374,7 @@ class BinaryDecoder:
             ret.append(n)
         return ret
 
-    def read_node(self) -> Node:
+    def read_node(self) -> "Node":
         """
         Read a node from the data.
 
@@ -382,6 +384,7 @@ class BinaryDecoder:
             EOFError: If reading would go beyond the end of the data
             InvalidNodeError
         """
+        from .node import Node
         size = self.read_int8(False)
         list_size = self.read_list_size(size)
         raw_desc = self.read(True)
@@ -524,22 +527,3 @@ class DecodingError(PymeowError):
     """Error that occurs during binary decoding operations."""
 
     pass
-
-
-def unmarshal(data: bytes) -> Node:
-    """
-    Unmarshal binary data into a Node.
-
-    Args:
-        data: The binary data to unmarshal
-
-    Returns:
-        A tuple containing the Node and an optional error
-    Raises:
-        DecodingError: if r.index != len(r.data): leftover bytes after decoding
-    """
-    r = BinaryDecoder.new_decoder(data)
-    n = r.read_node()
-    if r.index != len(r.data):
-        raise DecodingError(f"{len(r.data) - r.index} leftover bytes after decoding")
-    return n

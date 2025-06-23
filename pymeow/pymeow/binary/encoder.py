@@ -6,7 +6,7 @@ Port of whatsmeow/binary/encoder.go
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Union
+from typing import Any, Callable, Dict, Union, TYPE_CHECKING
 
 from ..datatypes.jid import (
     DEFAULT_USER_SERVER,
@@ -17,7 +17,6 @@ from ..datatypes.jid import (
     MESSENGER_SERVER,
 )
 from .errors import InvalidTypeError
-from .node import Node
 from .token import (
     AD_JID,
     BINARY_8,
@@ -34,6 +33,9 @@ from .token import (
     NIBBLE_8,
     PACKED_MAX,
 )
+
+if TYPE_CHECKING:
+    from .node import Node
 
 # Size of a tag in the WhatsApp protocol
 TAG_SIZE = 1
@@ -100,7 +102,7 @@ class BinaryEncoder:
         else:
             raise ValueError(f"length is too large: {length}")
 
-    def write_node(self, n: Node) -> None:
+    def write_node(self, n: "Node") -> None:
         """Write a node to the data."""
         if n.tag == "0":
             self.push_byte(LIST_8)
@@ -116,6 +118,7 @@ class BinaryEncoder:
 
     def write(self, data: Any) -> None:
         """Write any data to the encoder."""
+        from .node import Node
         if data is None:
             self.push_byte(LIST_EMPTY)
         elif isinstance(data, JID):
