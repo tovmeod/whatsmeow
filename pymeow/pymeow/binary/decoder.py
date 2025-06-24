@@ -6,7 +6,7 @@ Port of whatsmeow/binary/decoder.go
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from ..datatypes.jid import INTEROP_SERVER, JID, MESSENGER_SERVER
 from ..exceptions import PymeowError
@@ -385,6 +385,7 @@ class BinaryDecoder:
             InvalidNodeError
         """
         from .node import Node
+
         size = self.read_int8(False)
         list_size = self.read_list_size(size)
         raw_desc = self.read(True)

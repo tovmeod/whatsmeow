@@ -9,9 +9,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
-from .decoder import BinaryDecoder, DecodingError
 from ..datatypes.jid import BROADCAST_SERVER, DEFAULT_USER_SERVER, GROUP_SERVER, JID, NEWSLETTER_SERVER
 from .attrs import Attrs, AttrUtility
+from .decoder import BinaryDecoder, DecodingError
 
 logger = logging.getLogger(__name__)
 
