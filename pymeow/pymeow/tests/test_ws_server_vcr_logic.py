@@ -9,7 +9,7 @@ from aiohttp import WSMsgType, web
 
 # Assuming ws_server_vcr is in the same directory or adjust path accordingly
 # For the purpose of this exercise, I'll assume it's importable like this:
-from .ws_server_vcr import ReplayMismatchError, create_ws_server_from_cassette
+from .ws_server_vcr import create_ws_server_from_cassette
 
 # Configure logging for tests (optional, but can be helpful for debugging)
 logging.basicConfig(level=logging.DEBUG)
@@ -181,7 +181,7 @@ async def test_strict_replay_payload_mismatch(tmp_path, unused_tcp_port):
                     await ws.send_str("pinnng")  # Mismatched payload
                     # The VCR server will detect the mismatch, log ReplayMismatchError,
                     # and send a WebSocket close frame.
-                    await ws.receive_str(timeout=1) # This will raise WSMessageTypeError
+                    await ws.receive_str(timeout=1)  # This will raise WSMessageTypeError
 
         # No need to check excinfo.value for ReplayMismatchError content,
         # as that's a server-side exception. We're checking client's observation.
@@ -213,7 +213,7 @@ async def test_strict_replay_type_mismatch(tmp_path, unused_tcp_port):
                     await ws.send_bytes(b"ping_bytes")  # Mismatched type (BINARY instead of TEXT)
                     # The VCR server will detect the mismatch, log ReplayMismatchError,
                     # and send a WebSocket close frame.
-                    await ws.receive_str(timeout=1) # This will raise WSMessageTypeError
+                    await ws.receive_str(timeout=1)  # This will raise WSMessageTypeError
 
         # No need to check excinfo.value for ReplayMismatchError content,
         # as that's a server-side exception. We're checking client's observation.
@@ -248,7 +248,7 @@ async def test_strict_replay_timeout(tmp_path, unused_tcp_port):
 
                 # By now, server should have closed the connection due to client_receive_timeout.
                 logging.info("Client woke up, attempting to send a late message.")
-                await ws.send_str("late_message") # This might succeed if send is buffered
+                await ws.send_str("late_message")  # This might succeed if send is buffered
                 logging.info("Client sent late_message; server should have already closed. Expecting error on receive.")
                 # Attempting to receive should now fail as server has closed connection.
                 # Server should send a CLOSE frame when it times out the client.

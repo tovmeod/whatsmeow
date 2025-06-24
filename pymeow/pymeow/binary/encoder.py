@@ -6,7 +6,7 @@ Port of whatsmeow/binary/encoder.go
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Dict, Union
 
 from ..datatypes.jid import (
     DEFAULT_USER_SERVER,
@@ -119,6 +119,7 @@ class BinaryEncoder:
     def write(self, data: Any) -> None:
         """Write any data to the encoder."""
         from .node import Node
+
         if data is None:
             self.push_byte(LIST_EMPTY)
         elif isinstance(data, JID):
