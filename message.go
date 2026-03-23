@@ -326,7 +326,21 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			cli.Log.Warnf("No LID found for %s", info.Sender)
 		}
 	}
+	// Cache sender's session to reduce DB round-trips during decryption.
+	// Same mechanism as send path (send.go:1279-1316).
+	sessionAddr := senderEncryptionJID.SignalAddress().String()
+	if _, cachedCtx, cacheErr := cli.Store.WithCachedSessions(ctx, []string{sessionAddr}); cacheErr != nil {
+		cli.Log.Warnf("Failed to prefetch session for %s: %v", info.SourceString(), cacheErr)
+	} else {
+		ctx = cachedCtx
+		defer func() {
+			if flushErr := cli.Store.PutCachedSessions(ctx); flushErr != nil {
+				cli.Log.Errorf("Failed to flush session cache for %s: %v", info.SourceString(), flushErr)
+			}
+		}()
+	}
 	var recognizedStanza, protobufFailed bool
+	var encTypes []string
 	for _, child := range children {
 		if child.Tag != "enc" {
 			continue
@@ -337,6 +351,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		if !ok {
 			continue
 		}
+		encTypes = append(encTypes, encType)
 		var decrypted []byte
 		var ciphertextHash *[32]byte
 		var err error
@@ -383,11 +398,33 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			cli.Log.Warnf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
 			continue
 		} else if err != nil {
-			cli.Log.Warnf("Error decrypting message %s from %s: %v", info.ID, info.SourceString(), err)
+			cli.Log.Warnf("Error decrypting message %s from %s (encTypes=%v, containsDirectMsg=%v): %v", info.ID, info.SourceString(), encTypes, containsDirectMsg, err)
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				return
 			}
-			isUnavailable := encType == "skmsg" && !containsDirectMsg && errors.Is(err, signalerror.ErrNoSenderKeyForUser)
+			// Force include identity (our prekeys) in retry when:
+			// 1. No sender key for group decryption (need SKDM)
+			// 2. No session for pairwise decryption
+			// 3. Sender used an old/invalid prekey ID (critical after data loss/recovery)
+			// 4. No valid sessions (session exists but chain state is invalid)
+			// 5. Sender key state mismatch (have sender key but wrong chain iteration)
+			isUnavailable := (encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser)) ||
+				(encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID)) ||
+				errors.Is(err, signalerror.ErrNoSessionForUser) ||
+				errors.Is(err, signalerror.ErrNoValidSessions) ||
+				errors.Is(err, signalerror.ErrNoOneTimeKeyFound)
+			// Log senders that haven't distributed SKDM to us yet
+			if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser) {
+				cli.Log.Debugf("SENDER_NEEDS_SESSION: sender=%s group=%s containsDirectMsg=%v - sender has not distributed SKDM to us yet", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg)
+			}
+			// Log sender key state mismatch for diagnostics
+			if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID) {
+				cli.Log.Warnf("SENDER_KEY_MISMATCH: sender=%s group=%s containsDirectMsg=%v error=%v", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg, err)
+			}
+			// Log stale prekey ID errors - sender has cached old prekey, retry with fresh prekeys should fix
+			if errors.Is(err, signalerror.ErrNoOneTimeKeyFound) {
+				cli.Log.Warnf("STALE_PREKEY: sender=%s - sender used old prekey ID, sending retry with fresh prekeys", senderEncryptionJID.String())
+			}
 			if encType == "msmsg" {
 				cli.backgroundIfAsyncAck(func() {
 					cli.sendAck(ctx, node, NackMissingMessageSecret)
@@ -396,9 +433,17 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				cli.sendRetryReceipt(ctx, node, info, isUnavailable)
 				// TODO this probably isn't supposed to ack
 				cli.sendAck(ctx, node, 0)
+				// Proactively establish session for pairwise session errors
+				if errors.Is(err, signalerror.ErrNoSessionForUser) {
+					go cli.establishSessionWithSender(context.WithoutCancel(ctx), senderEncryptionJID)
+				}
 			} else {
 				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
 				go cli.sendAck(ctx, node, 0)
+				// Proactively establish session for pairwise session errors
+				if errors.Is(err, signalerror.ErrNoSessionForUser) {
+					go cli.establishSessionWithSender(context.WithoutCancel(ctx), senderEncryptionJID)
+				}
 			}
 			cli.dispatchEvent(&events.UndecryptableMessage{
 				Info:            *info,
@@ -409,6 +454,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		}
 		retryCount := ag.OptionalInt("count")
 		cli.cancelDelayedRequestFromPhone(info.ID)
+		cli.clearMessageRetry(info.ID)
 
 		var msg waE2E.Message
 		var handlerFailed bool
@@ -1053,5 +1099,43 @@ func (cli *Client) sendProtocolMessageReceipt(ctx context.Context, id types.Mess
 	})
 	if err != nil {
 		cli.Log.Warnf("Failed to send acknowledgement for protocol message %s: %v", id, err)
+	}
+}
+
+// establishSessionWithSender proactively fetches prekeys and establishes a Signal session.
+// This allows future messages from the sender to be decrypted.
+// Should be called in a goroutine after a decryption failure with ErrNoSessionForUser.
+func (cli *Client) establishSessionWithSender(ctx context.Context, sender types.JID) {
+	cli.sessionRecreateHistoryLock.Lock()
+	lastAttempt, ok := cli.sessionRecreateHistory[sender]
+	if ok && time.Since(lastAttempt) < 5*time.Minute {
+		cli.sessionRecreateHistoryLock.Unlock()
+		cli.Log.Debugf("Skipping session establishment with %s (attempted %s ago)", sender, time.Since(lastAttempt))
+		return
+	}
+	cli.sessionRecreateHistory[sender] = time.Now()
+	cli.sessionRecreateHistoryLock.Unlock()
+
+	cli.Log.Infof("Proactively fetching prekeys to establish session with %s", sender)
+	bundles := cli.fetchPreKeysNoError(ctx, []types.JID{sender})
+	bundle, ok := bundles[sender]
+	if !ok || bundle == nil {
+		cli.Log.Warnf("No prekey bundle received for %s", sender)
+		return
+	}
+	builder := session.NewBuilderFromSignal(cli.Store, sender.SignalAddress(), pbSerializer)
+	err := builder.ProcessBundle(ctx, bundle)
+	if cli.AutoTrustIdentity && errors.Is(err, signalerror.ErrUntrustedIdentity) {
+		cli.Log.Warnf("Got untrusted identity while establishing session with %s, clearing and retrying", sender)
+		if clearErr := cli.clearUntrustedIdentity(ctx, sender); clearErr != nil {
+			cli.Log.Errorf("Failed to clear untrusted identity for %s: %v", sender, clearErr)
+			return
+		}
+		err = builder.ProcessBundle(ctx, bundle)
+	}
+	if err != nil {
+		cli.Log.Warnf("Failed to establish session with %s: %v", sender, err)
+	} else {
+		cli.Log.Infof("Successfully established session with %s", sender)
 	}
 }

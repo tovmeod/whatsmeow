@@ -976,14 +976,11 @@ func getButtonTypeFromMessage(msg *waE2E.Message) string {
 		return getButtonTypeFromMessage(msg.EphemeralMessage.Message)
 	case msg.ButtonsMessage != nil:
 		return "buttons"
-	case msg.ButtonsResponseMessage != nil:
-		return "buttons_response"
 	case msg.ListMessage != nil:
 		return "list"
-	case msg.ListResponseMessage != nil:
-		return "list_response"
-	case msg.InteractiveResponseMessage != nil:
-		return "interactive_response"
+	// Response types (ButtonsResponseMessage, ListResponseMessage, InteractiveResponseMessage)
+	// must NOT get a <biz> stanza wrapper — they are user-side responses, not business messages.
+	// Including them here causes WhatsApp error 479 (smax-invalid) from linked devices.
 	default:
 		return ""
 	}
