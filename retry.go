@@ -11,6 +11,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"time"
@@ -19,6 +20,8 @@ import (
 	"go.mau.fi/libsignal/groups"
 	"go.mau.fi/libsignal/keys/prekey"
 	"go.mau.fi/libsignal/protocol"
+	"go.mau.fi/libsignal/session"
+	"go.mau.fi/libsignal/signalerror"
 	"google.golang.org/protobuf/proto"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -213,6 +216,43 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 	if !ag.OK() {
 		return ag.Error()
 	}
+	// Process prekey bundle BEFORE checking if message exists.
+	// This ensures we establish a session with the requester even if we can't
+	// find the original message. This way, our next group message will include
+	// SKDM for them, fixing the "no sender key" error for future messages.
+	if _, hasKeys := node.GetOptionalChildByTag("keys"); hasKeys {
+		bundle, bundleErr := nodeToPreKeyBundle(uint32(receipt.Sender.Device), *node)
+		if bundleErr != nil {
+			cli.Log.Warnf("Failed to parse prekey bundle from retry receipt from %s: %v", receipt.Sender, bundleErr)
+		} else if bundle != nil {
+			encryptionIdentity := receipt.Sender
+			if receipt.Sender.Server == types.DefaultUserServer {
+				lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, receipt.Sender)
+				if err != nil {
+					cli.Log.Warnf("Failed to get LID for %s: %v", receipt.Sender, err)
+				} else if !lidForPN.IsEmpty() {
+					cli.migrateSessionStore(ctx, receipt.Sender, lidForPN)
+					encryptionIdentity = lidForPN
+				}
+			}
+			builder := session.NewBuilderFromSignal(cli.Store, encryptionIdentity.SignalAddress(), pbSerializer)
+			processErr := builder.ProcessBundle(ctx, bundle)
+			if cli.AutoTrustIdentity && errors.Is(processErr, signalerror.ErrUntrustedIdentity) {
+				cli.Log.Warnf("Got untrusted identity processing prekey bundle from retry receipt from %s, clearing and retrying", receipt.Sender)
+				if clearErr := cli.clearUntrustedIdentity(ctx, encryptionIdentity); clearErr != nil {
+					cli.Log.Errorf("Failed to clear untrusted identity for %s: %v", encryptionIdentity, clearErr)
+				} else {
+					processErr = builder.ProcessBundle(ctx, bundle)
+				}
+			}
+			if processErr != nil {
+				cli.Log.Warnf("Failed to process prekey bundle from retry receipt from %s: %v", receipt.Sender, processErr)
+			} else {
+				cli.Log.Infof("Established session with %s from retry receipt prekey bundle (message %s)", receipt.Sender, messageID)
+			}
+		}
+	}
+
 	msg, err := cli.getMessageForRetry(ctx, receipt, messageID)
 	if err != nil {
 		return err
@@ -461,6 +501,12 @@ func (cli *Client) clearDelayedMessageRequests() {
 	}
 }
 
+func (cli *Client) clearMessageRetry(msgID types.MessageID) {
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+	delete(cli.messageRetries, string(msgID))
+}
+
 // sendRetryReceipt sends a retry receipt for an incoming message.
 func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, forceIncludeIdentity bool) {
 	id, _ := node.Attrs["id"].(string)
@@ -533,5 +579,7 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 	err := cli.sendNode(ctx, payload)
 	if err != nil {
 		cli.Log.Errorf("Failed to send retry receipt for %s: %v", id, err)
+	} else {
+		cli.Log.Infof("Sent retry receipt for message %s from %s (attempt %d, forceIncludeIdentity=%v)", id, info.SourceString(), retryCount, forceIncludeIdentity)
 	}
 }

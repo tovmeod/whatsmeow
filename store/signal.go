@@ -121,6 +121,13 @@ func (device *Device) StoreSession(ctx context.Context, address *protocol.Signal
 
 func (device *Device) ContainsSession(ctx context.Context, remoteAddress *protocol.SignalAddress) (bool, error) {
 	addrString := remoteAddress.String()
+
+	// Check cache first - sessions may exist in cache but not yet flushed to DB
+	if exists, inCache := hasCachedSession(ctx, addrString); inCache {
+		return exists, nil
+	}
+
+	// Fall back to database check
 	hasSession, err := device.Sessions.HasSession(ctx, addrString)
 	if err != nil {
 		return false, fmt.Errorf("failed to check if store has session for %s: %w", addrString, err)

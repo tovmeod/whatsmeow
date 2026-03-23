@@ -69,6 +69,20 @@ func putCachedSession(ctx context.Context, addr string, record *record.Session) 
 	return true
 }
 
+// hasCachedSession checks if a session exists in the cache.
+// Returns (exists bool, inCache bool) - inCache indicates if cache was checked.
+func hasCachedSession(ctx context.Context, addr string) (exists bool, inCache bool) {
+	cache := getSessionCache(ctx)
+	if cache == nil {
+		return false, false
+	}
+	entry, ok := cache.Get(addr)
+	if !ok {
+		return false, true // Cache exists but no entry for this address
+	}
+	return entry.Found, true
+}
+
 func (device *Device) WithCachedSessions(ctx context.Context, addresses []string) (map[string]bool, context.Context, error) {
 	if len(addresses) == 0 {
 		return nil, ctx, nil
