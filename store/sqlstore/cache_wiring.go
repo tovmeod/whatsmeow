@@ -23,6 +23,7 @@ import (
 
 	"go.mau.fi/whatsmeow/store"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"go.mau.fi/whatsmeow/util/walltime"
 )
 
 // Shared LRU capacities for the three signal-store caches. 100k entries each
@@ -143,11 +144,19 @@ func (c *Container) emitMetricsLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+		// Phase 17.5.1-04: decrypt_wall p50/p95/p99/count appended so operators
+		// can correlate cache hit-rate trends with end-to-end decrypt latency
+		// from a single journalctl log line. Quantile estimates are approximate
+		// (bucket-upper-bound resolution); zero-sample histogram formats as 0s.
 		c.log.Infof(
-			"Cache metrics: sessions={len=%d, cap=%d, evictions=%d} identities={len=%d, cap=%d, evictions=%d} sender_keys={len=%d, cap=%d, evictions=%d}",
+			"Cache metrics: sessions={len=%d, cap=%d, evictions=%d} identities={len=%d, cap=%d, evictions=%d} sender_keys={len=%d, cap=%d, evictions=%d} decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
 			c.caches.Session.Len(), signalSessionCacheCap, atomic.LoadUint64(&c.caches.SessionEvictions),
 			c.caches.Identity.Len(), signalIdentityCacheCap, atomic.LoadUint64(&c.caches.IdentityEvictions),
 			c.caches.SenderKey.Len(), signalSenderKeyCacheCap, atomic.LoadUint64(&c.caches.SenderKeyEvictions),
+			walltime.DecryptHistogram.Quantile(0.5),
+			walltime.DecryptHistogram.Quantile(0.95),
+			walltime.DecryptHistogram.Quantile(0.99),
+			walltime.DecryptHistogram.Count(),
 		)
 	}
 }
