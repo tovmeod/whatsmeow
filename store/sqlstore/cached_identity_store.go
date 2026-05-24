@@ -35,6 +35,19 @@ import (
 // fakeIdentityStore test-helper also satisfies it. If a future test
 // injects a non-conforming fake, the wrapper falls back to
 // inner.IsTrustedIdentity without caching — defensive, no log spam.
+//
+// Single-goroutine-per-account assumption (WR-05 closure):
+// The kavtov-driver-go deployment runs one whatsmeow.Client per phone,
+// and all signal-store operations for that phone execute on that
+// Client's read-loop goroutine. Different phones map to different
+// *store.Device and thus different CachedIdentityStore instances; the
+// shared process-LRU is keyed by `jid + "|" + address`, so per-device
+// key spaces never overlap. For any single cache key, at most one
+// goroutine ever calls IsTrustedIdentity / PutIdentity / DeleteIdentity.
+// This closes the WR-05 populate-on-miss race (two concurrent
+// IsTrustedIdentity calls for the same address both reaching c.cache.Add
+// before either's PutIdentity) — that interleaving cannot occur under
+// the single-writer invariant.
 type CachedIdentityStore struct {
 	inner store.IdentityStore
 	jid   string
