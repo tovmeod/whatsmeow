@@ -30,11 +30,11 @@ import (
 //
 // IsTrustedIdentity populates the cache on miss via a runtime type-assertion
 // against `interface{ getIdentityBytes(context.Context, string) (*[32]byte, error) }`.
-// The concrete *SQLStore satisfies this assertion (see store.go private
-// method added in Plan 17.5-03 Task 1). The fakeIdentityStore test-helper
-// also satisfies it. If a future test injects a non-conforming fake, the
-// wrapper falls back to inner.IsTrustedIdentity without caching — defensive,
-// no log spam.
+// The concrete *SQLStore satisfies this assertion (see the private
+// getIdentityBytes method on SQLStore in this package). The
+// fakeIdentityStore test-helper also satisfies it. If a future test
+// injects a non-conforming fake, the wrapper falls back to
+// inner.IsTrustedIdentity without caching — defensive, no log spam.
 type CachedIdentityStore struct {
 	inner store.IdentityStore
 	jid   string
@@ -54,9 +54,8 @@ type identityReader interface {
 }
 
 // NewCachedIdentityStore constructs a wrapper over inner. jid is the
-// device JID (used as cache-key prefix per RESEARCH §7). cache is a shared
-// LRU constructed by the Container (Plan 17.5-02 declared the field on
-// Container; Plan 17.5-04 constructs it).
+// device JID (used as cache-key prefix). cache is a shared LRU
+// constructed by the Container.
 func NewCachedIdentityStore(inner store.IdentityStore, jid string, cache *lru.Cache[string, *[32]byte]) *CachedIdentityStore {
 	return &CachedIdentityStore{
 		inner: inner,
@@ -69,9 +68,12 @@ func (c *CachedIdentityStore) key(address string) string {
 	return c.jid + "|" + address
 }
 
-// Stats returns (hits, misses, dedupedWrites) for test observability and for
-// Plan 17.5-04's emitMetricsLoop to surface deduped UPSERT counts (the headline
-// closure of RESEARCH Pitfall 3).
+// Stats returns (hits, misses, dedupedWrites) for test observability and
+// for the Container's emitMetricsLoop to surface deduped UPSERT counts —
+// the headline closure of the libsignal "SaveIdentity after every
+// IsTrustedIdentity" 1:1 SELECT:UPSERT pattern (~99% of those UPSERTs
+// eliminated in steady state by the value-equal write-skip in
+// PutIdentity below).
 func (c *CachedIdentityStore) Stats() (hits, misses, dedupedWrites uint64) {
 	return atomic.LoadUint64(&c.hits),
 		atomic.LoadUint64(&c.misses),
