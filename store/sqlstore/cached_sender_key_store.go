@@ -1,0 +1,103 @@
+// Copyright (c) 2026 Kavtov Platform (Phase 17.5)
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package sqlstore
+
+import (
+	"context"
+	"sync/atomic"
+
+	lru "github.com/hashicorp/golang-lru/v2"
+
+	"go.mau.fi/whatsmeow/store"
+)
+
+// CachedSenderKeyStore wraps an inner store.SenderKeyStore with a
+// process-shared *lru.Cache[string, []byte]. Cache key is the three-element
+// composite jid + "|" + group + "|" + user (RESEARCH Finding 7) — group and
+// user form the natural identity for a sender-key record (whatsmeow_sender_keys
+// is keyed (our_jid, chat_id, sender_id) in PG).
+//
+// Compared to CachedSessionStore, this wrapper is intentionally simple:
+//   - No write-coalesce / FlushIfDirty. Although sender_keys exhibits the
+//     same 1:1 SELECT:UPSERT ratio as sessions (RESEARCH Open Question #2),
+//     the write-coalesce extension is deferred to a post-deploy phase per
+//     CONTEXT.md D-CACHE-03 (framed as sessions-only for v1).
+//   - No value-equal write-skip. Sender keys mutate naturally as the group
+//     ratchet advances; equal-value writes would be rare and the savings
+//     don't justify the comparison overhead on every PutSenderKey.
+type CachedSenderKeyStore struct {
+	inner store.SenderKeyStore
+	jid   string
+	cache *lru.Cache[string, []byte]
+
+	hits, misses uint64
+}
+
+var _ store.SenderKeyStore = (*CachedSenderKeyStore)(nil)
+
+// NewCachedSenderKeyStore constructs a wrapper over inner. jid is the device
+// JID (used as cache-key prefix). cache is a shared LRU constructed by the
+// Container (Plan 17.5-02 declared the field on Container; Plan 17.5-04
+// constructs it).
+func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte]) *CachedSenderKeyStore {
+	return &CachedSenderKeyStore{
+		inner: inner,
+		jid:   jid,
+		cache: cache,
+	}
+}
+
+func (c *CachedSenderKeyStore) key(group, user string) string {
+	return c.jid + "|" + group + "|" + user
+}
+
+// Stats returns (hits, misses) for test observability and for Plan 17.5-04's
+// emitMetricsLoop.
+func (c *CachedSenderKeyStore) Stats() (hits, misses uint64) {
+	return atomic.LoadUint64(&c.hits),
+		atomic.LoadUint64(&c.misses)
+}
+
+// Purge clears the entire cache. The SenderKeyStore interface has no
+// DeleteAll* method, but Plan 17.5-04's Container.PurgeAllSignalCaches
+// reaches the shared LRU via Container.SenderKeyCache directly; Purge is
+// exposed here for symmetry with CachedSessionStore and for tests that
+// want to reset state without recreating the wrapper.
+func (c *CachedSenderKeyStore) Purge() {
+	c.cache.Purge()
+}
+
+// ---------------------------------------------------------------------------
+// store.SenderKeyStore
+// ---------------------------------------------------------------------------
+
+func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user string) ([]byte, error) {
+	k := c.key(group, user)
+	if v, ok := c.cache.Get(k); ok {
+		atomic.AddUint64(&c.hits, 1)
+		return v, nil
+	}
+	atomic.AddUint64(&c.misses, 1)
+	v, err := c.inner.GetSenderKey(ctx, group, user)
+	if err == nil && v != nil {
+		// Do NOT cache nil (Pitfall 5 from sessions wrapper) — a future
+		// PutSenderKey would not invalidate a nil entry and subsequent
+		// Gets would erroneously return nil.
+		c.cache.Add(k, v)
+	}
+	return v, err
+}
+
+func (c *CachedSenderKeyStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
+	// TODO(post-deploy): consider extending coalesce to sender_keys per
+	// RESEARCH §Open Question #2.
+	if err := c.inner.PutSenderKey(ctx, group, user, session); err != nil {
+		return err
+	}
+	c.cache.Add(c.key(group, user), session)
+	return nil
+}
