@@ -86,17 +86,24 @@ type CachedSessionStore struct {
 	cache *lru.Cache[string, []byte]
 
 	hits, misses, evictions uint64
+
+	// explicitRemoves points at the Container-level SessionExplicitRemoves
+	// counter (signalCaches.SessionExplicitRemoves). Incremented at call
+	// sites of Remove() before delegating to the LRU (Phase 17.5.2).
+	explicitRemoves *uint64
 }
 
 var _ store.SessionStore = (*CachedSessionStore)(nil)
 
 // NewCachedSessionStore constructs a wrapper over inner with the given JID
-// scope and shared LRU.
-func NewCachedSessionStore(inner store.SessionStore, jid string, cache *lru.Cache[string, []byte]) *CachedSessionStore {
+// scope and shared LRU. explicitRemoves is a pointer to the Container-level
+// SessionExplicitRemoves counter (Phase 17.5.2).
+func NewCachedSessionStore(inner store.SessionStore, jid string, cache *lru.Cache[string, []byte], explicitRemoves *uint64) *CachedSessionStore {
 	return &CachedSessionStore{
-		inner: inner,
-		jid:   jid,
-		cache: cache,
+		inner:           inner,
+		jid:             jid,
+		cache:           cache,
+		explicitRemoves: explicitRemoves,
 	}
 }
 
@@ -230,6 +237,8 @@ func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) 
 	if err := c.inner.DeleteSession(ctx, address); err != nil {
 		return err
 	}
+	// kavtov-fork: Phase 17.5.2 - pre-increment explicit-remove counter (see Plan 17.5.2-03)
+	atomic.AddUint64(c.explicitRemoves, 1)
 	c.cache.Remove(c.key(address))
 	return nil
 }
@@ -259,6 +268,8 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 		// len(jidPfx). Match the SQL predicate exactly: address starts
 		// with phone + ":".
 		if strings.HasPrefix(k[len(jidPfx):], addrPfx) {
+			// kavtov-fork: Phase 17.5.2 - pre-increment per iteration (loop calls Remove N times)
+			atomic.AddUint64(c.explicitRemoves, 1)
 			c.cache.Remove(k)
 		}
 	}
@@ -319,6 +330,8 @@ func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.J
 	// Pass 2: evict. Reads against the new LID address will cache-miss
 	// and repopulate from inner on first access.
 	for _, k := range victims {
+		// kavtov-fork: Phase 17.5.2 - pre-increment per iteration in MigratePNToLID
+		atomic.AddUint64(c.explicitRemoves, 1)
 		c.cache.Remove(k)
 	}
 	return nil

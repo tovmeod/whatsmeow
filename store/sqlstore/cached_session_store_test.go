@@ -28,11 +28,12 @@ import (
 
 // ---------------------------------------------------------------------------
 // Test helper: newTestCachedSessionStore wires a fakeSessionStore, a fresh
-// session-only LRU cache, and the 3-arg NewCachedSessionStore constructor
-// (inner, jid, cache). The Container literal is not needed since Phase 17.5
-// FIX dropped the container reverse-pointer and the cross-cache purge helper.
-// Test caches use plain lru.New (no eviction callback) — Container-level
-// eviction counters are not exercised by these tests.
+// session-only LRU cache, and the 4-arg NewCachedSessionStore constructor
+// (inner, jid, cache, explicitRemoves). The Container literal is not needed
+// since Phase 17.5 FIX dropped the container reverse-pointer and the
+// cross-cache purge helper. Test caches use plain lru.New (no eviction
+// callback) — Container-level eviction counters are not exercised by these
+// tests (Phase 17.5.2 counter discrimination tests live in cache_wiring_test.go).
 // ---------------------------------------------------------------------------
 
 func newTestCachedSessionStore(t *testing.T, capSize int) (*CachedSessionStore, *fakeSessionStore, *lru.Cache[string, []byte]) {
@@ -42,7 +43,10 @@ func newTestCachedSessionStore(t *testing.T, capSize int) (*CachedSessionStore, 
 	if err != nil {
 		t.Fatalf("lru.New[string, []byte] failed: %v", err)
 	}
-	wrapper := NewCachedSessionStore(inner, "test-jid", sessionCache)
+	// explicitRemoves: a local dummy counter — these tests exercise caching
+	// logic, not Container-level counter discrimination (Phase 17.5.2).
+	var dummyExplicitRemoves uint64
+	wrapper := NewCachedSessionStore(inner, "test-jid", sessionCache, &dummyExplicitRemoves)
 	return wrapper, inner, sessionCache
 }
 

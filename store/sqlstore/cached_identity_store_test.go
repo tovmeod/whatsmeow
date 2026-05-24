@@ -47,7 +47,10 @@ func newTestCachedIdentityStore(t *testing.T, capSize int) (*CachedIdentityStore
 	}
 	// "test-jid" with no trailing pipe — wrapper's key() prepends the
 	// separator. Matches production format used by Container.initializeDevice.
-	wrapper := NewCachedIdentityStore(inner, "test-jid", cache)
+	// explicitRemoves: a local dummy counter — these tests exercise caching
+	// logic, not Container-level counter discrimination (Phase 17.5.2).
+	var dummyExplicitRemoves uint64
+	wrapper := NewCachedIdentityStore(inner, "test-jid", cache, &dummyExplicitRemoves)
 	return wrapper, inner
 }
 

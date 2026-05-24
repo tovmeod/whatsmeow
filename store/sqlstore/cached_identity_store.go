@@ -54,6 +54,11 @@ type CachedIdentityStore struct {
 	cache *lru.Cache[string, *[32]byte]
 
 	hits, misses, dedupedWrites uint64
+
+	// explicitRemoves points at the Container-level IdentityExplicitRemoves
+	// counter (signalCaches.IdentityExplicitRemoves). Incremented at call
+	// sites of Remove() and Purge() before delegating to the LRU (Phase 17.5.2).
+	explicitRemoves *uint64
 }
 
 var _ store.IdentityStore = (*CachedIdentityStore)(nil)
@@ -68,12 +73,14 @@ type identityReader interface {
 
 // NewCachedIdentityStore constructs a wrapper over inner. jid is the
 // device JID (used as cache-key prefix). cache is a shared LRU
-// constructed by the Container.
-func NewCachedIdentityStore(inner store.IdentityStore, jid string, cache *lru.Cache[string, *[32]byte]) *CachedIdentityStore {
+// constructed by the Container. explicitRemoves is a pointer to the
+// Container-level IdentityExplicitRemoves counter (Phase 17.5.2).
+func NewCachedIdentityStore(inner store.IdentityStore, jid string, cache *lru.Cache[string, *[32]byte], explicitRemoves *uint64) *CachedIdentityStore {
 	return &CachedIdentityStore{
-		inner: inner,
-		jid:   jid,
-		cache: cache,
+		inner:           inner,
+		jid:             jid,
+		cache:           cache,
+		explicitRemoves: explicitRemoves,
 	}
 }
 
@@ -159,6 +166,8 @@ func (c *CachedIdentityStore) DeleteIdentity(ctx context.Context, address string
 	if err := c.inner.DeleteIdentity(ctx, address); err != nil {
 		return err
 	}
+	// kavtov-fork: Phase 17.5.2 - pre-increment explicit-remove counter (see Plan 17.5.2-03)
+	atomic.AddUint64(c.explicitRemoves, 1)
 	c.cache.Remove(c.key(address))
 	return nil
 }
@@ -170,6 +179,10 @@ func (c *CachedIdentityStore) DeleteAllIdentities(ctx context.Context, phone str
 	// Bulk mutation — Pitfall 1: identity composite-key prefix scan would be
 	// O(N) over the cache; cheaper to purge entirely and let the natural
 	// re-fill repopulate the working set.
+	// Purge fires the eviction callback Len() times; pre-add Len() so the
+	// log-time cleanCounters(cap, exp) can cancel the callback inflation.
+	// kavtov-fork: Phase 17.5.2 - pre-add Len() to explicit-remove counter (see Plan 17.5.2-03)
+	atomic.AddUint64(c.explicitRemoves, uint64(c.cache.Len()))
 	c.cache.Purge()
 	return nil
 }
