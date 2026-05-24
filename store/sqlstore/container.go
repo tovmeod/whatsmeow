@@ -108,10 +108,10 @@ func NewWithDB(db *sql.DB, dialect string, log waLog.Logger) *Container {
 	return NewWithWrappedDB(wrapped, log)
 }
 
-// Phase 17.5 Plan 04: shared LRU capacities. 10k entries each puts the total
-// memory budget at ~32 MB under mean value sizes per RESEARCH §4 — well under
-// the 500 MB SC-4 budget. One-line tune in a future PR if the cardinality
-// profile drifts.
+// Shared LRU capacities for the three signal-store caches. 10k entries each
+// puts the total memory budget at ~32 MB under mean value sizes — well under
+// the workspace's 500 MB cache budget. Tune here if the cardinality profile
+// drifts.
 const (
 	signalSessionCacheCap   = 10_000
 	signalIdentityCacheCap  = 10_000
@@ -355,11 +355,12 @@ func (c *Container) initializeDevice(device *store.Device) {
 	innerStore := NewSQLStore(c, *device.ID)
 	device.SetAllStores(innerStore)
 
-	// Phase 17.5 Plan 04: overwrite the three signal stores (Sessions,
-	// Identities, SenderKeys) with Cached*Store wrappers. The other 8 stores
-	// set by SetAllStores remain pointed at the bare *SQLStore. Phase 17.5
-	// FIX dropped the wrapper-registry append — emitMetricsLoop no longer
-	// aggregates per-wrapper state, only container-level cache stats.
+	// Overwrite the three signal stores (Sessions, Identities, SenderKeys)
+	// with Cached*Store wrappers. The other 8 stores set by SetAllStores
+	// remain pointed at the bare *SQLStore. The wrapper-registry append
+	// formerly performed here was dropped in the strict-write-through
+	// rewrite — emitMetricsLoop no longer aggregates per-wrapper state,
+	// only container-level cache stats.
 	jid := device.ID.String()
 	device.Sessions = NewCachedSessionStore(innerStore, jid, c.SessionCache)
 	device.Identities = NewCachedIdentityStore(innerStore, jid, c.IdentityCache)
