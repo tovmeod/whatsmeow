@@ -36,6 +36,7 @@ import (
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/walltime"
 )
 
 var pbSerializer = store.SignalProtobufSerializer
@@ -296,6 +297,12 @@ func (cli *Client) migrateSessionStore(ctx context.Context, pn, lid types.JID) {
 }
 
 func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
+	// Phase 17.5.1-04: per-message wall-time observation covers every
+	// exit path (unavailable early-return, success-path ack, error
+	// returns, panics). Quantiles surface alongside cache metrics in
+	// store/sqlstore.cache_wiring.go emitMetricsLoop every 5 minutes.
+	start := time.Now()
+	defer walltime.DecryptHistogram.Observe(time.Since(start))
 	unavailableNode, ok := node.GetOptionalChildByTag("unavailable")
 	if ok && len(node.GetChildrenByTag("enc")) == 0 {
 		uType := events.UnavailableType(unavailableNode.AttrGetter().String("type"))
