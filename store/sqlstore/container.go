@@ -46,6 +46,12 @@ type Container struct {
 	// emitMetricsLoop.
 	SessionEvictions, IdentityEvictions, SenderKeyEvictions uint64
 
+	// Phase 17.5.1 WR-01: cancellable ctx for emitMetricsLoop. Cancelled
+	// by Container.Close() so the metrics goroutine cleanly exits and
+	// does not race with logger teardown during process shutdown.
+	metricsCtx    context.Context
+	metricsCancel context.CancelFunc
+
 	// Phase 17.5 FIX: per-device wrapper registry (formerly a sync.Mutex
 	// plus three slices) was removed along with the cross-cache purge fan-
 	// out helper. Strict write-through caching no longer needs cross-cache
@@ -155,7 +161,10 @@ func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
 		panic(err)
 	}
 
-	go c.emitMetricsLoop(context.Background())
+	// Phase 17.5.1 WR-01: cancelled by Container.Close so emitMetricsLoop
+	// exits before logger/db teardown.
+	c.metricsCtx, c.metricsCancel = context.WithCancel(context.Background())
+	go c.emitMetricsLoop(c.metricsCtx)
 	return c
 }
 
@@ -323,9 +332,18 @@ func (c *Container) NewDevice() *store.Device {
 // ErrDeviceIDMustBeSet is the error returned by PutDevice if you try to save a device before knowing its JID.
 var ErrDeviceIDMustBeSet = errors.New("device JID must be known before accessing database")
 
-// Close will close the container's database
+// Close will close the container's database. Phase 17.5.1 WR-01: also cancels
+// the metricsCtx so emitMetricsLoop's goroutine exits before db/logger
+// teardown. The nil-guard on c.metricsCancel keeps Close safe on a
+// partially-constructed Container.
 func (c *Container) Close() error {
-	if c != nil && c.db != nil {
+	if c == nil {
+		return nil
+	}
+	if c.metricsCancel != nil {
+		c.metricsCancel()
+	}
+	if c.db != nil {
 		return c.db.Close()
 	}
 	return nil
