@@ -170,10 +170,11 @@ type fakeIdentityStore struct {
 	mu         sync.Mutex
 	identities map[string][32]byte
 
-	putCalls       atomic.Int64
-	deleteAllCalls atomic.Int64
-	deleteCalls    atomic.Int64
-	isTrustedCalls atomic.Int64
+	putCalls              atomic.Int64
+	deleteAllCalls        atomic.Int64
+	deleteCalls           atomic.Int64
+	isTrustedCalls        atomic.Int64
+	getIdentityBytesCalls atomic.Int64
 }
 
 func newFakeIdentityStore() *fakeIdentityStore {
@@ -221,6 +222,23 @@ func (f *fakeIdentityStore) IsTrustedIdentity(_ context.Context, address string,
 		return true, nil
 	}
 	return existing == key, nil
+}
+
+// getIdentityBytes mirrors the private SQLStore.getIdentityBytes signature
+// (Phase 17.5-03 Task 1). CachedIdentityStore type-asserts inner against
+// `interface{ getIdentityBytes(context.Context, string) (*[32]byte, error) }`
+// to populate the cache on miss; the fake satisfies the assertion so wrapper
+// tests can exercise the populate-on-miss path without a live SQL backend.
+func (f *fakeIdentityStore) getIdentityBytes(_ context.Context, address string) (*[32]byte, error) {
+	f.getIdentityBytesCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	existing, ok := f.identities[address]
+	if !ok {
+		return nil, nil
+	}
+	out := existing
+	return &out, nil
 }
 
 // ---------------------------------------------------------------------------
