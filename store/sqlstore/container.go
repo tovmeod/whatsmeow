@@ -14,6 +14,7 @@ import (
 	mathRand "math/rand/v2"
 
 	"github.com/google/uuid"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"go.mau.fi/util/dbutil"
 	"go.mau.fi/util/random"
 
@@ -30,6 +31,11 @@ type Container struct {
 	db     *dbutil.Database
 	log    waLog.Logger
 	LIDMap *CachedLIDMap
+
+	// Phase 17.5: shared LRU caches (constructed in Plan 04 EDIT 3; declared here so test stubs compile)
+	SessionCache   *lru.Cache[string, []byte]
+	IdentityCache  *lru.Cache[string, *[32]byte]
+	SenderKeyCache *lru.Cache[string, []byte]
 }
 
 var _ store.DeviceContainer = (*Container)(nil)
