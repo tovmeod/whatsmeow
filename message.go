@@ -329,10 +329,16 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 	// D-CACHE-06: DECRYPT no longer prefetches via a context-scope session
 	// cache — the CachedSessionStore wrapper (wired into device.Sessions by
 	// Plan 17.5-04 initializeDevice) now serves session reads from a
-	// process-shared LRU. sessionAddr is retained for the session-flush
-	// gate immediately before the ack block below (D-CACHE-03
-	// ack-after-flush invariant).
-	sessionAddr := senderEncryptionJID.SignalAddress().String()
+	// process-shared LRU.
+	//
+	// Phase 17.5 FIX: the prior ack-after-flush gate (an anonymous-interface
+	// type-assertion against the session-store flush method, formerly
+	// inserted just before the success-path ack) was removed along with the
+	// write-back machinery in cached_session_store.go. The wrapper is now a
+	// strict write-through cache: every PutSession returns only after the
+	// inner store has acknowledged the write, so there is no "pending dirty
+	// state" to drain before acking. D-CACHE-03 is trivially satisfied by
+	// the synchronous write contract.
 	var recognizedStanza, protobufFailed bool
 	var encTypes []string
 	for _, child := range children {
@@ -495,25 +501,6 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 					}
 				}()
 			}
-		}
-	}
-	// D-CACHE-03 ack-after-flush gate: drain any deferred coalesced session
-	// write for sessionAddr BEFORE the ack runs. If the flush fails we
-	// return without acking so WhatsApp redelivers the message; the
-	// alternative (ack-and-replay) is brittle because libsignal's ratchet
-	// is not guaranteed replay-safe in all states.
-	//
-	// The type-assertion lets the SessionStore interface stay un-widened.
-	// In production device.Sessions is *CachedSessionStore (wired by
-	// initializeDevice) which satisfies the assertion. If a future test
-	// stub does not, the decrypt path falls through to the normal ack as
-	// before — no nil-deref, no panic, ~ns overhead.
-	if flusher, ok := cli.Store.Sessions.(interface {
-		FlushIfDirty(ctx context.Context, address string) error
-	}); ok {
-		if err := flusher.FlushIfDirty(ctx, sessionAddr); err != nil {
-			cli.Log.Errorf("Failed to flush session before ack for %s: %v", info.SourceString(), err)
-			return
 		}
 	}
 	cli.backgroundIfAsyncAck(func() {

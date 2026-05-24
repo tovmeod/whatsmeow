@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	mathRand "math/rand/v2"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,28 +34,25 @@ type Container struct {
 	log    waLog.Logger
 	LIDMap *CachedLIDMap
 
-	// Phase 17.5: shared LRU caches (constructed in Plan 04 EDIT 3; declared here so test stubs compile)
+	// Phase 17.5: shared LRU caches. One LRU per cache type, shared across
+	// every device. Per-wrapper JID scoping (jid + "|" prefix on every key)
+	// keeps device A's entries from colliding with device B's.
 	SessionCache   *lru.Cache[string, []byte]
 	IdentityCache  *lru.Cache[string, *[32]byte]
 	SenderKeyCache *lru.Cache[string, []byte]
 
-	// Phase 17.5 Plan 04: cross-cache eviction counters incremented by the
+	// Phase 17.5: cross-cache eviction counters incremented by the
 	// lru.NewWithEvict callbacks in NewWithWrappedDB. Surfaced via
-	// emitMetricsLoop alongside the per-wrapper counters.
+	// emitMetricsLoop.
 	SessionEvictions, IdentityEvictions, SenderKeyEvictions uint64
 
-	// Phase 17.5 Plan 04: per-device wrapper registry. initializeDevice
-	// registers each Cached*Store wrapper here under wrappersMu so
-	// emitMetricsLoop can iterate and sum per-device hits/misses/coalesced/
-	// flushed/deduped counters across the whole Container.
-	//
-	// LOCK ORDER: wrappersMu is ALWAYS released before any operation that may
-	// acquire an LRU internal mutex OR call PurgeAllSignalCaches. Holding
-	// both in the wrong order across goroutines would deadlock.
-	wrappersMu        sync.Mutex
-	sessionWrappers   []*CachedSessionStore
-	identityWrappers  []*CachedIdentityStore
-	senderKeyWrappers []*CachedSenderKeyStore
+	// Phase 17.5 FIX: per-device wrapper registry (formerly a sync.Mutex
+	// plus three slices) was removed along with the cross-cache purge fan-
+	// out helper. Strict write-through caching no longer needs cross-cache
+	// invalidation, and emitMetricsLoop now logs only Container-level cache
+	// state (Len + eviction counters). Per-wrapper Stats() remains
+	// available for tests but is no longer aggregated by the metrics
+	// goroutine.
 }
 
 var _ store.DeviceContainer = (*Container)(nil)
@@ -163,24 +159,13 @@ func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
 	return c
 }
 
-// PurgeAllSignalCaches drops every entry from all three shared signal-store
-// caches in one call. Used by CachedSessionStore.MigratePNToLID and
-// DeleteAllSessions to fan out cross-cache invalidation (PATTERNS Planner
-// Attention #3) — a PN->LID migration or a bulk session purge can leave stale
-// identity / sender-key entries pointing at the old JID, so we drop all three
-// together. Does NOT acquire wrappersMu; each LRU has its own internal mutex.
-func (c *Container) PurgeAllSignalCaches() {
-	c.SessionCache.Purge()
-	c.IdentityCache.Purge()
-	c.SenderKeyCache.Purge()
-}
-
-// emitMetricsLoop periodically logs aggregated cache metrics. Runs as a
-// long-lived goroutine spawned by NewWithWrappedDB; cadence is 5 minutes
-// (12 lines/hour per RESEARCH §9 quiet-by-default goal). Snapshots the
-// wrapper registry under wrappersMu, releases the lock, then calls Stats()
-// on each wrapper outside the critical section so wrappersMu is never held
-// during downstream work.
+// emitMetricsLoop periodically logs Container-level cache state. Runs as a
+// long-lived goroutine spawned by NewWithWrappedDB; cadence is 5 minutes.
+// Phase 17.5 FIX: the per-wrapper registry and its hit/miss/coalesced/
+// flushed/deduped aggregation were removed along with the write-back
+// machinery; the loop now reports only what the Container itself owns
+// (per-cache Len + eviction counters). Per-wrapper Stats() remains
+// callable from tests but is no longer aggregated here.
 func (c *Container) emitMetricsLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -190,43 +175,11 @@ func (c *Container) emitMetricsLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-
-		c.wrappersMu.Lock()
-		sessSnap := append([]*CachedSessionStore(nil), c.sessionWrappers...)
-		idSnap := append([]*CachedIdentityStore(nil), c.identityWrappers...)
-		skSnap := append([]*CachedSenderKeyStore(nil), c.senderKeyWrappers...)
-		c.wrappersMu.Unlock()
-
-		var sessHits, sessMisses, sessCoalesced, sessFlushed uint64
-		for _, w := range sessSnap {
-			h, m, _, co, fl := w.Stats()
-			sessHits += h
-			sessMisses += m
-			sessCoalesced += co
-			sessFlushed += fl
-		}
-		var idHits, idMisses, idDeduped uint64
-		for _, w := range idSnap {
-			h, m, d := w.Stats()
-			idHits += h
-			idMisses += m
-			idDeduped += d
-		}
-		var skHits, skMisses uint64
-		for _, w := range skSnap {
-			h, m := w.Stats()
-			skHits += h
-			skMisses += m
-		}
-
 		c.log.Infof(
-			"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, hits=%d, misses=%d, coalesced=%d, flushed=%d} identities={len=%d, evictions=%d, hits=%d, misses=%d, deduped=%d} sender_keys={len=%d, evictions=%d, hits=%d, misses=%d}",
+			"Cache metrics: sessions={len=%d, cap=%d, evictions=%d} identities={len=%d, cap=%d, evictions=%d} sender_keys={len=%d, cap=%d, evictions=%d}",
 			c.SessionCache.Len(), signalSessionCacheCap, atomic.LoadUint64(&c.SessionEvictions),
-			sessHits, sessMisses, sessCoalesced, sessFlushed,
-			c.IdentityCache.Len(), atomic.LoadUint64(&c.IdentityEvictions),
-			idHits, idMisses, idDeduped,
-			c.SenderKeyCache.Len(), atomic.LoadUint64(&c.SenderKeyEvictions),
-			skHits, skMisses,
+			c.IdentityCache.Len(), signalIdentityCacheCap, atomic.LoadUint64(&c.IdentityEvictions),
+			c.SenderKeyCache.Len(), signalSenderKeyCacheCap, atomic.LoadUint64(&c.SenderKeyEvictions),
 		)
 	}
 }
@@ -404,23 +357,13 @@ func (c *Container) initializeDevice(device *store.Device) {
 
 	// Phase 17.5 Plan 04: overwrite the three signal stores (Sessions,
 	// Identities, SenderKeys) with Cached*Store wrappers. The other 8 stores
-	// set by SetAllStores remain pointed at the bare *SQLStore.
+	// set by SetAllStores remain pointed at the bare *SQLStore. Phase 17.5
+	// FIX dropped the wrapper-registry append — emitMetricsLoop no longer
+	// aggregates per-wrapper state, only container-level cache stats.
 	jid := device.ID.String()
-	sessionWrapper := NewCachedSessionStore(innerStore, jid, c.SessionCache, c)
-	identityWrapper := NewCachedIdentityStore(innerStore, jid, c.IdentityCache)
-	senderKeyWrapper := NewCachedSenderKeyStore(innerStore, jid, c.SenderKeyCache)
-	device.Sessions = sessionWrapper
-	device.Identities = identityWrapper
-	device.SenderKeys = senderKeyWrapper
-
-	// Register the three wrappers under a single critical section so
-	// initializeDevice running concurrently across devices does not race on
-	// slice append. wrappersMu is released before any LRU operation.
-	c.wrappersMu.Lock()
-	c.sessionWrappers = append(c.sessionWrappers, sessionWrapper)
-	c.identityWrappers = append(c.identityWrappers, identityWrapper)
-	c.senderKeyWrappers = append(c.senderKeyWrappers, senderKeyWrapper)
-	c.wrappersMu.Unlock()
+	device.Sessions = NewCachedSessionStore(innerStore, jid, c.SessionCache)
+	device.Identities = NewCachedIdentityStore(innerStore, jid, c.IdentityCache)
+	device.SenderKeys = NewCachedSenderKeyStore(innerStore, jid, c.SenderKeyCache)
 
 	device.LIDs = c.LIDMap
 	device.Container = c
