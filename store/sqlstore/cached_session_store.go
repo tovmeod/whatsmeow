@@ -46,12 +46,14 @@ type dirtyEntry struct {
 // threshold trips) defers writes for up to coalesceWindow before flushing
 // the FINAL value through to inner.
 //
-// FlushIfDirty drains a single key's pending write synchronously; the SEND
-// path uses it as the "ack-after-flush" gate (D-CACHE-03).
+// FlushIfDirty drains a single key's pending write synchronously; the
+// DECRYPT path uses it as the "ack-after-flush" gate (D-CACHE-03) via an
+// anonymous-interface type-assertion in message.go.
 //
-// The *Container backref is present from Plan-02-day-1 so Plan 04 EDIT 7's
-// two-line flip (c.cache.Purge() -> c.container.PurgeAllSignalCaches()) is
-// the only future mutation of this file.
+// MigratePNToLID and DeleteAllSessions fan out to the Container's three
+// shared signal-store caches via container.PurgeAllSignalCaches so a JID
+// rewrite or bulk session purge cannot leave stale identity / sender-key
+// entries pointing at the old JID.
 type CachedSessionStore struct {
 	inner     store.SessionStore
 	jid       string
@@ -228,15 +230,13 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 	if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
 		return err
 	}
-	// TODO(plan-04): switch to c.container.PurgeAllSignalCaches()
-	c.cache.Purge()
+	c.container.PurgeAllSignalCaches()
 	c.dropAllDirty()
 	return nil
 }
 
 func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
-	// TODO(plan-04): switch to c.container.PurgeAllSignalCaches()
-	c.cache.Purge()
+	c.container.PurgeAllSignalCaches()
 	c.dropAllDirty()
 	return c.inner.MigratePNToLID(ctx, pn, lid)
 }
