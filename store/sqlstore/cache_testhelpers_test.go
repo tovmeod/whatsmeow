@@ -171,14 +171,28 @@ func (f *fakeSessionStore) MigratePNToLID(_ context.Context, pn, lid types.JID) 
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	pnStr := pn.String()
-	lidStr := lid.String()
-	for addr, session := range f.sessions {
-		if len(addr) >= len(pnStr) && addr[:len(pnStr)] == pnStr {
-			newAddr := lidStr + addr[len(pnStr):]
-			f.sessions[newAddr] = session
-			delete(f.sessions, addr)
+	// Mirror SQLStore.MigratePNToLID semantics (store.go:264-303 and
+	// migratePNToLIDSessionsQuery): match addresses whose libsignal user
+	// prefix equals pn.SignalAddressUser() followed by ':'. The previous
+	// matcher used pn.String() (full JID form) which never matched the
+	// production address format and concealed Phase 17.5 FIX2 BL-01 in
+	// wrapper tests by silently failing to migrate the inner-side rows
+	// either.
+	pnPfx := pn.SignalAddressUser() + ":"
+	lidUser := lid.SignalAddressUser()
+	// Two-pass: collect victims first (Go disallows mutating a map during
+	// `for ... range`).
+	var victims []string
+	for addr := range f.sessions {
+		if len(addr) >= len(pnPfx) && addr[:len(pnPfx)] == pnPfx {
+			victims = append(victims, addr)
 		}
+	}
+	for _, addr := range victims {
+		session := f.sessions[addr]
+		newAddr := lidUser + addr[len(pn.SignalAddressUser()):]
+		f.sessions[newAddr] = session
+		delete(f.sessions, addr)
 	}
 	return nil
 }

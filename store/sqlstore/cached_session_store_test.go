@@ -403,6 +403,12 @@ func TestCachedSessionStore_DeleteAllSessions_DoesNotTouchOtherJIDs(t *testing.T
 // ---------------------------------------------------------------------------
 // CR-04 regression: MigratePNToLID must write through to inner FIRST. On
 // inner failure the cache must be untouched.
+//
+// Phase 17.5 FIX2 BL-01: fixture now uses the production address shape —
+// `pn.SignalAddressUser() + ":<device>"` (libsignal address format), NOT
+// `pn.String() + ":<device>"` (full JID form). The prior fixture happened
+// to agree with the wrong-format-on-both-sides bug in the wrapper; this
+// rewrite catches a regression to that bug.
 // ---------------------------------------------------------------------------
 
 func TestCachedSessionStore_MigratePNToLID_InnerError_NoCacheUpdate(t *testing.T) {
@@ -411,10 +417,11 @@ func TestCachedSessionStore_MigratePNToLID_InnerError_NoCacheUpdate(t *testing.T
 
 	pn := types.JID{User: "12345", Server: types.DefaultUserServer}
 	lid := types.JID{User: "67890", Server: types.HiddenUserServer}
-	pnStr := pn.String()
 
-	// Seed a cache entry whose address starts with pn.String().
-	addr := pnStr + ":0"
+	// Production address shape: libsignal `<SignalAddressUser>:<device>`,
+	// built from JID.SignalAddressUser() to be independent of the format
+	// details (handles ActualAgent suffixing automatically).
+	addr := pn.SignalAddressUser() + ":0"
 	if err := c.PutSession(ctx, addr, []byte("preserve-me")); err != nil {
 		t.Fatalf("seed PutSession: %v", err)
 	}
@@ -431,41 +438,52 @@ func TestCachedSessionStore_MigratePNToLID_InnerError_NoCacheUpdate(t *testing.T
 	} else if !bytes.Equal(v, []byte("preserve-me")) {
 		t.Errorf("original cache value = %q, want %q", v, "preserve-me")
 	}
-	newAddr := lid.String() + ":0"
+	newAddr := lid.SignalAddressUser() + ":0"
 	if _, ok := cache.Get("test-jid|" + newAddr); ok {
 		t.Errorf("MigratePNToLID created a new cache key despite inner failure")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// MigratePNToLID happy path: inner succeeds; cache keys are rewritten from
-// PN to LID. Pre-existing LID entries are overwritten by the migrated value
-// (precedence: migrated value wins).
+// MigratePNToLID happy path (Phase 17.5 FIX2 BL-01 regression): inner
+// succeeds; PN-keyed entries are EVICTED. A subsequent GetSession against
+// the new LID address triggers a cache miss, fetches from inner (which
+// holds the migrated row), and populates the cache under the LID key.
+//
+// Production address shape: cache keys are
+// `<jid>|<SignalAddressUser>:<device>`, NOT `<jid>|<JID.String()>:<device>`.
+// This test uses JID.SignalAddressUser() throughout so it is independent
+// of the format details and catches the BL-01 regression (where the prior
+// implementation matched on pn.String() and never evicted anything in
+// production).
 // ---------------------------------------------------------------------------
 
-func TestCachedSessionStore_MigratePNToLID_WriteThroughFirst_ThenCacheRewrite(t *testing.T) {
+func TestCachedSessionStore_MigratePNToLID_EvictsPNKeys_LIDReadRepopulates(t *testing.T) {
 	ctx := context.Background()
 	c, inner, cache := newTestCachedSessionStore(t, 32)
 
 	pn := types.JID{User: "12345", Server: types.DefaultUserServer}
 	lid := types.JID{User: "67890", Server: types.HiddenUserServer}
-	pnStr := pn.String()
-	lidStr := lid.String()
+	pnUser := pn.SignalAddressUser()
+	lidUser := lid.SignalAddressUser()
 
-	// Seed two PN entries on this wrapper.
-	addrPN0 := pnStr + ":0"
-	addrPN1 := pnStr + ":1"
+	// Seed two PN-keyed entries through the wrapper using the production
+	// libsignal address format.
+	addrPN0 := pnUser + ":0"
+	addrPN1 := pnUser + ":1"
 	if err := c.PutSession(ctx, addrPN0, []byte("migrated-0")); err != nil {
 		t.Fatalf("seed PutSession PN0: %v", err)
 	}
 	if err := c.PutSession(ctx, addrPN1, []byte("migrated-1")); err != nil {
 		t.Fatalf("seed PutSession PN1: %v", err)
 	}
-	// Seed a pre-existing LID entry with a stale value to test precedence.
-	addrLID0 := lidStr + ":0"
-	cache.Add("test-jid|"+addrLID0, []byte("stale-lid"))
+	// The fake inner now also holds the PN rows; the fake's
+	// MigratePNToLID (which mirrors the SQL semantics) will rewrite those
+	// rows under the LID address when c.MigratePNToLID below delegates
+	// to inner.
 
-	// Seed an unrelated entry that must NOT be touched.
+	// Seed an unrelated entry under the same wrapper that must NOT be
+	// touched (different user). 999 does not match pnUser="12345".
 	cache.Add("test-jid|999:0", []byte("untouched"))
 
 	if err := c.MigratePNToLID(ctx, pn, lid); err != nil {
@@ -475,30 +493,108 @@ func TestCachedSessionStore_MigratePNToLID_WriteThroughFirst_ThenCacheRewrite(t 
 		t.Errorf("inner.migrateCalls = %d, want 1", got)
 	}
 
-	// Old PN keys must be removed.
+	// PN keys must be evicted from the cache.
 	if _, ok := cache.Get("test-jid|" + addrPN0); ok {
-		t.Errorf("PN key %q still present after Migrate", addrPN0)
+		t.Errorf("PN key %q still present in cache after Migrate (eviction failed)", addrPN0)
 	}
 	if _, ok := cache.Get("test-jid|" + addrPN1); ok {
-		t.Errorf("PN key %q still present after Migrate", addrPN1)
+		t.Errorf("PN key %q still present in cache after Migrate (eviction failed)", addrPN1)
 	}
-	// New LID keys must hold the MIGRATED values, not the stale LID value.
-	if v, ok := cache.Get("test-jid|" + addrLID0); !ok {
-		t.Errorf("migrated LID key %q missing", addrLID0)
-	} else if !bytes.Equal(v, []byte("migrated-0")) {
-		t.Errorf("migrated LID key %q = %q, want %q (precedence)", addrLID0, v, "migrated-0")
+	// LID keys must NOT exist in the cache yet — eviction-not-rewrite means
+	// the cache is empty for the LID address until a read repopulates it.
+	addrLID0 := lidUser + ":0"
+	if _, ok := cache.Get("test-jid|" + addrLID0); ok {
+		t.Errorf("LID key %q present in cache immediately after Migrate; expected eviction-only, no pre-populate", addrLID0)
 	}
-	addrLID1 := lidStr + ":1"
-	if v, ok := cache.Get("test-jid|" + addrLID1); !ok {
-		t.Errorf("migrated LID key %q missing", addrLID1)
-	} else if !bytes.Equal(v, []byte("migrated-1")) {
-		t.Errorf("migrated LID key %q = %q, want %q", addrLID1, v, "migrated-1")
+
+	// Subsequent GetSession against the LID address must cache-miss,
+	// fetch from inner (which holds the migrated row), and populate the
+	// cache under the LID key. The fake's MigratePNToLID performed the
+	// inner-side rewrite so inner.GetSession("67890:0") returns
+	// "migrated-0".
+	inner.getCalls.Store(0)
+	got, err := c.GetSession(ctx, addrLID0)
+	if err != nil {
+		t.Fatalf("GetSession LID after Migrate: %v", err)
 	}
-	// Unrelated entry must be untouched.
+	if !bytes.Equal(got, []byte("migrated-0")) {
+		t.Errorf("GetSession LID = %q, want %q (inner should hold migrated row)", got, "migrated-0")
+	}
+	if n := inner.getCalls.Load(); n != 1 {
+		t.Errorf("inner.getCalls after first LID read = %d, want 1 (cache should have missed)", n)
+	}
+	// Second GetSession for the same LID address must hit cache.
+	if _, err := c.GetSession(ctx, addrLID0); err != nil {
+		t.Fatalf("GetSession LID second: %v", err)
+	}
+	if n := inner.getCalls.Load(); n != 1 {
+		t.Errorf("inner.getCalls after second LID read = %d, want 1 (second read should hit cache)", n)
+	}
+
+	// Unrelated entry must be untouched throughout.
 	if v, ok := cache.Get("test-jid|999:0"); !ok {
 		t.Errorf("unrelated entry was removed by Migrate")
 	} else if !bytes.Equal(v, []byte("untouched")) {
 		t.Errorf("unrelated entry corrupted: got %q, want %q", v, "untouched")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-account isolation (Phase 17.5 FIX2 BL-01): a single wrapper holds
+// cache entries for two distinct PN users. MigratePNToLID(pnA -> lidA)
+// must evict ONLY pnA's entries; pnB's entries (different SignalAddressUser)
+// must remain untouched. Catches the case where the eviction predicate is
+// too loose (e.g. forgets the trailing ':' separator and matches any
+// address starting with the same digit string).
+// ---------------------------------------------------------------------------
+
+func TestCachedSessionStore_MigratePNToLID_MixedAccount_OnlyEvictsTargetUser(t *testing.T) {
+	ctx := context.Background()
+	c, _, cache := newTestCachedSessionStore(t, 32)
+
+	pnA := types.JID{User: "12345", Server: types.DefaultUserServer}
+	lidA := types.JID{User: "67890", Server: types.HiddenUserServer}
+	pnB := types.JID{User: "99999", Server: types.DefaultUserServer}
+
+	// Seed cache entries for both pnA and pnB on this wrapper.
+	pnAUser := pnA.SignalAddressUser()
+	pnBUser := pnB.SignalAddressUser()
+	addrsA := []string{pnAUser + ":0", pnAUser + ":1"}
+	addrsB := []string{pnBUser + ":0", pnBUser + ":1"}
+	for _, addr := range addrsA {
+		if err := c.PutSession(ctx, addr, []byte("a-"+addr)); err != nil {
+			t.Fatalf("seed PutSession A %s: %v", addr, err)
+		}
+	}
+	for _, addr := range addrsB {
+		if err := c.PutSession(ctx, addr, []byte("b-"+addr)); err != nil {
+			t.Fatalf("seed PutSession B %s: %v", addr, err)
+		}
+	}
+	if got := cache.Len(); got != 4 {
+		t.Fatalf("pre-Migrate cache Len = %d, want 4", got)
+	}
+
+	if err := c.MigratePNToLID(ctx, pnA, lidA); err != nil {
+		t.Fatalf("MigratePNToLID: %v", err)
+	}
+
+	// pnA entries must be evicted.
+	for _, addr := range addrsA {
+		if _, ok := cache.Get("test-jid|" + addr); ok {
+			t.Errorf("pnA entry %q still cached after MigratePNToLID(pnA -> lidA)", addr)
+		}
+	}
+	// pnB entries must remain untouched.
+	for _, addr := range addrsB {
+		v, ok := cache.Get("test-jid|" + addr)
+		if !ok {
+			t.Errorf("pnB entry %q removed by MigratePNToLID(pnA -> lidA) — eviction should be user-scoped", addr)
+			continue
+		}
+		if !bytes.Equal(v, []byte("b-"+addr)) {
+			t.Errorf("pnB entry %q value = %q, want %q (corrupted)", addr, v, "b-"+addr)
+		}
 	}
 }
 
