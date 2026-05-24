@@ -24,9 +24,17 @@ import (
 
 // ---------------------------------------------------------------------------
 // Test helper: newTestCachedSenderKeyStore wires a fakeSenderKeyStore and
-// an LRU cache of []byte sized to capSize. Wrapper uses fixed "test-jid|"
-// prefix; final cache key shape is jid + "|" + group + "|" + user
-// (three-element per RESEARCH Finding 7).
+// an LRU cache of []byte sized to capSize. The wrapper uses "test-jid"
+// (no trailing pipe) as the JID — matching production usage at
+// container.go:363 where the JID comes from `device.ID.String()` without
+// a trailing pipe. The wrapper composes the full cache key internally as
+// `jid + "|" + group + "|" + user` (three-element per RESEARCH Finding 7),
+// producing single-pipe keys (`"test-jid|<group>|<user>"`).
+//
+// Group and user fixtures passed to the wrapper's methods are bare strings.
+// Tests MUST NOT pre-compose group/user with the JID or with a trailing
+// pipe — that would produce double-pipe or other malformed cache keys
+// that disagree with the production code path. (Phase 17.5 FIX2 IN-01.)
 // ---------------------------------------------------------------------------
 
 func newTestCachedSenderKeyStore(t *testing.T, capSize int) (*CachedSenderKeyStore, *fakeSenderKeyStore) {
@@ -36,7 +44,9 @@ func newTestCachedSenderKeyStore(t *testing.T, capSize int) (*CachedSenderKeySto
 	if err != nil {
 		t.Fatalf("lru.New[string, []byte] failed: %v", err)
 	}
-	wrapper := NewCachedSenderKeyStore(inner, "test-jid|", cache)
+	// "test-jid" with no trailing pipe — wrapper's key() prepends the
+	// separator. Matches production format used by Container.initializeDevice.
+	wrapper := NewCachedSenderKeyStore(inner, "test-jid", cache)
 	return wrapper, inner
 }
 

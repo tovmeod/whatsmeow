@@ -23,9 +23,19 @@ import (
 
 // ---------------------------------------------------------------------------
 // Test helper: newTestCachedIdentityStore wires a fakeIdentityStore and an
-// LRU cache of *[32]byte sized to capSize. The wrapper uses a fixed
-// "test-jid|" prefix so composite keys match the production format
-// (jid + "|" + address) per RESEARCH §7.
+// LRU cache of *[32]byte sized to capSize. The wrapper uses "test-jid"
+// (no trailing pipe) as the JID — matching production usage at
+// container.go:363 where the JID comes from `device.ID.String()` without
+// a trailing pipe. The wrapper composes the full cache key internally as
+// `jid + "|" + address`, producing single-pipe keys
+// (`"test-jid|<address>"`).
+//
+// Address fixtures passed to the wrapper's methods use the bare libsignal
+// format (e.g. `"addr-A"`, or in the production analog
+// `"<SignalAddressUser>:<device>"`). Tests MUST NOT pre-compose addresses
+// with the JID or with a trailing pipe — that would produce double-pipe
+// or other malformed cache keys that disagree with the production code
+// path. (Phase 17.5 FIX2 IN-01.)
 // ---------------------------------------------------------------------------
 
 func newTestCachedIdentityStore(t *testing.T, capSize int) (*CachedIdentityStore, *fakeIdentityStore) {
@@ -35,7 +45,9 @@ func newTestCachedIdentityStore(t *testing.T, capSize int) (*CachedIdentityStore
 	if err != nil {
 		t.Fatalf("lru.New[string, *[32]byte] failed: %v", err)
 	}
-	wrapper := NewCachedIdentityStore(inner, "test-jid|", cache)
+	// "test-jid" with no trailing pipe — wrapper's key() prepends the
+	// separator. Matches production format used by Container.initializeDevice.
+	wrapper := NewCachedIdentityStore(inner, "test-jid", cache)
 	return wrapper, inner
 }
 
