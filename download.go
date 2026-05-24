@@ -307,6 +307,17 @@ func (cli *Client) DownloadMediaWithPath(
 	return
 }
 
+// isFileLengthMismatch returns true when a peer-supplied fileLength claim
+// disagrees with the actually-downloaded byte count. Returns false when
+// expected <= 0 ("unknown, skip the check") -- matches the existing
+// -1 = skip convention used at line 186, 246 for thumbnails. Phase 17.5.2:
+// changed from `>= 0` to `> 0` so peers reporting FileLength=0 no longer
+// hard-fail the download (5% of inbound media post-17.5.1 deploy). SHA256
+// integrity is still validated separately by the caller.
+func isFileLengthMismatch(expected, actual int) bool {
+	return expected > 0 && actual != expected
+}
+
 func (cli *Client) downloadAndDecrypt(
 	ctx context.Context,
 	url string,
@@ -328,7 +339,8 @@ func (cli *Client) downloadAndDecrypt(
 	} else if data, err = cbcutil.Decrypt(cipherKey, iv, ciphertext); err != nil {
 		err = fmt.Errorf("failed to decrypt file: %w", err)
 	} else if ReturnDownloadWarnings {
-		if fileLength >= 0 && len(data) != fileLength {
+		// kavtov-fork: Phase 17.5.2 - FileLength=0 means unknown (see isFileLengthMismatch)
+		if isFileLengthMismatch(fileLength, len(data)) {
 			err = fmt.Errorf("%w: expected %d, got %d", ErrFileLengthMismatch, fileLength, len(data))
 		} else if len(fileSHA256) == 32 && sha256.Sum256(data) != *(*[32]byte)(fileSHA256) {
 			err = ErrInvalidMediaSHA256
