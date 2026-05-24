@@ -12,6 +12,9 @@ import (
 	"errors"
 	"fmt"
 	mathRand "math/rand/v2"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -36,6 +39,24 @@ type Container struct {
 	SessionCache   *lru.Cache[string, []byte]
 	IdentityCache  *lru.Cache[string, *[32]byte]
 	SenderKeyCache *lru.Cache[string, []byte]
+
+	// Phase 17.5 Plan 04: cross-cache eviction counters incremented by the
+	// lru.NewWithEvict callbacks in NewWithWrappedDB. Surfaced via
+	// emitMetricsLoop alongside the per-wrapper counters.
+	SessionEvictions, IdentityEvictions, SenderKeyEvictions uint64
+
+	// Phase 17.5 Plan 04: per-device wrapper registry. initializeDevice
+	// registers each Cached*Store wrapper here under wrappersMu so
+	// emitMetricsLoop can iterate and sum per-device hits/misses/coalesced/
+	// flushed/deduped counters across the whole Container.
+	//
+	// LOCK ORDER: wrappersMu is ALWAYS released before any operation that may
+	// acquire an LRU internal mutex OR call PurgeAllSignalCaches. Holding
+	// both in the wrong order across goroutines would deadlock.
+	wrappersMu        sync.Mutex
+	sessionWrappers   []*CachedSessionStore
+	identityWrappers  []*CachedIdentityStore
+	senderKeyWrappers []*CachedSenderKeyStore
 }
 
 var _ store.DeviceContainer = (*Container)(nil)
@@ -91,14 +112,122 @@ func NewWithDB(db *sql.DB, dialect string, log waLog.Logger) *Container {
 	return NewWithWrappedDB(wrapped, log)
 }
 
+// Phase 17.5 Plan 04: shared LRU capacities. 10k entries each puts the total
+// memory budget at ~32 MB under mean value sizes per RESEARCH §4 — well under
+// the 500 MB SC-4 budget. One-line tune in a future PR if the cardinality
+// profile drifts.
+const (
+	signalSessionCacheCap   = 10_000
+	signalIdentityCacheCap  = 10_000
+	signalSenderKeyCacheCap = 10_000
+)
+
 func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
 	if log == nil {
 		log = waLog.Noop
 	}
-	return &Container{
+	c := &Container{
 		db:     wrapped,
 		log:    log,
 		LIDMap: NewCachedLIDMap(wrapped),
+	}
+
+	// Two-step construction: build *Container first, THEN attach the LRUs
+	// with eviction callbacks that reference &c.<counter>. Constructing the
+	// LRUs before c exists would close over a stale local-variable copy of
+	// the counter address (RESEARCH §1 closure-capture bug).
+	var err error
+	c.SessionCache, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(string, []byte) {
+		atomic.AddUint64(&c.SessionEvictions, 1)
+	})
+	if err != nil {
+		log.Errorf("Failed to construct SessionCache (cap=%d): %v", signalSessionCacheCap, err)
+		panic(err)
+	}
+	c.IdentityCache, err = lru.NewWithEvict[string, *[32]byte](signalIdentityCacheCap, func(string, *[32]byte) {
+		atomic.AddUint64(&c.IdentityEvictions, 1)
+	})
+	if err != nil {
+		log.Errorf("Failed to construct IdentityCache (cap=%d): %v", signalIdentityCacheCap, err)
+		panic(err)
+	}
+	c.SenderKeyCache, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(string, []byte) {
+		atomic.AddUint64(&c.SenderKeyEvictions, 1)
+	})
+	if err != nil {
+		log.Errorf("Failed to construct SenderKeyCache (cap=%d): %v", signalSenderKeyCacheCap, err)
+		panic(err)
+	}
+
+	go c.emitMetricsLoop(context.Background())
+	return c
+}
+
+// PurgeAllSignalCaches drops every entry from all three shared signal-store
+// caches in one call. Used by CachedSessionStore.MigratePNToLID and
+// DeleteAllSessions to fan out cross-cache invalidation (PATTERNS Planner
+// Attention #3) — a PN->LID migration or a bulk session purge can leave stale
+// identity / sender-key entries pointing at the old JID, so we drop all three
+// together. Does NOT acquire wrappersMu; each LRU has its own internal mutex.
+func (c *Container) PurgeAllSignalCaches() {
+	c.SessionCache.Purge()
+	c.IdentityCache.Purge()
+	c.SenderKeyCache.Purge()
+}
+
+// emitMetricsLoop periodically logs aggregated cache metrics. Runs as a
+// long-lived goroutine spawned by NewWithWrappedDB; cadence is 5 minutes
+// (12 lines/hour per RESEARCH §9 quiet-by-default goal). Snapshots the
+// wrapper registry under wrappersMu, releases the lock, then calls Stats()
+// on each wrapper outside the critical section so wrappersMu is never held
+// during downstream work.
+func (c *Container) emitMetricsLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		c.wrappersMu.Lock()
+		sessSnap := append([]*CachedSessionStore(nil), c.sessionWrappers...)
+		idSnap := append([]*CachedIdentityStore(nil), c.identityWrappers...)
+		skSnap := append([]*CachedSenderKeyStore(nil), c.senderKeyWrappers...)
+		c.wrappersMu.Unlock()
+
+		var sessHits, sessMisses, sessCoalesced, sessFlushed uint64
+		for _, w := range sessSnap {
+			h, m, _, co, fl := w.Stats()
+			sessHits += h
+			sessMisses += m
+			sessCoalesced += co
+			sessFlushed += fl
+		}
+		var idHits, idMisses, idDeduped uint64
+		for _, w := range idSnap {
+			h, m, d := w.Stats()
+			idHits += h
+			idMisses += m
+			idDeduped += d
+		}
+		var skHits, skMisses uint64
+		for _, w := range skSnap {
+			h, m := w.Stats()
+			skHits += h
+			skMisses += m
+		}
+
+		c.log.Infof(
+			"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, hits=%d, misses=%d, coalesced=%d, flushed=%d} identities={len=%d, evictions=%d, hits=%d, misses=%d, deduped=%d} sender_keys={len=%d, evictions=%d, hits=%d, misses=%d}",
+			c.SessionCache.Len(), signalSessionCacheCap, atomic.LoadUint64(&c.SessionEvictions),
+			sessHits, sessMisses, sessCoalesced, sessFlushed,
+			c.IdentityCache.Len(), atomic.LoadUint64(&c.IdentityEvictions),
+			idHits, idMisses, idDeduped,
+			c.SenderKeyCache.Len(), atomic.LoadUint64(&c.SenderKeyEvictions),
+			skHits, skMisses,
+		)
 	}
 }
 
@@ -272,6 +401,27 @@ func (c *Container) PutDevice(ctx context.Context, device *store.Device) error {
 func (c *Container) initializeDevice(device *store.Device) {
 	innerStore := NewSQLStore(c, *device.ID)
 	device.SetAllStores(innerStore)
+
+	// Phase 17.5 Plan 04: overwrite the three signal stores (Sessions,
+	// Identities, SenderKeys) with Cached*Store wrappers. The other 8 stores
+	// set by SetAllStores remain pointed at the bare *SQLStore.
+	jid := device.ID.String()
+	sessionWrapper := NewCachedSessionStore(innerStore, jid, c.SessionCache, c)
+	identityWrapper := NewCachedIdentityStore(innerStore, jid, c.IdentityCache)
+	senderKeyWrapper := NewCachedSenderKeyStore(innerStore, jid, c.SenderKeyCache)
+	device.Sessions = sessionWrapper
+	device.Identities = identityWrapper
+	device.SenderKeys = senderKeyWrapper
+
+	// Register the three wrappers under a single critical section so
+	// initializeDevice running concurrently across devices does not race on
+	// slice append. wrappersMu is released before any LRU operation.
+	c.wrappersMu.Lock()
+	c.sessionWrappers = append(c.sessionWrappers, sessionWrapper)
+	c.identityWrappers = append(c.identityWrappers, identityWrapper)
+	c.senderKeyWrappers = append(c.senderKeyWrappers, senderKeyWrapper)
+	c.wrappersMu.Unlock()
+
 	device.LIDs = c.LIDMap
 	device.Container = c
 	device.Initialized = true
