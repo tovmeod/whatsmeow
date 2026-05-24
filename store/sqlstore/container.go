@@ -108,14 +108,14 @@ func NewWithDB(db *sql.DB, dialect string, log waLog.Logger) *Container {
 	return NewWithWrappedDB(wrapped, log)
 }
 
-// Shared LRU capacities for the three signal-store caches. 10k entries each
-// puts the total memory budget at ~32 MB under mean value sizes — well under
-// the workspace's 500 MB cache budget. Tune here if the cardinality profile
-// drifts.
+// Shared LRU capacities for the three signal-store caches. 100k entries each
+// puts the total memory budget at ~300 MB under mean value sizes — still under
+// the workspace's 500 MB cache budget; re-validate post-deploy per ROADMAP
+// Phase 17.5.1 caution #1. Tune here if the cardinality profile drifts.
 const (
-	signalSessionCacheCap   = 10_000
-	signalIdentityCacheCap  = 10_000
-	signalSenderKeyCacheCap = 10_000
+	signalSessionCacheCap   = 100_000
+	signalIdentityCacheCap  = 100_000
+	signalSenderKeyCacheCap = 100_000
 )
 
 func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
