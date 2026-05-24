@@ -64,11 +64,16 @@ import (
 //     same shared LRU are left untouched because cache keys are JID-scoped.
 //
 //   - MigratePNToLID(pn, lid): inner.MigratePNToLID FIRST; on success, walks
-//     cache.Keys() and rewrites any entry whose address-part starts with
-//     `pn.String()` to a new key with the address rewritten to start with
-//     `lid.String()` instead. If the rewrite collides with a pre-existing
-//     LID entry, the migrated value wins — mirroring the precedence
-//     enforced inside inner.MigratePNToLID.
+//     cache.Keys() and EVICTS any entry whose libsignal address-user equals
+//     `pn.SignalAddressUser()`. The inner SQL row has already been migrated
+//     to the LID address; reads under the new LID address will cache-miss,
+//     fetch from inner, and repopulate the cache with the LID key on first
+//     access. This avoids the complexity of in-place key rewrites (and the
+//     ambiguous precedence vs pre-existing LID entries that those would
+//     introduce) and reaches the same eventual-consistency point on the
+//     next read. Cache keys store the libsignal-format address
+//     (`<SignalAddressUser>:<device>`, e.g. `"12345:0"`), NOT the full JID
+//     form (`"12345@s.whatsapp.net"`).
 //
 // Single-writer assumption: every mutation to whatsmeow_sessions for this
 // device's JID MUST go through this wrapper. Out-of-band mutations to the
@@ -264,54 +269,58 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 // MigratePNToLID writes through to inner FIRST (Phase 17.5 FIX CR-04
 // regression: the prior implementation dropped pending writes and purged
 // caches BEFORE calling inner, leaving the migrated row at a stale value).
-// On success, rewrites cache keys whose address prefix matches the PN JID
-// to use the LID JID instead. If the rewritten key collides with an
-// existing LID entry, the migrated value wins — mirroring the precedence
-// the inner store enforces.
+// On success, EVICTS any cache entries under this wrapper's JID prefix
+// whose libsignal address-user equals pn.SignalAddressUser(). Subsequent
+// reads against the new LID address will cache-miss, fetch the migrated
+// value from inner, and populate the cache under the LID key naturally.
+//
+// Key-format note (Phase 17.5 FIX2 BL-01): cache keys are
+// `<jid>|<SignalAddressUser>:<device>`, not `<jid>|<JID.String()>:<device>`.
+// The libsignal layer composes addresses via
+// `JID.SignalAddress() = NewSignalAddress(jid.SignalAddressUser(), device)`
+// (whatsmeow-fork/types/jid.go:107-109), and SignalAddress.String() returns
+// `<name>:<deviceID>`. The inner SQL layer agrees: store.go:272 passes
+// `pn.SignalAddressUser()` to the SQL predicate `their_id >= $2 || ':'`.
+// The previous implementation matched on `pn.String()` (e.g.
+// `"12345@s.whatsapp.net"`), which never shared a prefix with any
+// production cache key (`"12345:0"`) — so the cache-rewrite loop was a
+// no-op in production. The fix evicts using `pn.SignalAddressUser() + ":"`
+// to mirror the SQL semantics exactly.
+//
+// Evict-not-rewrite rationale: the old "rewrite into the new LID key"
+// behaviour had to define precedence vs a pre-existing LID entry under
+// the same key (caused by a prior failed migration attempt or out-of-band
+// activity). Plain eviction is unambiguously correct: the inner SQL row
+// holds the post-migration value, and the next read picks it up. The
+// throughput cost is one extra inner.GetSession per migrated address on
+// the first post-migration decrypt — negligible at the steady-state PN
+// -> LID migration rate.
 func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
 	if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
 		return err
 	}
 	jidPfx := c.jidPrefix()
-	pnStr := pn.String()
-	lidStr := lid.String()
+	pnPfx := pn.SignalAddressUser() + ":"
 
 	// Two-pass walk so cache mutation during iteration is well-defined.
-	// Pass 1: collect rewrites under this wrapper's JID prefix whose
-	// address part starts with pnStr.
-	type rewrite struct {
-		oldKey, newKey string
-		value          []byte
-	}
-	var rewrites []rewrite
+	// Pass 1: collect victim keys under this wrapper's JID prefix whose
+	// libsignal-address user matches pn.SignalAddressUser().
+	var victims []string
 	for _, k := range c.cache.Keys() {
 		if !strings.HasPrefix(k, jidPfx) {
 			continue
 		}
-		addr := k[len(jidPfx):]
-		if !strings.HasPrefix(addr, pnStr) {
-			continue
+		// k has shape "<jid>|<address>" where <address> is
+		// "<SignalAddressUser>:<device>". Match the SQL predicate exactly:
+		// address starts with pn.SignalAddressUser() + ":".
+		if strings.HasPrefix(k[len(jidPfx):], pnPfx) {
+			victims = append(victims, k)
 		}
-		v, ok := c.cache.Get(k)
-		if !ok {
-			// Entry evicted between Keys() and Get() — skip; the inner
-			// store has already done the migration so a future Get will
-			// repopulate against the new LID key naturally.
-			continue
-		}
-		newAddr := lidStr + addr[len(pnStr):]
-		rewrites = append(rewrites, rewrite{
-			oldKey: k,
-			newKey: jidPfx + newAddr,
-			value:  copyBytes(v),
-		})
 	}
-	// Pass 2: apply the rewrites. Remove old key, then Add new key — the
-	// Add overwrites any pre-existing LID entry (precedence: migrated
-	// value wins).
-	for _, r := range rewrites {
-		c.cache.Remove(r.oldKey)
-		c.cache.Add(r.newKey, r.value)
+	// Pass 2: evict. Reads against the new LID address will cache-miss
+	// and repopulate from inner on first access.
+	for _, k := range victims {
+		c.cache.Remove(k)
 	}
 	return nil
 }
