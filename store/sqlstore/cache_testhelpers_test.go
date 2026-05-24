@@ -42,6 +42,21 @@ type fakeSessionStore struct {
 	deleteAllCalls atomic.Int64
 	deleteCalls    atomic.Int64
 	migrateCalls   atomic.Int64
+
+	// lastGetManyBatchBuf retains a copy of the addresses argument from the
+	// most recent GetManySessions call so cache tests can assert the wrapper
+	// passes only the misses to the inner store (D-CACHE-06 / Phase 17.5-02).
+	lastGetManyBatchBuf []string
+}
+
+// lastGetManyBatch returns a copy of the addresses passed to the most recent
+// GetManySessions call.
+func (f *fakeSessionStore) lastGetManyBatch() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.lastGetManyBatchBuf))
+	copy(out, f.lastGetManyBatchBuf)
+	return out
 }
 
 func newFakeSessionStore() *fakeSessionStore {
@@ -75,6 +90,7 @@ func (f *fakeSessionStore) GetManySessions(_ context.Context, addresses []string
 	f.getManyCalls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastGetManyBatchBuf = append(f.lastGetManyBatchBuf[:0], addresses...)
 	result := make(map[string][]byte, len(addresses))
 	for _, addr := range addresses {
 		if v, ok := f.sessions[addr]; ok {
