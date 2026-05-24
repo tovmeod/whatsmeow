@@ -90,9 +90,7 @@ type CachedSessionStore struct {
 var _ store.SessionStore = (*CachedSessionStore)(nil)
 
 // NewCachedSessionStore constructs a wrapper over inner with the given JID
-// scope and shared LRU. The 3-arg signature (inner, jid, cache) replaces
-// the 4-arg form from Plan 17.5-02 — the container reverse-pointer was only
-// used by the now-removed cross-cache purge fan-out.
+// scope and shared LRU.
 func NewCachedSessionStore(inner store.SessionStore, jid string, cache *lru.Cache[string, []byte]) *CachedSessionStore {
 	return &CachedSessionStore{
 		inner: inner,
@@ -275,13 +273,13 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 // value from inner, and populate the cache under the LID key naturally.
 //
 // Key-format note (Phase 17.5 FIX2 BL-01): cache keys are
-// `<jid>|<SignalAddressUser>:<device>`, not `<jid>|<JID.String()>:<device>`.
+// `<jid>|<SignalAddressUser>:<device>`, NOT the full JID-string form.
 // The libsignal layer composes addresses via
 // `JID.SignalAddress() = NewSignalAddress(jid.SignalAddressUser(), device)`
 // (whatsmeow-fork/types/jid.go:107-109), and SignalAddress.String() returns
 // `<name>:<deviceID>`. The inner SQL layer agrees: store.go:272 passes
 // `pn.SignalAddressUser()` to the SQL predicate `their_id >= $2 || ':'`.
-// The previous implementation matched on `pn.String()` (e.g.
+// The previous implementation matched on the full JID-string form (e.g.
 // `"12345@s.whatsapp.net"`), which never shared a prefix with any
 // production cache key (`"12345:0"`) — so the cache-rewrite loop was a
 // no-op in production. The fix evicts using `pn.SignalAddressUser() + ":"`

@@ -43,8 +43,7 @@ var _ store.SenderKeyStore = (*CachedSenderKeyStore)(nil)
 
 // NewCachedSenderKeyStore constructs a wrapper over inner. jid is the device
 // JID (used as cache-key prefix). cache is a shared LRU constructed by the
-// Container (Plan 17.5-02 declared the field on Container; Plan 17.5-04
-// constructs it).
+// Container.
 func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte]) *CachedSenderKeyStore {
 	return &CachedSenderKeyStore{
 		inner: inner,
@@ -57,8 +56,8 @@ func (c *CachedSenderKeyStore) key(group, user string) string {
 	return c.jid + "|" + group + "|" + user
 }
 
-// Stats returns (hits, misses) for test observability and for Plan 17.5-04's
-// emitMetricsLoop.
+// Stats returns (hits, misses) for test observability and for the
+// Container's emitMetricsLoop.
 func (c *CachedSenderKeyStore) Stats() (hits, misses uint64) {
 	return atomic.LoadUint64(&c.hits),
 		atomic.LoadUint64(&c.misses)

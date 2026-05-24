@@ -327,9 +327,9 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		}
 	}
 	// D-CACHE-06: DECRYPT no longer prefetches via a context-scope session
-	// cache — the CachedSessionStore wrapper (wired into device.Sessions by
-	// Plan 17.5-04 initializeDevice) now serves session reads from a
-	// process-shared LRU.
+	// cache — the CachedSessionStore wrapper (wired into device.Sessions
+	// by sqlstore.Container.initializeDevice) now serves session reads
+	// from a process-shared LRU.
 	//
 	// Phase 17.5 FIX: the prior ack-after-flush gate (an anonymous-interface
 	// type-assertion against the session-store flush method, formerly
