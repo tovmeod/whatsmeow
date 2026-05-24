@@ -12,11 +12,8 @@ import (
 	"errors"
 	"fmt"
 	mathRand "math/rand/v2"
-	"sync/atomic"
-	"time"
 
 	"github.com/google/uuid"
-	lru "github.com/hashicorp/golang-lru/v2"
 	"go.mau.fi/util/dbutil"
 	"go.mau.fi/util/random"
 
@@ -34,31 +31,13 @@ type Container struct {
 	log    waLog.Logger
 	LIDMap *CachedLIDMap
 
-	// Phase 17.5: shared LRU caches. One LRU per cache type, shared across
-	// every device. Per-wrapper JID scoping (jid + "|" prefix on every key)
-	// keeps device A's entries from colliding with device B's.
-	SessionCache   *lru.Cache[string, []byte]
-	IdentityCache  *lru.Cache[string, *[32]byte]
-	SenderKeyCache *lru.Cache[string, []byte]
-
-	// Phase 17.5: cross-cache eviction counters incremented by the
-	// lru.NewWithEvict callbacks in NewWithWrappedDB. Surfaced via
-	// emitMetricsLoop.
-	SessionEvictions, IdentityEvictions, SenderKeyEvictions uint64
-
-	// Phase 17.5.1 WR-01: cancellable ctx for emitMetricsLoop. Cancelled
-	// by Container.Close() so the metrics goroutine cleanly exits and
-	// does not race with logger teardown during process shutdown.
-	metricsCtx    context.Context
-	metricsCancel context.CancelFunc
-
-	// Phase 17.5 FIX: per-device wrapper registry (formerly a sync.Mutex
-	// plus three slices) was removed along with the cross-cache purge fan-
-	// out helper. Strict write-through caching no longer needs cross-cache
-	// invalidation, and emitMetricsLoop now logs only Container-level cache
-	// state (Len + eviction counters). Per-wrapper Stats() remains
-	// available for tests but is no longer aggregated by the metrics
-	// goroutine.
+	// Phase 17.5.1-03: bridge to cache_wiring.go — all cache state
+	// (Session/Identity/SenderKey LRUs, eviction counters, metrics-loop
+	// ctx + cancel) lives in signalCaches. See cache_wiring.go for the
+	// type and the wireSignalCaches / attachCachedStores /
+	// closeSignalCaches helpers that own initialisation, device hookup,
+	// and teardown.
+	caches signalCaches
 }
 
 var _ store.DeviceContainer = (*Container)(nil)
@@ -114,16 +93,6 @@ func NewWithDB(db *sql.DB, dialect string, log waLog.Logger) *Container {
 	return NewWithWrappedDB(wrapped, log)
 }
 
-// Shared LRU capacities for the three signal-store caches. 100k entries each
-// puts the total memory budget at ~300 MB under mean value sizes — still under
-// the workspace's 500 MB cache budget; re-validate post-deploy per ROADMAP
-// Phase 17.5.1 caution #1. Tune here if the cardinality profile drifts.
-const (
-	signalSessionCacheCap   = 100_000
-	signalIdentityCacheCap  = 100_000
-	signalSenderKeyCacheCap = 100_000
-)
-
 func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
 	if log == nil {
 		log = waLog.Noop
@@ -133,64 +102,13 @@ func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
 		log:    log,
 		LIDMap: NewCachedLIDMap(wrapped),
 	}
-
-	// Two-step construction: build *Container first, THEN attach the LRUs
-	// with eviction callbacks that reference &c.<counter>. Constructing the
-	// LRUs before c exists would close over a stale local-variable copy of
-	// the counter address (RESEARCH §1 closure-capture bug).
-	var err error
-	c.SessionCache, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(string, []byte) {
-		atomic.AddUint64(&c.SessionEvictions, 1)
-	})
-	if err != nil {
-		log.Errorf("Failed to construct SessionCache (cap=%d): %v", signalSessionCacheCap, err)
-		panic(err)
-	}
-	c.IdentityCache, err = lru.NewWithEvict[string, *[32]byte](signalIdentityCacheCap, func(string, *[32]byte) {
-		atomic.AddUint64(&c.IdentityEvictions, 1)
-	})
-	if err != nil {
-		log.Errorf("Failed to construct IdentityCache (cap=%d): %v", signalIdentityCacheCap, err)
-		panic(err)
-	}
-	c.SenderKeyCache, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(string, []byte) {
-		atomic.AddUint64(&c.SenderKeyEvictions, 1)
-	})
-	if err != nil {
-		log.Errorf("Failed to construct SenderKeyCache (cap=%d): %v", signalSenderKeyCacheCap, err)
-		panic(err)
-	}
-
-	// Phase 17.5.1 WR-01: cancelled by Container.Close so emitMetricsLoop
-	// exits before logger/db teardown.
-	c.metricsCtx, c.metricsCancel = context.WithCancel(context.Background())
-	go c.emitMetricsLoop(c.metricsCtx)
+	// Two-step construction (RESEARCH §1 closure-capture preservation):
+	// allocate *Container first, THEN wire the LRUs + metrics goroutine
+	// from cache_wiring.go. The eviction callbacks close over
+	// &c.caches.<Counter> — the heap address on the already-allocated
+	// Container.
+	wireSignalCaches(c, log)
 	return c
-}
-
-// emitMetricsLoop periodically logs Container-level cache state. Runs as a
-// long-lived goroutine spawned by NewWithWrappedDB; cadence is 5 minutes.
-// Phase 17.5 FIX: the per-wrapper registry and its hit/miss/coalesced/
-// flushed/deduped aggregation were removed along with the write-back
-// machinery; the loop now reports only what the Container itself owns
-// (per-cache Len + eviction counters). Per-wrapper Stats() remains
-// callable from tests but is no longer aggregated here.
-func (c *Container) emitMetricsLoop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		c.log.Infof(
-			"Cache metrics: sessions={len=%d, cap=%d, evictions=%d} identities={len=%d, cap=%d, evictions=%d} sender_keys={len=%d, cap=%d, evictions=%d}",
-			c.SessionCache.Len(), signalSessionCacheCap, atomic.LoadUint64(&c.SessionEvictions),
-			c.IdentityCache.Len(), signalIdentityCacheCap, atomic.LoadUint64(&c.IdentityEvictions),
-			c.SenderKeyCache.Len(), signalSenderKeyCacheCap, atomic.LoadUint64(&c.SenderKeyEvictions),
-		)
-	}
 }
 
 // Upgrade upgrades the database from the current to the latest version available.
@@ -333,16 +251,14 @@ func (c *Container) NewDevice() *store.Device {
 var ErrDeviceIDMustBeSet = errors.New("device JID must be known before accessing database")
 
 // Close will close the container's database. Phase 17.5.1 WR-01: also cancels
-// the metricsCtx so emitMetricsLoop's goroutine exits before db/logger
-// teardown. The nil-guard on c.metricsCancel keeps Close safe on a
-// partially-constructed Container.
+// the metrics-loop ctx (via closeSignalCaches in cache_wiring.go) so the
+// metrics goroutine exits before db/logger teardown. The nil-guard inside
+// closeSignalCaches keeps Close safe on a partially-constructed Container.
 func (c *Container) Close() error {
 	if c == nil {
 		return nil
 	}
-	if c.metricsCancel != nil {
-		c.metricsCancel()
-	}
+	closeSignalCaches(c)
 	if c.db != nil {
 		return c.db.Close()
 	}
@@ -372,18 +288,11 @@ func (c *Container) PutDevice(ctx context.Context, device *store.Device) error {
 func (c *Container) initializeDevice(device *store.Device) {
 	innerStore := NewSQLStore(c, *device.ID)
 	device.SetAllStores(innerStore)
-
 	// Overwrite the three signal stores (Sessions, Identities, SenderKeys)
-	// with Cached*Store wrappers. The other 8 stores set by SetAllStores
-	// remain pointed at the bare *SQLStore. The wrapper-registry append
-	// formerly performed here was dropped in the strict-write-through
-	// rewrite — emitMetricsLoop no longer aggregates per-wrapper state,
-	// only container-level cache stats.
-	jid := device.ID.String()
-	device.Sessions = NewCachedSessionStore(innerStore, jid, c.SessionCache)
-	device.Identities = NewCachedIdentityStore(innerStore, jid, c.IdentityCache)
-	device.SenderKeys = NewCachedSenderKeyStore(innerStore, jid, c.SenderKeyCache)
-
+	// with Cached*Store wrappers (see cache_wiring.go.attachCachedStores).
+	// The other 8 stores set by SetAllStores remain pointed at the bare
+	// *SQLStore.
+	attachCachedStores(c, device, innerStore)
 	device.LIDs = c.LIDMap
 	device.Container = c
 	device.Initialized = true
