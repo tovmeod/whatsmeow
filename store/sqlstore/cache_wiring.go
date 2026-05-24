@@ -16,6 +16,7 @@ package sqlstore
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -52,10 +53,14 @@ type signalCaches struct {
 	Identity  *lru.Cache[string, *[32]byte]
 	SenderKey *lru.Cache[string, []byte]
 
-	// Phase 17.5: cross-cache eviction counters incremented by the
-	// lru.NewWithEvict callbacks in wireSignalCaches. Surfaced via
-	// emitMetricsLoop.
-	SessionEvictions, IdentityEvictions, SenderKeyEvictions uint64
+	// kavtov-fork: Phase 17.5.2 - split eviction counter into capacity-overflow
+	// ("Capacity*", incremented by lru.NewWithEvict callback) vs explicit
+	// Remove/Purge ("Explicit*", incremented at call sites in cached_*_store.go
+	// before delegating to the LRU). Splits the 17.5.1 conflated counter so
+	// operator can tell TOFU/identity-change churn (high explicit_removes on
+	// identities) from actual cap pressure (high capacity_evictions on any cache).
+	SessionCapacityEvictions, IdentityCapacityEvictions, SenderKeyCapacityEvictions uint64
+	SessionExplicitRemoves, IdentityExplicitRemoves, SenderKeyExplicitRemoves       uint64
 
 	// Phase 17.5.1 WR-01: cancellable ctx for emitMetricsLoop. Cancelled
 	// by Container.Close() (via closeSignalCaches) so the metrics
@@ -82,17 +87,17 @@ type signalCaches struct {
 // non-positive cap, which is a programmer error caught at startup).
 func wireSignalCaches(c *Container, log waLog.Logger) {
 	var err error
-	c.caches.Session, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(string, []byte) { atomic.AddUint64(&c.caches.SessionEvictions, 1) })
+	c.caches.Session, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(string, []byte) { atomic.AddUint64(&c.caches.SessionCapacityEvictions, 1) })
 	if err != nil {
 		log.Errorf("Failed to construct SessionCache (cap=%d): %v", signalSessionCacheCap, err)
 		panic(err)
 	}
-	c.caches.Identity, err = lru.NewWithEvict[string, *[32]byte](signalIdentityCacheCap, func(string, *[32]byte) { atomic.AddUint64(&c.caches.IdentityEvictions, 1) })
+	c.caches.Identity, err = lru.NewWithEvict[string, *[32]byte](signalIdentityCacheCap, func(string, *[32]byte) { atomic.AddUint64(&c.caches.IdentityCapacityEvictions, 1) })
 	if err != nil {
 		log.Errorf("Failed to construct IdentityCache (cap=%d): %v", signalIdentityCacheCap, err)
 		panic(err)
 	}
-	c.caches.SenderKey, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(string, []byte) { atomic.AddUint64(&c.caches.SenderKeyEvictions, 1) })
+	c.caches.SenderKey, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(string, []byte) { atomic.AddUint64(&c.caches.SenderKeyCapacityEvictions, 1) })
 	if err != nil {
 		log.Errorf("Failed to construct SenderKeyCache (cap=%d): %v", signalSenderKeyCacheCap, err)
 		panic(err)
@@ -113,8 +118,8 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 // container.go.initializeDevice.
 func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore) {
 	jid := device.ID.String()
-	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session)
-	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity)
+	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves)
+	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity, &c.caches.IdentityExplicitRemoves)
 	device.SenderKeys = NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey)
 }
 
@@ -128,6 +133,24 @@ func closeSignalCaches(c *Container) {
 	}
 }
 
+// cleanCounters computes the three log-time values from a pair of raw atomic
+// counter reads. Because explicit Remove/Purge calls fire the LRU eviction
+// callback (which increments CapacityEvictions), the raw CapacityEvictions
+// counter is inflated by ExplicitRemoves. cap_clean subtracts out the
+// explicit-remove contribution; a max(0, ...) guard handles the unlikely
+// atomic load-ordering edge case where ExplicitRemoves momentarily overtakes
+// CapacityEvictions.
+//
+// Returns: (evictions, capClean, expClean) where evictions = capClean + expClean.
+func cleanCounters(cap, exp uint64) (evictions, capClean, expClean uint64) {
+	expClean = exp
+	if cap > exp {
+		capClean = cap - exp
+	}
+	evictions = capClean + expClean
+	return
+}
+
 // emitMetricsLoop periodically logs Container-level cache state. Runs as a
 // long-lived goroutine spawned by wireSignalCaches; cadence is 5 minutes.
 // Phase 17.5 FIX: the per-wrapper registry and its hit/miss/coalesced/
@@ -135,6 +158,11 @@ func closeSignalCaches(c *Container) {
 // machinery; the loop now reports only what the Container itself owns
 // (per-cache Len + eviction counters). Per-wrapper Stats() remains
 // callable from tests but is no longer aggregated here.
+//
+// kavtov-fork: Phase 17.5.2 - extended log line splits `evictions=N` into
+// `capacity_evictions=A explicit_removes=B`. Old `evictions=` field is
+// retained as a sum (A+B) for one cycle of operator-tooling grace; a
+// follow-up phase drops the sum once tooling is updated.
 func (c *Container) emitMetricsLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -148,15 +176,33 @@ func (c *Container) emitMetricsLoop(ctx context.Context) {
 		// can correlate cache hit-rate trends with end-to-end decrypt latency
 		// from a single journalctl log line. Quantile estimates are approximate
 		// (bucket-upper-bound resolution); zero-sample histogram formats as 0s.
-		c.log.Infof(
-			"Cache metrics: sessions={len=%d, cap=%d, evictions=%d} identities={len=%d, cap=%d, evictions=%d} sender_keys={len=%d, cap=%d, evictions=%d} decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
-			c.caches.Session.Len(), signalSessionCacheCap, atomic.LoadUint64(&c.caches.SessionEvictions),
-			c.caches.Identity.Len(), signalIdentityCacheCap, atomic.LoadUint64(&c.caches.IdentityEvictions),
-			c.caches.SenderKey.Len(), signalSenderKeyCacheCap, atomic.LoadUint64(&c.caches.SenderKeyEvictions),
-			walltime.DecryptHistogram.Quantile(0.5),
-			walltime.DecryptHistogram.Quantile(0.95),
-			walltime.DecryptHistogram.Quantile(0.99),
-			walltime.DecryptHistogram.Count(),
-		)
+		c.log.Infof("%s", formatCacheMetrics(c))
 	}
+}
+
+// formatCacheMetrics formats the cache-metrics log line as a string. Extracted
+// so tests can assert on the formatted output without log-capture plumbing.
+func formatCacheMetrics(c *Container) string {
+	sessEvic, sessCap, sessExp := cleanCounters(
+		atomic.LoadUint64(&c.caches.SessionCapacityEvictions),
+		atomic.LoadUint64(&c.caches.SessionExplicitRemoves),
+	)
+	idntEvic, idntCap, idntExp := cleanCounters(
+		atomic.LoadUint64(&c.caches.IdentityCapacityEvictions),
+		atomic.LoadUint64(&c.caches.IdentityExplicitRemoves),
+	)
+	sndkEvic, sndkCap, sndkExp := cleanCounters(
+		atomic.LoadUint64(&c.caches.SenderKeyCapacityEvictions),
+		atomic.LoadUint64(&c.caches.SenderKeyExplicitRemoves),
+	)
+	return fmt.Sprintf(
+		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
+		c.caches.Session.Len(), signalSessionCacheCap, sessEvic, sessCap, sessExp,
+		c.caches.Identity.Len(), signalIdentityCacheCap, idntEvic, idntCap, idntExp,
+		c.caches.SenderKey.Len(), signalSenderKeyCacheCap, sndkEvic, sndkCap, sndkExp,
+		walltime.DecryptHistogram.Quantile(0.5),
+		walltime.DecryptHistogram.Quantile(0.95),
+		walltime.DecryptHistogram.Quantile(0.99),
+		walltime.DecryptHistogram.Count(),
+	)
 }
