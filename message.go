@@ -36,6 +36,7 @@ import (
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/walltime"
 )
 
 var pbSerializer = store.SignalProtobufSerializer
@@ -296,6 +297,12 @@ func (cli *Client) migrateSessionStore(ctx context.Context, pn, lid types.JID) {
 }
 
 func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
+	// Phase 17.5.1-04: per-message wall-time observation covers every
+	// exit path (unavailable early-return, success-path ack, error
+	// returns, panics). Quantiles surface alongside cache metrics in
+	// store/sqlstore.cache_wiring.go emitMetricsLoop every 5 minutes.
+	start := time.Now()
+	defer walltime.DecryptHistogram.Observe(time.Since(start))
 	unavailableNode, ok := node.GetOptionalChildByTag("unavailable")
 	if ok && len(node.GetChildrenByTag("enc")) == 0 {
 		uType := events.UnavailableType(unavailableNode.AttrGetter().String("type"))
@@ -326,19 +333,19 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			cli.Log.Warnf("No LID found for %s", info.Sender)
 		}
 	}
-	// Cache sender's session to reduce DB round-trips during decryption.
-	// Same mechanism as send path (send.go:1279-1316).
-	sessionAddr := senderEncryptionJID.SignalAddress().String()
-	if _, cachedCtx, cacheErr := cli.Store.WithCachedSessions(ctx, []string{sessionAddr}); cacheErr != nil {
-		cli.Log.Warnf("Failed to prefetch session for %s: %v", info.SourceString(), cacheErr)
-	} else {
-		ctx = cachedCtx
-		defer func() {
-			if flushErr := cli.Store.PutCachedSessions(ctx); flushErr != nil {
-				cli.Log.Errorf("Failed to flush session cache for %s: %v", info.SourceString(), flushErr)
-			}
-		}()
-	}
+	// D-CACHE-06: DECRYPT no longer prefetches via a context-scope session
+	// cache — the CachedSessionStore wrapper (wired into device.Sessions
+	// by sqlstore.Container.initializeDevice) now serves session reads
+	// from a process-shared LRU.
+	//
+	// Phase 17.5 FIX: the prior ack-after-flush gate (an anonymous-interface
+	// type-assertion against the session-store flush method, formerly
+	// inserted just before the success-path ack) was removed along with the
+	// write-back machinery in cached_session_store.go. The wrapper is now a
+	// strict write-through cache: every PutSession returns only after the
+	// inner store has acknowledged the write, so there is no "pending dirty
+	// state" to drain before acking. D-CACHE-03 is trivially satisfied by
+	// the synchronous write contract.
 	var recognizedStanza, protobufFailed bool
 	var encTypes []string
 	for _, child := range children {

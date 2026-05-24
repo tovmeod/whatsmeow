@@ -30,6 +30,14 @@ type Container struct {
 	db     *dbutil.Database
 	log    waLog.Logger
 	LIDMap *CachedLIDMap
+
+	// Phase 17.5.1-03: bridge to cache_wiring.go — all cache state
+	// (Session/Identity/SenderKey LRUs, eviction counters, metrics-loop
+	// ctx + cancel) lives in signalCaches. See cache_wiring.go for the
+	// type and the wireSignalCaches / attachCachedStores /
+	// closeSignalCaches helpers that own initialisation, device hookup,
+	// and teardown.
+	caches signalCaches
 }
 
 var _ store.DeviceContainer = (*Container)(nil)
@@ -89,11 +97,18 @@ func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
 	if log == nil {
 		log = waLog.Noop
 	}
-	return &Container{
+	c := &Container{
 		db:     wrapped,
 		log:    log,
 		LIDMap: NewCachedLIDMap(wrapped),
 	}
+	// Two-step construction (RESEARCH §1 closure-capture preservation):
+	// allocate *Container first, THEN wire the LRUs + metrics goroutine
+	// from cache_wiring.go. The eviction callbacks close over
+	// &c.caches.<Counter> — the heap address on the already-allocated
+	// Container.
+	wireSignalCaches(c, log)
+	return c
 }
 
 // Upgrade upgrades the database from the current to the latest version available.
@@ -235,9 +250,16 @@ func (c *Container) NewDevice() *store.Device {
 // ErrDeviceIDMustBeSet is the error returned by PutDevice if you try to save a device before knowing its JID.
 var ErrDeviceIDMustBeSet = errors.New("device JID must be known before accessing database")
 
-// Close will close the container's database
+// Close will close the container's database. Phase 17.5.1 WR-01: also cancels
+// the metrics-loop ctx (via closeSignalCaches in cache_wiring.go) so the
+// metrics goroutine exits before db/logger teardown. The nil-guard inside
+// closeSignalCaches keeps Close safe on a partially-constructed Container.
 func (c *Container) Close() error {
-	if c != nil && c.db != nil {
+	if c == nil {
+		return nil
+	}
+	closeSignalCaches(c)
+	if c.db != nil {
 		return c.db.Close()
 	}
 	return nil
@@ -266,6 +288,11 @@ func (c *Container) PutDevice(ctx context.Context, device *store.Device) error {
 func (c *Container) initializeDevice(device *store.Device) {
 	innerStore := NewSQLStore(c, *device.ID)
 	device.SetAllStores(innerStore)
+	// Overwrite the three signal stores (Sessions, Identities, SenderKeys)
+	// with Cached*Store wrappers (see cache_wiring.go.attachCachedStores).
+	// The other 8 stores set by SetAllStores remain pointed at the bare
+	// *SQLStore.
+	attachCachedStores(c, device, innerStore)
 	device.LIDs = c.LIDMap
 	device.Container = c
 	device.Initialized = true

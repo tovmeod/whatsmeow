@@ -108,6 +108,22 @@ func (s *SQLStore) IsTrustedIdentity(ctx context.Context, address string, key [3
 	return *(*[32]byte)(existingIdentity) == key, nil
 }
 
+// getIdentityBytes is a private read accessor used by CachedIdentityStore for populate-on-miss. Not part of the IdentityStore interface.
+func (s *SQLStore) getIdentityBytes(ctx context.Context, address string) (*[32]byte, error) {
+	var existingIdentity []byte
+	err := s.db.QueryRow(ctx, getIdentityQuery, s.JID, address).Scan(&existingIdentity)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	} else if len(existingIdentity) != 32 {
+		return nil, ErrInvalidLength
+	}
+	out := [32]byte{}
+	copy(out[:], existingIdentity)
+	return &out, nil
+}
+
 const (
 	getSessionQuery             = `SELECT session FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
 	hasSessionQuery             = `SELECT true FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
