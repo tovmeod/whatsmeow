@@ -21,14 +21,16 @@ import (
 // user form the natural identity for a sender-key record (whatsmeow_sender_keys
 // is keyed (our_jid, chat_id, sender_id) in PG).
 //
-// Compared to CachedSessionStore, this wrapper is intentionally simple:
-//   - No write-coalesce / FlushIfDirty. Although sender_keys exhibits the
-//     same 1:1 SELECT:UPSERT ratio as sessions (RESEARCH Open Question #2),
-//     the write-coalesce extension is deferred to a post-deploy phase per
-//     CONTEXT.md D-CACHE-03 (framed as sessions-only for v1).
-//   - No value-equal write-skip. Sender keys mutate naturally as the group
-//     ratchet advances; equal-value writes would be rare and the savings
-//     don't justify the comparison overhead on every PutSenderKey.
+// Like CachedSessionStore (post-Phase-17.5-FIX), this wrapper is a strict
+// write-through cache: every PutSenderKey calls inner FIRST and only
+// updates the cache on success. There is no value-equal write-skip — sender
+// keys mutate naturally as the group ratchet advances, so equal-value
+// writes would be rare and the comparison overhead on every PutSenderKey
+// is not worth it.
+//
+// Copy discipline (Phase 17.5 FIX CR-06): GetSenderKey returns a copy of
+// the cached slice; PutSenderKey stores a copy of the caller's slice.
+// Neither side aliases the other's buffer.
 type CachedSenderKeyStore struct {
 	inner store.SenderKeyStore
 	jid   string
@@ -63,10 +65,8 @@ func (c *CachedSenderKeyStore) Stats() (hits, misses uint64) {
 }
 
 // Purge clears the entire cache. The SenderKeyStore interface has no
-// DeleteAll* method, but Plan 17.5-04's Container.PurgeAllSignalCaches
-// reaches the shared LRU via Container.SenderKeyCache directly; Purge is
-// exposed here for symmetry with CachedSessionStore and for tests that
-// want to reset state without recreating the wrapper.
+// DeleteAll* method; Purge is exposed here for tests that want to reset
+// state without recreating the wrapper.
 func (c *CachedSenderKeyStore) Purge() {
 	c.cache.Purge()
 }

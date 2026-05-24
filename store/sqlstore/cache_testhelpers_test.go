@@ -45,8 +45,17 @@ type fakeSessionStore struct {
 
 	// lastGetManyBatchBuf retains a copy of the addresses argument from the
 	// most recent GetManySessions call so cache tests can assert the wrapper
-	// passes only the misses to the inner store (D-CACHE-06 / Phase 17.5-02).
+	// passes only the misses to the inner store.
 	lastGetManyBatchBuf []string
+
+	// Error-injection fields (Phase 17.5 FIX). When set to non-nil, the
+	// corresponding method returns the error WITHOUT mutating the backing
+	// map — letting wrapper tests assert that a failed inner call leaves
+	// the cache untouched. Setters are not synchronized; tests should set
+	// these fields before exercising the wrapper.
+	putErr      error
+	putManyErr  error
+	migrateErr  error
 }
 
 // lastGetManyBatch returns a copy of the addresses passed to the most recent
@@ -104,6 +113,9 @@ func (f *fakeSessionStore) GetManySessions(_ context.Context, addresses []string
 
 func (f *fakeSessionStore) PutSession(_ context.Context, address string, session []byte) error {
 	f.putCalls.Add(1)
+	if f.putErr != nil {
+		return f.putErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	stored := make([]byte, len(session))
@@ -114,6 +126,9 @@ func (f *fakeSessionStore) PutSession(_ context.Context, address string, session
 
 func (f *fakeSessionStore) PutManySessions(_ context.Context, sessions map[string][]byte) error {
 	f.putManyCalls.Add(1)
+	if f.putManyErr != nil {
+		return f.putManyErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for addr, session := range sessions {
@@ -128,10 +143,13 @@ func (f *fakeSessionStore) DeleteAllSessions(_ context.Context, phone string) er
 	f.deleteAllCalls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	pfx := phone + ":"
 	for addr := range f.sessions {
-		// Mirror SQLStore.DeleteAllSessions semantics: drop entries whose
-		// address starts with the phone prefix.
-		if len(addr) >= len(phone) && addr[:len(phone)] == phone {
+		// Mirror SQLStore.DeleteAllSessions semantics: their_id >=
+		// phone||':' AND their_id < phone||';'. Canonical form is
+		// "address starts with phone+':'" — same predicate the wrapper
+		// uses on its cache walk.
+		if len(addr) >= len(pfx) && addr[:len(pfx)] == pfx {
 			delete(f.sessions, addr)
 		}
 	}
@@ -148,6 +166,9 @@ func (f *fakeSessionStore) DeleteSession(_ context.Context, address string) erro
 
 func (f *fakeSessionStore) MigratePNToLID(_ context.Context, pn, lid types.JID) error {
 	f.migrateCalls.Add(1)
+	if f.migrateErr != nil {
+		return f.migrateErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	pnStr := pn.String()

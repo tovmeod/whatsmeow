@@ -8,9 +8,8 @@ package sqlstore
 
 import (
 	"context"
-	"sync"
+	"strings"
 	"sync/atomic"
-	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 
@@ -18,67 +17,82 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
-// Burst-coalesce thresholds (D-CACHE-04). N=3 writes for the same key within
-// M=50ms triggers deferred flush for the Nth and subsequent within-window
-// writes. Values are research-inferred; tune post-deploy with the metrics
-// surfaced by Stats().
-const (
-	coalesceMinBurst = 3
-	coalesceWindow   = 50 * time.Millisecond
-)
-
-// dirtyEntry tracks a key's coalesce state. A non-nil pendingValue means
-// "the latest write for this key has NOT been flushed to the inner store".
-// burstFirstAt is the timestamp of the first write of the current burst
-// window. burstCount counts writes seen within that window.
-type dirtyEntry struct {
-	mu            sync.Mutex
-	burstFirstAt  time.Time
-	burstCount    int
-	pendingValue  []byte
-	pendingActive bool
-	timer         *time.Timer
-}
-
 // CachedSessionStore wraps an inner store.SessionStore with a process-shared
-// *lru.Cache and a per-key write-coalesce buffer. It serves cache hits in
-// memory, fans miss reads through to the inner store, and (after the burst
-// threshold trips) defers writes for up to coalesceWindow before flushing
-// the FINAL value through to inner.
+// *lru.Cache[string, []byte]. It is a strict write-through cache: every
+// mutating method calls the inner store FIRST and only updates the cache on
+// success. There is no write-back buffer, no deferred-write timer, no
+// coalesce window, and no flush gate — those constructs (introduced by
+// Plans 17.5-02 and 17.5-04) were rewritten out by the Phase 17.5 FIX
+// cycle after review found six BLOCKER-class data-loss paths rooted in the
+// timer-vs-Delete race and the "clear state before inner write" inversion.
 //
-// FlushIfDirty drains a single key's pending write synchronously; the
-// DECRYPT path uses it as the "ack-after-flush" gate (D-CACHE-03) via an
-// anonymous-interface type-assertion in message.go.
+// Correctness guarantees:
 //
-// MigratePNToLID and DeleteAllSessions fan out to the Container's three
-// shared signal-store caches via container.PurgeAllSignalCaches so a JID
-// rewrite or bulk session purge cannot leave stale identity / sender-key
-// entries pointing at the old JID.
+//   - PutSession returns only after inner.PutSession returns nil. By the
+//     time PutSession returns, the row is durable in the inner store; there
+//     is no "pending dirty state" the wrapper has to flush before acking.
+//     This trivially satisfies the D-CACHE-03 "ack-after-flush" invariant
+//     that the prior write-back design tried to enforce via a separate gate.
+//
+//   - DeleteSession / DeleteAllSessions / MigratePNToLID call inner first,
+//     then update the cache to mirror the inner state. A failed inner call
+//     leaves the cache untouched, so the cache and inner can never diverge
+//     after a failed mutation.
+//
+//   - GetSession / GetManySessions / HasSession return cached values when
+//     the cache is warm; a miss fans through to inner and (on success)
+//     populates the cache with a heap-private copy.
+//
+// Copy discipline (Phase 17.5 FIX CR-06):
+//
+//   - PutSession stores a copy of the caller's slice in the cache. The
+//     caller is free to reuse / mutate its buffer after PutSession returns.
+//   - GetSession returns a copy of the cached slice. The caller is free to
+//     mutate the returned slice without corrupting the cache.
+//   - GetManySessions returns a map whose values are copies of the cached
+//     slices (mirroring the per-key Get behaviour).
+//   - Nil values are NEVER cached (Pitfall 5). An inner store that returns
+//     (nil, nil) for an absent address must hit inner on every Get; caching
+//     nil would silently mask a later PutSession for the same address.
+//
+// Bulk-mutation key scoping:
+//
+//   - DeleteAllSessions(phone): walks cache.Keys() and removes only entries
+//     whose key starts with `jid + "|" + phone + ":"` (matching the SQL
+//     `their_id >= phone||':' AND their_id < phone||';'` predicate from
+//     deleteAllSessionsQuery in store.go). Other wrappers' entries in the
+//     same shared LRU are left untouched because cache keys are JID-scoped.
+//
+//   - MigratePNToLID(pn, lid): inner.MigratePNToLID FIRST; on success, walks
+//     cache.Keys() and rewrites any entry whose address-part starts with
+//     `pn.String()` to a new key with the address rewritten to start with
+//     `lid.String()` instead. If the rewrite collides with a pre-existing
+//     LID entry, the migrated value wins — mirroring the precedence
+//     enforced inside inner.MigratePNToLID.
+//
+// Single-writer assumption: every mutation to whatsmeow_sessions for this
+// device's JID MUST go through this wrapper. Out-of-band mutations to the
+// underlying SQL table cannot be observed by the cache and will produce
+// stale reads until the cache entry naturally evicts.
 type CachedSessionStore struct {
-	inner     store.SessionStore
-	jid       string
-	cache     *lru.Cache[string, []byte]
-	container *Container
+	inner store.SessionStore
+	jid   string
+	cache *lru.Cache[string, []byte]
 
-	dirtyLock sync.Mutex
-	dirty     map[string]*dirtyEntry
-
-	hits, misses, evictions, coalescedWrites, flushedWrites uint64
+	hits, misses, evictions uint64
 }
 
 var _ store.SessionStore = (*CachedSessionStore)(nil)
 
-// NewCachedSessionStore constructs a wrapper over inner. The 4-arg signature
-// (inner, jid, cache, container) is locked from Plan-02-day-1 so Plan 04's
-// EDIT 5 wire-up requires no constructor change. container must be non-nil
-// (Plan 04 EDIT 7 dereferences it).
-func NewCachedSessionStore(inner store.SessionStore, jid string, cache *lru.Cache[string, []byte], container *Container) *CachedSessionStore {
+// NewCachedSessionStore constructs a wrapper over inner with the given JID
+// scope and shared LRU. The 3-arg signature (inner, jid, cache) replaces
+// the 4-arg form from Plan 17.5-02 — the container reverse-pointer was only
+// used by the now-removed cross-cache purge fan-out.
+func NewCachedSessionStore(inner store.SessionStore, jid string, cache *lru.Cache[string, []byte]) *CachedSessionStore {
 	return &CachedSessionStore{
-		inner:     inner,
-		jid:       jid,
-		cache:     cache,
-		container: container,
-		dirty:     make(map[string]*dirtyEntry),
+		inner: inner,
+		jid:   jid,
+		cache: cache,
 	}
 }
 
@@ -86,15 +100,19 @@ func (c *CachedSessionStore) key(address string) string {
 	return c.jid + "|" + address
 }
 
-// Stats returns the current values of the per-wrapper atomic counters in a
-// fixed (hits, misses, evictions, coalesced, flushed) order. Used by Plan
-// 04's emitMetricsLoop and by unit tests.
-func (c *CachedSessionStore) Stats() (hits, misses, evictions, coalesced, flushed uint64) {
+// jidPrefix returns the per-wrapper key prefix used to scope cache walks to
+// this device's entries.
+func (c *CachedSessionStore) jidPrefix() string {
+	return c.jid + "|"
+}
+
+// Stats returns the current values of the per-wrapper atomic counters.
+// Phase 17.5 FIX dropped the coalesced / flushed counters along with the
+// write-back machinery — only hits / misses / evictions remain.
+func (c *CachedSessionStore) Stats() (hits, misses, evictions uint64) {
 	return atomic.LoadUint64(&c.hits),
 		atomic.LoadUint64(&c.misses),
-		atomic.LoadUint64(&c.evictions),
-		atomic.LoadUint64(&c.coalescedWrites),
-		atomic.LoadUint64(&c.flushedWrites)
+		atomic.LoadUint64(&c.evictions)
 }
 
 // ---------------------------------------------------------------------------
@@ -105,14 +123,28 @@ func (c *CachedSessionStore) GetSession(ctx context.Context, address string) ([]
 	k := c.key(address)
 	if v, ok := c.cache.Get(k); ok {
 		atomic.AddUint64(&c.hits, 1)
-		return v, nil
+		// Copy out so caller mutation cannot corrupt the cached slice
+		// (Phase 17.5 FIX CR-06).
+		return copyBytes(v), nil
 	}
 	atomic.AddUint64(&c.misses, 1)
 	v, err := c.inner.GetSession(ctx, address)
-	if err == nil && v != nil {
-		c.cache.Add(k, v)
+	if err != nil {
+		return nil, err
 	}
-	return v, err
+	if v == nil {
+		// Pitfall 5: never cache nil. A subsequent PutSession would not
+		// invalidate a nil entry and subsequent Gets would erroneously
+		// return nil.
+		return nil, nil
+	}
+	// inner.GetSession returns a fresh heap slice; cache a copy so future
+	// callers receive their own copies even if a prior caller's slice got
+	// rewritten in place (defence in depth — the inner store already heap-
+	// allocates, but the wrapper should not depend on that).
+	stored := copyBytes(v)
+	c.cache.Add(k, stored)
+	return copyBytes(stored), nil
 }
 
 func (c *CachedSessionStore) HasSession(ctx context.Context, address string) (bool, error) {
@@ -121,6 +153,10 @@ func (c *CachedSessionStore) HasSession(ctx context.Context, address string) (bo
 		return true, nil
 	}
 	atomic.AddUint64(&c.misses, 1)
+	// Intentionally do NOT cache the boolean result. The cache only stores
+	// session payloads, populated by PutSession / GetSession. Caching a
+	// "true" sentinel would have no payload to serve from and caching a
+	// "false" sentinel would risk masking a later PutSession.
 	return c.inner.HasSession(ctx, address)
 }
 
@@ -130,7 +166,7 @@ func (c *CachedSessionStore) GetManySessions(ctx context.Context, addresses []st
 	for _, addr := range addresses {
 		if v, ok := c.cache.Get(c.key(addr)); ok {
 			atomic.AddUint64(&c.hits, 1)
-			result[addr] = v
+			result[addr] = copyBytes(v)
 		} else {
 			atomic.AddUint64(&c.misses, 1)
 			misses = append(misses, addr)
@@ -144,69 +180,36 @@ func (c *CachedSessionStore) GetManySessions(ctx context.Context, addresses []st
 		return nil, err
 	}
 	for addr, v := range fetched {
-		result[addr] = v
-		if v != nil {
-			c.cache.Add(c.key(addr), v)
+		if v == nil {
+			// Pitfall 5: skip caching of nil; still surface to caller so
+			// they observe the same map shape they'd get from inner.
+			result[addr] = nil
+			continue
 		}
+		stored := copyBytes(v)
+		c.cache.Add(c.key(addr), stored)
+		result[addr] = copyBytes(stored)
 	}
 	return result, nil
 }
 
 // ---------------------------------------------------------------------------
-// store.SessionStore — write methods (with burst-coalesce)
+// store.SessionStore — write methods (strict write-through)
 // ---------------------------------------------------------------------------
 
-// PutSession applies the LOCKED coalesce model: the first (N-1) writes per
-// key within coalesceWindow go straight through to inner ("write-through"
-// regime). Once the Nth-in-window write arrives, that write — and every
-// subsequent write within the same window — is deferred. A time.AfterFunc
-// timer drains the deferred write coalesceWindow after the first dirty
-// write to bound crash exposure to <=coalesceWindow regardless of FlushIfDirty.
+// PutSession writes synchronously through to the inner store, then mirrors
+// the value into the cache on success. Caller may reuse the session buffer
+// after this call returns; the cache stores its own copy.
 func (c *CachedSessionStore) PutSession(ctx context.Context, address string, session []byte) error {
-	k := c.key(address)
-	entry := c.getOrCreateDirty(k)
-	entry.mu.Lock()
-	now := time.Now()
-	if entry.burstCount == 0 || now.Sub(entry.burstFirstAt) > coalesceWindow {
-		// New window starts; the old window (if any) is already flushed.
-		entry.burstFirstAt = now
-		entry.burstCount = 0
+	if err := c.inner.PutSession(ctx, address, session); err != nil {
+		return err
 	}
-	entry.burstCount++
-
-	if entry.burstCount < coalesceMinBurst {
-		// Write-through regime.
-		entry.mu.Unlock()
-		if err := c.inner.PutSession(ctx, address, session); err != nil {
-			return err
-		}
-		c.cache.Add(k, copyBytes(session))
-		return nil
-	}
-
-	// Defer: stash the latest value in cache + dirty buffer, arm the drain
-	// timer if not already running.
-	stored := copyBytes(session)
-	entry.pendingValue = stored
-	if !entry.pendingActive {
-		entry.pendingActive = true
-		atomic.AddUint64(&c.coalescedWrites, 1)
-		drainAt := entry.burstFirstAt.Add(coalesceWindow)
-		delay := time.Until(drainAt)
-		if delay <= 0 {
-			delay = time.Microsecond
-		}
-		entry.timer = time.AfterFunc(delay, func() {
-			// Use background context for the autonomous timer drain; the
-			// originating request's ctx may already be cancelled.
-			_ = c.flushDirty(context.Background(), address, k)
-		})
-	}
-	c.cache.Add(k, stored)
-	entry.mu.Unlock()
+	c.cache.Add(c.key(address), copyBytes(session))
 	return nil
 }
 
+// PutManySessions writes through to inner.PutManySessions and then populates
+// the cache with copies of every value on success.
 func (c *CachedSessionStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
 	if err := c.inner.PutManySessions(ctx, sessions); err != nil {
 		return err
@@ -217,129 +220,110 @@ func (c *CachedSessionStore) PutManySessions(ctx context.Context, sessions map[s
 	return nil
 }
 
+// DeleteSession writes through to inner and (on success) removes the cache
+// entry for this address.
 func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) error {
 	if err := c.inner.DeleteSession(ctx, address); err != nil {
 		return err
 	}
 	c.cache.Remove(c.key(address))
-	c.dropDirty(c.key(address))
 	return nil
 }
 
+// DeleteAllSessions writes through to inner and (on success) removes from
+// the cache only those entries whose address starts with `phone + ":"`,
+// mirroring the SQL `their_id >= phone||':' AND their_id < phone||';'`
+// predicate (deleteAllSessionsQuery in store.go). Entries for other phones
+// (and for other devices' wrappers sharing this LRU) are left intact.
+//
+// Phase 17.5 FIX CR-03 regression: the previous implementation dropped
+// every dirty entry in the per-wrapper buffer AND purged every key in the
+// shared LRU via a Container-level cross-cache fan-out — a single phone
+// delete would silently roll back unrelated conversations on the same
+// device and every conversation on every other device too.
 func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string) error {
 	if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
 		return err
 	}
-	c.container.PurgeAllSignalCaches()
-	c.dropAllDirty()
+	jidPfx := c.jidPrefix()
+	addrPfx := phone + ":"
+	for _, k := range c.cache.Keys() {
+		if !strings.HasPrefix(k, jidPfx) {
+			continue
+		}
+		// k has shape "<jid>|<address>"; the address part starts at
+		// len(jidPfx). Match the SQL predicate exactly: address starts
+		// with phone + ":".
+		if strings.HasPrefix(k[len(jidPfx):], addrPfx) {
+			c.cache.Remove(k)
+		}
+	}
 	return nil
 }
 
+// MigratePNToLID writes through to inner FIRST (Phase 17.5 FIX CR-04
+// regression: the prior implementation dropped pending writes and purged
+// caches BEFORE calling inner, leaving the migrated row at a stale value).
+// On success, rewrites cache keys whose address prefix matches the PN JID
+// to use the LID JID instead. If the rewritten key collides with an
+// existing LID entry, the migrated value wins — mirroring the precedence
+// the inner store enforces.
 func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
-	c.container.PurgeAllSignalCaches()
-	c.dropAllDirty()
-	return c.inner.MigratePNToLID(ctx, pn, lid)
-}
+	if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
+		return err
+	}
+	jidPfx := c.jidPrefix()
+	pnStr := pn.String()
+	lidStr := lid.String()
 
-// ---------------------------------------------------------------------------
-// FlushIfDirty — D-CACHE-03 "ack-after-flush" gate. Called from message.go
-// via anonymous-interface type-assert (Plan 04 EDIT 6); the SessionStore
-// interface is NOT widened.
-// ---------------------------------------------------------------------------
-
-func (c *CachedSessionStore) FlushIfDirty(ctx context.Context, address string) error {
-	return c.flushDirty(ctx, address, c.key(address))
+	// Two-pass walk so cache mutation during iteration is well-defined.
+	// Pass 1: collect rewrites under this wrapper's JID prefix whose
+	// address part starts with pnStr.
+	type rewrite struct {
+		oldKey, newKey string
+		value          []byte
+	}
+	var rewrites []rewrite
+	for _, k := range c.cache.Keys() {
+		if !strings.HasPrefix(k, jidPfx) {
+			continue
+		}
+		addr := k[len(jidPfx):]
+		if !strings.HasPrefix(addr, pnStr) {
+			continue
+		}
+		v, ok := c.cache.Get(k)
+		if !ok {
+			// Entry evicted between Keys() and Get() — skip; the inner
+			// store has already done the migration so a future Get will
+			// repopulate against the new LID key naturally.
+			continue
+		}
+		newAddr := lidStr + addr[len(pnStr):]
+		rewrites = append(rewrites, rewrite{
+			oldKey: k,
+			newKey: jidPfx + newAddr,
+			value:  copyBytes(v),
+		})
+	}
+	// Pass 2: apply the rewrites. Remove old key, then Add new key — the
+	// Add overwrites any pre-existing LID entry (precedence: migrated
+	// value wins).
+	for _, r := range rewrites {
+		c.cache.Remove(r.oldKey)
+		c.cache.Add(r.newKey, r.value)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-func (c *CachedSessionStore) getOrCreateDirty(k string) *dirtyEntry {
-	c.dirtyLock.Lock()
-	defer c.dirtyLock.Unlock()
-	entry, ok := c.dirty[k]
-	if !ok {
-		entry = &dirtyEntry{}
-		c.dirty[k] = entry
-	}
-	return entry
-}
-
-func (c *CachedSessionStore) lookupDirty(k string) *dirtyEntry {
-	c.dirtyLock.Lock()
-	defer c.dirtyLock.Unlock()
-	return c.dirty[k]
-}
-
-func (c *CachedSessionStore) dropDirty(k string) {
-	c.dirtyLock.Lock()
-	entry := c.dirty[k]
-	delete(c.dirty, k)
-	c.dirtyLock.Unlock()
-	if entry != nil {
-		entry.mu.Lock()
-		if entry.timer != nil {
-			entry.timer.Stop()
-			entry.timer = nil
-		}
-		entry.pendingActive = false
-		entry.pendingValue = nil
-		entry.mu.Unlock()
-	}
-}
-
-func (c *CachedSessionStore) dropAllDirty() {
-	c.dirtyLock.Lock()
-	entries := make([]*dirtyEntry, 0, len(c.dirty))
-	for _, e := range c.dirty {
-		entries = append(entries, e)
-	}
-	c.dirty = make(map[string]*dirtyEntry)
-	c.dirtyLock.Unlock()
-	for _, e := range entries {
-		e.mu.Lock()
-		if e.timer != nil {
-			e.timer.Stop()
-			e.timer = nil
-		}
-		e.pendingActive = false
-		e.pendingValue = nil
-		e.mu.Unlock()
-	}
-}
-
-// flushDirty drains any deferred write for the key. address is the raw
-// address (what inner.PutSession expects); k is the cache composite key.
-func (c *CachedSessionStore) flushDirty(ctx context.Context, address, k string) error {
-	entry := c.lookupDirty(k)
-	if entry == nil {
-		return nil
-	}
-	entry.mu.Lock()
-	if !entry.pendingActive {
-		entry.mu.Unlock()
-		return nil
-	}
-	value := entry.pendingValue
-	entry.pendingValue = nil
-	entry.pendingActive = false
-	if entry.timer != nil {
-		entry.timer.Stop()
-		entry.timer = nil
-	}
-	// Reset burst counter so the next write starts a fresh window. Without
-	// this, a Flush followed by a single write inside the original window
-	// would still trip the coalesce regime even though the buffer is empty.
-	entry.burstCount = 0
-	entry.mu.Unlock()
-	if err := c.inner.PutSession(ctx, address, value); err != nil {
-		return err
-	}
-	atomic.AddUint64(&c.flushedWrites, 1)
-	return nil
-}
-
+// copyBytes returns a heap-private duplicate of b, or nil if b is nil. Used
+// to break the alias between caller-stack / inner-store slices and the
+// cache's internal storage (Phase 17.5 FIX CR-06). Shared with the sender-
+// key wrapper in the same package.
 func copyBytes(b []byte) []byte {
 	if b == nil {
 		return nil
