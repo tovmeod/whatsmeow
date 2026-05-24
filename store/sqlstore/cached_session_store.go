@@ -79,6 +79,7 @@ import (
 // device's JID MUST go through this wrapper. Out-of-band mutations to the
 // underlying SQL table cannot be observed by the cache and will produce
 // stale reads until the cache entry naturally evicts.
+// (WR-04 closure: re-audited 17.5.1-02, no code change needed.)
 type CachedSessionStore struct {
 	inner store.SessionStore
 	jid   string
