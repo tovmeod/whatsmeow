@@ -301,8 +301,14 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 	// exit path (unavailable early-return, success-path ack, error
 	// returns, panics). Quantiles surface alongside cache metrics in
 	// store/sqlstore.cache_wiring.go emitMetricsLoop every 5 minutes.
+	// kavtov-fork: Phase 17.5.3 DEFER-01 fix — wrap in closure so time.Since
+	// evaluates when the deferred call RUNS (function exit), not at defer-setup.
+	// Previously: defer walltime.DecryptHistogram.Observe(time.Since(start)) — this
+	// evaluated time.Since(start) eagerly at the defer statement (nanoseconds
+	// after function entry), making every observation near-zero and the entire
+	// p50/p95/p99 metric meaningless garbage.
 	start := time.Now()
-	defer walltime.DecryptHistogram.Observe(time.Since(start))
+	defer func() { walltime.DecryptHistogram.Observe(time.Since(start)) }()
 	unavailableNode, ok := node.GetOptionalChildByTag("unavailable")
 	if ok && len(node.GetChildrenByTag("enc")) == 0 {
 		uType := events.UnavailableType(unavailableNode.AttrGetter().String("type"))
