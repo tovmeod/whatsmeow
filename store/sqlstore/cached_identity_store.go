@@ -8,6 +8,7 @@ package sqlstore
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -176,13 +177,24 @@ func (c *CachedIdentityStore) DeleteAllIdentities(ctx context.Context, phone str
 	if err := c.inner.DeleteAllIdentities(ctx, phone); err != nil {
 		return err
 	}
-	// Bulk mutation — Pitfall 1: identity composite-key prefix scan would be
-	// O(N) over the cache; cheaper to purge entirely and let the natural
-	// re-fill repopulate the working set.
-	// Purge fires the eviction callback Len() times; pre-add Len() so the
-	// log-time cleanCounters(cap, exp) can cancel the callback inflation.
-	// kavtov-fork: Phase 17.5.2 - pre-add Len() to explicit-remove counter (see Plan 17.5.2-03)
-	atomic.AddUint64(c.explicitRemoves, uint64(c.cache.Len()))
-	c.cache.Purge()
+	// kavtov-fork: Phase 17.5.3 - prefix-scan removes only this wrapper's
+	// entries for the target remote phone. Previously this called the
+	// LRU's bulk Purge which wiped the entire process-shared cache across
+	// all device wrappers, causing ~26 explicit_removes/sec churn and
+	// undoing the Phase 17.5 cache benefit for unrelated devices. See
+	// 17.5.3-RCA-IDENTITIES-CACHE.md for evidence (identities.len swinging
+	// 30..1617, capacity_evictions=0). The new scope matches the SQL
+	// predicate `our_jid=$1 AND their_id LIKE $phone||':' ...` exactly:
+	// libsignal addresses are `<phone>:<device>`, cache keys are
+	// `<c.jid>|<address>`, so the composite prefix is `<c.jid>|<phone>:`.
+	prefix := c.jid + "|" + phone + ":"
+	for _, k := range c.cache.Keys() {
+		if strings.HasPrefix(k, prefix) {
+			// kavtov-fork: Phase 17.5.3 - pre-increment per iteration (matches
+			// cached_session_store.go DeleteAllSessions sibling pattern)
+			atomic.AddUint64(c.explicitRemoves, 1)
+			c.cache.Remove(k)
+		}
+	}
 	return nil
 }
