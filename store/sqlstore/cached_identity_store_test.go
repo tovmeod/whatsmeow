@@ -260,10 +260,17 @@ func TestCachedIdentityStore_DeleteIdentity_RemovesFromCache(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DeleteAllIdentities: bulk purge — cache Len() drops to 0.
+// DeleteAllIdentities: under Phase 17.5.3 prefix-scan semantics, the inner
+// SQL DELETE always runs (delegates to inner.DeleteAllIdentities), but the
+// cache is only touched for keys matching `<c.jid>|<phone>:`. If no cache
+// key matches the target phone, the cache is left intact — which is the
+// correct mirror of the SQL predicate (rows matching the LIKE clause are
+// already absent from the inner store, nothing to invalidate in cache).
+// The pre-17.5.3 implementation wiped every other phone's entries on every
+// <identity/> notification — see 17.5.3-RCA-IDENTITIES-CACHE.md.
 // ---------------------------------------------------------------------------
 
-func TestCachedIdentityStore_DeleteAllIdentities_PurgesCache(t *testing.T) {
+func TestCachedIdentityStore_DeleteAllIdentities_DelegatesToInner_NoMatchingPrefix_LeavesCache(t *testing.T) {
 	ctx := context.Background()
 	c, inner := newTestCachedIdentityStore(t, 16)
 	for i, addr := range []string{"addr-1", "addr-2", "addr-3"} {
@@ -274,14 +281,119 @@ func TestCachedIdentityStore_DeleteAllIdentities_PurgesCache(t *testing.T) {
 	if got := c.cache.Len(); got != 3 {
 		t.Fatalf("pre-DeleteAll cache Len = %d, want 3", got)
 	}
+	// "phone-X" does not match any of the seeded addresses (none of
+	// "addr-1/2/3" begins with "phone-X:"), so the prefix-scan must leave
+	// the cache untouched even though the inner delegate is still invoked.
 	if err := c.DeleteAllIdentities(ctx, "phone-X"); err != nil {
 		t.Fatalf("DeleteAllIdentities: %v", err)
 	}
 	if got := inner.deleteAllCalls.Load(); got != 1 {
 		t.Errorf("inner.deleteAllCalls = %d, want 1", got)
 	}
-	if got := c.cache.Len(); got != 0 {
-		t.Errorf("post-DeleteAll cache Len = %d, want 0 (Purge expected)", got)
+	if got := c.cache.Len(); got != 3 {
+		t.Errorf("post-DeleteAll cache Len = %d, want 3 (no matching prefix means no cache removal)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17.5.3 RCA: DeleteAllIdentities(phoneA) must NOT drop cache entries
+// for phoneB on the same wrapper. The previous implementation purged every
+// entry in the shared LRU on every <identity/> notification, undoing the
+// Phase 17.5 cache benefit for all unrelated remote phones.
+// ---------------------------------------------------------------------------
+
+func TestCachedIdentityStore_DeleteAllIdentities_RemovesOnlyMatchingPhonePrefix(t *testing.T) {
+	ctx := context.Background()
+	c, inner := newTestCachedIdentityStore(t, 32)
+
+	// Address format mirrors libsignal: "<phone>:<device>". The wrapper's
+	// prefix-scan matches `<c.jid>|<phone>:` exactly — same shape used in
+	// production for identity_keys rows.
+	addrsA := []string{"111:0", "111:1"}
+	addrsB := []string{"222:0", "222:1"}
+	for i, addr := range addrsA {
+		if err := c.PutIdentity(ctx, addr, fillKey(byte(0xA0+i))); err != nil {
+			t.Fatalf("seed PutIdentity A %s: %v", addr, err)
+		}
+	}
+	for i, addr := range addrsB {
+		if err := c.PutIdentity(ctx, addr, fillKey(byte(0xB0+i))); err != nil {
+			t.Fatalf("seed PutIdentity B %s: %v", addr, err)
+		}
+	}
+	if got := c.cache.Len(); got != 4 {
+		t.Fatalf("pre-DeleteAll cache Len = %d, want 4", got)
+	}
+
+	if err := c.DeleteAllIdentities(ctx, "111"); err != nil {
+		t.Fatalf("DeleteAllIdentities: %v", err)
+	}
+	if got := inner.deleteAllCalls.Load(); got != 1 {
+		t.Errorf("inner.deleteAllCalls = %d, want 1", got)
+	}
+
+	// PhoneA entries must be removed; phoneB entries must survive.
+	for _, addr := range addrsA {
+		if _, ok := c.cache.Get("test-jid|" + addr); ok {
+			t.Errorf("cache still holds %q after DeleteAllIdentities(111)", addr)
+		}
+	}
+	for _, addr := range addrsB {
+		if _, ok := c.cache.Get("test-jid|" + addr); !ok {
+			t.Errorf("cache lost unrelated entry %q after DeleteAllIdentities(111)", addr)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17.5.3 RCA (cross-jid scope): DeleteAllIdentities on a
+// CachedIdentityStore bound to jid-A must NOT touch entries under jid-B in
+// the same process-shared LRU. The previous implementation called the
+// LRU's bulk Purge which wiped both; the prefix-scan limits removals to
+// keys starting with `<c.jid>|<phone>:`.
+//
+// This test builds the wrapper inline (skipping newTestCachedIdentityStore)
+// so it can hold a reference to the shared LRU and inject a sibling-device
+// entry under a different jid prefix — same pattern as
+// TestCachedSessionStore_DeleteAllSessions_DoesNotTouchOtherJIDs.
+// ---------------------------------------------------------------------------
+
+func TestCachedIdentityStore_DeleteAllIdentities_OtherJIDEntriesSurvive(t *testing.T) {
+	ctx := context.Background()
+	cache, err := lru.New[string, *[32]byte](32)
+	if err != nil {
+		t.Fatalf("lru.New[string, *[32]byte] failed: %v", err)
+	}
+	inner := newFakeIdentityStore()
+	var dummyA uint64
+	cA := NewCachedIdentityStore(inner, "jid-A", cache, &dummyA)
+
+	// Seed cA's wrapper under jid-A for phone 111.
+	if err := cA.PutIdentity(ctx, "111:0", fillKey(0x01)); err != nil {
+		t.Fatalf("seed cA.PutIdentity: %v", err)
+	}
+	// Inject a sibling-device entry directly into the shared LRU under
+	// jid-B. Simulates a second CachedIdentityStore wrapper that shares
+	// the process-LRU.
+	keyB := fillKey(0x99)
+	cache.Add("jid-B|111:0", &keyB)
+
+	if got := cache.Len(); got != 2 {
+		t.Fatalf("pre-DeleteAll cache Len = %d, want 2", got)
+	}
+
+	if err := cA.DeleteAllIdentities(ctx, "111"); err != nil {
+		t.Fatalf("DeleteAllIdentities: %v", err)
+	}
+
+	if _, ok := cache.Get("jid-A|111:0"); ok {
+		t.Errorf("cache still holds jid-A|111:0 after DeleteAllIdentities (own scope must be removed)")
+	}
+	if _, ok := cache.Get("jid-B|111:0"); !ok {
+		t.Errorf("DeleteAllIdentities removed an entry under a different JID prefix — must be JID-scoped")
+	}
+	if dummyA != 1 {
+		t.Errorf("dummyA (explicitRemoves for jid-A) = %d, want 1 (one matching key removed)", dummyA)
 	}
 }
 
