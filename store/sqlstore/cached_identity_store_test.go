@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,7 +51,7 @@ func newTestCachedIdentityStore(t *testing.T, capSize int) (*CachedIdentityStore
 	// explicitRemoves: a local dummy counter — these tests exercise caching
 	// logic, not Container-level counter discrimination (Phase 17.5.2).
 	var dummyExplicitRemoves uint64
-	wrapper := NewCachedIdentityStore(inner, "test-jid", cache, &dummyExplicitRemoves)
+	wrapper := NewCachedIdentityStore(inner, "test-jid", cache, &dummyExplicitRemoves, newIdentitySecondaryIndex())
 	return wrapper, inner
 }
 
@@ -366,7 +367,7 @@ func TestCachedIdentityStore_DeleteAllIdentities_OtherJIDEntriesSurvive(t *testi
 	}
 	inner := newFakeIdentityStore()
 	var dummyA uint64
-	cA := NewCachedIdentityStore(inner, "jid-A", cache, &dummyA)
+	cA := NewCachedIdentityStore(inner, "jid-A", cache, &dummyA, newIdentitySecondaryIndex())
 
 	// Seed cA's wrapper under jid-A for phone 111.
 	if err := cA.PutIdentity(ctx, "111:0", fillKey(0x01)); err != nil {
@@ -439,5 +440,88 @@ func TestCachedIdentityStore_Race_50Goroutines(t *testing.T) {
 		// ok
 	case <-time.After(10 * time.Second):
 		t.Fatal("race test deadlocked (10s)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R3: explicit_removes counter delta equals number of cache entries removed
+// by DeleteAllIdentities.
+// ---------------------------------------------------------------------------
+
+func TestCachedIdentityStore_DeleteAllIdentities_ExplicitRemovesDelta_EqualsRemoved(t *testing.T) {
+	ctx := context.Background()
+	idx := newIdentitySecondaryIndex()
+	var explicitRemovesA uint64
+	cacheWithEvict, err := lru.NewWithEvict[string, *[32]byte](1000, func(key string, _ *[32]byte) {
+		if jid, phone, ok := parseCacheKey(key); ok {
+			idx.EvictCleanup(key, jid, phone)
+		}
+	})
+	if err != nil {
+		t.Fatalf("lru.NewWithEvict failed: %v", err)
+	}
+	innerA := newFakeIdentityStore()
+	cA := NewCachedIdentityStore(innerA, "jid-A", cacheWithEvict, &explicitRemovesA, idx)
+
+	// Build a second wrapper sharing the same cache + index (different jid).
+	var explicitRemovesB uint64
+	innerB := newFakeIdentityStore()
+	cB := NewCachedIdentityStore(innerB, "jid-B", cacheWithEvict, &explicitRemovesB, idx)
+
+	// Populate 4 entries under "111" on cA.
+	for d := 0; d < 4; d++ {
+		addr := fmt.Sprintf("111:%d", d)
+		if err := cA.PutIdentity(ctx, addr, fillKey(byte(0xA0+d))); err != nil {
+			t.Fatalf("cA.PutIdentity 111:%d: %v", d, err)
+		}
+	}
+	// Populate 2 entries under "222" on cA (same jid, different phone).
+	for d := 0; d < 2; d++ {
+		addr := fmt.Sprintf("222:%d", d)
+		if err := cA.PutIdentity(ctx, addr, fillKey(byte(0xB0+d))); err != nil {
+			t.Fatalf("cA.PutIdentity 222:%d: %v", d, err)
+		}
+	}
+	// Populate 3 entries under "111" on cB (different jid, must survive).
+	for d := 0; d < 3; d++ {
+		addr := fmt.Sprintf("111:%d", d)
+		if err := cB.PutIdentity(ctx, addr, fillKey(byte(0xC0+d))); err != nil {
+			t.Fatalf("cB.PutIdentity 111:%d: %v", d, err)
+		}
+	}
+
+	before := atomic.LoadUint64(&explicitRemovesA)
+
+	if err := cA.DeleteAllIdentities(ctx, "111"); err != nil {
+		t.Fatalf("DeleteAllIdentities: %v", err)
+	}
+
+	after := atomic.LoadUint64(&explicitRemovesA)
+	if delta := after - before; delta != 4 {
+		t.Errorf("explicitRemovesA delta = %d, want 4 (one per removed cache entry)", delta)
+	}
+
+	// inner.deleteAllCalls must be 1.
+	if got := innerA.deleteAllCalls.Load(); got != 1 {
+		t.Errorf("innerA.deleteAllCalls = %d, want 1", got)
+	}
+
+	// "222" entries under jid-A must survive.
+	for d := 0; d < 2; d++ {
+		ck := fmt.Sprintf("jid-A|222:%d", d)
+		if _, ok := cacheWithEvict.Get(ck); !ok {
+			t.Errorf("cache lost jid-A|222:%d after DeleteAllIdentities(111)", d)
+		}
+	}
+	// "jid-B|111" entries (cB) must survive.
+	for d := 0; d < 3; d++ {
+		ck := fmt.Sprintf("jid-B|111:%d", d)
+		if _, ok := cacheWithEvict.Get(ck); !ok {
+			t.Errorf("cache lost cross-wrapper entry jid-B|111:%d (cross-wrapper isolation violated)", d)
+		}
+	}
+	// explicitRemovesB must be untouched.
+	if explicitRemovesB != 0 {
+		t.Errorf("explicitRemovesB = %d, want 0 (jid-B entries not removed)", explicitRemovesB)
 	}
 }

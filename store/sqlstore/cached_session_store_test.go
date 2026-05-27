@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,7 +47,7 @@ func newTestCachedSessionStore(t *testing.T, capSize int) (*CachedSessionStore, 
 	// explicitRemoves: a local dummy counter — these tests exercise caching
 	// logic, not Container-level counter discrimination (Phase 17.5.2).
 	var dummyExplicitRemoves uint64
-	wrapper := NewCachedSessionStore(inner, "test-jid", sessionCache, &dummyExplicitRemoves)
+	wrapper := NewCachedSessionStore(inner, "test-jid", sessionCache, &dummyExplicitRemoves, newSessionSecondaryIndex())
 	return wrapper, inner, sessionCache
 }
 
@@ -758,5 +759,330 @@ func TestCachedSessionStore_Race_GetPutDelete(t *testing.T) {
 		// ok
 	case <-time.After(10 * time.Second):
 		t.Fatal("race test deadlocked (10s)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// newTestCachedSessionStoreWithEvict builds a test wrapper whose LRU is wired
+// with NewWithEvict + EvictCleanup, mirroring wireSignalCaches. Required by
+// tests that exercise the secondary-index consistency under capacity eviction
+// (counter-accuracy, orphan-detection, benchmark).
+// ---------------------------------------------------------------------------
+
+func newTestCachedSessionStoreWithEvict(t *testing.T, capSize int, explicitRemoves *uint64) (*CachedSessionStore, *fakeSessionStore, *lru.Cache[string, []byte], *sessionSecondaryIndex) {
+	t.Helper()
+	inner := newFakeSessionStore()
+	idx := newSessionSecondaryIndex()
+	sessionCache, err := lru.NewWithEvict[string, []byte](capSize, func(key string, _ []byte) {
+		if jid, phone, ok := parseCacheKey(key); ok {
+			idx.EvictCleanup(key, jid, phone)
+		}
+	})
+	if err != nil {
+		t.Fatalf("lru.NewWithEvict[string, []byte] failed: %v", err)
+	}
+	wrapper := NewCachedSessionStore(inner, "test-jid", sessionCache, explicitRemoves, idx)
+	return wrapper, inner, sessionCache, idx
+}
+
+// ---------------------------------------------------------------------------
+// R2: explicit_removes counter delta equals number of cache entries removed
+// by DeleteAllSessions.
+// ---------------------------------------------------------------------------
+
+func TestCachedSessionStore_DeleteAllSessions_ExplicitRemovesDelta_EqualsRemoved(t *testing.T) {
+	ctx := context.Background()
+	var explicitRemoves uint64
+	wrapper, inner, cache, idx := newTestCachedSessionStoreWithEvict(t, 1000, &explicitRemoves)
+
+	// Build a second wrapper on the same cache + index (different jid) to
+	// prove cross-wrapper isolation: the second wrapper's entries must survive.
+	var dummyB uint64
+	inner2 := newFakeSessionStore()
+	wrapper2 := NewCachedSessionStore(inner2, "other-jid", cache, &dummyB, idx)
+
+	// Populate 5 entries under "11111" on wrapper (test-jid).
+	for d := 0; d < 5; d++ {
+		addr := fmt.Sprintf("11111:%d", d)
+		if err := wrapper.PutSession(ctx, addr, []byte(fmt.Sprintf("v11111-%d", d))); err != nil {
+			t.Fatalf("PutSession 11111:%d: %v", d, err)
+		}
+	}
+	// Populate 3 entries under "22222" on wrapper (same jid, different phone).
+	for d := 0; d < 3; d++ {
+		addr := fmt.Sprintf("22222:%d", d)
+		if err := wrapper.PutSession(ctx, addr, []byte(fmt.Sprintf("v22222-%d", d))); err != nil {
+			t.Fatalf("PutSession 22222:%d: %v", d, err)
+		}
+	}
+	// Populate 2 entries under "11111" on wrapper2 (other-jid).
+	for d := 0; d < 2; d++ {
+		addr := fmt.Sprintf("11111:%d", d)
+		if err := wrapper2.PutSession(ctx, addr, []byte(fmt.Sprintf("vB-%d", d))); err != nil {
+			t.Fatalf("wrapper2.PutSession 11111:%d: %v", d, err)
+		}
+	}
+
+	before := atomic.LoadUint64(&explicitRemoves)
+
+	if err := wrapper.DeleteAllSessions(ctx, "11111"); err != nil {
+		t.Fatalf("DeleteAllSessions: %v", err)
+	}
+
+	after := atomic.LoadUint64(&explicitRemoves)
+	if delta := after - before; delta != 5 {
+		t.Errorf("explicitRemoves delta = %d, want 5 (one per removed cache entry)", delta)
+	}
+
+	// inner.deleteAllCalls must be 1.
+	if got := inner.deleteAllCalls.Load(); got != 1 {
+		t.Errorf("inner.deleteAllCalls = %d, want 1", got)
+	}
+
+	// "22222" entries under test-jid must survive.
+	for d := 0; d < 3; d++ {
+		ck := fmt.Sprintf("test-jid|22222:%d", d)
+		if _, ok := cache.Get(ck); !ok {
+			t.Errorf("cache lost test-jid|22222:%d after DeleteAllSessions(11111)", d)
+		}
+	}
+	// "other-jid|11111" entries (wrapper2) must survive.
+	for d := 0; d < 2; d++ {
+		ck := fmt.Sprintf("other-jid|11111:%d", d)
+		if _, ok := cache.Get(ck); !ok {
+			t.Errorf("cache lost other-jid|11111:%d (cross-wrapper isolation violated)", d)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R2 (MigratePNToLID path): explicit_removes delta equals number removed.
+// ---------------------------------------------------------------------------
+
+func TestCachedSessionStore_MigratePNToLID_ExplicitRemovesDelta_EqualsRemoved(t *testing.T) {
+	ctx := context.Background()
+	var explicitRemoves uint64
+	wrapper, _, cache, idx := newTestCachedSessionStoreWithEvict(t, 1000, &explicitRemoves)
+
+	pn := types.JID{User: "12345", Server: types.DefaultUserServer}
+	lid := types.JID{User: "67890", Server: types.HiddenUserServer}
+	pnUser := pn.SignalAddressUser()
+
+	// Build a second wrapper on same cache+index (different jid) to prove
+	// cross-wrapper isolation.
+	var dummyB uint64
+	inner2 := newFakeSessionStore()
+	wrapper2 := NewCachedSessionStore(inner2, "other-jid", cache, &dummyB, idx)
+
+	// Seed 2 PN-keyed entries for wrapper (test-jid).
+	for d := 0; d < 2; d++ {
+		addr := fmt.Sprintf("%s:%d", pnUser, d)
+		if err := wrapper.PutSession(ctx, addr, []byte(fmt.Sprintf("migrated-%d", d))); err != nil {
+			t.Fatalf("PutSession pn:%d: %v", d, err)
+		}
+	}
+	// Seed 1 entry for a different user on wrapper (must survive).
+	otherAddr := "99999:0"
+	if err := wrapper.PutSession(ctx, otherAddr, []byte("other")); err != nil {
+		t.Fatalf("PutSession other: %v", err)
+	}
+	// Seed 1 entry under other-jid for same pn (must survive cross-wrapper).
+	if err := wrapper2.PutSession(ctx, pnUser+":0", []byte("sibling")); err != nil {
+		t.Fatalf("wrapper2.PutSession: %v", err)
+	}
+
+	before := atomic.LoadUint64(&explicitRemoves)
+
+	if err := wrapper.MigratePNToLID(ctx, pn, lid); err != nil {
+		t.Fatalf("MigratePNToLID: %v", err)
+	}
+
+	after := atomic.LoadUint64(&explicitRemoves)
+	if delta := after - before; delta != 2 {
+		t.Errorf("explicitRemoves delta = %d, want 2 (one per PN-keyed entry removed)", delta)
+	}
+
+	// PN-keyed entries must be gone from cache.
+	for d := 0; d < 2; d++ {
+		ck := fmt.Sprintf("test-jid|%s:%d", pnUser, d)
+		if _, ok := cache.Get(ck); ok {
+			t.Errorf("PN cache entry %s still present after MigratePNToLID", ck)
+		}
+	}
+	// Other-user entry under test-jid must survive.
+	if _, ok := cache.Get("test-jid|" + otherAddr); !ok {
+		t.Errorf("unrelated entry test-jid|%s was removed by MigratePNToLID", otherAddr)
+	}
+	// Sibling entry under other-jid must survive.
+	siblingCK := fmt.Sprintf("other-jid|%s:0", pnUser)
+	if _, ok := cache.Get(siblingCK); !ok {
+		t.Errorf("cross-wrapper entry %s was removed by MigratePNToLID (cross-wrapper isolation violated)", siblingCK)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// B1 regression gate: GetSession read-populate is tracked in the secondary
+// index and therefore reachable by DeleteAllSessions via SnapshotKeys.
+// ---------------------------------------------------------------------------
+
+func TestSessionStore_ReadPopulate_NoOrphan_After_DeleteAllSessions(t *testing.T) {
+	ctx := context.Background()
+	var explicitRemoves uint64
+	wrapper, inner, _, _ := newTestCachedSessionStoreWithEvict(t, 1000, &explicitRemoves)
+
+	// Seed the inner fake so GetSession returns a non-nil payload.
+	if err := inner.PutSession(ctx, "33333:0", []byte("session-33333")); err != nil {
+		t.Fatalf("seed inner.PutSession: %v", err)
+	}
+	inner.getCalls.Store(0)
+	inner.putCalls.Store(0)
+
+	// Step 1: cold cache read — exercises the §157 read-populate path in
+	// GetSession, which calls c.cache.Add AND secondaryIndex.Insert.
+	got, err := wrapper.GetSession(ctx, "33333:0")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if !bytes.Equal(got, []byte("session-33333")) {
+		t.Fatalf("GetSession returned %q, want %q", got, "session-33333")
+	}
+
+	// Step 2: cache must now hold 1 entry.
+	if n := wrapper.cache.Len(); n != 1 {
+		t.Fatalf("cache Len after read-populate = %d, want 1", n)
+	}
+
+	// Step 3: bulk remove — must reach the read-populated entry via
+	// SnapshotKeys("33333") and remove it from the cache.
+	beforeRemoves := atomic.LoadUint64(&explicitRemoves)
+	if err := wrapper.DeleteAllSessions(ctx, "33333"); err != nil {
+		t.Fatalf("DeleteAllSessions: %v", err)
+	}
+
+	// Step 4: orphan-free assertion — cache must be empty.
+	// Without the B1 fix (read-path secondaryIndex.Insert), the read-populated
+	// entry would survive: cache.Len() would be 1 (orphan). With the fix: 0.
+	if n := wrapper.cache.Len(); n != 0 {
+		t.Errorf("cache Len after DeleteAllSessions = %d, want 0 (B1 orphan detected: read-populate not in index)", n)
+	}
+
+	// Step 5: counter delta must be exactly 1.
+	afterRemoves := atomic.LoadUint64(&explicitRemoves)
+	if delta := afterRemoves - beforeRemoves; delta != 1 {
+		t.Errorf("explicitRemoves delta = %d, want 1 (one read-populated entry removed)", delta)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// B1 regression gate (GetManySessions path): read-path populates via
+// GetManySessions are tracked in the secondary index and reachable by
+// DeleteAllSessions.
+// ---------------------------------------------------------------------------
+
+func TestSessionStore_GetMany_Populate_NoOrphan(t *testing.T) {
+	ctx := context.Background()
+	var explicitRemoves uint64
+	wrapper, inner, _, _ := newTestCachedSessionStoreWithEvict(t, 1000, &explicitRemoves)
+
+	// Seed the inner fake with 3 entries for "44444".
+	for d := 0; d < 3; d++ {
+		addr := fmt.Sprintf("44444:%d", d)
+		if err := inner.PutSession(ctx, addr, []byte(fmt.Sprintf("session-44444-%d", d))); err != nil {
+			t.Fatalf("seed inner.PutSession %s: %v", addr, err)
+		}
+	}
+	inner.getCalls.Store(0)
+	inner.putCalls.Store(0)
+	inner.getManyCalls.Store(0)
+
+	// Step 1: GetManySessions — exercises §201 read-populate loop, which calls
+	// c.cache.Add AND secondaryIndex.Insert for each fetched entry.
+	addrs := []string{"44444:0", "44444:1", "44444:2"}
+	result, err := wrapper.GetManySessions(ctx, addrs)
+	if err != nil {
+		t.Fatalf("GetManySessions: %v", err)
+	}
+	if len(result) != 3 {
+		t.Fatalf("GetManySessions returned %d entries, want 3", len(result))
+	}
+
+	// Step 2: all 3 must be in the cache.
+	if n := wrapper.cache.Len(); n != 3 {
+		t.Fatalf("cache Len after GetManySessions populate = %d, want 3", n)
+	}
+
+	// Step 3: bulk remove via DeleteAllSessions.
+	beforeRemoves := atomic.LoadUint64(&explicitRemoves)
+	if err := wrapper.DeleteAllSessions(ctx, "44444"); err != nil {
+		t.Fatalf("DeleteAllSessions: %v", err)
+	}
+
+	// Step 4: orphan-free — all 3 read-populated entries must be gone.
+	if n := wrapper.cache.Len(); n != 0 {
+		t.Errorf("cache Len after DeleteAllSessions = %d, want 0 (B1 orphan: GetManySessions populate not in index)", n)
+	}
+
+	// Step 5: counter delta must be exactly 3.
+	afterRemoves := atomic.LoadUint64(&explicitRemoves)
+	if delta := afterRemoves - beforeRemoves; delta != 3 {
+		t.Errorf("explicitRemoves delta = %d, want 3 (one per read-populated entry removed)", delta)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC AC: micro-benchmark — 100k entries spanning 100 phones; DeleteAllSessions
+// on one phone completes <1ms (target ~100µs); build-fail gate at >10ms.
+// ---------------------------------------------------------------------------
+
+func BenchmarkDeleteAllSessions_LargeShared(b *testing.B) {
+	ctx := context.Background()
+	var explicitRemoves uint64
+	idx := newSessionSecondaryIndex()
+	cache, err := lru.NewWithEvict[string, []byte](100_000, func(key string, _ []byte) {
+		if jid, phone, ok := parseCacheKey(key); ok {
+			idx.EvictCleanup(key, jid, phone)
+		}
+	})
+	if err != nil {
+		b.Fatalf("lru.NewWithEvict failed: %v", err)
+	}
+	inner := newFakeSessionStore()
+	wrapper := NewCachedSessionStore(inner, "bench-jid", cache, &explicitRemoves, idx)
+
+	// Pre-populate 100k entries: 100 phones × 1000 devices each.
+	payload := []byte("benchmark-session-payload")
+	for phoneIdx := 0; phoneIdx < 100; phoneIdx++ {
+		for deviceIdx := 0; deviceIdx < 1000; deviceIdx++ {
+			addr := fmt.Sprintf("%d:%d", phoneIdx, deviceIdx)
+			if err := wrapper.PutSession(ctx, addr, payload); err != nil {
+				b.Fatalf("pre-populate PutSession %s: %v", addr, err)
+			}
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		phone := fmt.Sprintf("%d", i%100)
+
+		// Exclude repopulate time from the measurement.
+		b.StopTimer()
+		for d := 0; d < 1000; d++ {
+			addr := fmt.Sprintf("%s:%d", phone, d)
+			if err := wrapper.PutSession(ctx, addr, payload); err != nil {
+				b.Fatalf("repopulate PutSession: %v", err)
+			}
+		}
+		b.StartTimer()
+
+		wrapper.DeleteAllSessions(ctx, phone) //nolint:errcheck
+	}
+	b.StopTimer()
+
+	// SPEC AC build-fail gate: >10ms per op is a regression.
+	if b.N > 0 {
+		nsPerOp := b.Elapsed().Nanoseconds() / int64(b.N)
+		if nsPerOp > 10_000_000 {
+			b.Fatalf("DeleteAllSessions regressed: %d ns/op (>10ms threshold)", nsPerOp)
+		}
 	}
 }

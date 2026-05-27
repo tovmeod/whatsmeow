@@ -17,6 +17,8 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +39,244 @@ const (
 	signalIdentityCacheCap  = 100_000
 	signalSenderKeyCacheCap = 100_000
 )
+
+// ---------------------------------------------------------------------------
+// Phase 24: secondary indexes for Sessions and Identities caches (D-02)
+// ---------------------------------------------------------------------------
+
+// indexKey is the composite outer map key for the secondary indexes.
+// jid identifies the per-device JID wrapper; phone is the SignalAddressUser
+// portion of the libsignal address (the "<user>" part of "<user>:<device>").
+type indexKey struct{ jid, phone string }
+
+// sessionSecondaryIndex is a process-shared secondary index for the Session
+// cache. It maps (jid, phone) → set of cacheKeys, allowing O(1) bulk-removal
+// of all cache entries belonging to a given (jid, phone) pair without walking
+// the LRU's Keys() slice. Concurrency-safe via sync.RWMutex (mirrors
+// lidmap.go:33 pattern). Phase 24 D-02.
+type sessionSecondaryIndex struct {
+	mu sync.RWMutex
+	m  map[indexKey]map[string]struct{}
+}
+
+func newSessionSecondaryIndex() *sessionSecondaryIndex {
+	return &sessionSecondaryIndex{m: make(map[indexKey]map[string]struct{})}
+}
+
+// Insert adds cacheKey to the (jid, phone) bucket in the index.
+func (idx *sessionSecondaryIndex) Insert(jid, phone, cacheKey string) {
+	k := indexKey{jid, phone}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.m[k] == nil {
+		idx.m[k] = make(map[string]struct{})
+	}
+	idx.m[k][cacheKey] = struct{}{}
+}
+
+// Remove deletes cacheKey from the (jid, phone) bucket. If the bucket becomes
+// empty the outer indexKey entry is also deleted to avoid leaking empty maps.
+func (idx *sessionSecondaryIndex) Remove(jid, phone, cacheKey string) {
+	k := indexKey{jid, phone}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	bucket := idx.m[k]
+	if bucket == nil {
+		return
+	}
+	delete(bucket, cacheKey)
+	if len(bucket) == 0 {
+		delete(idx.m, k)
+	}
+}
+
+// SnapshotKeys acquires a read lock, copies the (jid, phone) bucket into a
+// new []string, releases the lock, and returns the snapshot. The caller must
+// iterate the snapshot and call cache.Remove(k) WITHOUT holding any index
+// lock — this snapshot-then-release discipline is the lock-ordering rule that
+// prevents deadlock against the EvictCleanup callback (Phase 24 D-01).
+func (idx *sessionSecondaryIndex) SnapshotKeys(jid, phone string) []string {
+	k := indexKey{jid, phone}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	bucket := idx.m[k]
+	if len(bucket) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(bucket))
+	for ck := range bucket {
+		out = append(out, ck)
+	}
+	return out
+}
+
+// DropKey deletes the entire (jid, phone) outer entry. Called by bulk-remove
+// paths AFTER all cache.Remove calls have completed (the eviction callback
+// will already have cleaned each per-cacheKey entry; this is a defensive
+// sweep that is a no-op if the index is already clean).
+func (idx *sessionSecondaryIndex) DropKey(jid, phone string) {
+	k := indexKey{jid, phone}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	delete(idx.m, k)
+}
+
+// EvictCleanup removes cacheKey from the (jid, phone) bucket. Called by the
+// lru.NewWithEvict callback; the (jid, phone) pair is parsed from cacheKey by
+// the caller using parseCacheKey.
+func (idx *sessionSecondaryIndex) EvictCleanup(cacheKey, jid, phone string) {
+	k := indexKey{jid, phone}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	bucket := idx.m[k]
+	if bucket == nil {
+		return
+	}
+	delete(bucket, cacheKey)
+	if len(bucket) == 0 {
+		delete(idx.m, k)
+	}
+}
+
+// TEST-ONLY: totalKeyCount sums the sizes of all inner sets in the session
+// secondary index. Used by TestSecondaryIndex_BoundedAfter1000CapacityEvictions
+// to assert that the index size does not exceed the LRU cap after evictions.
+// Do not call in production code — acquires RLock, iterates all buckets.
+func (idx *sessionSecondaryIndex) totalKeyCount() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	total := 0
+	for _, bucket := range idx.m {
+		total += len(bucket)
+	}
+	return total
+}
+
+// identitySecondaryIndex is the same structure as sessionSecondaryIndex for
+// the Identity cache. Kept as a distinct type (not generic-deduped) so that
+// Wave 2 constructor wiring can reference each index type unambiguously.
+// Phase 24 D-02.
+type identitySecondaryIndex struct {
+	mu sync.RWMutex
+	m  map[indexKey]map[string]struct{}
+}
+
+func newIdentitySecondaryIndex() *identitySecondaryIndex {
+	return &identitySecondaryIndex{m: make(map[indexKey]map[string]struct{})}
+}
+
+// Insert adds cacheKey to the (jid, phone) bucket.
+func (idx *identitySecondaryIndex) Insert(jid, phone, cacheKey string) {
+	k := indexKey{jid, phone}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.m[k] == nil {
+		idx.m[k] = make(map[string]struct{})
+	}
+	idx.m[k][cacheKey] = struct{}{}
+}
+
+// Remove deletes cacheKey from the (jid, phone) bucket; drops the outer entry
+// when the bucket becomes empty.
+func (idx *identitySecondaryIndex) Remove(jid, phone, cacheKey string) {
+	k := indexKey{jid, phone}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	bucket := idx.m[k]
+	if bucket == nil {
+		return
+	}
+	delete(bucket, cacheKey)
+	if len(bucket) == 0 {
+		delete(idx.m, k)
+	}
+}
+
+// SnapshotKeys returns a copy of the (jid, phone) bucket under a read lock.
+// See sessionSecondaryIndex.SnapshotKeys for the lock-ordering rationale.
+func (idx *identitySecondaryIndex) SnapshotKeys(jid, phone string) []string {
+	k := indexKey{jid, phone}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	bucket := idx.m[k]
+	if len(bucket) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(bucket))
+	for ck := range bucket {
+		out = append(out, ck)
+	}
+	return out
+}
+
+// DropKey deletes the entire (jid, phone) outer entry.
+func (idx *identitySecondaryIndex) DropKey(jid, phone string) {
+	k := indexKey{jid, phone}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	delete(idx.m, k)
+}
+
+// EvictCleanup removes cacheKey from the (jid, phone) bucket. Called by the
+// lru.NewWithEvict callback.
+func (idx *identitySecondaryIndex) EvictCleanup(cacheKey, jid, phone string) {
+	k := indexKey{jid, phone}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	bucket := idx.m[k]
+	if bucket == nil {
+		return
+	}
+	delete(bucket, cacheKey)
+	if len(bucket) == 0 {
+		delete(idx.m, k)
+	}
+}
+
+// TEST-ONLY: totalKeyCount sums the sizes of all inner sets in the identity
+// secondary index. Used by TestSecondaryIndex_BoundedAfter1000CapacityEvictions
+// to assert that the index size does not exceed the LRU cap after evictions.
+// Do not call in production code — acquires RLock, iterates all buckets.
+func (idx *identitySecondaryIndex) totalKeyCount() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	total := 0
+	for _, bucket := range idx.m {
+		total += len(bucket)
+	}
+	return total
+}
+
+// ---------------------------------------------------------------------------
+// Phase 24: address-parsing helpers
+// ---------------------------------------------------------------------------
+
+// parseCacheKey splits a cache key of the form "<jid>|<address>" into its
+// jid and address parts, then derives phone from the address by splitting
+// on the first ":" (libsignal address form "<user>:<device>"). Returns
+// ok=false if the key shape doesn't match. Used by the lru.NewWithEvict
+// callbacks to compute the indexKey from just the LRU-supplied cacheKey.
+func parseCacheKey(cacheKey string) (jid, phone string, ok bool) {
+	jid, address, found := strings.Cut(cacheKey, "|")
+	if !found {
+		return "", "", false
+	}
+	phone = addressUser(address)
+	if phone == "" {
+		return "", "", false
+	}
+	return jid, phone, true
+}
+
+// addressUser returns the user portion of a libsignal address string of the
+// form "<user>:<device>". If the string contains no ":" the whole string is
+// returned as the user (defensive; should not occur in practice). Used by
+// Wave 2 PutSession/PutIdentity callsites to compute the index "phone" from
+// a raw libsignal address string.
+func addressUser(address string) string {
+	user, _, _ := strings.Cut(address, ":")
+	return user
+}
 
 // signalCaches owns every cache-related piece of Container state. Container
 // embeds this struct (by value) as the single "caches signalCaches" bridge
@@ -61,6 +301,13 @@ type signalCaches struct {
 	// identities) from actual cap pressure (high capacity_evictions on any cache).
 	SessionCapacityEvictions, IdentityCapacityEvictions, SenderKeyCapacityEvictions uint64
 	SessionExplicitRemoves, IdentityExplicitRemoves, SenderKeyExplicitRemoves       uint64
+
+	// Phase 24 D-02: process-shared secondary indexes for Sessions and
+	// Identities. Pointer-typed fields; initialized by wireSignalCaches BEFORE
+	// the LRUs are constructed so that the NewWithEvict callbacks can close
+	// over the already-populated pointer values.
+	SessionIndex  *sessionSecondaryIndex
+	IdentityIndex *identitySecondaryIndex
 
 	// Phase 17.5.1 WR-01: cancellable ctx for emitMetricsLoop. Cancelled
 	// by Container.Close() (via closeSignalCaches) so the metrics
@@ -87,16 +334,38 @@ type signalCaches struct {
 // non-positive cap, which is a programmer error caught at startup).
 func wireSignalCaches(c *Container, log waLog.Logger) {
 	var err error
-	c.caches.Session, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(string, []byte) { atomic.AddUint64(&c.caches.SessionCapacityEvictions, 1) })
+
+	// Phase 24 D-02: initialize secondary indexes BEFORE constructing the
+	// LRUs. The NewWithEvict callbacks close over c (same as the existing
+	// counter captures); the indexes are pointer-typed fields on c.caches so
+	// the deref inside the callback hits the heap-allocated value, never a
+	// stale local copy. This ordering satisfies the closure-capture invariant
+	// documented above (§77-87).
+	c.caches.SessionIndex = newSessionSecondaryIndex()
+	c.caches.IdentityIndex = newIdentitySecondaryIndex()
+
+	c.caches.Session, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(key string, _ []byte) {
+		atomic.AddUint64(&c.caches.SessionCapacityEvictions, 1)
+		if jid, phone, ok := parseCacheKey(key); ok {
+			c.caches.SessionIndex.EvictCleanup(key, jid, phone)
+		}
+	})
 	if err != nil {
 		log.Errorf("Failed to construct SessionCache (cap=%d): %v", signalSessionCacheCap, err)
 		panic(err)
 	}
-	c.caches.Identity, err = lru.NewWithEvict[string, *[32]byte](signalIdentityCacheCap, func(string, *[32]byte) { atomic.AddUint64(&c.caches.IdentityCapacityEvictions, 1) })
+	c.caches.Identity, err = lru.NewWithEvict[string, *[32]byte](signalIdentityCacheCap, func(key string, _ *[32]byte) {
+		atomic.AddUint64(&c.caches.IdentityCapacityEvictions, 1)
+		if jid, phone, ok := parseCacheKey(key); ok {
+			c.caches.IdentityIndex.EvictCleanup(key, jid, phone)
+		}
+	})
 	if err != nil {
 		log.Errorf("Failed to construct IdentityCache (cap=%d): %v", signalIdentityCacheCap, err)
 		panic(err)
 	}
+	// SenderKey callback UNCHANGED — sender_keys cache is explicitly out of
+	// scope for the secondary-index feature (SPEC Boundaries).
 	c.caches.SenderKey, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(string, []byte) { atomic.AddUint64(&c.caches.SenderKeyCapacityEvictions, 1) })
 	if err != nil {
 		log.Errorf("Failed to construct SenderKeyCache (cap=%d): %v", signalSenderKeyCacheCap, err)
@@ -116,10 +385,17 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 // device.SetAllStores remain pointed at the bare *SQLStore. Replaces the
 // three NewCached*Store assignments formerly inlined in
 // container.go.initializeDevice.
+//
+// Phase 24 Wave 1 note: constructors for Session and Identity are called here
+// with a 5th argument (the secondary-index pointer). The constructors
+// themselves are extended in Phase 24 Wave 2 (plans 24-02 and 24-03) to
+// accept the new parameter. The build is intentionally broken between the end
+// of Wave 1 and the end of Wave 2 — do not partial-deploy or commit during
+// this window.
 func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore) {
 	jid := device.ID.String()
-	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves)
-	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity, &c.caches.IdentityExplicitRemoves)
+	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
+	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity, &c.caches.IdentityExplicitRemoves, c.caches.IdentityIndex)
 	device.SenderKeys = NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey)
 }
 

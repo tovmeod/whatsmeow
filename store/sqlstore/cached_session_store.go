@@ -8,7 +8,6 @@ package sqlstore
 
 import (
 	"context"
-	"strings"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -55,23 +54,21 @@ import (
 //     (nil, nil) for an absent address must hit inner on every Get; caching
 //     nil would silently mask a later PutSession for the same address.
 //
-// Bulk-mutation key scoping:
+// Bulk-mutation key scoping (Phase 24: O(K) secondary-index lookup):
 //
-//   - DeleteAllSessions(phone): walks cache.Keys() and removes only entries
-//     whose key starts with `jid + "|" + phone + ":"` (matching the SQL
-//     `their_id >= phone||':' AND their_id < phone||';'` predicate from
-//     deleteAllSessionsQuery in store.go). Other wrappers' entries in the
-//     same shared LRU are left untouched because cache keys are JID-scoped.
+//   - DeleteAllSessions(phone): looks up matching entries in the secondary
+//     index for (jid, phone) and removes them via O(K) SnapshotKeys lookup
+//     (matching the SQL `their_id >= phone||':' AND their_id < phone||';'`
+//     predicate from deleteAllSessionsQuery in store.go). Other wrappers'
+//     entries in the shared LRU are left untouched — the index is (jid,
+//     phone)-scoped so cross-wrapper isolation is preserved by construction.
 //
-//   - MigratePNToLID(pn, lid): inner.MigratePNToLID FIRST; on success, walks
-//     cache.Keys() and EVICTS any entry whose libsignal address-user equals
-//     `pn.SignalAddressUser()`. The inner SQL row has already been migrated
-//     to the LID address; reads under the new LID address will cache-miss,
-//     fetch from inner, and repopulate the cache with the LID key on first
-//     access. This avoids the complexity of in-place key rewrites (and the
-//     ambiguous precedence vs pre-existing LID entries that those would
-//     introduce) and reaches the same eventual-consistency point on the
-//     next read. Cache keys store the libsignal-format address
+//   - MigratePNToLID(pn, lid): inner.MigratePNToLID FIRST; on success,
+//     looks up matching entries via O(K) SnapshotKeys on (jid,
+//     pn.SignalAddressUser()) and EVICTS them. The inner SQL row has already
+//     been migrated to the LID address; reads under the new LID address will
+//     cache-miss, fetch from inner, and repopulate the cache with the LID key
+//     on first access. Cache keys store the libsignal-format address
 //     (`<SignalAddressUser>:<device>`, e.g. `"12345:0"`), NOT the full JID
 //     form (`"12345@s.whatsapp.net"`).
 //
@@ -91,19 +88,27 @@ type CachedSessionStore struct {
 	// counter (signalCaches.SessionExplicitRemoves). Incremented at call
 	// sites of Remove() before delegating to the LRU (Phase 17.5.2).
 	explicitRemoves *uint64
+
+	// secondaryIndex is the process-shared (jid,phone)→cacheKeys index
+	// shared across all device wrappers. Used by DeleteAllSessions and
+	// MigratePNToLID for O(K) bulk removal. Maintained in lockstep with
+	// every c.cache.Add call. Phase 24.
+	secondaryIndex *sessionSecondaryIndex
 }
 
 var _ store.SessionStore = (*CachedSessionStore)(nil)
 
 // NewCachedSessionStore constructs a wrapper over inner with the given JID
 // scope and shared LRU. explicitRemoves is a pointer to the Container-level
-// SessionExplicitRemoves counter (Phase 17.5.2).
-func NewCachedSessionStore(inner store.SessionStore, jid string, cache *lru.Cache[string, []byte], explicitRemoves *uint64) *CachedSessionStore {
+// SessionExplicitRemoves counter (Phase 17.5.2). secondaryIndex is the
+// process-shared (jid,phone)→cacheKeys secondary index (Phase 24).
+func NewCachedSessionStore(inner store.SessionStore, jid string, cache *lru.Cache[string, []byte], explicitRemoves *uint64, secondaryIndex *sessionSecondaryIndex) *CachedSessionStore {
 	return &CachedSessionStore{
 		inner:           inner,
 		jid:             jid,
 		cache:           cache,
 		explicitRemoves: explicitRemoves,
+		secondaryIndex:  secondaryIndex,
 	}
 }
 
@@ -155,6 +160,10 @@ func (c *CachedSessionStore) GetSession(ctx context.Context, address string) ([]
 	// allocates, but the wrapper should not depend on that).
 	stored := copyBytes(v)
 	c.cache.Add(k, stored)
+	// Phase 24 orphan-free invariant: every c.cache.Add must be paired with
+	// a secondaryIndex.Insert so SnapshotKeys can reach read-populated
+	// entries during DeleteAllSessions / MigratePNToLID eviction.
+	c.secondaryIndex.Insert(c.jid, addressUser(address), k)
 	return copyBytes(stored), nil
 }
 
@@ -199,6 +208,10 @@ func (c *CachedSessionStore) GetManySessions(ctx context.Context, addresses []st
 		}
 		stored := copyBytes(v)
 		c.cache.Add(c.key(addr), stored)
+		// Phase 24 orphan-free invariant: every c.cache.Add must be paired
+		// with a secondaryIndex.Insert so SnapshotKeys can reach read-
+		// populated entries during bulk-remove paths.
+		c.secondaryIndex.Insert(c.jid, addressUser(addr), c.key(addr))
 		result[addr] = copyBytes(stored)
 	}
 	return result, nil
@@ -216,6 +229,10 @@ func (c *CachedSessionStore) PutSession(ctx context.Context, address string, ses
 		return err
 	}
 	c.cache.Add(c.key(address), copyBytes(session))
+	// Phase 24 orphan-free invariant: maintain secondaryIndex in lockstep
+	// with every cache.Add (D-05). addressUser extracts the libsignal user
+	// portion ("<user>" from "<user>:<device>") as the index "phone".
+	c.secondaryIndex.Insert(c.jid, addressUser(address), c.key(address))
 	return nil
 }
 
@@ -227,6 +244,9 @@ func (c *CachedSessionStore) PutManySessions(ctx context.Context, sessions map[s
 	}
 	for addr, v := range sessions {
 		c.cache.Add(c.key(addr), copyBytes(v))
+		// Phase 24 orphan-free invariant: every c.cache.Add paired with
+		// secondaryIndex.Insert on the same success branch (D-05).
+		c.secondaryIndex.Insert(c.jid, addressUser(addr), c.key(addr))
 	}
 	return nil
 }
@@ -240,6 +260,10 @@ func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) 
 	// kavtov-fork: Phase 17.5.2 - pre-increment explicit-remove counter (see Plan 17.5.2-03)
 	atomic.AddUint64(c.explicitRemoves, 1)
 	c.cache.Remove(c.key(address))
+	// Phase 24: No explicit secondaryIndex.Remove call here. Index cleanup
+	// happens via the eviction callback (cache_wiring.go) which fires for
+	// every cache.Remove including explicit ones — no separate index.Remove
+	// needed here.
 	return nil
 }
 
@@ -254,25 +278,34 @@ func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) 
 // shared LRU via a Container-level cross-cache fan-out — a single phone
 // delete would silently roll back unrelated conversations on the same
 // device and every conversation on every other device too.
+//
+// Phase 24: the former O(N) cache.Keys() prefix-walk is replaced by a
+// single O(K) lookup against the secondary index (where K is the number
+// of matching entries for this (jid, phone) pair, typically 1–10).
+// Cross-wrapper isolation (Phase 17.5.3) is preserved by construction:
+// the index is (jid, phone)-scoped, so SnapshotKeys never returns keys
+// belonging to other wrappers.
 func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string) error {
 	if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
 		return err
 	}
-	jidPfx := c.jidPrefix()
-	addrPfx := phone + ":"
-	for _, k := range c.cache.Keys() {
-		if !strings.HasPrefix(k, jidPfx) {
-			continue
-		}
-		// k has shape "<jid>|<address>"; the address part starts at
-		// len(jidPfx). Match the SQL predicate exactly: address starts
-		// with phone + ":".
-		if strings.HasPrefix(k[len(jidPfx):], addrPfx) {
-			// kavtov-fork: Phase 17.5.2 - pre-increment per iteration (loop calls Remove N times)
-			atomic.AddUint64(c.explicitRemoves, 1)
-			c.cache.Remove(k)
-		}
+	// Phase 24: single O(K) lookup instead of O(N) cache.Keys() scan.
+	// SnapshotKeys acquires a read lock, copies the bucket, and releases
+	// before returning — callers iterate the snapshot without holding any
+	// index lock (lock-ordering discipline prevents deadlock with the
+	// EvictCleanup callback).
+	victims := c.secondaryIndex.SnapshotKeys(c.jid, phone)
+	for _, k := range victims {
+		// kavtov-fork: Phase 17.5.2 - pre-increment per iteration (Phase 24: one per snapshot entry)
+		atomic.AddUint64(c.explicitRemoves, 1)
+		c.cache.Remove(k)
+		// Each cache.Remove fires the eviction callback (cache_wiring.go)
+		// which calls EvictCleanup on the index — no separate index.Remove.
 	}
+	// Defensive sweep: DropKey is idempotent and guards against the race
+	// where capacity eviction removed some keys between SnapshotKeys and
+	// the explicit Remove loop, leaving a stale empty bucket in the index.
+	c.secondaryIndex.DropKey(c.jid, phone)
 	return nil
 }
 
@@ -303,37 +336,32 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 // activity). Plain eviction is unambiguously correct: the inner SQL row
 // holds the post-migration value, and the next read picks it up. The
 // throughput cost is one extra inner.GetSession per migrated address on
-// the first post-migration decrypt — negligible at the steady-state PN
-// -> LID migration rate.
+// the first post-migration decrypt — an O(K) secondary-index lookup per
+// invocation (Phase 24), replacing the former O(N) cache.Keys() full-LRU
+// scan that measured 13.43% of driver CPU in the 2026-05-28 60s pprof.
+// The claim in the prior docstring that this cost was "negligible at the
+// steady-state PN→LID migration rate" was contradicted by that profile;
+// the O(K) implementation makes it genuinely negligible.
 func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
 	if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
 		return err
 	}
-	jidPfx := c.jidPrefix()
-	pnPfx := pn.SignalAddressUser() + ":"
-
-	// Two-pass walk so cache mutation during iteration is well-defined.
-	// Pass 1: collect victim keys under this wrapper's JID prefix whose
-	// libsignal-address user matches pn.SignalAddressUser().
-	var victims []string
-	for _, k := range c.cache.Keys() {
-		if !strings.HasPrefix(k, jidPfx) {
-			continue
-		}
-		// k has shape "<jid>|<address>" where <address> is
-		// "<SignalAddressUser>:<device>". Match the SQL predicate exactly:
-		// address starts with pn.SignalAddressUser() + ":".
-		if strings.HasPrefix(k[len(jidPfx):], pnPfx) {
-			victims = append(victims, k)
-		}
-	}
-	// Pass 2: evict. Reads against the new LID address will cache-miss
-	// and repopulate from inner on first access.
+	// Phase 24: single O(K) lookup instead of the former O(N) two-pass
+	// cache.Keys() walk (13.43% driver CPU per 2026-05-28 60s pprof).
+	// SnapshotKeys acquires a read lock, copies the bucket, and releases
+	// before returning — callers iterate without holding any index lock
+	// (lock-ordering discipline prevents deadlock with EvictCleanup).
+	victims := c.secondaryIndex.SnapshotKeys(c.jid, pn.SignalAddressUser())
 	for _, k := range victims {
 		// kavtov-fork: Phase 17.5.2 - pre-increment per iteration in MigratePNToLID
 		atomic.AddUint64(c.explicitRemoves, 1)
 		c.cache.Remove(k)
+		// Each cache.Remove fires the eviction callback (cache_wiring.go)
+		// which calls EvictCleanup on the index — no separate index.Remove.
 	}
+	// Defensive sweep: idempotent guard against the race where capacity
+	// eviction removed some keys between SnapshotKeys and the Remove loop.
+	c.secondaryIndex.DropKey(c.jid, pn.SignalAddressUser())
 	return nil
 }
 

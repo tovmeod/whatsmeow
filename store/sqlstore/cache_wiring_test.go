@@ -41,7 +41,7 @@ func TestCacheCounters_ExplicitRemoveIncrementsExplicit_NotPureCapacity(t *testi
 		t.Fatalf("lru.NewWithEvict failed: %v", err)
 	}
 
-	wrapper := NewCachedIdentityStore(inner, "test-jid", cache, &explicitRemoves)
+	wrapper := NewCachedIdentityStore(inner, "test-jid", cache, &explicitRemoves, newIdentitySecondaryIndex())
 	ctx := context.Background()
 
 	address := "12345:0"
@@ -188,5 +188,52 @@ func TestCacheMetricsLogFormat_ExtendedFields(t *testing.T) {
 	}
 	if !strings.Contains(msg, "sender_keys={len=0, cap=100000, evictions=0, capacity_evictions=0, explicit_removes=0}") {
 		t.Errorf("expected zeroed sender_keys block in: %s", msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R4: secondary-index size does not exceed LRU cap after 1,000 capacity
+// evictions. Tests the EvictCleanup callback wiring directly (no wrapper).
+// ---------------------------------------------------------------------------
+
+func TestSecondaryIndex_BoundedAfter1000CapacityEvictions(t *testing.T) {
+	// cap=100, will populate 1100 distinct entries → 1000 capacity evictions.
+	const cap = 100
+	idx := newSessionSecondaryIndex()
+
+	cache, err := lru.NewWithEvict[string, []byte](cap, func(key string, _ []byte) {
+		if jid, phone, ok := parseCacheKey(key); ok {
+			idx.EvictCleanup(key, jid, phone)
+		}
+	})
+	if err != nil {
+		t.Fatalf("lru.NewWithEvict cap=%d failed: %v", cap, err)
+	}
+
+	// Populate 1100 entries: distinct (jid, phone, device) triples.
+	// Use 11 jids × 10 phones × 10 devices = 1100 entries.
+	payload := []byte("v")
+	for j := 0; j < 11; j++ {
+		jid := fmt.Sprintf("jid-%d", j)
+		for p := 0; p < 10; p++ {
+			phone := fmt.Sprintf("%d", p)
+			for d := 0; d < 10; d++ {
+				// Cache key shape: "<jid>|<phone>:<device>"
+				cacheKey := fmt.Sprintf("%s|%s:%d", jid, phone, d)
+				idx.Insert(jid, phone, cacheKey)
+				cache.Add(cacheKey, payload)
+			}
+		}
+	}
+
+	// LRU must be at cap.
+	if got := cache.Len(); got != cap {
+		t.Errorf("cache.Len() = %d, want %d (at cap after 1100 inserts)", got, cap)
+	}
+
+	// Secondary index must not exceed cap: every eviction callback must have
+	// removed the evicted key from the index.
+	if got := idx.totalKeyCount(); got > cap {
+		t.Errorf("index totalKeyCount = %d, exceeds LRU cap %d (R4 violation: stale index entries after capacity evictions)", got, cap)
 	}
 }

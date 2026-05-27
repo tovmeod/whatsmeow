@@ -8,7 +8,6 @@ package sqlstore
 
 import (
 	"context"
-	"strings"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -60,6 +59,12 @@ type CachedIdentityStore struct {
 	// counter (signalCaches.IdentityExplicitRemoves). Incremented at call
 	// sites of Remove() and Purge() before delegating to the LRU (Phase 17.5.2).
 	explicitRemoves *uint64
+
+	// secondaryIndex is the process-shared (jid,phone)→cacheKeys index
+	// shared across all device wrappers. Used by DeleteAllIdentities for
+	// O(K) bulk removal. Maintained in lockstep with every c.cache.Add call.
+	// Phase 24.
+	secondaryIndex *identitySecondaryIndex
 }
 
 var _ store.IdentityStore = (*CachedIdentityStore)(nil)
@@ -76,12 +81,15 @@ type identityReader interface {
 // device JID (used as cache-key prefix). cache is a shared LRU
 // constructed by the Container. explicitRemoves is a pointer to the
 // Container-level IdentityExplicitRemoves counter (Phase 17.5.2).
-func NewCachedIdentityStore(inner store.IdentityStore, jid string, cache *lru.Cache[string, *[32]byte], explicitRemoves *uint64) *CachedIdentityStore {
+// secondaryIndex is the process-shared (jid,phone)→cacheKeys secondary
+// index (Phase 24).
+func NewCachedIdentityStore(inner store.IdentityStore, jid string, cache *lru.Cache[string, *[32]byte], explicitRemoves *uint64, secondaryIndex *identitySecondaryIndex) *CachedIdentityStore {
 	return &CachedIdentityStore{
 		inner:           inner,
 		jid:             jid,
 		cache:           cache,
 		explicitRemoves: explicitRemoves,
+		secondaryIndex:  secondaryIndex,
 	}
 }
 
@@ -132,6 +140,12 @@ func (c *CachedIdentityStore) IsTrustedIdentity(ctx context.Context, address str
 	// bytes == nil represents "known absent"; cache it so subsequent calls
 	// for the same address are also served from cache.
 	c.cache.Add(k, bytes)
+	// Phase 24 orphan-free invariant: every c.cache.Add must be paired with
+	// a secondaryIndex.Insert so SnapshotKeys can reach all entries for this
+	// (jid, phone) during DeleteAllIdentities — including the cached-nil
+	// "known absent" sentinel entries, which must also be evicted when the
+	// SQL row is gone.
+	c.secondaryIndex.Insert(c.jid, addressUser(address), k)
 	if bytes == nil {
 		return true, nil
 	}
@@ -160,6 +174,13 @@ func (c *CachedIdentityStore) PutIdentity(ctx context.Context, address string, k
 	}
 	keyCopy := key
 	c.cache.Add(k, &keyCopy)
+	// Phase 24 orphan-free invariant: maintain secondaryIndex in lockstep
+	// with every cache.Add (D-05). addressUser extracts the libsignal user
+	// portion ("<user>" from "<user>:<device>") as the index "phone".
+	// Insert is idempotent: re-inserting an existing key (e.g. PutIdentity
+	// updating the cached value when the index entry already exists from a
+	// prior populate) is a map-set no-op.
+	c.secondaryIndex.Insert(c.jid, addressUser(address), k)
 	return nil
 }
 
@@ -170,6 +191,10 @@ func (c *CachedIdentityStore) DeleteIdentity(ctx context.Context, address string
 	// kavtov-fork: Phase 17.5.2 - pre-increment explicit-remove counter (see Plan 17.5.2-03)
 	atomic.AddUint64(c.explicitRemoves, 1)
 	c.cache.Remove(c.key(address))
+	// Phase 24: No explicit secondaryIndex.Remove call here. Index cleanup
+	// happens via the eviction callback in cache_wiring.go which fires for
+	// every cache.Remove including explicit ones — no separate index.Remove
+	// needed here.
 	return nil
 }
 
@@ -177,24 +202,37 @@ func (c *CachedIdentityStore) DeleteAllIdentities(ctx context.Context, phone str
 	if err := c.inner.DeleteAllIdentities(ctx, phone); err != nil {
 		return err
 	}
-	// kavtov-fork: Phase 17.5.3 - prefix-scan removes only this wrapper's
-	// entries for the target remote phone. Previously this called the
-	// LRU's bulk Purge which wiped the entire process-shared cache across
-	// all device wrappers, causing ~26 explicit_removes/sec churn and
-	// undoing the Phase 17.5 cache benefit for unrelated devices. See
-	// 17.5.3-RCA-IDENTITIES-CACHE.md for evidence (identities.len swinging
-	// 30..1617, capacity_evictions=0). The new scope matches the SQL
-	// predicate `our_jid=$1 AND their_id LIKE $phone||':' ...` exactly:
-	// libsignal addresses are `<phone>:<device>`, cache keys are
-	// `<c.jid>|<address>`, so the composite prefix is `<c.jid>|<phone>:`.
-	prefix := c.jid + "|" + phone + ":"
-	for _, k := range c.cache.Keys() {
-		if strings.HasPrefix(k, prefix) {
-			// kavtov-fork: Phase 17.5.3 - pre-increment per iteration (matches
-			// cached_session_store.go DeleteAllSessions sibling pattern)
-			atomic.AddUint64(c.explicitRemoves, 1)
-			c.cache.Remove(k)
-		}
+	// kavtov-fork: Phase 17.5.3 - the secondary index keyed by (jid, phone)
+	// returns only this wrapper's entries for the target remote phone,
+	// preserving the Phase 17.5.3 cross-wrapper isolation invariant exactly.
+	// Previously this called the LRU's bulk Purge which wiped the entire
+	// process-shared cache across all device wrappers, causing ~26
+	// explicit_removes/sec churn and undoing the Phase 17.5 cache benefit
+	// for unrelated devices. See 17.5.3-RCA-IDENTITIES-CACHE.md for
+	// evidence (identities.len swinging 30..1617, capacity_evictions=0).
+	// The SQL predicate `our_jid=$1 AND their_id LIKE $phone||':' ...`
+	// matches libsignal addresses of the form `<phone>:<device>`; the
+	// secondary index stores them under (jid, phone) so the lookup is
+	// bounded to exactly this wrapper's entries for the target phone.
+	//
+	// Phase 24: the former O(N) cache.Keys() prefix-walk is replaced by a
+	// single O(K) SnapshotKeys lookup (where K is the number of matching
+	// entries for this (jid, phone) pair, typically 1–10).
+	// SnapshotKeys acquires a read lock, copies the bucket, and releases
+	// before returning — callers iterate the snapshot without holding any
+	// index lock (lock-ordering discipline prevents deadlock with the
+	// EvictCleanup callback).
+	victims := c.secondaryIndex.SnapshotKeys(c.jid, phone)
+	for _, k := range victims {
+		// kavtov-fork: Phase 17.5.2 - pre-increment per iteration (Phase 24: one per snapshot entry)
+		atomic.AddUint64(c.explicitRemoves, 1)
+		c.cache.Remove(k)
+		// Each cache.Remove fires the eviction callback (cache_wiring.go)
+		// which calls EvictCleanup on the index — no separate index.Remove.
 	}
+	// Defensive sweep: DropKey is idempotent and guards against the race
+	// where capacity eviction removed some keys between SnapshotKeys and
+	// the explicit Remove loop, leaving a stale empty bucket in the index.
+	c.secondaryIndex.DropKey(c.jid, phone)
 	return nil
 }
