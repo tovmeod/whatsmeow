@@ -659,7 +659,8 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 		return nil, nil, fmt.Errorf("message content is not a byte slice")
 	}
 
-	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
+	// kavtov-fork: Phase 26 — bare-normalize sender-key address (ToNonAD) so inbound store+lookup converge; upstream Tulir 2021 code is device-qualified.
+	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.ToNonAD().SignalAddress())
 	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
 	cipher := groups.NewGroupCipher(builder, senderKeyName, cli.Store)
 	msg, err := protocol.NewSenderKeyMessageFromBytes(content, pbSerializer.SenderKeyMessage)
@@ -711,7 +712,8 @@ func padMessage(plaintext []byte) []byte {
 
 func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat, from types.JID, axolotlSKDM []byte) {
 	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
-	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
+	// kavtov-fork: Phase 26 — bare-normalize sender-key address (ToNonAD) so inbound store+lookup converge; upstream Tulir 2021 code is device-qualified.
+	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.ToNonAD().SignalAddress())
 	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(axolotlSKDM, pbSerializer.SenderKeyDistributionMessage)
 	if err != nil {
 		cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
