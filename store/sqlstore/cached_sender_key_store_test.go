@@ -44,9 +44,13 @@ func newTestCachedSenderKeyStore(t *testing.T, capSize int) (*CachedSenderKeySto
 	if err != nil {
 		t.Fatalf("lru.New[string, []byte] failed: %v", err)
 	}
+	deviceCache, err := lru.New[string, []string](capSize)
+	if err != nil {
+		t.Fatalf("lru.New[string, []string] failed: %v", err)
+	}
 	// "test-jid" with no trailing pipe — wrapper's key() prepends the
 	// separator. Matches production format used by Container.initializeDevice.
-	wrapper := NewCachedSenderKeyStore(inner, "test-jid", cache)
+	wrapper := NewCachedSenderKeyStore(inner, "test-jid", cache, deviceCache)
 	return wrapper, inner
 }
 
@@ -215,19 +219,17 @@ func TestCachedSenderKeyStore_EvictionAtCap(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetSenderKeyDevices: passthrough reaches inner; LRU is NOT touched.
-// Per <cache_interaction> FACT 1: the LRU is keyed on the exact
-// jid|group|user device-qualified string and has no per-userBare device-set
-// index. Caching the device list would risk staleness when a new device's
-// SKDM arrives. The method is a straight passthrough.
+// GetSenderKeyDevices (kavtov-fork Phase 27): cache-served device-set index.
+// Cold call reaches inner once and caches; warm call is served from the
+// device-set cache (inner not called again). A ratchet write-back (Put of an
+// already-known device) must NOT invalidate; a genuinely new device's SKDM
+// MUST invalidate so the next call re-queries inner and includes it.
 // ---------------------------------------------------------------------------
 
-func TestCachedSenderKeyStore_GetSenderKeyDevices_PassthroughAndNoCacheTouch(t *testing.T) {
+func TestCachedSenderKeyStore_GetSenderKeyDevices_CacheServedAndInvalidatedOnNewDevice(t *testing.T) {
 	ctx := context.Background()
 	c, inner := newTestCachedSenderKeyStore(t, 16)
 
-	// Seed two device-qualified keys for the same group+userBare in inner.
-	// Use group+"|"+user keys matching fakeSenderKeyStore.PutSenderKey convention.
 	if err := inner.PutSenderKey(ctx, "group-X", "99user_1:0", []byte("sk-0")); err != nil {
 		t.Fatalf("seed inner key :0: %v", err)
 	}
@@ -236,32 +238,50 @@ func TestCachedSenderKeyStore_GetSenderKeyDevices_PassthroughAndNoCacheTouch(t *
 	}
 	inner.devicesCalls.Store(0)
 
-	// Call GetSenderKeyDevices through the cache wrapper.
+	// (1) Cold call → inner once, result has both devices, cached.
 	devices, err := c.GetSenderKeyDevices(ctx, "group-X", "99user_1")
 	if err != nil {
-		t.Fatalf("GetSenderKeyDevices: %v", err)
+		t.Fatalf("GetSenderKeyDevices (cold): %v", err)
+	}
+	if got := inner.devicesCalls.Load(); got != 1 {
+		t.Errorf("inner.devicesCalls after cold = %d, want 1", got)
+	}
+	if len(devices) != 2 {
+		t.Errorf("cold returned %d devices, want 2; got %v", len(devices), devices)
 	}
 
-	// (a) The call must have reached inner exactly once.
+	// (2) Warm call → served from cache; inner NOT called again.
+	if _, err := c.GetSenderKeyDevices(ctx, "group-X", "99user_1"); err != nil {
+		t.Fatalf("GetSenderKeyDevices (warm): %v", err)
+	}
 	if got := inner.devicesCalls.Load(); got != 1 {
-		t.Errorf("inner.devicesCalls = %d, want 1 (passthrough must reach inner)", got)
+		t.Errorf("inner.devicesCalls after warm = %d, want 1 (served from cache)", got)
 	}
-	// (b) The result must contain exactly the two seeded device strings.
-	if len(devices) != 2 {
-		t.Errorf("GetSenderKeyDevices returned %d devices, want 2; got %v", len(devices), devices)
+
+	// (3) Ratchet write-back (Put of an already-known device) must NOT invalidate.
+	if err := c.PutSenderKey(ctx, "group-X", "99user_1:0", []byte("sk-0b")); err != nil {
+		t.Fatalf("Put existing device: %v", err)
 	}
-	deviceSet := make(map[string]bool, len(devices))
-	for _, d := range devices {
-		deviceSet[d] = true
+	if _, err := c.GetSenderKeyDevices(ctx, "group-X", "99user_1"); err != nil {
+		t.Fatalf("GetSenderKeyDevices after write-back: %v", err)
 	}
-	for _, want := range []string{"99user_1:0", "99user_1:5"} {
-		if !deviceSet[want] {
-			t.Errorf("device %q missing from result %v", want, devices)
-		}
+	if got := inner.devicesCalls.Load(); got != 1 {
+		t.Errorf("inner.devicesCalls after write-back = %d, want 1 (write-back must not invalidate)", got)
 	}
-	// (c) The LRU must NOT have been touched — no entry added.
-	if got := c.cache.Len(); got != 0 {
-		t.Errorf("cache.Len = %d after GetSenderKeyDevices, want 0 (passthrough must not touch LRU)", got)
+
+	// (4) New device's SKDM → invalidates; next call re-queries inner, includes it.
+	if err := c.PutSenderKey(ctx, "group-X", "99user_1:7", []byte("sk-7")); err != nil {
+		t.Fatalf("Put new device: %v", err)
+	}
+	devices3, err := c.GetSenderKeyDevices(ctx, "group-X", "99user_1")
+	if err != nil {
+		t.Fatalf("GetSenderKeyDevices after new-device Put: %v", err)
+	}
+	if got := inner.devicesCalls.Load(); got != 2 {
+		t.Errorf("inner.devicesCalls after new-device Put = %d, want 2 (new device invalidates)", got)
+	}
+	if len(devices3) != 3 {
+		t.Errorf("after new device returned %d devices, want 3; got %v", len(devices3), devices3)
 	}
 }
 

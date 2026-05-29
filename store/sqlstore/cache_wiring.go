@@ -38,6 +38,9 @@ const (
 	signalSessionCacheCap   = 100_000
 	signalIdentityCacheCap  = 100_000
 	signalSenderKeyCacheCap = 100_000
+	// kavtov-fork: Phase 27 — device-set index (one small []string per
+	// jid|group|userBare). Same cap as the record cache; values are tiny.
+	signalSenderKeyDevicesCacheCap = 100_000
 )
 
 // ---------------------------------------------------------------------------
@@ -292,6 +295,12 @@ type signalCaches struct {
 	Session   *lru.Cache[string, []byte]
 	Identity  *lru.Cache[string, *[32]byte]
 	SenderKey *lru.Cache[string, []byte]
+	// kavtov-fork: Phase 27 — device-set index for the device-tolerant group
+	// sender-key lookup. Keyed jid|group|userBare → the device-qualified
+	// sender_id list. Lets GetSenderKeyDevices be answered from cache (0 DB
+	// queries warm) instead of the DB passthrough; invalidated by PutSenderKey
+	// when a sender's device set may have changed (a new SKDM).
+	SenderKeyDevices *lru.Cache[string, []string]
 
 	// kavtov-fork: Phase 17.5.2 - split eviction counter into capacity-overflow
 	// ("Capacity*", incremented by lru.NewWithEvict callback) vs explicit
@@ -371,6 +380,12 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 		log.Errorf("Failed to construct SenderKeyCache (cap=%d): %v", signalSenderKeyCacheCap, err)
 		panic(err)
 	}
+	// kavtov-fork: Phase 27 — device-set index cache (see signalCaches.SenderKeyDevices).
+	c.caches.SenderKeyDevices, err = lru.New[string, []string](signalSenderKeyDevicesCacheCap)
+	if err != nil {
+		log.Errorf("Failed to construct SenderKeyDevicesCache (cap=%d): %v", signalSenderKeyDevicesCacheCap, err)
+		panic(err)
+	}
 
 	// Phase 17.5.1 WR-01: cancelled by Container.Close (via
 	// closeSignalCaches) so emitMetricsLoop exits before logger/db
@@ -396,7 +411,7 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	jid := device.ID.String()
 	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
 	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity, &c.caches.IdentityExplicitRemoves, c.caches.IdentityIndex)
-	device.SenderKeys = NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey)
+	device.SenderKeys = NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices)
 }
 
 // closeSignalCaches cancels the metrics-loop ctx so emitMetricsLoop exits

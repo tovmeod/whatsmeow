@@ -340,18 +340,20 @@ func TestGroupSenderKeyFallbackAbsentSender(t *testing.T) {
 	}
 }
 
-// TestGroupSenderKeySelfExtinguishingRecovery proves the SELF-EXTINGUISHING
-// property: once a fresh SKDM stores bare :0, the fast path hits and the
-// fallback is no longer entered.
+// TestGroupSenderKeyDeviceMatchedRecovery proves Phase-27 recovery: a message
+// whose sender key was first reachable only under a non-labeled device (:5)
+// still decrypts via the device-tolerant loop, AND once the sender's key is
+// stored under the message's labeled device (:0) the message decrypts with the
+// labeled device tried first.
 //
-// This is grounded in 26-02 <cache_interaction> FACT 2: the production
-// CachedSenderKeyStore never caches a :0 miss, so the fast path is
-// re-evaluated on every call; once bare :0 exists, it hits and the fallback
-// branch (which calls GetSenderKeyDevices) is never reached.
-//
-// The root test uses the in-memory fakeSenderKeyStore (no LRU), so the
-// recovery is asserted via the getDevicesCalls invocation counter on the fake.
-func TestGroupSenderKeySelfExtinguishingRecovery(t *testing.T) {
+// Phase-27 note (supersedes the Phase-26 "self-extinguishing" invariant): the
+// device-tolerant lookup ALWAYS enumerates the sender's device set — there is no
+// fast-path/fallback split — so GetSenderKeyDevices is consulted once per
+// decrypt. In production that enumerate is cache-served by CachedSenderKeyStore
+// (0 DB queries warm — see the sqlstore cache tests); the in-memory
+// fakeSenderKeyStore here has no LRU, so getDevicesCalls increments by exactly
+// one per decrypt. The behavioral guarantee is that the decrypt SUCCEEDS.
+func TestGroupSenderKeyDeviceMatchedRecovery(t *testing.T) {
 	ctx := context.Background()
 	chat := types.JID{User: "120363000000000004", Server: types.GroupServer}
 	senderDev5 := types.JID{User: "75811323404294", Server: types.HiddenUserServer, Device: 5}
@@ -390,18 +392,21 @@ func TestGroupSenderKeySelfExtinguishingRecovery(t *testing.T) {
 	skdmBytes2, skmsgBytes2 := aliceCrypto(ctx, t, chat.String(), plaintext2)
 	seedDeviceQualifiedRecord(ctx, t, cli, chat, senderBare, skdmBytes2)
 
-	// Step 3: deliver second skmsg — should hit the bare :0 fast path.
+	// Step 3: deliver second skmsg (labeled :0). The device-tolerant loop tries
+	// the labeled device (:0) first and decrypts. Phase 27: the loop always
+	// enumerates once (no fast-path skip), so getDevicesCalls increments by 1.
 	before := fake.getDevicesCalls
 	skmsgNode2 := &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: skmsgBytes2}
 	pt2, _, err := cli.decryptGroupMsg(ctx, skmsgNode2, senderBare, chat, time.Now())
 	if err != nil {
-		t.Fatalf("second decrypt (via fast path) failed: %v", err)
+		t.Fatalf("second decrypt (labeled-device match) failed: %v", err)
 	}
 	if string(pt2) != string(plaintext2) {
 		t.Fatalf("second decrypt plaintext mismatch: got %q want %q", pt2, plaintext2)
 	}
-	// Fallback was NOT entered — the fast path hit bare :0.
-	if fake.getDevicesCalls != before {
-		t.Fatalf("self-extinguishing invariant violated: getDevicesCalls changed from %d to %d during fast-path decrypt (fallback was entered when it should not be)", before, fake.getDevicesCalls)
+	// Phase 27: the unified loop enumerates exactly once per decrypt (cache-served
+	// in prod). The recovery guarantee is decrypt success, asserted above.
+	if fake.getDevicesCalls != before+1 {
+		t.Fatalf("expected one enumerate per decrypt (Phase 27 device-tolerant loop): getDevicesCalls %d → %d, want +1", before, fake.getDevicesCalls)
 	}
 }

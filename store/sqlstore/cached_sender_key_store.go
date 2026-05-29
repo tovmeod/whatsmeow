@@ -8,6 +8,7 @@ package sqlstore
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -35,6 +36,11 @@ type CachedSenderKeyStore struct {
 	inner store.SenderKeyStore
 	jid   string
 	cache *lru.Cache[string, []byte]
+	// kavtov-fork: Phase 27 — device-set index, keyed jid|group|userBare → the
+	// device-qualified sender_id list for that sender. Lets GetSenderKeyDevices
+	// be served from cache (the device-tolerant lookup's enumerate). Invalidated
+	// by PutSenderKey only when a genuinely new device appears (see PutSenderKey).
+	deviceCache *lru.Cache[string, []string]
 
 	hits, misses uint64
 }
@@ -44,11 +50,12 @@ var _ store.SenderKeyStore = (*CachedSenderKeyStore)(nil)
 // NewCachedSenderKeyStore constructs a wrapper over inner. jid is the device
 // JID (used as cache-key prefix). cache is a shared LRU constructed by the
 // Container.
-func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte]) *CachedSenderKeyStore {
+func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte], deviceCache *lru.Cache[string, []string]) *CachedSenderKeyStore {
 	return &CachedSenderKeyStore{
-		inner: inner,
-		jid:   jid,
-		cache: cache,
+		inner:       inner,
+		jid:         jid,
+		cache:       cache,
+		deviceCache: deviceCache,
 	}
 }
 
@@ -107,15 +114,54 @@ func (c *CachedSenderKeyStore) PutSenderKey(ctx context.Context, group, user str
 	// Copy before stash so caller's buffer reuse cannot corrupt the cache
 	// (Phase 17.5 FIX CR-06: prior code aliased the caller's slice).
 	c.cache.Add(c.key(group, user), copyBytes(session))
+	// kavtov-fork: Phase 27 — keep the device-set index fresh. PutSenderKey fires
+	// on every ratchet write-back, so invalidate ONLY when this device is not
+	// already in the cached set (a genuinely new device, e.g. a fresh SKDM).
+	// Invalidating on every write-back would defeat the device-set cache.
+	dk := c.key(group, senderKeyUserBare(user))
+	if set, ok := c.deviceCache.Get(dk); ok && !containsString(set, user) {
+		c.deviceCache.Remove(dk)
+	}
 	return nil
 }
 
-// GetSenderKeyDevices is a straight passthrough to inner.GetSenderKeyDevices —
-// no cache read, no cache write. The LRU is keyed on the exact
-// jid|group|user device-qualified string (key(), lines 55-57) and has no
-// per-userBare device-set index, so it cannot answer an enumerate-by-prefix
-// query. Caching the device list would also risk staleness when a new
-// device's SKDM arrives (see <cache_interaction> FACT 1 in the 26-02 plan).
+// GetSenderKeyDevices answers the device-tolerant lookup's enumerate from the
+// dedicated device-set LRU (keyed jid|group|userBare), falling to the inner
+// store once on a cold key. kavtov-fork Phase 27: this replaces the old DB
+// passthrough so the hot path issues 0 DB queries. The staleness risk the old
+// passthrough cited is handled by PutSenderKey, which invalidates this key when
+// a genuinely new device appears.
 func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
-	return c.inner.GetSenderKeyDevices(ctx, group, userBare)
+	dk := c.key(group, userBare)
+	if v, ok := c.deviceCache.Get(dk); ok {
+		atomic.AddUint64(&c.hits, 1)
+		return append([]string(nil), v...), nil // copy-out (CR-06)
+	}
+	atomic.AddUint64(&c.misses, 1)
+	devices, err := c.inner.GetSenderKeyDevices(ctx, group, userBare)
+	if err != nil {
+		return nil, err // never cache on error
+	}
+	// An empty set is safe to cache: PutSenderKey invalidates this key when a
+	// new device's SKDM arrives, so a cached empty cannot go permanently stale.
+	c.deviceCache.Add(dk, append([]string(nil), devices...))
+	return devices, nil
+}
+
+// senderKeyUserBare strips the device qualifier from a device-qualified
+// sender_id ("<user>:<dev>" → "<user>"). Used to key the device-set cache.
+func senderKeyUserBare(user string) string {
+	if i := strings.LastIndex(user, ":"); i >= 0 {
+		return user[:i]
+	}
+	return user
+}
+
+func containsString(xs []string, x string) bool {
+	for _, s := range xs {
+		if s == x {
+			return true
+		}
+	}
+	return false
 }

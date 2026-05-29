@@ -660,82 +660,75 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 		return nil, nil, fmt.Errorf("message content is not a byte slice")
 	}
 
-	// kavtov-fork: Phase 26 — bare-normalize sender-key address (ToNonAD) so inbound store+lookup converge; upstream Tulir 2021 code is device-qualified.
-	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.ToNonAD().SignalAddress())
-	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
-	cipher := groups.NewGroupCipher(builder, senderKeyName, cli.Store)
 	msg, err := protocol.NewSenderKeyMessageFromBytes(content, pbSerializer.SenderKeyMessage)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse group message: %w", err)
 	}
+	// kavtov-fork: Phase 27 — device-tolerant group sender-key lookup. WhatsApp delivers the SKDM
+	// and the skmsg with inconsistent device numbers for the same sender key; the message keyID
+	// (not the device label) identifies the key. decryptGroupSenderKey tries the sender's stored
+	// device-qualified records (labeled device first) and lets GroupCipher select the state by
+	// keyID + verify the signature (a wrong candidate fails closed). Each candidate decrypts under
+	// its own address, so the ratchet writes back to the correct record. No :0 normalization, no merge.
 	plaintext, ciphertextHash, err := cli.bufferedDecrypt(ctx, content, serverTS, func(decryptCtx context.Context) ([]byte, error) {
-		return cipher.Decrypt(decryptCtx, msg)
+		return cli.decryptGroupSenderKey(decryptCtx, chat, from, msg)
 	}, "senderkey", chat.String(), from.String())
 	if err != nil {
-		// kavtov-fork: Phase 26 (fallback) — on a sender-key miss, enumerate
-		// the sender's existing device-qualified records and attempt Decrypt
-		// against each (first success wins). This reuses the ~2.33M live :N
-		// records immediately, without waiting for a re-distribution SKDM.
-		//
-		// The fallback is MISS-PATH-ONLY (entered only on ErrNoSenderKeyForUser)
-		// and SELF-EXTINGUISHING (once a fresh SKDM stores bare :0, the fast
-		// path hits and this branch is never reached for that sender).
-		//
-		// READ-ONLY: the fallback never calls PutSenderKey / StoreSenderKey
-		// itself. A winning candidate's own :N record may have its ratchet
-		// advanced in place by libsignal GroupCipher.Decrypt — that is correct
-		// in-place maintenance, NOT a :0 write and NOT a merge (D-06).
-		if !errors.Is(err, signalerror.ErrNoSenderKeyForUser) {
-			return nil, nil, fmt.Errorf("failed to decrypt group message: %w", err)
-		}
-		fastPathErr := err
-		// The bare :0 string that the fast path tried (and missed).
-		bareKey := senderKeyName.Sender().String()
-		devices, derr := cli.Store.SenderKeys.GetSenderKeyDevices(ctx, chat.String(), from.SignalAddressUser())
-		if derr != nil {
-			cli.Log.Warnf("Failed to enumerate sender-key devices for fallback (group=%s sender=%s): %v", chat, from, derr)
-			return nil, nil, fmt.Errorf("failed to decrypt group message: %w", fastPathErr)
-		}
-		for _, dev := range devices {
-			if dev == bareKey {
-				// Already tried by the fast path — skip.
-				continue
-			}
-			// Reconstruct the candidate SenderKeyName from the stored sender_id
-			// string (format "<name>:<deviceID>", e.g. "75811323404294_1:5").
-			sep := strings.LastIndex(dev, ":")
-			if sep < 0 {
-				cli.Log.Debugf("Skipping malformed sender-key candidate %q (no colon separator)", dev)
-				continue
-			}
-			candUser := dev[:sep]
-			candDevID, parseErr := strconv.ParseUint(dev[sep+1:], 10, 32)
-			if parseErr != nil {
-				cli.Log.Debugf("Skipping malformed sender-key candidate %q (bad device id: %v)", dev, parseErr)
-				continue
-			}
-			candName := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(candUser, uint32(candDevID)))
-			candCipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), candName, cli.Store)
-			candPlaintext, candErr := candCipher.Decrypt(ctx, msg)
-			if candErr != nil {
-				cli.Log.Debugf("Sender-key fallback candidate %q failed: %v", dev, candErr)
-				continue
-			}
-			// First success wins.
-			plaintext = candPlaintext
-			err = nil
-			break
-		}
-		if err != nil {
-			// All candidates missed — return the original miss error.
-			return nil, nil, fmt.Errorf("failed to decrypt group message: %w", fastPathErr)
-		}
+		return nil, nil, fmt.Errorf("failed to decrypt group message: %w", err)
 	}
 	plaintext, err = unpadMessage(plaintext, child.AttrGetter().Int("v"))
 	if err != nil {
 		return nil, nil, err
 	}
 	return plaintext, &ciphertextHash, nil
+}
+
+// decryptGroupSenderKey performs the Phase-27 device-tolerant group sender-key lookup. It
+// enumerates the sender's stored device-qualified records for the group (a cache-served call —
+// see CachedSenderKeyStore) and attempts decryption against each, trying the labeled device first.
+// libsignal's GroupCipher selects the key state by the message keyID and verifies the signature,
+// so a wrong candidate fails closed (never a mis-decrypt); the winning candidate's ratchet is
+// written back to its own device record by GroupCipher.Decrypt. There is no error-class branching:
+// we try every stored device for the sender and let the keyID pick. Returns ErrNoSenderKeyForUser
+// when no stored device record decrypts the message (so the retry-receipt path is unchanged).
+func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.JID, msg *protocol.SenderKeyMessage) ([]byte, error) {
+	devices, err := cli.Store.SenderKeys.GetSenderKeyDevices(ctx, chat.String(), from.SignalAddressUser())
+	if err != nil {
+		return nil, fmt.Errorf("failed to enumerate sender-key devices: %w", err)
+	}
+	// Try the labeled device first (the common case), then the remaining devices.
+	labeled := from.SignalAddress().String()
+	ordered := make([]string, 0, len(devices))
+	for _, sid := range devices {
+		if sid == labeled {
+			ordered = append(ordered, sid)
+		}
+	}
+	for _, sid := range devices {
+		if sid != labeled {
+			ordered = append(ordered, sid)
+		}
+	}
+	for _, sid := range ordered {
+		sep := strings.LastIndex(sid, ":")
+		if sep < 0 {
+			cli.Log.Debugf("Skipping malformed sender-key id %q (no colon separator)", sid)
+			continue
+		}
+		devID, parseErr := strconv.ParseUint(sid[sep+1:], 10, 32)
+		if parseErr != nil {
+			cli.Log.Debugf("Skipping malformed sender-key id %q (bad device id: %v)", sid, parseErr)
+			continue
+		}
+		name := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(sid[:sep], uint32(devID)))
+		cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
+		plaintext, decErr := cipher.Decrypt(ctx, msg)
+		if decErr == nil {
+			return plaintext, nil
+		}
+		cli.Log.Debugf("Group sender-key candidate %q did not decrypt: %v", sid, decErr)
+	}
+	return nil, signalerror.ErrNoSenderKeyForUser
 }
 
 const checkPadding = true
@@ -770,8 +763,8 @@ func padMessage(plaintext []byte) []byte {
 
 func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat, from types.JID, axolotlSKDM []byte) {
 	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
-	// kavtov-fork: Phase 26 — bare-normalize sender-key address (ToNonAD) so inbound store+lookup converge; upstream Tulir 2021 code is device-qualified.
-	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.ToNonAD().SignalAddress())
+	// kavtov-fork: Phase 27 — device-qualified store; the message keyID disambiguates devices; device-tolerant lookup (27-01) finds the record regardless of which device the skmsg is labeled with.
+	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
 	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(axolotlSKDM, pbSerializer.SenderKeyDistributionMessage)
 	if err != nil {
 		cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)

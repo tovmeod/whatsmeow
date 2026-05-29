@@ -437,14 +437,21 @@ const (
 		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
 	`
 	// getSenderKeyDevicesQuery returns all device-qualified sender_id strings for a
-	// (our_jid, chat_id, userBare) triple. The range idiom mirrors
-	// deleteAllSenderKeysQuery / migratePNToLIDSenderKeysQuery:
-	//   sender_id >= $3 || ':' AND sender_id < $3 || ';'
-	// This is exact and parameterized — NOT a LIKE clause. userBare contains the
-	// _1 LIDDomain agent suffix and '_' is a LIKE metacharacter that would
-	// over-match; the range avoids both injection and wildcard expansion (T-26-04).
-	getSenderKeyDevicesQuery = `SELECT sender_id FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id >= $3 || ':' AND sender_id < $3 || ';'`
+	// (our_jid, chat_id, userBare) triple. kavtov-fork Phase 27: a collation-stable
+	// prefix match. The previous range idiom (sender_id >= $3||':' AND < $3||';')
+	// silently returned 0 rows on the prod DB's en_US.utf8 collation — the ';'
+	// upper bound does not order after ':' there. LIKE matches by character, not
+	// collation ordering, and is portable (PG + SQLite). userBare contains a '_'
+	// (the LID agent suffix) and may contain '%'/'\', all LIKE metacharacters, so
+	// the bound value is escaped caller-side before binding (see GetSenderKeyDevices).
+	getSenderKeyDevicesQuery = `SELECT sender_id FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id LIKE $3 || ':%' ESCAPE '\'`
 )
+
+// senderKeyLikeEscaper escapes the three LIKE metacharacters in a userBare value
+// before it is bound to getSenderKeyDevicesQuery. '\' MUST be replaced first;
+// strings.NewReplacer performs a single left-to-right pass with no re-processing
+// of inserted bytes, so the backslashes added for '%'/'_' are not double-escaped.
+var senderKeyLikeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 func (s *SQLStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
 	_, err := s.db.Exec(ctx, putSenderKeyQuery, s.JID, group, user, session)
@@ -466,7 +473,8 @@ func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []
 // the caller to rebuild a SenderKeyName per device and let the existing cached
 // LoadSenderKey fetch each record.
 func (s *SQLStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
-	rows, err := s.db.Query(ctx, getSenderKeyDevicesQuery, s.JID, group, userBare)
+	// Escape LIKE metacharacters so the prefix match is literal up to the ':' (Phase 27).
+	rows, err := s.db.Query(ctx, getSenderKeyDevicesQuery, s.JID, group, senderKeyLikeEscaper.Replace(userBare))
 	if err != nil {
 		return nil, err
 	}
