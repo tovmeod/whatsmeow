@@ -436,6 +436,14 @@ const (
 		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key) VALUES ($1, $2, $3, $4)
 		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
 	`
+	// getSenderKeyDevicesQuery returns all device-qualified sender_id strings for a
+	// (our_jid, chat_id, userBare) triple. The range idiom mirrors
+	// deleteAllSenderKeysQuery / migratePNToLIDSenderKeysQuery:
+	//   sender_id >= $3 || ':' AND sender_id < $3 || ';'
+	// This is exact and parameterized — NOT a LIKE clause. userBare contains the
+	// _1 LIDDomain agent suffix and '_' is a LIKE metacharacter that would
+	// over-match; the range avoids both injection and wildcard expansion (T-26-04).
+	getSenderKeyDevicesQuery = `SELECT sender_id FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id >= $3 || ':' AND sender_id < $3 || ';'`
 )
 
 func (s *SQLStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
@@ -449,6 +457,32 @@ func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []
 		err = nil
 	}
 	return
+}
+
+// GetSenderKeyDevices returns the device-qualified sender_id strings (e.g.
+// "75811323404294_1:0", "75811323404294_1:5") that exist for (our_jid, group,
+// userBare). READ-ONLY: this is a SELECT; it never writes, merges, or rewrites
+// any sender_id (D-06 carried forward). The returned strings are consumed by
+// the caller to rebuild a SenderKeyName per device and let the existing cached
+// LoadSenderKey fetch each record.
+func (s *SQLStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
+	rows, err := s.db.Query(ctx, getSenderKeyDevicesQuery, s.JID, group, userBare)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var devices []string
+	for rows.Next() {
+		var senderID string
+		if err := rows.Scan(&senderID); err != nil {
+			return nil, err
+		}
+		devices = append(devices, senderID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return devices, nil
 }
 
 const (

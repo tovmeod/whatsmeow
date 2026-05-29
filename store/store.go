@@ -50,6 +50,16 @@ type PreKeyStore interface {
 type SenderKeyStore interface {
 	PutSenderKey(ctx context.Context, group, user string, session []byte) error
 	GetSenderKey(ctx context.Context, group, user string) ([]byte, error)
+	// GetSenderKeyDevices is READ-ONLY (a SELECT; no write, merge, or migration).
+	// It returns the full device-qualified sender_id strings (e.g. "75811323404294_1:0",
+	// "75811323404294_1:5") that exist in (our_jid, group, userBare) so a caller can
+	// rebuild a SenderKeyName per device and let the existing cached LoadSenderKey
+	// fetch each record. userBare is the device-stripped sender user string
+	// (from.SignalAddressUser() form, e.g. "75811323404294_1") — the range query matches
+	// rows with sender_id starting with "<userBare>:". The returned strings are
+	// device-qualified; an empty/nil slice means no candidates exist. Carries forward D-06:
+	// this method never writes, merges, or rewrites any sender_id.
+	GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error)
 }
 
 type AppStateSyncKey struct {

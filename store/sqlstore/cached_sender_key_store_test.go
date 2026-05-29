@@ -215,6 +215,57 @@ func TestCachedSenderKeyStore_EvictionAtCap(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// GetSenderKeyDevices: passthrough reaches inner; LRU is NOT touched.
+// Per <cache_interaction> FACT 1: the LRU is keyed on the exact
+// jid|group|user device-qualified string and has no per-userBare device-set
+// index. Caching the device list would risk staleness when a new device's
+// SKDM arrives. The method is a straight passthrough.
+// ---------------------------------------------------------------------------
+
+func TestCachedSenderKeyStore_GetSenderKeyDevices_PassthroughAndNoCacheTouch(t *testing.T) {
+	ctx := context.Background()
+	c, inner := newTestCachedSenderKeyStore(t, 16)
+
+	// Seed two device-qualified keys for the same group+userBare in inner.
+	// Use group+"|"+user keys matching fakeSenderKeyStore.PutSenderKey convention.
+	if err := inner.PutSenderKey(ctx, "group-X", "99user_1:0", []byte("sk-0")); err != nil {
+		t.Fatalf("seed inner key :0: %v", err)
+	}
+	if err := inner.PutSenderKey(ctx, "group-X", "99user_1:5", []byte("sk-5")); err != nil {
+		t.Fatalf("seed inner key :5: %v", err)
+	}
+	inner.devicesCalls.Store(0)
+
+	// Call GetSenderKeyDevices through the cache wrapper.
+	devices, err := c.GetSenderKeyDevices(ctx, "group-X", "99user_1")
+	if err != nil {
+		t.Fatalf("GetSenderKeyDevices: %v", err)
+	}
+
+	// (a) The call must have reached inner exactly once.
+	if got := inner.devicesCalls.Load(); got != 1 {
+		t.Errorf("inner.devicesCalls = %d, want 1 (passthrough must reach inner)", got)
+	}
+	// (b) The result must contain exactly the two seeded device strings.
+	if len(devices) != 2 {
+		t.Errorf("GetSenderKeyDevices returned %d devices, want 2; got %v", len(devices), devices)
+	}
+	deviceSet := make(map[string]bool, len(devices))
+	for _, d := range devices {
+		deviceSet[d] = true
+	}
+	for _, want := range []string{"99user_1:0", "99user_1:5"} {
+		if !deviceSet[want] {
+			t.Errorf("device %q missing from result %v", want, devices)
+		}
+	}
+	// (c) The LRU must NOT have been touched — no entry added.
+	if got := c.cache.Len(); got != 0 {
+		t.Errorf("cache.Len = %d after GetSenderKeyDevices, want 0 (passthrough must not touch LRU)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Race test: N=50 goroutines, mixed Get/Put on overlapping keys.
 // Must run clean under `go test -race` and must not deadlock.
 // ---------------------------------------------------------------------------
