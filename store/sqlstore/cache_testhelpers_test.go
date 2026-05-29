@@ -8,6 +8,7 @@ package sqlstore
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -284,8 +285,9 @@ type fakeSenderKeyStore struct {
 	mu   sync.Mutex
 	keys map[string][]byte
 
-	getCalls atomic.Int64
-	putCalls atomic.Int64
+	getCalls     atomic.Int64
+	putCalls     atomic.Int64
+	devicesCalls atomic.Int64
 }
 
 func newFakeSenderKeyStore() *fakeSenderKeyStore {
@@ -315,6 +317,24 @@ func (f *fakeSenderKeyStore) GetSenderKey(_ context.Context, group, user string)
 	out := make([]byte, len(v))
 	copy(out, v)
 	return out, nil
+}
+
+// GetSenderKeyDevices is the real prefix-scan over f.keys — mirrors
+// SQLStore.GetSenderKeyDevices semantics for test coverage. It records
+// calls so the cached-store passthrough test can assert that the LRU
+// was not touched.
+func (f *fakeSenderKeyStore) GetSenderKeyDevices(_ context.Context, group, userBare string) ([]string, error) {
+	f.devicesCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prefix := group + "|" + userBare + ":"
+	var devices []string
+	for k := range f.keys {
+		if strings.HasPrefix(k, prefix) {
+			devices = append(devices, k[len(group)+1:])
+		}
+	}
+	return devices, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -109,3 +109,13 @@ func (c *CachedSenderKeyStore) PutSenderKey(ctx context.Context, group, user str
 	c.cache.Add(c.key(group, user), copyBytes(session))
 	return nil
 }
+
+// GetSenderKeyDevices is a straight passthrough to inner.GetSenderKeyDevices —
+// no cache read, no cache write. The LRU is keyed on the exact
+// jid|group|user device-qualified string (key(), lines 55-57) and has no
+// per-userBare device-set index, so it cannot answer an enumerate-by-prefix
+// query. Caching the device list would also risk staleness when a new
+// device's SKDM arrives (see <cache_interaction> FACT 1 in the 26-02 plan).
+func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
+	return c.inner.GetSenderKeyDevices(ctx, group, userBare)
+}

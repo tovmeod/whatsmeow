@@ -16,6 +16,7 @@ package whatsmeow
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,27 @@ func (f *fakeSenderKeyStore) PutSenderKey(ctx context.Context, group, user strin
 
 func (f *fakeSenderKeyStore) GetSenderKey(ctx context.Context, group, user string) ([]byte, error) {
 	return f.keys[f.slot(group, user)], nil
+}
+
+// GetSenderKeyDevices is the real prefix-scan over f.keys — the in-memory
+// mirror of SQLStore.GetSenderKeyDevices. It scans for slot keys equal to
+// group + "|" + userBare + ":" + <dev> and returns the <userBare>:<dev>
+// portion (the slot key with the group+"|" prefix removed). This ships in
+// Plan 02 so the root whatsmeow test binary compiles against the enlarged
+// interface; the fallback loop that calls it lands in Plan 03. The two
+// existing 26-01 tests pass unchanged (they don't invoke this method).
+// Plan 03 will add an invocation counter — this method is intentionally
+// easy to instrument (no counter here).
+func (f *fakeSenderKeyStore) GetSenderKeyDevices(_ context.Context, group, userBare string) ([]string, error) {
+	prefix := group + "|" + userBare + ":"
+	var devices []string
+	for k := range f.keys {
+		if strings.HasPrefix(k, prefix) {
+			// slot = group + "|" + user; return the user part (after group+"|")
+			devices = append(devices, k[len(group)+1:])
+		}
+	}
+	return devices, nil
 }
 
 // aliceSenderKeyStore is Alice's own libsignal sender-key store, used ONLY to
