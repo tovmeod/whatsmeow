@@ -17,6 +17,7 @@ import (
 	"io"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -671,7 +672,64 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 		return cipher.Decrypt(decryptCtx, msg)
 	}, "senderkey", chat.String(), from.String())
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to decrypt group message: %w", err)
+		// kavtov-fork: Phase 26 (fallback) — on a sender-key miss, enumerate
+		// the sender's existing device-qualified records and attempt Decrypt
+		// against each (first success wins). This reuses the ~2.33M live :N
+		// records immediately, without waiting for a re-distribution SKDM.
+		//
+		// The fallback is MISS-PATH-ONLY (entered only on ErrNoSenderKeyForUser)
+		// and SELF-EXTINGUISHING (once a fresh SKDM stores bare :0, the fast
+		// path hits and this branch is never reached for that sender).
+		//
+		// READ-ONLY: the fallback never calls PutSenderKey / StoreSenderKey
+		// itself. A winning candidate's own :N record may have its ratchet
+		// advanced in place by libsignal GroupCipher.Decrypt — that is correct
+		// in-place maintenance, NOT a :0 write and NOT a merge (D-06).
+		if !errors.Is(err, signalerror.ErrNoSenderKeyForUser) {
+			return nil, nil, fmt.Errorf("failed to decrypt group message: %w", err)
+		}
+		fastPathErr := err
+		// The bare :0 string that the fast path tried (and missed).
+		bareKey := senderKeyName.Sender().String()
+		devices, derr := cli.Store.SenderKeys.GetSenderKeyDevices(ctx, chat.String(), from.SignalAddressUser())
+		if derr != nil {
+			cli.Log.Warnf("Failed to enumerate sender-key devices for fallback (group=%s sender=%s): %v", chat, from, derr)
+			return nil, nil, fmt.Errorf("failed to decrypt group message: %w", fastPathErr)
+		}
+		for _, dev := range devices {
+			if dev == bareKey {
+				// Already tried by the fast path — skip.
+				continue
+			}
+			// Reconstruct the candidate SenderKeyName from the stored sender_id
+			// string (format "<name>:<deviceID>", e.g. "75811323404294_1:5").
+			sep := strings.LastIndex(dev, ":")
+			if sep < 0 {
+				cli.Log.Debugf("Skipping malformed sender-key candidate %q (no colon separator)", dev)
+				continue
+			}
+			candUser := dev[:sep]
+			candDevID, parseErr := strconv.ParseUint(dev[sep+1:], 10, 32)
+			if parseErr != nil {
+				cli.Log.Debugf("Skipping malformed sender-key candidate %q (bad device id: %v)", dev, parseErr)
+				continue
+			}
+			candName := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(candUser, uint32(candDevID)))
+			candCipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), candName, cli.Store)
+			candPlaintext, candErr := candCipher.Decrypt(ctx, msg)
+			if candErr != nil {
+				cli.Log.Debugf("Sender-key fallback candidate %q failed: %v", dev, candErr)
+				continue
+			}
+			// First success wins.
+			plaintext = candPlaintext
+			err = nil
+			break
+		}
+		if err != nil {
+			// All candidates missed — return the original miss error.
+			return nil, nil, fmt.Errorf("failed to decrypt group message: %w", fastPathErr)
+		}
 	}
 	plaintext, err = unpadMessage(plaintext, child.AttrGetter().Int("v"))
 	if err != nil {
