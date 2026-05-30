@@ -737,11 +737,80 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 		cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
 		plaintext, decErr := cipher.Decrypt(ctx, msg)
 		if decErr == nil {
+			// kavtov-fork (P2a): KEY-path decrypt success. If this inbound tuple was previously a
+			// total miss, this is a genuine per-tuple convergence (NOT PDO content-recovery, which
+			// runs elsewhere and installs no key). Emit ONE INFO and drop the entry.
+			if cli.clearFailedSenderKeyTuple(labeled, chat.String()) {
+				cli.Log.Infof("SENDER_KEY_CONVERGED keypath sender=%s device=%d group=%s prevFailed=true", from.SignalAddressUser(), from.Device, chat.String())
+			}
 			return plaintext, nil
 		}
 		cli.Log.Debugf("Group sender-key candidate %q did not decrypt: %v", sid, decErr)
 	}
+	// kavtov-fork (P2a): total miss for this inbound (sender,device,group) tuple. Record it so a
+	// later KEY-path decrypt success for the same tuple is recognizable as convergence.
+	cli.recordFailedSenderKeyTuple(labeled, chat.String())
 	return nil, signalerror.ErrNoSenderKeyForUser
+}
+
+// kavtov-fork (P2a): bounded recently-failed group sender-key tuple set. See client.go field doc.
+// failedSenderKeyTuplesSize caps the set; the failing working set is a few hundred distinct tuples
+// per ~8-min window (~289 sender|group pairs observed, more once device-qualified) against ~0
+// current convergence, so 4096 holds the entire failing population indefinitely until a tuple
+// actually converges. Memory is trivial (a few hundred KB of small structs); err large so the
+// signal this instrument exists to catch is never evicted before it can fire. Eviction is a ring
+// buffer (oldest tuple dropped when full), identical to recentMessages, with dedup on add.
+const failedSenderKeyTuplesSize = 4096
+
+// failedSenderKeyTuple keys the failed-set by the inbound sender's device-qualified signal address
+// (e.g. "34278519877736_1:1") plus the group JID. Keying by the INBOUND device (not the winning
+// stored device) is deliberate: convergence means "a later message from this inbound
+// (sender,device,group) now decrypts", regardless of which stored record supplied the key.
+type failedSenderKeyTuple struct {
+	Sender string // from.SignalAddress().String()
+	Group  string // chat.String()
+}
+
+// recordFailedSenderKeyTuple marks an inbound (sender,device,group) tuple as a total decrypt miss.
+// Dedups on add (the failure load repeats the same tuples heavily) so a duplicate does not consume
+// a ring slot and evict a still-unconverged tuple. Guarded by failedSenderKeyTuplesLock; safe under
+// the concurrent decrypt path.
+func (cli *Client) recordFailedSenderKeyTuple(sender, group string) {
+	key := failedSenderKeyTuple{Sender: sender, Group: group}
+	cli.failedSenderKeyTuplesLock.Lock()
+	defer cli.failedSenderKeyTuplesLock.Unlock()
+	if cli.failedSenderKeyTuples == nil {
+		// Lazy init: the production constructor seeds this, but a bare &Client{} (tests / direct
+		// construction) must not nil-panic on the hot decrypt path.
+		cli.failedSenderKeyTuples = make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize)
+	}
+	if _, exists := cli.failedSenderKeyTuples[key]; exists {
+		return
+	}
+	if old := cli.failedSenderKeyTuplesList[cli.failedSenderKeyTuplesPtr]; old.Sender != "" {
+		delete(cli.failedSenderKeyTuples, old)
+	}
+	cli.failedSenderKeyTuples[key] = struct{}{}
+	cli.failedSenderKeyTuplesList[cli.failedSenderKeyTuplesPtr] = key
+	cli.failedSenderKeyTuplesPtr++
+	if cli.failedSenderKeyTuplesPtr >= len(cli.failedSenderKeyTuplesList) {
+		cli.failedSenderKeyTuplesPtr = 0
+	}
+}
+
+// clearFailedSenderKeyTuple removes an inbound (sender,group) tuple from the failed set and reports
+// whether it was present. A true result means this tuple previously failed and has now decrypted via
+// the KEY path — a genuine per-tuple convergence. The stale ring-list slot is left to be overwritten
+// by the ring (a cleared entry just becomes a no-op delete when its slot recycles).
+func (cli *Client) clearFailedSenderKeyTuple(sender, group string) bool {
+	key := failedSenderKeyTuple{Sender: sender, Group: group}
+	cli.failedSenderKeyTuplesLock.Lock()
+	defer cli.failedSenderKeyTuplesLock.Unlock()
+	if _, exists := cli.failedSenderKeyTuples[key]; !exists {
+		return false
+	}
+	delete(cli.failedSenderKeyTuples, key)
+	return true
 }
 
 const checkPadding = true

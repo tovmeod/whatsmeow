@@ -149,6 +149,20 @@ type Client struct {
 	recentMessagesPtr  int
 	recentMessagesLock sync.RWMutex
 
+	// kavtov-fork: P2a group sender-key convergence instrument. Bounded in-memory set of
+	// recently-FAILED group decrypt tuples, keyed by the inbound sender's device-qualified
+	// signal address + group JID. Populated on the total-miss path (decryptGroupSenderKey
+	// returning ErrNoSenderKeyForUser); when a later message from the SAME inbound tuple later
+	// decrypts via the KEY path we emit ONE INFO SENDER_KEY_CONVERGED and drop the entry. This is
+	// the only honest convergence signal: it distinguishes genuine group-key recovery from PDO
+	// content-recovery (which lands content with the key still missing). Same ring-buffer idiom as
+	// recentMessages, but dedups on add (tuples repeat heavily under the failure load) and is
+	// sized to the distinct-failing-tuple working set. See debug no-sender-key-recurring ch6 (P2a).
+	failedSenderKeyTuples     map[failedSenderKeyTuple]struct{}
+	failedSenderKeyTuplesList [failedSenderKeyTuplesSize]failedSenderKeyTuple
+	failedSenderKeyTuplesPtr  int
+	failedSenderKeyTuplesLock sync.Mutex
+
 	sessionRecreateHistory     map[types.JID]time.Time
 	sessionRecreateHistoryLock sync.Mutex
 	// GetMessageForRetry is used to find the source message for handling retry receipts
@@ -271,6 +285,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		userDevicesCache: make(map[types.JID]deviceCache),
 
 		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
+		failedSenderKeyTuples:  make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
 		sessionRecreateHistory: make(map[types.JID]time.Time),
 		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
