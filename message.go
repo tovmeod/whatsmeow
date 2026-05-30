@@ -439,19 +439,6 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			if errors.Is(err, signalerror.ErrNoOneTimeKeyFound) {
 				cli.Log.Warnf("STALE_PREKEY: sender=%s - sender used old prekey ID, sending retry with fresh prekeys", senderEncryptionJID.String())
 			}
-			// kavtov-fork (fix/skmsg-establish-session): proactively establish a pairwise
-			// Signal session when a group skmsg fails with ErrNoSenderKeyForUser AND we
-			// have no session with the sender. A SenderKeyDistributionMessage arrives
-			// inside a pairwise (pkmsg/msg) envelope; without a session we cannot open
-			// that envelope, so the sender key never lands. Mirrors the existing
-			// ErrNoSessionForUser handling exactly (same helper, same self-dedup guard,
-			// same device-qualified senderEncryptionJID).
-			// SCOPE CAVEAT — PARTIAL, NOT A ROOT-CAUSE FIX: this only recovers the
-			// ~30% no-session bucket. The ~70% session-present majority still fails
-			// because the sender does not redistribute the group sender key on our
-			// retry receipt (a peer/transport-side redistribution gap, see debug
-			// chapter 3/4). This does NOT fix the bug; it closes one bucket.
-			establishSessionForNoSenderKey := encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser)
 			if encType == "msmsg" {
 				cli.backgroundIfAsyncAck(func() {
 					cli.sendAck(ctx, node, NackMissingMessageSecret)
@@ -461,14 +448,14 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				// TODO this probably isn't supposed to ack
 				cli.sendAck(ctx, node, 0)
 				// Proactively establish session for pairwise session errors
-				if errors.Is(err, signalerror.ErrNoSessionForUser) || establishSessionForNoSenderKey {
+				if errors.Is(err, signalerror.ErrNoSessionForUser) {
 					go cli.establishSessionWithSender(context.WithoutCancel(ctx), senderEncryptionJID)
 				}
 			} else {
 				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
 				go cli.sendAck(ctx, node, 0)
 				// Proactively establish session for pairwise session errors
-				if errors.Is(err, signalerror.ErrNoSessionForUser) || establishSessionForNoSenderKey {
+				if errors.Is(err, signalerror.ErrNoSessionForUser) {
 					go cli.establishSessionWithSender(context.WithoutCancel(ctx), senderEncryptionJID)
 				}
 			}
