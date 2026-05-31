@@ -68,6 +68,30 @@ func (c *captureLogger) infoContaining(substr string) int {
 	return n
 }
 
+// infoMatchingAll counts INFO lines that contain ALL of the given substrings.
+// Used to scope an assertion to a specific log line (e.g. the SENDER_KEY_CONVERGED
+// line) rather than counting a substring (like "device=1") across every INFO line,
+// which would conflate it with other instruments that share the field (e.g. the
+// STEP 1 SKDM_FOR_FAILED_TUPLE line).
+func (c *captureLogger) infoMatchingAll(substrs ...string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, m := range c.info {
+		all := true
+		for _, s := range substrs {
+			if !strings.Contains(m, s) {
+				all = false
+				break
+			}
+		}
+		if all {
+			n++
+		}
+	}
+	return n
+}
+
 // --- core bookkeeping tests -------------------------------------------------
 
 // Case 1: clear returns FALSE for a tuple that was never recorded. No
@@ -133,8 +157,8 @@ func TestConvergeDedupOnAddPreservesCanary(t *testing.T) {
 	dup := "dup_1:1"
 
 	cli.recordFailedSenderKeyTuple(canary, group) // slot 0
-	cli.recordFailedSenderKeyTuple(dup, group)     // slot 1
-	cli.recordFailedSenderKeyTuple(dup, group)     // dedup: consumes NO slot (the property under test)
+	cli.recordFailedSenderKeyTuple(dup, group)    // slot 1
+	cli.recordFailedSenderKeyTuple(dup, group)    // dedup: consumes NO slot (the property under test)
 
 	// Add (size-2) more DISTINCT tuples. Total distinct = canary + dup + (size-2) = size.
 	for i := 0; i < failedSenderKeyTuplesSize-2; i++ {
@@ -238,6 +262,14 @@ func TestConvergeEndToEndKeyPathEmitsConverged(t *testing.T) {
 
 	// Store the sender key for the group.
 	cli.handleSenderKeyDistributionMessage(ctx, chat, sender, skdmBytes)
+	// STEP 1 instrument: the SKDM arrives for a tuple that pass 1 recorded as a total
+	// miss, so handleSenderKeyDistributionMessage must emit exactly one
+	// SKDM_FOR_FAILED_TUPLE line with installed=y carrying the inbound device (=1).
+	// This positively exercises the new instrument on the live receive path.
+	if n := log.infoMatchingAll("SKDM_FOR_FAILED_TUPLE", "installed=y", "device=1"); n != 1 {
+		t.Fatalf("expected exactly one SKDM_FOR_FAILED_TUPLE installed=y device=1 line for the "+
+			"stuck tuple, got %d; the STEP 1 instrument is NOT wired to handleSenderKeyDistributionMessage", n)
+	}
 
 	// Pass 2: same skmsg now decrypts via the KEY path -> CONVERGED.
 	pt, _, err := cli.decryptGroupMsg(ctx, skmsgNode, sender, chat, time.Now())
@@ -258,13 +290,15 @@ func TestConvergeEndToEndKeyPathEmitsConverged(t *testing.T) {
 	// If a future change re-introduced ToNonAD()/:0 normalization on the sender
 	// before this call, every inbound device would collapse to :0 and the set would
 	// degrade to per-(sender,group) -- breaking the per-(sender,device,group) claim.
-	// Asserting device=1 here locks that in.
-	if log.infoContaining("device=1") != 1 {
-		t.Fatalf("CONVERGED line did not carry the inbound device (device=1); "+
-			"the sender device was normalized (e.g. to :0) before decryptGroupSenderKey, "+
+	// Asserting device=1 on the CONVERGED line specifically locks that in (scoped to
+	// the CONVERGED line so the SKDM_FOR_FAILED_TUPLE line, which also carries
+	// device=1, does not inflate the count).
+	if log.infoMatchingAll("SENDER_KEY_CONVERGED", "device=1") != 1 {
+		t.Fatalf("CONVERGED line did not carry the inbound device (device=1); " +
+			"the sender device was normalized (e.g. to :0) before decryptGroupSenderKey, " +
 			"degrading the set to per-(sender,group)")
 	}
-	if log.infoContaining("device=0") != 0 {
+	if log.infoMatchingAll("SENDER_KEY_CONVERGED", "device=0") != 0 {
 		t.Fatal("CONVERGED logged device=0 for a Device=1 inbound; :0 normalization regressed")
 	}
 }

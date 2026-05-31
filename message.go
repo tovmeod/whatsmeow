@@ -800,6 +800,19 @@ func (cli *Client) clearFailedSenderKeyTuple(sender, group string) bool {
 	return true
 }
 
+// isFailedSenderKeyTuple reports whether an inbound (sender,group) tuple is CURRENTLY in the failed
+// set, WITHOUT mutating it. Read-only by design: clearing on SKDM arrival would suppress the later
+// SENDER_KEY_CONVERGED signal (which fires only when the decrypt-success path sees prevFailed=true),
+// so the SKDM-reception instrument must only PROBE, never clear. Guarded by the same lock as
+// record/clear; safe under the concurrent decrypt + receive paths.
+func (cli *Client) isFailedSenderKeyTuple(sender, group string) bool {
+	key := failedSenderKeyTuple{Sender: sender, Group: group}
+	cli.failedSenderKeyTuplesLock.Lock()
+	defer cli.failedSenderKeyTuplesLock.Unlock()
+	_, exists := cli.failedSenderKeyTuples[key]
+	return exists
+}
+
 const checkPadding = true
 
 func isValidPadding(plaintext []byte) bool {
@@ -834,15 +847,33 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
 	// kavtov-fork: Phase 27 — device-qualified store; the message keyID disambiguates devices; device-tolerant lookup (27-01) finds the record regardless of which device the skmsg is labeled with.
 	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
+	// kavtov-fork (STEP 1 instrument): is this arriving SKDM for a tuple that is CURRENTLY stuck (a
+	// prior total decrypt miss recorded by the P2a failed-set)? Keyed IDENTICALLY to the decrypt path
+	// (from.SignalAddress().String() + chat.String(), see decryptGroupSenderKey ~:700/:739). Probe is
+	// read-only; it never clears the tuple (clearing belongs to the convergence success hook). Fires
+	// at most once per arriving SKDM for an already-stuck tuple → low volume, general, no hardcoded
+	// sender. Fills the prod blind spot: successful SKDM receipt is Debug-only (:847), so today an
+	// arriving key for a stuck tuple is invisible. installed=y/n distinguishes "arrived AND processed"
+	// from "arrived but failed to install" (a stuck tuple specifically, not the generic :844 Errorf).
+	wasFailed := cli.isFailedSenderKeyTuple(from.SignalAddress().String(), chat.String())
 	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(axolotlSKDM, pbSerializer.SenderKeyDistributionMessage)
 	if err != nil {
 		cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
+		if wasFailed {
+			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=parse", from.SignalAddressUser(), from.Device, chat.String())
+		}
 		return
 	}
 	err = builder.Process(ctx, senderKeyName, sdkMsg)
 	if err != nil {
 		cli.Log.Errorf("Failed to process sender key distribution message from %s for %s: %v", from, chat, err)
+		if wasFailed {
+			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=process", from.SignalAddressUser(), from.Device, chat.String())
+		}
 		return
+	}
+	if wasFailed {
+		cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=y", from.SignalAddressUser(), from.Device, chat.String())
 	}
 	cli.Log.Debugf("Processed sender key distribution message from %s in %s", senderKeyName.Sender().String(), senderKeyName.GroupID())
 }
