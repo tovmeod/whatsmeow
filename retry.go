@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -125,10 +126,24 @@ func (cli *Client) getMessageForRetry(ctx context.Context, receipt *events.Recei
 	}
 	if cli.UseRetryMessageStore {
 		format, buf, err := cli.Store.EventBuffer.GetOutgoingEvent(ctx, receipt.Chat, altChat, messageID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get message from retry store: %w", err)
+		if err == nil {
+			return parseRecentMessage(format, buf)
 		}
-		return parseRecentMessage(format, buf)
+		// kavtov: own-account (DeviceSentMessage / IsFromMe) retries arrive keyed by our own
+		// account, but the message was stored under its destination chat — so the (chat,id)
+		// lookup above misses. We only ever receive a retry receipt for a message we sent, so
+		// the message is in the store (within retention) under some chat; look it up by id alone.
+		if errors.Is(err, sql.ErrNoRows) && receipt.Chat.User == cli.getOwnID().User {
+			formatByID, bufByID, errByID := cli.Store.EventBuffer.GetOutgoingEventByID(ctx, messageID)
+			if errByID == nil {
+				cli.Log.Infof("Served retry receipt by message-id (self-chat fallback) for %s/%s from %s", receipt.Chat, messageID, receipt.Sender)
+				return parseRecentMessage(formatByID, bufByID)
+			}
+			if !errors.Is(errByID, sql.ErrNoRows) {
+				return nil, fmt.Errorf("failed to get message from retry store by id: %w", errByID)
+			}
+		}
+		return nil, fmt.Errorf("failed to get message from retry store: %w", err)
 	}
 	waMsg := cli.GetMessageForRetry(receipt.Sender, receipt.Chat, messageID)
 	if waMsg != nil {

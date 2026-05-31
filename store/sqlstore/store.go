@@ -1153,6 +1153,12 @@ const (
 	getOutgoingEventQuery = `
 		SELECT format, plaintext FROM whatsmeow_retry_buffer WHERE our_jid=$1 AND (chat_jid=$2 OR chat_jid=$3) AND message_id=$4
 	`
+	// kavtov: look up a stored outgoing message by ID alone (ignoring chat_jid). message_id is
+	// per-message unique, so this is safe. Serves own-account/DeviceSentMessage retries that
+	// arrive keyed by our own account while the message is stored under its destination chat.
+	getOutgoingEventByIDQuery = `
+		SELECT format, plaintext FROM whatsmeow_retry_buffer WHERE our_jid=$1 AND message_id=$2 LIMIT 1
+	`
 	addOutgoingEventQuery = `
 		INSERT INTO whatsmeow_retry_buffer (our_jid, chat_jid, message_id, format, plaintext, timestamp)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -1166,6 +1172,11 @@ const (
 
 func (s *SQLStore) GetOutgoingEvent(ctx context.Context, chatJID, altChatJID types.JID, id types.MessageID) (format string, result []byte, err error) {
 	err = s.db.QueryRow(ctx, getOutgoingEventQuery, s.JID, chatJID, altChatJID, id).Scan(&format, &result)
+	return
+}
+
+func (s *SQLStore) GetOutgoingEventByID(ctx context.Context, id types.MessageID) (format string, result []byte, err error) {
+	err = s.db.QueryRow(ctx, getOutgoingEventByIDQuery, s.JID, id).Scan(&format, &result)
 	return
 }
 

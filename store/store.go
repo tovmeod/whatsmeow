@@ -179,6 +179,10 @@ type EventBuffer interface {
 	DeleteOldBufferedHashes(ctx context.Context) error
 
 	GetOutgoingEvent(ctx context.Context, chatJID, altChatJID types.JID, id types.MessageID) (string, []byte, error)
+	// GetOutgoingEventByID looks up a stored outgoing message by ID alone (ignoring chat). Used
+	// to serve own-account/DeviceSentMessage retries, which arrive keyed by our own account
+	// while the message is stored under its destination chat. See getMessageForRetry.
+	GetOutgoingEventByID(ctx context.Context, id types.MessageID) (string, []byte, error)
 	AddOutgoingEvent(ctx context.Context, chatJID types.JID, id types.MessageID, format string, plaintext []byte) error
 	DeleteOldOutgoingEvents(ctx context.Context) error
 }

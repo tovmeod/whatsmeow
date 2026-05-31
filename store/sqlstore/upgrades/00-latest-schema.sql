@@ -1,4 +1,4 @@
--- v0 -> v14 (compatible with v8+): Latest schema
+-- v0 -> v15 (compatible with v8+): Latest schema
 CREATE TABLE whatsmeow_device (
 	jid TEXT PRIMARY KEY,
 	lid TEXT,
@@ -178,3 +178,4 @@ CREATE TABLE whatsmeow_retry_buffer (
 );
 
 CREATE INDEX whatsmeow_retry_buffer_timestamp_idx ON whatsmeow_retry_buffer (our_jid, timestamp);
+CREATE INDEX whatsmeow_retry_buffer_msgid_idx ON whatsmeow_retry_buffer (our_jid, message_id);

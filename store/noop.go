@@ -305,6 +305,10 @@ func (n *NoopStore) GetOutgoingEvent(ctx context.Context, chatJID, altChatJID ty
 	return "", nil, nil
 }
 
+func (n *NoopStore) GetOutgoingEventByID(ctx context.Context, id types.MessageID) (string, []byte, error) {
+	return "", nil, nil
+}
+
 func (n *NoopStore) AddOutgoingEvent(ctx context.Context, chatJID types.JID, id types.MessageID, format string, plaintext []byte) error {
 	return nil
 }
