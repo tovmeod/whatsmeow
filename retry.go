@@ -553,6 +553,10 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 				"id":    id,
 				"t":     node.Attrs["t"],
 				"v":     1,
+				// error="0" matches Baileys/WA-Web's inner <retry> node (messages-recv.ts);
+				// upstream whatsmeow omits it. Likely a no-op (the sender reads only count),
+				// but the cleanest low-risk content variant the deployed SKDM instrument can measure.
+				"error": "0",
 			}},
 			{Tag: "registration", Content: registrationIDBytes[:]},
 		},
