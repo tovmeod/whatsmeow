@@ -1175,6 +1175,9 @@ func (s *SQLStore) AddOutgoingEvent(ctx context.Context, chatJID types.JID, id t
 }
 
 func (s *SQLStore) DeleteOldOutgoingEvents(ctx context.Context) error {
-	_, err := s.db.Exec(ctx, deleteOldOutgoingEventsQuery, s.JID, time.Now().Add(-7*24*time.Hour).UnixMilli())
+	// kavtov-fork: retry-message store retention shortened 7d -> 48h to bound
+	// whatsmeow_retry_buffer disk growth on a 63-account fleet (prior disk-bloat history).
+	// 48h still covers a driver's phone being offline a couple days then retrying its backlog.
+	_, err := s.db.Exec(ctx, deleteOldOutgoingEventsQuery, s.JID, time.Now().Add(-48*time.Hour).UnixMilli())
 	return err
 }
