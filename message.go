@@ -15,9 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -738,28 +740,12 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	// kavtov-fork: cross-account recovery diagnostic. Logs the keyID + iteration THIS message needs
 	// ("need_*") and what we currently HOLD per candidate device of this sender ("have"), so a
 	// recovery sweep can pick a source account whose key matches keyid and is within 2000 iterations
-	// behind need_iter. Deserialization runs only when we hold candidate devices for the sender.
-	have := "none"
-	if len(devices) > 0 {
-		parts := make([]string, 0, len(devices))
-		for _, sid := range devices {
-			kb, kerr := cli.Store.SenderKeys.GetSenderKey(ctx, chat.String(), sid)
-			if kerr != nil || len(kb) == 0 {
-				continue
-			}
-			rec, rerr := record.NewSenderKeyFromBytes(kb, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
-			if rerr != nil {
-				continue
-			}
-			if st, serr := rec.GetSenderKeyStateByID(msg.KeyID()); serr == nil {
-				parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d,match)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
-			} else if st, serr := rec.SenderKeyState(); serr == nil {
-				parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
-			}
-		}
-		if len(parts) > 0 {
-			have = strings.Join(parts, ",")
-		}
+	// behind need_iter. The need_* fields are cheap (read straight off the message); the have= block
+	// costs one GetSenderKey + record deserialize per candidate device, so it is computed only on a
+	// 1-in-N sampled fraction of misses (senderKeyMissShouldSample, perf 260601-uuy).
+	have := "sampled-out"
+	if senderKeyMissShouldSample() {
+		have = extractSenderKeyHave(ctx, cli.Store.SenderKeys, chat.String(), devices, msg.KeyID())
 	}
 	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d have=[%s]",
 		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration(), have)
@@ -767,6 +753,78 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	// later KEY-path decrypt success for the same tuple is recognizable as convergence.
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
 	return nil, signalerror.ErrNoSenderKeyForUser
+}
+
+// extractSenderKeyHave formats the diagnostic "have=" string for a
+// SENDERKEY_MISS event. It calls GetSenderKey per candidate device and
+// deserializes the stored sender-key record to read the current keyID and chain
+// iteration. This is intentionally expensive (one DB read + deserialize per
+// candidate) and MUST NOT run on every failure — call via
+// senderKeyMissShouldSample() (perf 260601-uuy). Returns "none" when there are
+// no candidate devices or none yield a readable record.
+func extractSenderKeyHave(ctx context.Context, senderKeyStore store.SenderKeyStore, chat string, devices []string, targetKeyID uint32) string {
+	if len(devices) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(devices))
+	for _, sid := range devices {
+		kb, kerr := senderKeyStore.GetSenderKey(ctx, chat, sid)
+		if kerr != nil || len(kb) == 0 {
+			continue
+		}
+		rec, rerr := record.NewSenderKeyFromBytes(kb, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
+		if rerr != nil {
+			continue
+		}
+		if st, serr := rec.GetSenderKeyStateByID(targetKeyID); serr == nil {
+			parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d,match)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
+		} else if st, serr := rec.SenderKeyState(); serr == nil {
+			parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
+// senderKeyMissHaveDefaultRate is the default 1-in-N sampling for the have=
+// diagnostic. At 1-in-100, peak SENDERKEY_MISS volume (a few thousand/min at
+// peak) pays the deserialization cost ~tens of times per minute instead of
+// every time.
+const senderKeyMissHaveDefaultRate = 100
+
+// senderKeyMissHaveRate is the resolved sample rate (read once at init):
+//
+//	0 = disabled entirely (no GetSenderKey calls in the miss diagnostic)
+//	N = 1-in-N misses compute the have= block
+//
+// Configured via env KAVTOV_SENDERKEY_MISS_HAVE. Declared as a var (not const)
+// so internal tests can override it (save/restore around the test).
+var senderKeyMissHaveRate = func() int {
+	s := os.Getenv("KAVTOV_SENDERKEY_MISS_HAVE")
+	if s == "0" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil && n > 0 {
+		return n
+	}
+	return senderKeyMissHaveDefaultRate
+}()
+
+// senderKeyMissCounter is the process-wide miss counter driving the sampler.
+var senderKeyMissCounter atomic.Uint64
+
+// senderKeyMissShouldSample returns true on 1-in-senderKeyMissHaveRate calls.
+// Always false when senderKeyMissHaveRate == 0 (and never touches the counter
+// in that case, so the disabled path is allocation- and contention-free).
+func senderKeyMissShouldSample() bool {
+	rate := senderKeyMissHaveRate
+	if rate == 0 {
+		return false
+	}
+	n := senderKeyMissCounter.Add(1)
+	return n%uint64(rate) == 0
 }
 
 // kavtov-fork (P2a): bounded recently-failed group sender-key tuple set. See client.go field doc.
