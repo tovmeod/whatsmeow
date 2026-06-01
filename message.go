@@ -22,6 +22,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/libsignal/groups"
+	"go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/protocol"
 	"go.mau.fi/libsignal/session"
 	"go.mau.fi/libsignal/signalerror"
@@ -734,6 +735,34 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 		}
 		cli.Log.Debugf("Group sender-key candidate %q did not decrypt: %v", sid, decErr)
 	}
+	// kavtov-fork: cross-account recovery diagnostic. Logs the keyID + iteration THIS message needs
+	// ("need_*") and what we currently HOLD per candidate device of this sender ("have"), so a
+	// recovery sweep can pick a source account whose key matches keyid and is within 2000 iterations
+	// behind need_iter. Deserialization runs only when we hold candidate devices for the sender.
+	have := "none"
+	if len(devices) > 0 {
+		parts := make([]string, 0, len(devices))
+		for _, sid := range devices {
+			kb, kerr := cli.Store.SenderKeys.GetSenderKey(ctx, chat.String(), sid)
+			if kerr != nil || len(kb) == 0 {
+				continue
+			}
+			rec, rerr := record.NewSenderKeyFromBytes(kb, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
+			if rerr != nil {
+				continue
+			}
+			if st, serr := rec.GetSenderKeyStateByID(msg.KeyID()); serr == nil {
+				parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d,match)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
+			} else if st, serr := rec.SenderKeyState(); serr == nil {
+				parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
+			}
+		}
+		if len(parts) > 0 {
+			have = strings.Join(parts, ",")
+		}
+	}
+	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d have=[%s]",
+		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration(), have)
 	// kavtov-fork (P2a): total miss for this inbound (sender,device,group) tuple. Record it so a
 	// later KEY-path decrypt success for the same tuple is recognizable as convergence.
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
