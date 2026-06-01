@@ -17,6 +17,8 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,18 +31,59 @@ import (
 	"go.mau.fi/whatsmeow/util/walltime"
 )
 
-// Shared LRU capacities for the three signal-store caches. 100k entries each
-// puts the total memory budget at ~300 MB under mean value sizes — still
-// under the workspace's 500 MB cache budget; re-validate post-deploy per
-// ROADMAP Phase 17.5.1 caution #1. Tune here if the cardinality profile
-// drifts.
-const (
-	signalSessionCacheCap   = 100_000
-	signalIdentityCacheCap  = 100_000
-	signalSenderKeyCacheCap = 100_000
+// envCapOrDefault reads an integer LRU capacity from the named env var. A blank,
+// non-integer, or non-positive value falls back to the compiled default. Lets
+// the operator reduce (or raise) caps without a fork rebuild — clamps malicious
+// values to the safe default by construction.
+func envCapOrDefault(key string, fallback int) int {
+	s := os.Getenv(key)
+	if s == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+// Shared LRU capacities for the signal-store caches. Resolved once at package
+// init from env vars (KAVTOV_CACHE_*_CAP) with the compiled defaults below.
+// The original const names are kept as vars so wireSignalCaches /
+// formatCacheMetrics references stay identical.
+//
+// Memory budget at proposed cap defaults (box: 16 GB, PG shared_buffers=4 GB,
+// RSS base~1 GB). Blob sizes measured via ~1-2% TABLESAMPLE on prod (avg / p95
+// / max):
+//
+//	sender_key: avg=720 B, p95=1301 B, max=282966 B (rare fat tail)
+//	session:    avg=2620 B, p95=5185 B, max=653645 B (rare fat tail)
+//	message_secret key: 32 B fixed; ~150 B map/LRU overhead per entry
+//
+//	Cache            | Value size (avg) | Cap       | Budget at avg size
+//	-----------------|------------------|-----------|--------------------
+//	SenderKey blobs  | 720 B avg        | 1,500,000 | ~1,080 MB + ~200 MB overhead = ~1,280 MB
+//	Sessions         | 2620 B avg       |   250,000 |   ~655 MB + ~100 MB overhead =   ~755 MB
+//	MsgSecret pairs  | ~182 B (32+150)  |   500,000 |    ~91 MB
+//	SKDevices ([]str)| ~200 B           |   500,000 |   ~100 MB
+//	Identities       | 32 B             |   250,000 |     ~8 MB + ~50 MB overhead  =    ~58 MB
+//	Total at avg                                    | ~2,284 MB (~2.3 GB)
+//
+//	Fat-tail blobs (p95) are already factored into the avg-based budget via their rarity.
+//	Target RSS sum of caches: ~2.5 GB. OOMKill ceiling: 6 GB (matches systemd MemoryMax).
+//	Headroom: 6 GB - 1 GB base - 2.5 GB caches - 4 GB PG shared_buffers = well within box.
+//	Sessions cap is headroom: peak today showed len=88726, capacity_evictions=0
+//	(not yet saturated). Sender_keys IS saturated (len=100000, 512705 evictions).
+//	Override env vars to reduce caps without a fork rebuild.
+var (
+	signalSessionCacheCap   = envCapOrDefault("KAVTOV_CACHE_SESSION_CAP", 250_000)
+	signalIdentityCacheCap  = envCapOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 250_000)
+	signalSenderKeyCacheCap = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 1_500_000)
 	// kavtov-fork: Phase 27 — device-set index (one small []string per
-	// jid|group|userBare). Same cap as the record cache; values are tiny.
-	signalSenderKeyDevicesCacheCap = 100_000
+	// jid|group|userBare).
+	signalSenderKeyDevicesCacheCap = envCapOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 500_000)
+	// perf 260601-uuy: message-secret pair cache (secret + realSender).
+	signalMsgSecretCacheCap = envCapOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 500_000)
 )
 
 // ---------------------------------------------------------------------------
@@ -301,6 +344,11 @@ type signalCaches struct {
 	// queries warm) instead of the DB passthrough; invalidated by PutSenderKey
 	// when a sender's device set may have changed (a new SKDM).
 	SenderKeyDevices *lru.Cache[string, []string]
+	// perf 260601-uuy: message-secret pair cache. Keyed
+	// jid|chat.ToNonAD()|sender.ToNonAD()|message_id → (secret, realSender).
+	// Avoids a PG read + JSON-less Scan on the 22 GB whatsmeow_message_secrets
+	// table for repeat decrypts of the same message tuple.
+	MsgSecret *lru.Cache[string, msgSecretEntry]
 
 	// kavtov-fork: Phase 17.5.2 - split eviction counter into capacity-overflow
 	// ("Capacity*", incremented by lru.NewWithEvict callback) vs explicit
@@ -310,6 +358,12 @@ type signalCaches struct {
 	// identities) from actual cap pressure (high capacity_evictions on any cache).
 	SessionCapacityEvictions, IdentityCapacityEvictions, SenderKeyCapacityEvictions uint64
 	SessionExplicitRemoves, IdentityExplicitRemoves, SenderKeyExplicitRemoves       uint64
+
+	// perf 260601-uuy: message-secret cache counters. ExplicitRemoves is
+	// unused (MsgSecretStore has no Delete method) but kept for counter
+	// uniformity with the other caches and the formatCacheMetrics block.
+	MsgSecretCapacityEvictions uint64
+	MsgSecretExplicitRemoves   uint64
 
 	// Phase 24 D-02: process-shared secondary indexes for Sessions and
 	// Identities. Pointer-typed fields; initialized by wireSignalCaches BEFORE
@@ -386,6 +440,17 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 		log.Errorf("Failed to construct SenderKeyDevicesCache (cap=%d): %v", signalSenderKeyDevicesCacheCap, err)
 		panic(err)
 	}
+	// perf 260601-uuy: message-secret pair cache. Same closure-capture
+	// invariant as the counters above — the eviction callback closes over
+	// &c.caches.MsgSecretCapacityEvictions (the heap field on the already-
+	// allocated Container).
+	c.caches.MsgSecret, err = lru.NewWithEvict[string, msgSecretEntry](signalMsgSecretCacheCap, func(string, msgSecretEntry) {
+		atomic.AddUint64(&c.caches.MsgSecretCapacityEvictions, 1)
+	})
+	if err != nil {
+		log.Errorf("Failed to construct MsgSecretCache (cap=%d): %v", signalMsgSecretCacheCap, err)
+		panic(err)
+	}
 
 	// Phase 17.5.1 WR-01: cancelled by Container.Close (via
 	// closeSignalCaches) so emitMetricsLoop exits before logger/db
@@ -412,6 +477,8 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
 	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity, &c.caches.IdentityExplicitRemoves, c.caches.IdentityIndex)
 	device.SenderKeys = NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices)
+	// perf 260601-uuy: message-secret pair cache.
+	device.MsgSecrets = NewCachedMessageSecretStore(innerStore, jid, c.caches.MsgSecret, &c.caches.MsgSecretExplicitRemoves)
 }
 
 // closeSignalCaches cancels the metrics-loop ctx so emitMetricsLoop exits
@@ -486,11 +553,26 @@ func formatCacheMetrics(c *Container) string {
 		atomic.LoadUint64(&c.caches.SenderKeyCapacityEvictions),
 		atomic.LoadUint64(&c.caches.SenderKeyExplicitRemoves),
 	)
+	// perf 260601-uuy: message_secrets block. Nil-guarded so a test Container
+	// built without MsgSecret (or any partially-constructed Container) formats
+	// a "not_wired" sentinel instead of panicking on a nil Len() call.
+	msgSecBlock := "message_secrets={not_wired}"
+	if c.caches.MsgSecret != nil {
+		msgSecEvic, msgSecCap, msgSecExp := cleanCounters(
+			atomic.LoadUint64(&c.caches.MsgSecretCapacityEvictions),
+			atomic.LoadUint64(&c.caches.MsgSecretExplicitRemoves),
+		)
+		msgSecBlock = fmt.Sprintf(
+			"message_secrets={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d}",
+			c.caches.MsgSecret.Len(), signalMsgSecretCacheCap, msgSecEvic, msgSecCap, msgSecExp,
+		)
+	}
 	return fmt.Sprintf(
-		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
+		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
 		c.caches.Session.Len(), signalSessionCacheCap, sessEvic, sessCap, sessExp,
 		c.caches.Identity.Len(), signalIdentityCacheCap, idntEvic, idntCap, idntExp,
 		c.caches.SenderKey.Len(), signalSenderKeyCacheCap, sndkEvic, sndkCap, sndkExp,
+		msgSecBlock,
 		walltime.DecryptHistogram.Quantile(0.5),
 		walltime.DecryptHistogram.Quantile(0.95),
 		walltime.DecryptHistogram.Quantile(0.99),

@@ -150,18 +150,25 @@ func TestCacheMetricsLogFormat_ExtendedFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lru.New senderkey: %v", err)
 	}
+	msgSecCache, err := lru.New[string, msgSecretEntry](10)
+	if err != nil {
+		t.Fatalf("lru.New msgsecret: %v", err)
+	}
 
 	c := &Container{
 		caches: signalCaches{
 			Session:   sessCache,
 			Identity:  idntCache,
 			SenderKey: sndkCache,
+			MsgSecret: msgSecCache,
 		},
 	}
 
 	// Set IdentityCapacityEvictions=10, IdentityExplicitRemoves=3.
 	atomic.StoreUint64(&c.caches.IdentityCapacityEvictions, 10)
 	atomic.StoreUint64(&c.caches.IdentityExplicitRemoves, 3)
+	// perf 260601-uuy: MsgSecretCapacityEvictions=5, no explicit removes.
+	atomic.StoreUint64(&c.caches.MsgSecretCapacityEvictions, 5)
 
 	msg := formatCacheMetrics(c)
 
@@ -183,11 +190,24 @@ func TestCacheMetricsLogFormat_ExtendedFields(t *testing.T) {
 		t.Errorf("expected identity block %q in msg: %s", idntBlock, msg)
 	}
 	// Sanity: sessions and sender_keys both show evictions=0, capacity_evictions=0, explicit_removes=0.
-	if !strings.Contains(msg, "sessions={len=0, cap=100000, evictions=0, capacity_evictions=0, explicit_removes=0}") {
-		t.Errorf("expected zeroed session block in: %s", msg)
+	// Caps are env-resolved vars now (perf 260601-uuy), not hardcoded 100000 literals.
+	sessBlock := fmt.Sprintf("sessions={len=0, cap=%d, evictions=0, capacity_evictions=0, explicit_removes=0}", signalSessionCacheCap)
+	if !strings.Contains(msg, sessBlock) {
+		t.Errorf("expected zeroed session block %q in: %s", sessBlock, msg)
 	}
-	if !strings.Contains(msg, "sender_keys={len=0, cap=100000, evictions=0, capacity_evictions=0, explicit_removes=0}") {
-		t.Errorf("expected zeroed sender_keys block in: %s", msg)
+	sndkBlock := fmt.Sprintf("sender_keys={len=0, cap=%d, evictions=0, capacity_evictions=0, explicit_removes=0}", signalSenderKeyCacheCap)
+	if !strings.Contains(msg, sndkBlock) {
+		t.Errorf("expected zeroed sender_keys block %q in: %s", sndkBlock, msg)
+	}
+	// perf 260601-uuy: message_secrets block. Cap-only evictions:
+	// cleanCounters(5, 0) = (evictions=5, capClean=5, explicit=0).
+	if !strings.Contains(msg, "message_secrets={len=") {
+		t.Errorf("expected 'message_secrets={len=' in: %s", msg)
+	}
+	msgSecBlock := fmt.Sprintf("message_secrets={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d}",
+		0, signalMsgSecretCacheCap, 5, 5, 0)
+	if !strings.Contains(msg, msgSecBlock) {
+		t.Errorf("expected message_secrets block %q in: %s", msgSecBlock, msg)
 	}
 }
 
