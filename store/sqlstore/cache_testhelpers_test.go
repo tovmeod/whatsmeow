@@ -54,9 +54,9 @@ type fakeSessionStore struct {
 	// map — letting wrapper tests assert that a failed inner call leaves
 	// the cache untouched. Setters are not synchronized; tests should set
 	// these fields before exercising the wrapper.
-	putErr      error
-	putManyErr  error
-	migrateErr  error
+	putErr     error
+	putManyErr error
+	migrateErr error
 }
 
 // lastGetManyBatch returns a copy of the addresses passed to the most recent
@@ -338,6 +338,66 @@ func (f *fakeSenderKeyStore) GetSenderKeyDevices(_ context.Context, group, userB
 }
 
 // ---------------------------------------------------------------------------
+// fakeMessageSecretStore implements store.MsgSecretStore (store/store.go:143).
+// ---------------------------------------------------------------------------
+
+type fakeMessageSecretStore struct {
+	mu      sync.Mutex
+	secrets map[string]msgSecretEntry // key: chat|sender|id (all ToNonAD)
+
+	getCalls  atomic.Int64
+	putCalls  atomic.Int64
+	bulkCalls atomic.Int64
+}
+
+func newFakeMessageSecretStore() *fakeMessageSecretStore {
+	return &fakeMessageSecretStore{
+		secrets: make(map[string]msgSecretEntry),
+	}
+}
+
+func (f *fakeMessageSecretStore) fakeKey(chat, sender types.JID, id types.MessageID) string {
+	return chat.ToNonAD().String() + "|" + sender.ToNonAD().String() + "|" + string(id)
+}
+
+// GetMessageSecret mirrors SQLStore.GetMessageSecret: an unknown key collapses
+// to (nil, types.EmptyJID, nil) — the same sentinel ErrNoRows produces.
+func (f *fakeMessageSecretStore) GetMessageSecret(_ context.Context, chat, sender types.JID, id types.MessageID) ([]byte, types.JID, error) {
+	f.getCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	entry, ok := f.secrets[f.fakeKey(chat, sender, id)]
+	if !ok {
+		return nil, types.EmptyJID, nil
+	}
+	out := make([]byte, len(entry.Secret))
+	copy(out, entry.Secret)
+	return out, entry.RealSender, nil
+}
+
+func (f *fakeMessageSecretStore) PutMessageSecret(_ context.Context, chat, sender types.JID, id types.MessageID, secret []byte) error {
+	f.putCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	stored := make([]byte, len(secret))
+	copy(stored, secret)
+	f.secrets[f.fakeKey(chat, sender, id)] = msgSecretEntry{Secret: stored, RealSender: sender.ToNonAD()}
+	return nil
+}
+
+func (f *fakeMessageSecretStore) PutMessageSecrets(_ context.Context, inserts []store.MessageSecretInsert) error {
+	f.bulkCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, insert := range inserts {
+		stored := make([]byte, len(insert.Secret))
+		copy(stored, insert.Secret)
+		f.secrets[f.fakeKey(insert.Chat, insert.Sender, insert.ID)] = msgSecretEntry{Secret: stored, RealSender: insert.Sender.ToNonAD()}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // Interface-conformance assertions: any drift in the Store interfaces
 // surfaces as a compile error here, not at runtime. Avoids the need for
 // reflection-based conformance probing (forbidden per CLAUDE.md
@@ -347,3 +407,4 @@ func (f *fakeSenderKeyStore) GetSenderKeyDevices(_ context.Context, group, userB
 var _ store.SessionStore = (*fakeSessionStore)(nil)
 var _ store.IdentityStore = (*fakeIdentityStore)(nil)
 var _ store.SenderKeyStore = (*fakeSenderKeyStore)(nil)
+var _ store.MsgSecretStore = (*fakeMessageSecretStore)(nil)
