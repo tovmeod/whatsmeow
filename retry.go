@@ -545,7 +545,12 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 		return
 	}
 	if retryCount == 1 {
-		if cli.SynchronousAck {
+		// forceIncludeIdentity marks the "can't decrypt, must re-fetch" failures (dominated by
+		// group no-sender-key, where the key is permanently lost). For those the message never
+		// arrives on its own, so the RequestFromPhoneDelay (5s) is pure latency before the phone
+		// request fires anyway — fetch immediately to cut ride-alert latency. Same request count,
+		// just sooner. Transient cases (negligible volume) also fetch immediately, which is fine.
+		if cli.SynchronousAck || forceIncludeIdentity {
 			cli.immediateRequestMessageFromPhone(ctx, info)
 		} else {
 			go cli.delayedRequestMessageFromPhone(info)
