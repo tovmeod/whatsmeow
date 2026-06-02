@@ -25,6 +25,8 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
+	librecord "go.mau.fi/libsignal/state/record"
 
 	"go.mau.fi/whatsmeow/store"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -84,6 +86,11 @@ var (
 	signalSenderKeyDevicesCacheCap = envCapOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 500_000)
 	// perf 260601-uuy: message-secret pair cache (secret + realSender).
 	signalMsgSecretCacheCap = envCapOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 500_000)
+	// Phase 17.8: decoded struct-LRU caches. Sized to match the []byte LRU caps
+	// so evictions occur at the same working-set boundary (eviction of a parsed
+	// entry is silent — next Load re-populates from the []byte LRU).
+	signalSKParsedCacheCap   = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
+	signalSessParsedCacheCap = envCapOrDefault("KAVTOV_CACHE_SESSION_DECODED_CAP", 250_000)
 )
 
 // ---------------------------------------------------------------------------
@@ -344,6 +351,15 @@ type signalCaches struct {
 	// queries warm) instead of the DB passthrough; invalidated by PutSenderKey
 	// when a sender's device set may have changed (a new SKDM).
 	SenderKeyDevices *lru.Cache[string, []string]
+	// Phase 17.8: decoded struct-LRU caches. Store *Structure pointers so
+	// LoadSenderKey / LoadSession hits call NewSenderKeyFromStruct /
+	// NewSessionFromStructure instead of JSON Deserialize + graph-rebuild.
+	// Keyed with the same jid-prefix as the []byte LRU (device scoping on
+	// the shared process-level LRU). Eviction is a silent no-op — next Load
+	// re-populates from the []byte LRU.
+	SKParsed      *lru.Cache[string, *groupRecord.SenderKeyStructure]
+	SessionParsed *lru.Cache[string, *librecord.SessionStructure]
+
 	// perf 260601-uuy: message-secret pair cache. Keyed
 	// jid|chat.ToNonAD()|sender.ToNonAD()|message_id → (secret, realSender).
 	// Avoids a PG read + JSON-less Scan on the 22 GB whatsmeow_message_secrets
@@ -499,6 +515,19 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 		panic(err)
 	}
 
+	// Phase 17.8: decoded struct-LRU caches. lru.New (no eviction callback) —
+	// struct LRU eviction is a silent no-op; no flusher interaction needed.
+	c.caches.SKParsed, err = lru.New[string, *groupRecord.SenderKeyStructure](signalSKParsedCacheCap)
+	if err != nil {
+		log.Errorf("Failed to construct SKParsedCache (cap=%d): %v", signalSKParsedCacheCap, err)
+		panic(err)
+	}
+	c.caches.SessionParsed, err = lru.New[string, *librecord.SessionStructure](signalSessParsedCacheCap)
+	if err != nil {
+		log.Errorf("Failed to construct SessionParsedCache (cap=%d): %v", signalSessParsedCacheCap, err)
+		panic(err)
+	}
+
 	// Phase 17.5.1 WR-01: cancelled by Container.Close (via
 	// closeSignalCaches) so emitMetricsLoop exits before logger/db
 	// teardown.
@@ -536,6 +565,19 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	c.caches.senderKeyFlusherMap[jid] = flusher
 	c.caches.senderKeyFlushersMu.Unlock()
 	device.SenderKeys = senderKeyStore
+
+	// Phase 17.8: wire decoded struct-LRU caches to the device. Both parsed
+	// caches use the same shared LRU (constructed in wireSignalCaches) but are
+	// accessed via thin wrappers that enforce the Store-time mutex discipline.
+	device.ParsedSKCache = store.NewParsedSKCache(c.caches.SKParsed)
+	device.ParsedSessionCache = store.NewParsedSessionCache(c.caches.SessionParsed)
+
+	// Inject the wasFailed invalidation callback into the senderKeyStore so
+	// that PutSenderKeyWithMeta(wasFailed=true) recovery paths invalidate the
+	// struct cache (Pitfall 4 guard, T-17.8-05 mitigation).
+	senderKeyStore.SetParsedInvalidate(func(key string) {
+		device.ParsedSKCache.Invalidate(key)
+	})
 
 	// perf 260601-uuy: message-secret pair cache.
 	device.MsgSecrets = NewCachedMessageSecretStore(innerStore, jid, c.caches.MsgSecret, &c.caches.MsgSecretExplicitRemoves)

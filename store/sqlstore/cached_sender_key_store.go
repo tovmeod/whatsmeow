@@ -47,6 +47,11 @@ type CachedSenderKeyStore struct {
 	// (will fall back to write-through when nil, preserving backward compat).
 	flusher *SenderKeyFlusher
 
+	// Phase 17.8: optional callback to invalidate the decoded struct cache on
+	// wasFailed=true recovery writes (Pitfall 4 / T-17.8-05 mitigation). Nil
+	// when no struct cache is wired (test scenarios, pre-attachCachedStores).
+	parsedInvalidate func(key string)
+
 	hits, misses uint64
 }
 
@@ -69,6 +74,14 @@ func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.
 // PutSenderKey calls in production.
 func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 	c.flusher = f
+}
+
+// SetParsedInvalidate attaches the Phase 17.8 struct-cache invalidation callback.
+// Called by attachCachedStores after the parsed LRU is wired to the device.
+// The callback fires when wasFailed=true (failed-tuple recovery) to ensure
+// the next LoadSenderKey re-parses the recovered []byte (Pitfall 4 guard).
+func (c *CachedSenderKeyStore) SetParsedInvalidate(fn func(key string)) {
+	c.parsedInvalidate = fn
 }
 
 func (c *CachedSenderKeyStore) key(group, user string) string {
@@ -207,6 +220,15 @@ func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, 
 
 	// Enqueue dirty entry (SKDM dedup logic lives in flusher.Enqueue).
 	c.flusher.Enqueue(group, user, session, keyID, iter, wasFailed)
+
+	// Phase 17.8: on a failed-tuple recovery write, invalidate the decoded
+	// struct cache so the next LoadSenderKey re-parses the recovered []byte
+	// instead of serving the pre-recovery struct (Pitfall 4 / T-17.8-05).
+	// Normal (wasFailed=false) stores do NOT invalidate here — the struct cache
+	// is already replaced by signal.go's StoreSenderKey via StoreStruct (Pitfall 2).
+	if wasFailed && c.parsedInvalidate != nil {
+		c.parsedInvalidate(c.key(group, user))
+	}
 
 	// Update device-set index (Phase 27 logic unchanged).
 	c.updateDeviceCache(group, user)
