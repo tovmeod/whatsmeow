@@ -458,6 +458,63 @@ func (s *SQLStore) PutSenderKey(ctx context.Context, group, user string, session
 	return err
 }
 
+// SenderKeyRow is one (group, user, blob) triple to upsert via
+// PutManySenderKeys. Group and User are whatsmeow JID strings drawn from the
+// in-process cache key (not external input); Session is the serialized sender
+// key record.
+type SenderKeyRow struct {
+	Group   string
+	User    string
+	Session []byte
+}
+
+// senderKeyBatchChunkSize bounds how many rows go into one multi-row INSERT.
+// 100 rows × 4 params = 400 bind params per statement, far below Postgres'
+// 65535 limit (T-17.7-02-02). Tunable later from the flusher (plan 03) based
+// on telemetry.
+const senderKeyBatchChunkSize = 100
+
+// PutManySenderKeys upserts a batch of sender keys using true multi-row
+// INSERT ... VALUES (...),(...) ON CONFLICT DO UPDATE statements. It amortizes
+// N dirty-cache entries into ceil(N/senderKeyBatchChunkSize) SQL statements
+// instead of N per-row PutSenderKey calls — the write-volume reduction
+// mechanism for the write-back flusher's batched drain (plan 03).
+//
+// The ON CONFLICT clause is identical to putSenderKeyQuery, so TOAST/fillfactor
+// behavior is unchanged (same table, same storage params, same conflict action;
+// T-17.7-02-01). Each chunk is executed on its own via s.db.Exec — no enclosing
+// transaction; a chunk is atomic by virtue of being a single statement. The
+// first error stops processing and is returned.
+//
+// An empty or nil slice is a no-op that issues no SQL.
+func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error {
+	for start := 0; start < len(keys); start += senderKeyBatchChunkSize {
+		end := start + senderKeyBatchChunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunk := keys[start:end]
+
+		var qb strings.Builder
+		qb.WriteString("INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key) VALUES ")
+		args := make([]any, 0, len(chunk)*4)
+		for i, row := range chunk {
+			if i > 0 {
+				qb.WriteByte(',')
+			}
+			n := i * 4
+			fmt.Fprintf(&qb, "($%d,$%d,$%d,$%d)", n+1, n+2, n+3, n+4)
+			args = append(args, s.JID, row.Group, row.User, row.Session)
+		}
+		qb.WriteString(" ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key")
+
+		if _, err := s.db.Exec(ctx, qb.String(), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []byte, err error) {
 	err = s.db.QueryRow(ctx, getSenderKeyQuery, s.JID, group, user).Scan(&key)
 	if errors.Is(err, sql.ErrNoRows) {
