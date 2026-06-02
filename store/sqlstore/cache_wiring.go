@@ -372,6 +372,15 @@ type signalCaches struct {
 	SessionIndex  *sessionSecondaryIndex
 	IdentityIndex *identitySecondaryIndex
 
+	// Phase 17.7-03: per-device write-back flushers for sender_keys. One flusher
+	// per device is created in attachCachedStores and keyed by JID string here.
+	// The LRU eviction callback looks up the flusher by JID (parsed from the
+	// cache key) to re-enqueue dirty entries before LRU drops them.
+	// Stopped (with synchronous drain) by closeSignalCaches.
+	// senderKeyFlushersMu guards concurrent reads/writes.
+	senderKeyFlushersMu sync.RWMutex
+	senderKeyFlusherMap map[string]*SenderKeyFlusher // key: JID string
+
 	// Phase 17.5.1 WR-01: cancellable ctx for emitMetricsLoop. Cancelled
 	// by Container.Close() (via closeSignalCaches) so the metrics
 	// goroutine cleanly exits and does not race with logger teardown
@@ -406,6 +415,9 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 	// documented above (§77-87).
 	c.caches.SessionIndex = newSessionSecondaryIndex()
 	c.caches.IdentityIndex = newIdentitySecondaryIndex()
+	// Phase 17.7-03: initialize the JID→flusher map before constructing the
+	// SenderKey LRU so the eviction callback can safely read from it.
+	c.caches.senderKeyFlusherMap = make(map[string]*SenderKeyFlusher)
 
 	c.caches.Session, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(key string, _ []byte) {
 		atomic.AddUint64(&c.caches.SessionCapacityEvictions, 1)
@@ -427,13 +439,48 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 		log.Errorf("Failed to construct IdentityCache (cap=%d): %v", signalIdentityCacheCap, err)
 		panic(err)
 	}
-	// SenderKey callback UNCHANGED — sender_keys cache is explicitly out of
-	// scope for the secondary-index feature (SPEC Boundaries).
-	c.caches.SenderKey, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(string, []byte) { atomic.AddUint64(&c.caches.SenderKeyCapacityEvictions, 1) })
+	// Phase 17.7-03: SenderKey eviction callback re-enqueues dirty entries to
+	// the flusher before the LRU drops them — ensuring no dirty entry is
+	// silently lost on eviction (T-17.7-03-05 mitigation).
+	//
+	// Lock ordering: the LRU callback is called while the LRU's internal lock
+	// is held. The callback must NOT call PutSenderKey synchronously (which
+	// would acquire the LRU lock again → deadlock). It calls flusher.Enqueue
+	// directly, which only acquires f.mu (not the LRU lock).
+	//
+	// The flusher pointer is captured by the closure via &c.caches — the same
+	// heap-address capture pattern used for the counter fields above.
+	c.caches.SenderKey, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(cacheKey string, value []byte) {
+		atomic.AddUint64(&c.caches.SenderKeyCapacityEvictions, 1)
+		// Phase 17.7-03: re-enqueue the evicted value to the per-device flusher
+		// so it is not lost on LRU capacity eviction (T-17.7-03-05 mitigation).
+		//
+		// The callback MUST NOT call PutSenderKey (no DB round-trip in evict
+		// callback — design §6 Pitfall 2). It calls flusher.Enqueue directly,
+		// which only acquires f.mu (not the LRU lock).
+		//
+		// Cache key format: "<our_jid>|<chat_id>|<sender_id>"
+		if jid, after, ok := strings.Cut(cacheKey, "|"); ok {
+			if group, user, ok2 := strings.Cut(after, "|"); ok2 {
+				c.caches.senderKeyFlushersMu.RLock()
+				f := c.caches.senderKeyFlusherMap[jid]
+				c.caches.senderKeyFlushersMu.RUnlock()
+				if f != nil {
+					iter := extractIteration(value)
+					// wasFailed=false: eviction is not a failed-tuple recovery.
+					f.Enqueue(group, user, value, iter, false)
+				}
+			}
+		}
+	})
 	if err != nil {
 		log.Errorf("Failed to construct SenderKeyCache (cap=%d): %v", signalSenderKeyCacheCap, err)
 		panic(err)
 	}
+
+	// Phase 17.7-03: per-device SenderKeyFlushers are constructed in
+	// attachCachedStores (one per SQLStore, so each flusher has the correct JID)
+	// and tracked in c.caches.senderKeyFlushers.
 	// kavtov-fork: Phase 27 — device-set index cache (see signalCaches.SenderKeyDevices).
 	c.caches.SenderKeyDevices, err = lru.New[string, []string](signalSenderKeyDevicesCacheCap)
 	if err != nil {
@@ -476,18 +523,41 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	jid := device.ID.String()
 	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
 	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity, &c.caches.IdentityExplicitRemoves, c.caches.IdentityIndex)
-	device.SenderKeys = NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices)
+
+	// Phase 17.7-03: create a per-device write-back flusher. Each flusher holds
+	// a reference to the device's SQLStore (which carries the device JID for
+	// PutManySenderKeys). The flusher is started here and registered with the
+	// Container so closeSignalCaches can Stop() it before the DB closes.
+	senderKeyStore := NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices)
+	flusher := NewSenderKeyFlusher(innerStore, c.log, 0)
+	senderKeyStore.SetFlusher(flusher)
+	flusher.Start()
+	c.caches.senderKeyFlushersMu.Lock()
+	c.caches.senderKeyFlusherMap[jid] = flusher
+	c.caches.senderKeyFlushersMu.Unlock()
+	device.SenderKeys = senderKeyStore
+
 	// perf 260601-uuy: message-secret pair cache.
 	device.MsgSecrets = NewCachedMessageSecretStore(innerStore, jid, c.caches.MsgSecret, &c.caches.MsgSecretExplicitRemoves)
 }
 
 // closeSignalCaches cancels the metrics-loop ctx so emitMetricsLoop exits
-// before db/logger teardown. Nil-guarded so Close stays safe on a
-// partially-constructed Container (test struct literals that never went
-// through wireSignalCaches).
+// before db/logger teardown, and stops all per-device SenderKeyFlushers so
+// their dirty-sets are synchronously drained before the DB connection closes.
+// Nil-guarded so Close stays safe on a partially-constructed Container (test
+// struct literals that never went through wireSignalCaches).
 func closeSignalCaches(c *Container) {
 	if c.caches.metricsCancel != nil {
 		c.caches.metricsCancel()
+	}
+	// Phase 17.7-03: stop all per-device flushers. Each Stop() closes the
+	// async goroutine and then calls Drain() synchronously, ensuring all
+	// dirty entries are written before the DB connection closes.
+	c.caches.senderKeyFlushersMu.Lock()
+	flusherMap := c.caches.senderKeyFlusherMap
+	c.caches.senderKeyFlushersMu.Unlock()
+	for _, f := range flusherMap {
+		f.Stop()
 	}
 }
 

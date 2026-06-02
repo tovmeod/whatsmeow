@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Kavtov Platform (Phase 17.5)
+// Copyright (c) 2026 Kavtov Platform (Phase 17.5 / Phase 17.7)
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -8,6 +8,7 @@ package sqlstore
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync/atomic"
 
@@ -22,12 +23,12 @@ import (
 // user form the natural identity for a sender-key record (whatsmeow_sender_keys
 // is keyed (our_jid, chat_id, sender_id) in PG).
 //
-// Like CachedSessionStore (post-Phase-17.5-FIX), this wrapper is a strict
-// write-through cache: every PutSenderKey calls inner FIRST and only
-// updates the cache on success. There is no value-equal write-skip — sender
-// keys mutate naturally as the group ratchet advances, so equal-value
-// writes would be rare and the comparison overhead on every PutSenderKey
-// is not worth it.
+// Phase 17.7-03: Write-back mode. PutSenderKey no longer calls the inner store
+// synchronously. Instead it marks the entry dirty in the SenderKeyFlusher and
+// updates the read cache. The flusher drains to DB asynchronously via
+// PutManySenderKeys. SKDM dedup is implicit: an arriving SKDM iteration that
+// does not advance the cached highIter is skipped (no dirty entry created or
+// updated).
 //
 // Copy discipline (Phase 17.5 FIX CR-06): GetSenderKey returns a copy of
 // the cached slice; PutSenderKey stores a copy of the caller's slice.
@@ -41,6 +42,10 @@ type CachedSenderKeyStore struct {
 	// be served from cache (the device-tolerant lookup's enumerate). Invalidated
 	// by PutSenderKey only when a genuinely new device appears (see PutSenderKey).
 	deviceCache *lru.Cache[string, []string]
+
+	// Phase 17.7-03: write-back flusher. May be nil before Start() wiring
+	// (will fall back to write-through when nil, preserving backward compat).
+	flusher *SenderKeyFlusher
 
 	hits, misses uint64
 }
@@ -59,6 +64,13 @@ func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.
 	}
 }
 
+// SetFlusher attaches the write-back flusher. Called by cache_wiring.go after
+// wireSignalCaches constructs the flusher. Must be called before any
+// PutSenderKey calls in production.
+func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
+	c.flusher = f
+}
+
 func (c *CachedSenderKeyStore) key(group, user string) string {
 	return c.jid + "|" + group + "|" + user
 }
@@ -75,6 +87,34 @@ func (c *CachedSenderKeyStore) Stats() (hits, misses uint64) {
 // state without recreating the wrapper.
 func (c *CachedSenderKeyStore) Purge() {
 	c.cache.Purge()
+}
+
+// senderKeyBlob is a minimal struct for extracting the SKDM iteration from a
+// serialized sender-key session blob. Only the path we need is unmarshalled;
+// if parsing fails, iteration is treated as 0 (forces flush at next N-boundary
+// — safe, no data is lost).
+type senderKeyBlob struct {
+	SenderKeyStates []struct {
+		SenderChainKey struct {
+			Iteration uint32 `json:"iteration"`
+		} `json:"senderChainKey"`
+	} `json:"senderKeyStates"`
+}
+
+// extractIteration reads the SenderChainKey.Iteration from a sender-key session
+// blob. Returns 0 on any parse failure.
+func extractIteration(session []byte) uint32 {
+	if len(session) == 0 {
+		return 0
+	}
+	var blob senderKeyBlob
+	if err := json.Unmarshal(session, &blob); err != nil {
+		return 0
+	}
+	if len(blob.SenderKeyStates) == 0 {
+		return 0
+	}
+	return blob.SenderKeyStates[0].SenderChainKey.Iteration
 }
 
 // ---------------------------------------------------------------------------
@@ -107,22 +147,65 @@ func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user str
 }
 
 func (c *CachedSenderKeyStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
-	// Write-through: inner first; only update cache on success.
-	if err := c.inner.PutSenderKey(ctx, group, user, session); err != nil {
-		return err
+	return c.putSenderKeyInternal(ctx, group, user, session, false)
+}
+
+// PutSenderKeyWithMeta is the internal version that accepts a wasFailed flag.
+// Used by the SKDM handler when the tuple is in failedSenderKeyTuples. The
+// wasFailed=true path bypasses dedup so a failed-tuple recovery always
+// re-processes. The public PutSenderKey interface remains backward-compatible.
+func (c *CachedSenderKeyStore) PutSenderKeyWithMeta(ctx context.Context, group, user string, session []byte, wasFailed bool) error {
+	return c.putSenderKeyInternal(ctx, group, user, session, wasFailed)
+}
+
+// putSenderKeyInternal is the shared implementation for PutSenderKey /
+// PutSenderKeyWithMeta.
+//
+// Phase 17.7-03: write-back mode. When a flusher is attached:
+//  - Updates the read cache immediately (LRU warm for subsequent decrypts).
+//  - Enqueues the dirty entry to the flusher (dedup + batched DB write).
+//  - Does NOT call inner.PutSenderKey synchronously.
+//
+// When no flusher is attached (nil): falls back to the prior write-through
+// behavior (calls inner synchronously). This covers test scenarios and the
+// pre-wiring window during startup.
+func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, user string, session []byte, wasFailed bool) error {
+	if c.flusher == nil {
+		// Write-through fallback (no flusher wired yet).
+		if err := c.inner.PutSenderKey(ctx, group, user, session); err != nil {
+			return err
+		}
+		c.cache.Add(c.key(group, user), copyBytes(session))
+		c.updateDeviceCache(group, user)
+		return nil
 	}
-	// Copy before stash so caller's buffer reuse cannot corrupt the cache
-	// (Phase 17.5 FIX CR-06: prior code aliased the caller's slice).
+
+	// Write-back: update read cache and enqueue to flusher.
+	// Extract iteration for SKDM dedup. Zero on parse failure → forces flush at
+	// next N-boundary (safe fallback; SKDM dedup loses at most one boundary skip).
+	iter := extractIteration(session)
+
+	// Update the read cache immediately so subsequent GetSenderKey calls are warm.
 	c.cache.Add(c.key(group, user), copyBytes(session))
-	// kavtov-fork: Phase 27 — keep the device-set index fresh. PutSenderKey fires
-	// on every ratchet write-back, so invalidate ONLY when this device is not
-	// already in the cached set (a genuinely new device, e.g. a fresh SKDM).
-	// Invalidating on every write-back would defeat the device-set cache.
+
+	// Enqueue dirty entry (SKDM dedup logic lives in flusher.Enqueue).
+	c.flusher.Enqueue(group, user, session, iter, wasFailed)
+
+	// Update device-set index (Phase 27 logic unchanged).
+	c.updateDeviceCache(group, user)
+
+	return nil
+}
+
+// updateDeviceCache keeps the device-set index fresh. PutSenderKey fires
+// on every ratchet write-back, so invalidate ONLY when this device is not
+// already in the cached set (a genuinely new device, e.g. a fresh SKDM).
+// Invalidating on every write-back would defeat the device-set cache.
+func (c *CachedSenderKeyStore) updateDeviceCache(group, user string) {
 	dk := c.key(group, senderKeyUserBare(user))
 	if set, ok := c.deviceCache.Get(dk); ok && !containsString(set, user) {
 		c.deviceCache.Remove(dk)
 	}
-	return nil
 }
 
 // GetSenderKeyDevices answers the device-tolerant lookup's enumerate from the
