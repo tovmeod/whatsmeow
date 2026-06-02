@@ -39,6 +39,7 @@ type dirtyEntry struct {
 	session     []byte // latest blob — monotonic forward ratchet makes "last wins" safe
 	highIter    uint32 // highest iteration seen for this entry
 	lastFlushed uint32 // iteration at last successful DB write
+	keyID       uint32 // keyID (generation) of the most-recent state; new keyID resets dedup
 }
 
 // SenderKeyFlusher batches dirty sender-key entries and drains them
@@ -127,21 +128,24 @@ func (f *SenderKeyFlusher) crossesBoundary(iter, lastFlushed uint32) bool {
 
 // Enqueue records a dirty entry. It implements the SKDM dedup rule and the
 // three flush trigger points:
-//  1. If iter <= highIter AND NOT wasFailed → skip (dedup) and increment skippedCount.
-//  2. Otherwise, update dirty-set (highIter advances, session blob replaces).
-//  3. If N-boundary crossed, signal the async flusher.
-//  4. If dirty-set > backpressureCap, perform an inline synchronous write.
+//  1. If iter <= highIter AND keyID == cached keyID AND NOT wasFailed → skip.
+//  2. A new keyID (generation rotation) always processes regardless of iter.
+//  3. wasFailed=true always processes (failed-tuple recovery bypass).
+//  4. If N-boundary crossed, signal the async flusher.
+//  5. If dirty-set > backpressureCap, perform an inline synchronous write.
 //
 // The session blob MUST be a copy owned by the flusher (caller retains
 // ownership of the original).
-func (f *SenderKeyFlusher) Enqueue(group, user string, session []byte, iter uint32, wasFailed bool) {
+func (f *SenderKeyFlusher) Enqueue(group, user string, session []byte, keyID, iter uint32, wasFailed bool) {
 	k := group + "|" + user
 
 	f.mu.Lock()
 
 	entry, exists := f.dirty[k]
-	if exists && iter <= entry.highIter && !wasFailed {
-		// SKDM dedup: same or lower iteration, not a failed-tuple recovery → skip.
+	sameGeneration := exists && entry.keyID == keyID
+	if sameGeneration && iter <= entry.highIter && !wasFailed {
+		// SKDM dedup: same or lower iteration within the same generation,
+		// not a failed-tuple recovery → skip.
 		n := f.skippedCount.Add(1)
 		if n%1000 == 0 {
 			processed := f.processedCount.Load()
@@ -150,19 +154,20 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, session []byte, iter uint
 			f.mu.Unlock()
 			// Embed counters in the message string for grep on JSON slog output.
 			// Plan 17.7-01 reads the slice with grep SKDM_DEDUP + processed=\d+ skipped=\d+.
-			slog.Info(fmt.Sprintf("SKDM_DEDUP processed=%d skipped=%d group=%s iter=%d cached=%d",
-				processed, skipped, group, iter, highIter))
+			slog.Info(fmt.Sprintf("SKDM_DEDUP processed=%d skipped=%d group=%s keyID=%d iter=%d cached=%d",
+				processed, skipped, group, keyID, iter, highIter))
 			return
 		}
 		f.mu.Unlock()
 		return
 	}
 
-	// Log every lower-iter arrival (not sampled — signals reordering or wrong assumption).
-	if exists && iter < entry.highIter {
+	// Log every lower-iter arrival within the same generation (not sampled —
+	// signals reordering or wrong iteration assumption).
+	if sameGeneration && iter < entry.highIter {
 		highIter := entry.highIter
 		f.mu.Unlock()
-		slog.Info(fmt.Sprintf("SKDM_DEDUP lower_iter group=%s iter=%d cached=%d", group, iter, highIter))
+		slog.Info(fmt.Sprintf("SKDM_DEDUP lower_iter group=%s keyID=%d iter=%d cached=%d", group, keyID, iter, highIter))
 		// Re-acquire lock to continue processing (wasFailed bypass path requires it).
 		f.mu.Lock()
 	}
@@ -174,12 +179,14 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, session []byte, iter uint
 		lastFlushed = entry.lastFlushed
 		entry.session = copyBytes(session)
 		entry.highIter = iter
+		entry.keyID = keyID
 	} else {
 		entry = &dirtyEntry{
 			group:    group,
 			user:     user,
 			session:  copyBytes(session),
 			highIter: iter,
+			keyID:    keyID,
 		}
 		f.dirty[k] = entry
 	}

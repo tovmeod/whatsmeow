@@ -466,9 +466,9 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 				f := c.caches.senderKeyFlusherMap[jid]
 				c.caches.senderKeyFlushersMu.RUnlock()
 				if f != nil {
-					iter := extractIteration(value)
+					keyID, iter := extractSenderKeyMeta(value)
 					// wasFailed=false: eviction is not a failed-tuple recovery.
-					f.Enqueue(group, user, value, iter, false)
+					f.Enqueue(group, user, value, keyID, iter, false)
 				}
 			}
 		}

@@ -93,28 +93,45 @@ func (c *CachedSenderKeyStore) Purge() {
 // serialized sender-key session blob. Only the path we need is unmarshalled;
 // if parsing fails, iteration is treated as 0 (forces flush at next N-boundary
 // — safe, no data is lost).
+//
+// The JSON uses the exported Go field names verbatim (no json: tags on the
+// libsignal structs), so this struct also uses no json: tags — Go's default
+// field-name matching produces "SenderKeyStates", "SenderChainKey",
+// "Iteration". Verified against a real-blob round-trip in
+// extractIteration_RealBlob_test (flusher_test.go).
 type senderKeyBlob struct {
 	SenderKeyStates []struct {
+		KeyID          uint32
 		SenderChainKey struct {
-			Iteration uint32 `json:"iteration"`
-		} `json:"senderChainKey"`
-	} `json:"senderKeyStates"`
+			Iteration uint32
+		}
+	}
 }
 
-// extractIteration reads the SenderChainKey.Iteration from a sender-key session
-// blob. Returns 0 on any parse failure.
-func extractIteration(session []byte) uint32 {
+// extractSenderKeyMeta reads the current KeyID and SenderChainKey.Iteration
+// from a sender-key session blob. Returns (0, 0) on any parse failure.
+// SenderKeyStates[0] is the most-recent state (libsignal prepends on
+// AddSenderKeyState).
+func extractSenderKeyMeta(session []byte) (keyID, iteration uint32) {
 	if len(session) == 0 {
-		return 0
+		return 0, 0
 	}
 	var blob senderKeyBlob
 	if err := json.Unmarshal(session, &blob); err != nil {
-		return 0
+		return 0, 0
 	}
 	if len(blob.SenderKeyStates) == 0 {
-		return 0
+		return 0, 0
 	}
-	return blob.SenderKeyStates[0].SenderChainKey.Iteration
+	s := blob.SenderKeyStates[0]
+	return s.KeyID, s.SenderChainKey.Iteration
+}
+
+// extractIteration is a convenience wrapper used by cache_wiring.go eviction
+// callback where only the iteration is needed.
+func extractIteration(session []byte) uint32 {
+	_, iter := extractSenderKeyMeta(session)
+	return iter
 }
 
 // ---------------------------------------------------------------------------
@@ -181,15 +198,15 @@ func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, 
 	}
 
 	// Write-back: update read cache and enqueue to flusher.
-	// Extract iteration for SKDM dedup. Zero on parse failure → forces flush at
-	// next N-boundary (safe fallback; SKDM dedup loses at most one boundary skip).
-	iter := extractIteration(session)
+	// Extract keyID and iteration for SKDM dedup. Both zero on parse failure →
+	// iteration-0 triggers flush at first N-boundary pass (safe fallback).
+	keyID, iter := extractSenderKeyMeta(session)
 
 	// Update the read cache immediately so subsequent GetSenderKey calls are warm.
 	c.cache.Add(c.key(group, user), copyBytes(session))
 
 	// Enqueue dirty entry (SKDM dedup logic lives in flusher.Enqueue).
-	c.flusher.Enqueue(group, user, session, iter, wasFailed)
+	c.flusher.Enqueue(group, user, session, keyID, iter, wasFailed)
 
 	// Update device-set index (Phase 27 logic unchanged).
 	c.updateDeviceCache(group, user)

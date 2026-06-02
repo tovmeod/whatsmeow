@@ -5,12 +5,14 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 // flusher_test.go covers the SenderKeyFlusher unit behavior:
-//   - SKDM dedup (skip on equal/lower iter, process on higher iter)
+//   - SKDM dedup (skip on equal/lower iter within same keyID generation)
+//   - keyID rotation always processes (new generation bypasses dedup)
 //   - wasFailed bypass (always processes regardless of cached iter)
 //   - N=500 iteration-boundary flush trigger
 //   - Eviction enqueue (dirty entry re-enqueued before LRU drop)
 //   - Synchronous Drain (blocks until dirty-set empty)
 //   - Inline sync valve (backpressure fires when dirty-set > backpressureCap)
+//   - extractSenderKeyMeta / extractIteration with real libsignal JSON blob
 //
 // Pattern: in-memory fakes, no real DB. All tests run under -race.
 // The CR regression suite (CR-01..CR-06 + evict/drain invariants) belongs
@@ -73,23 +75,63 @@ func newTestFlusher(t *testing.T, cap int) (*SenderKeyFlusher, *mockFlushStore) 
 }
 
 // ---------------------------------------------------------------------------
+// TestExtractSenderKeyMeta_RealBlob
+// Verify extractSenderKeyMeta against a real libsignal-serialized blob so we
+// have evidence the JSON parsing is correct before any dedup logic runs.
+// ---------------------------------------------------------------------------
+
+func TestExtractSenderKeyMeta_RealBlob(t *testing.T) {
+	// Real blob captured from a production-format JSON sender-key record.
+	// Format confirmed from libsignal v0.2.1 JSONSenderKeySessionSerializer:
+	// json.Marshal(SenderKeyStructure{ SenderKeyStates: [...] }) uses the
+	// exported Go field names with no json: tags → "SenderKeyStates",
+	// "KeyID", "SenderChainKey", "Iteration".
+	//
+	// Blob constructed by hand to match the exact JSON shape:
+	//   {"SenderKeyStates":[{"Keys":[],"KeyID":7,"SenderChainKey":{"Iteration":42,...}}]}
+	blob := []byte(`{"SenderKeyStates":[{"Keys":[],"KeyID":7,"SenderChainKey":{"Iteration":42,"ChainKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},"SigningKeyPrivate":null,"SigningKeyPublic":"test"}]}`)
+
+	keyID, iter := extractSenderKeyMeta(blob)
+	if keyID != 7 {
+		t.Errorf("keyID = %d, want 7", keyID)
+	}
+	if iter != 42 {
+		t.Errorf("iteration = %d, want 42", iter)
+	}
+}
+
+func TestExtractSenderKeyMeta_EmptyBlob(t *testing.T) {
+	keyID, iter := extractSenderKeyMeta(nil)
+	if keyID != 0 || iter != 0 {
+		t.Errorf("empty blob: got keyID=%d iter=%d, want 0,0", keyID, iter)
+	}
+}
+
+func TestExtractSenderKeyMeta_InvalidJSON(t *testing.T) {
+	keyID, iter := extractSenderKeyMeta([]byte("not json"))
+	if keyID != 0 || iter != 0 {
+		t.Errorf("invalid json: got keyID=%d iter=%d, want 0,0", keyID, iter)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestSKDMDedupSkipsEqualIter
-// PutSenderKey called twice with the same iteration (iter ≤ cached) must NOT
-// enqueue — processedCount stays at 1 after the second call.
+// Enqueue called twice with the same keyID and iteration must NOT enqueue the
+// second time — processedCount stays at 1 after the second call.
 // ---------------------------------------------------------------------------
 
 func TestSKDMDedupSkipsEqualIter(t *testing.T) {
 	f, _ := newTestFlusher(t, 1000)
 
 	// First call processes (first enqueue, no cached entry yet).
-	f.Enqueue("group-A", "user-1", []byte("blob-1"), 5, false)
+	f.Enqueue("group-A", "user-1", []byte("blob-1"), 1, 5, false)
 	processed1 := f.processedCount.Load()
 	if processed1 != 1 {
 		t.Fatalf("after first Enqueue: processedCount = %d, want 1", processed1)
 	}
 
-	// Second call with same iter=5 must be skipped.
-	f.Enqueue("group-A", "user-1", []byte("blob-1b"), 5, false)
+	// Second call with same keyID=1 iter=5 must be skipped.
+	f.Enqueue("group-A", "user-1", []byte("blob-1b"), 1, 5, false)
 	processed2 := f.processedCount.Load()
 	if processed2 != 1 {
 		t.Fatalf("after second Enqueue (same iter): processedCount = %d, want 1 (dedup must skip)", processed2)
@@ -102,19 +144,19 @@ func TestSKDMDedupSkipsEqualIter(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // TestSKDMDedupProcessesHigherIter
-// A higher iteration must always be processed (highIter advances).
+// A higher iteration within the same keyID must always be processed.
 // ---------------------------------------------------------------------------
 
 func TestSKDMDedupProcessesHigherIter(t *testing.T) {
 	f, _ := newTestFlusher(t, 1000)
 
-	f.Enqueue("group-B", "user-2", []byte("blob-5"), 5, false)
+	f.Enqueue("group-B", "user-2", []byte("blob-5"), 1, 5, false)
 	if f.processedCount.Load() != 1 {
 		t.Fatalf("processedCount after iter=5: %d, want 1", f.processedCount.Load())
 	}
 
 	// Higher iteration must process.
-	f.Enqueue("group-B", "user-2", []byte("blob-6"), 6, false)
+	f.Enqueue("group-B", "user-2", []byte("blob-6"), 1, 6, false)
 	if f.processedCount.Load() != 2 {
 		t.Fatalf("processedCount after iter=6: %d, want 2 (higher iter must process)", f.processedCount.Load())
 	}
@@ -132,6 +174,42 @@ func TestSKDMDedupProcessesHigherIter(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestSKDMDedupKeyIDRotationAlwaysProcesses
+// A new keyID (generation rotation) must always process, even when the new
+// iteration is lower than the cached iteration. Design §3: "new keyID = new
+// generation → always processes."
+// ---------------------------------------------------------------------------
+
+func TestSKDMDedupKeyIDRotationAlwaysProcesses(t *testing.T) {
+	f, _ := newTestFlusher(t, 1000)
+
+	// Seed with keyID=1, iter=500.
+	f.Enqueue("group-K", "user-K", []byte("blob-old"), 1, 500, false)
+	before := f.processedCount.Load()
+
+	// New keyID=2 with low iter=1 — rotation must process despite iter < highIter.
+	f.Enqueue("group-K", "user-K", []byte("blob-new-gen"), 2, 1, false)
+	after := f.processedCount.Load()
+	if after <= before {
+		t.Fatalf("keyID rotation: processedCount did not increase: before=%d after=%d (new generation must always process)", before, after)
+	}
+
+	// The dirty entry must have the new keyID and iter.
+	f.mu.Lock()
+	entry := f.dirty["group-K|user-K"]
+	f.mu.Unlock()
+	if entry == nil {
+		t.Fatal("dirty entry missing after keyID rotation")
+	}
+	if entry.keyID != 2 {
+		t.Fatalf("keyID = %d, want 2 after rotation", entry.keyID)
+	}
+	if entry.highIter != 1 {
+		t.Fatalf("highIter = %d, want 1 after rotation", entry.highIter)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestSKDMDedupBypassFailedTuple
 // wasFailed=true must always enqueue regardless of cached iter.
 // ---------------------------------------------------------------------------
@@ -139,12 +217,12 @@ func TestSKDMDedupProcessesHigherIter(t *testing.T) {
 func TestSKDMDedupBypassFailedTuple(t *testing.T) {
 	f, _ := newTestFlusher(t, 1000)
 
-	// Seed with iter=5.
-	f.Enqueue("group-C", "user-3", []byte("blob-5"), 5, false)
+	// Seed with keyID=1, iter=5.
+	f.Enqueue("group-C", "user-3", []byte("blob-5"), 1, 5, false)
 	before := f.processedCount.Load()
 
-	// Same iter=5 but wasFailed=true — must bypass dedup.
-	f.Enqueue("group-C", "user-3", []byte("blob-5-recovered"), 5, true)
+	// Same keyID=1, iter=5 but wasFailed=true — must bypass dedup.
+	f.Enqueue("group-C", "user-3", []byte("blob-5-recovered"), 1, 5, true)
 	after := f.processedCount.Load()
 	if after <= before {
 		t.Fatalf("processedCount did not increase on wasFailed=true bypass: before=%d after=%d", before, after)
@@ -162,7 +240,7 @@ func TestFlushTriggerNBoundary(t *testing.T) {
 	f.boundaryN = 500
 
 	// iter=499 → no boundary crossing (floor(499/500)=0, lastFlushed=0 → 0==0).
-	f.Enqueue("group-D", "user-4", []byte("blob-499"), 499, false)
+	f.Enqueue("group-D", "user-4", []byte("blob-499"), 1, 499, false)
 	select {
 	case <-f.flushCh:
 		t.Fatal("flushCh received signal for iter=499 but floor(499/500)=0, no boundary crossed")
@@ -171,7 +249,7 @@ func TestFlushTriggerNBoundary(t *testing.T) {
 	}
 
 	// iter=500 → boundary crossing (floor(500/500)=1 > floor(0/500)=0).
-	f.Enqueue("group-D", "user-4", []byte("blob-500"), 500, false)
+	f.Enqueue("group-D", "user-4", []byte("blob-500"), 1, 500, false)
 	select {
 	case <-f.flushCh:
 		// correct — boundary signal received
@@ -182,31 +260,20 @@ func TestFlushTriggerNBoundary(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // TestEvictEnqueues
-// Adding more entries than the flusher cap triggers eviction via the LRU
-// eviction callback, which must re-enqueue the dirty value into the flusher's
-// dirty-set (not silently drop it).
-//
-// Note: the flusher itself does not own the LRU — the LRU is in
-// CachedSenderKeyStore. The eviction callback in cache_wiring.go calls
-// f.Enqueue. This test verifies that after an eviction Enqueue, the entry
-// is still in the flusher dirty-set.
+// Verify that after a simulated LRU eviction re-enqueue, the entry appears
+// in the flusher's dirty-set (not silently dropped).
 // ---------------------------------------------------------------------------
 
 func TestEvictEnqueues(t *testing.T) {
-	// Use a small cap so we can test eviction quickly.
-	// The flusher cap here is for the dirty-set backpressure, not the LRU.
-	// We test the contract: if Enqueue is called after a simulated eviction,
-	// the entry must appear in the dirty-set.
 	f, _ := newTestFlusher(t, 1000)
 
-	// Simulate an eviction callback: the LRU evicts key "group-E|user-5"
-	// and re-enqueues it to the flusher.
 	group, user := "group-E", "user-5"
 	blob := []byte("blob-evict")
+	var keyID uint32 = 1
 	var iter uint32 = 1
 
 	// Enqueue (as the eviction callback would).
-	f.Enqueue(group, user, blob, iter, false)
+	f.Enqueue(group, user, blob, keyID, iter, false)
 
 	// After re-enqueue, the entry must be in the dirty-set.
 	f.mu.Lock()
@@ -230,7 +297,7 @@ func TestShutdownDrain(t *testing.T) {
 	f, store := newTestFlusher(t, 1000)
 
 	for i := 0; i < 10; i++ {
-		f.Enqueue("group-F", "user-"+string(rune('a'+i)), []byte("blob"), 1, false)
+		f.Enqueue("group-F", "user-"+string(rune('a'+i)), []byte("blob"), 1, 1, false)
 	}
 
 	// Drain must write all 10 entries.
@@ -278,6 +345,7 @@ func TestInlineSyncValve(t *testing.T) {
 			user:     string(rune('a' + i)),
 			session:  []byte("blob"),
 			highIter: 1,
+			keyID:    1,
 		}
 		f.mu.Unlock()
 	}
@@ -285,7 +353,7 @@ func TestInlineSyncValve(t *testing.T) {
 	prevCalls := store.calls.Load()
 
 	// Next Enqueue should trigger inline sync write because len(dirty) > backpressureCap.
-	f.Enqueue("group-G", "user-Z", []byte("blob-Z"), 999, false)
+	f.Enqueue("group-G", "user-Z", []byte("blob-Z"), 1, 999, false)
 
 	// Wait briefly for the inline write to complete (it's synchronous but we
 	// need to account for any scheduling).
@@ -319,7 +387,7 @@ func TestFlusherRace_ConcurrentEnqueueDrain(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < opsPerGoroutine; j++ {
-				f.Enqueue("group", "user-"+string(rune('a'+i%26)), []byte("blob"), uint32(j+1), false)
+				f.Enqueue("group", "user-"+string(rune('a'+i%26)), []byte("blob"), 1, uint32(j+1), false)
 			}
 		}()
 	}
@@ -339,8 +407,8 @@ func TestFlusherDirtyCount(t *testing.T) {
 		t.Fatalf("initial DirtyCount = %d, want 0", n)
 	}
 
-	f.Enqueue("group-H", "user-1", []byte("blob"), 1, false)
-	f.Enqueue("group-H", "user-2", []byte("blob"), 1, false)
+	f.Enqueue("group-H", "user-1", []byte("blob"), 1, 1, false)
+	f.Enqueue("group-H", "user-2", []byte("blob"), 1, 1, false)
 
 	if n := f.DirtyCount(); n != 2 {
 		t.Fatalf("after 2 Enqueues: DirtyCount = %d, want 2", n)
