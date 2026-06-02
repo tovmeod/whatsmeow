@@ -84,10 +84,48 @@ func (device *Device) ContainsPreKey(ctx context.Context, preKeyID uint32) (bool
 
 func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalAddress) (*record.Session, error) {
 	addrString := address.String()
+	// Context cache: send-path only (getCachedSession returns nil during decrypts).
+	// Preserve this check — it short-circuits before the struct-cache lookup
+	// for send-path contexts (RESEARCH Pitfall 6).
 	if sess := getCachedSession(ctx, addrString); sess != nil {
 		return sess, nil
 	}
 
+	// Phase 17.8: cacheKey includes device JID prefix so the shared struct LRU
+	// keeps each device's entries separate.
+	if device.ID != nil {
+		cacheKey := device.ID.String() + "|" + addrString
+		// 1. Check decoded structure cache (decode-once hit: ~375 ns, 20 allocs).
+		if device.ParsedSessionCache != nil {
+			if s, ok := device.ParsedSessionCache.LoadStruct(cacheKey); ok {
+				return record.NewSessionFromStructure(s, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+			}
+		}
+
+		// 2. Cache miss: fetch []byte from byte-cache (CachedSessionStore LRU or DB).
+		rawSess, err := device.Sessions.GetSession(ctx, addrString)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load session with %s: %w", addrString, err)
+		}
+		if rawSess == nil {
+			return record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State), nil
+		}
+
+		// 3. Deserialize once: JSON → structure.
+		structure, err := SignalProtobufSerializer.Session.Deserialize(rawSess)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize session with %s: %w", addrString, err)
+		}
+		// 4. Populate struct cache (decode-once stored).
+		if device.ParsedSessionCache != nil {
+			device.ParsedSessionCache.StoreStruct(cacheKey, structure)
+		}
+
+		// 5. Build live record from structure.
+		return record.NewSessionFromStructure(structure, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+	}
+
+	// Fallback: device.ID is nil (test or pre-init scenarios without a JID).
 	rawSess, err := device.Sessions.GetSession(ctx, addrString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load session with %s: %w", addrString, err)
@@ -108,11 +146,37 @@ func (device *Device) GetSubDeviceSessions(ctx context.Context, name string) ([]
 
 func (device *Device) StoreSession(ctx context.Context, address *protocol.SignalAddress, record *record.Session) error {
 	addrString := address.String()
-	if putCachedSession(ctx, addrString, record) {
+
+	// Phase 17.8: extract serialized bytes and post-ratchet structure BEFORE
+	// the putCachedSession branch so the struct cache is always updated
+	// regardless of which path takes the write (RESEARCH Pitfall 6, lines 447-449).
+	serialized := record.Serialize()
+	newStruct := record.Structure()
+	if device.ID != nil && device.ParsedSessionCache != nil {
+		cacheKey := device.ID.String() + "|" + addrString
+		device.ParsedSessionCache.StoreStruct(cacheKey, newStruct)
+
+		// Context cache: send-path only — preserve existing short-circuit.
+		// Struct cache already updated above before this branch.
+		if putCachedSession(ctx, addrString, record) {
+			return nil
+		}
+
+		err := device.Sessions.PutSession(ctx, addrString, serialized)
+		if err != nil {
+			// Roll back: struct cache advanced past DB; force re-fetch on next Load
+			// (session write-through coherence, RESEARCH lines 323-328).
+			device.ParsedSessionCache.Invalidate(cacheKey)
+			return fmt.Errorf("failed to store session with %s: %w", addrString, err)
+		}
 		return nil
 	}
 
-	err := device.Sessions.PutSession(ctx, addrString, record.Serialize())
+	// Fallback: device.ID is nil or no parsed cache wired (test or pre-init scenarios).
+	if putCachedSession(ctx, addrString, record) {
+		return nil
+	}
+	err := device.Sessions.PutSession(ctx, addrString, serialized)
 	if err != nil {
 		return fmt.Errorf("failed to store session with %s: %w", addrString, err)
 	}
@@ -172,7 +236,20 @@ func (device *Device) RemoveSignedPreKey(ctx context.Context, signedPreKeyID uin
 func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName, keyRecord *groupRecord.SenderKey) error {
 	groupID := senderKeyName.GroupID()
 	senderString := senderKeyName.Sender().String()
-	err := device.SenderKeys.PutSenderKey(ctx, groupID, senderString, keyRecord.Serialize())
+	// Phase 17.8: cacheKey includes device JID prefix so the shared LRU keeps
+	// each device's entries separate (matches CachedSenderKeyStore.key format).
+	cacheKey := device.ID.String() + "|" + groupID + "|" + senderString
+
+	// ONE serialize call — passed to PutSenderKey; no second serialize downstream (SC-3).
+	serialized := keyRecord.Serialize()
+
+	// Update struct cache with post-ratchet structure (brief mutex inside StoreStruct).
+	// REPLACE, not invalidate — avoids stale-after-write against async flusher (Pitfall 2).
+	if device.ParsedSKCache != nil {
+		device.ParsedSKCache.StoreStruct(cacheKey, keyRecord.Structure())
+	}
+
+	err := device.SenderKeys.PutSenderKey(ctx, groupID, senderString, serialized)
 	if err != nil {
 		return fmt.Errorf("failed to store sender key from %s for %s: %w", senderString, groupID, err)
 	}
@@ -182,6 +259,17 @@ func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protoco
 func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName) (*groupRecord.SenderKey, error) {
 	groupID := senderKeyName.GroupID()
 	senderString := senderKeyName.Sender().String()
+	// Phase 17.8: cacheKey includes device JID prefix (shared LRU, device scoping required).
+	cacheKey := device.ID.String() + "|" + groupID + "|" + senderString
+
+	// 1. Check decoded structure cache (decode-once hit: ~120 ns, 7 allocs).
+	if device.ParsedSKCache != nil {
+		if s, ok := device.ParsedSKCache.LoadStruct(cacheKey); ok {
+			return groupRecord.NewSenderKeyFromStruct(s, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
+		}
+	}
+
+	// 2. Cache miss: fetch []byte from byte-cache (CachedSenderKeyStore LRU or DB).
 	rawKey, err := device.SenderKeys.GetSenderKey(ctx, groupID, senderString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load sender key from %s for %s: %w", senderString, groupID, err)
@@ -189,9 +277,17 @@ func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol
 	if rawKey == nil {
 		return groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState), nil
 	}
-	key, err := groupRecord.NewSenderKeyFromBytes(rawKey, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
+
+	// 3. Deserialize once: JSON → structure.
+	structure, err := SignalProtobufSerializer.SenderKeyRecord.Deserialize(rawKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize sender key from %s for %s: %w", senderString, groupID, err)
 	}
-	return key, nil
+	// 4. Populate struct cache (decode-once stored).
+	if device.ParsedSKCache != nil {
+		device.ParsedSKCache.StoreStruct(cacheKey, structure)
+	}
+
+	// 5. Build live record from structure.
+	return groupRecord.NewSenderKeyFromStruct(structure, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
 }
