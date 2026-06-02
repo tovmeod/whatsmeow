@@ -255,6 +255,9 @@ type Device struct {
 	Sessions      SessionStore
 	PreKeys       PreKeyStore
 	SenderKeys    SenderKeyStore
+	// Phase 17.8: decode-once struct-LRU caches. Wired by attachCachedStores.
+	ParsedSKCache      *parsedSKCache
+	ParsedSessionCache *parsedSessionCache
 	AppStateKeys  AppStateSyncKeyStore
 	AppState      AppStateStore
 	Contacts      ContactStore
