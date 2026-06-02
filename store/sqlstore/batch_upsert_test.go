@@ -95,11 +95,15 @@ func newBatchTestStore(t *testing.T) (*sqlstore.SQLStore, *sql.DB) {
 	store := sqlstore.NewSQLStore(container, jid)
 
 	t.Cleanup(func() {
-		// Deleting the device cascades to whatsmeow_sender_keys (ON DELETE CASCADE).
+		// Delete the device first (needs an open db); ON DELETE CASCADE clears
+		// its sender_keys. Then Container.Close() cancels the metrics goroutine
+		// (Phase 17.5.1 WR-01) before closing the underlying db — do not close
+		// the raw db directly, which would leak the goroutine and invert the
+		// teardown ordering Close() guarantees.
 		if _, err := db.ExecContext(context.Background(), `DELETE FROM whatsmeow_device WHERE jid=$1`, testJID); err != nil {
 			t.Logf("cleanup delete device: %v", err)
 		}
-		db.Close()
+		container.Close()
 	})
 
 	return store, db
