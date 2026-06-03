@@ -42,12 +42,21 @@
 package sqlstore
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
+	"os"
 	"reflect"
 	"runtime"
 	"testing"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
+	"go.mau.fi/libsignal/groups/ratchet"
+
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -553,3 +562,185 @@ func gcTrend(deltaFromPrev int64, newEntries int) string {
 		return "rising-fast"
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Recovery latency benchmark (dimension d)
+//
+// Times RecoverSenderKey on a live test DB against a realistic donor
+// population. Skips gracefully when the DB is not reachable.
+//
+// The query is recoveryScanQuery (see recovery_sender_key.go) — a full
+// table scan over (chat_id, sender_id LIKE) rows across ALL accounts.
+// With a small donor population (≤10 rows per group) this is a fast
+// index-scan (or seq-scan on a very small table). The benchmark provides
+// the Go + DB round-trip latency; the SQL-only component and the cost at
+// large donor populations are noted separately in MEASUREMENTS.md.
+// ---------------------------------------------------------------------------
+
+const (
+	recovBenchDSN     = "postgresql://kavtov_test:kavtov_test@localhost:5433/kavtov_test"
+	recovBenchJIDA    = "18811110001@s.whatsapp.net"
+	recovBenchJIDB    = "18811110002@s.whatsapp.net"
+	recovBenchGroup   = "recovbench@g.us"
+	recovBenchSender  = "55500001_1"
+	recovBenchKeyID   = uint32(77)
+)
+
+// recovBenchDSNOrEnv returns the test DSN, honouring TEST_DSN / KAVTOV_TEST_DSN.
+func recovBenchDSNOrEnv() string {
+	if dsn := os.Getenv("TEST_DSN"); dsn != "" {
+		return dsn
+	}
+	if dsn := os.Getenv("KAVTOV_TEST_DSN"); dsn != "" {
+		return dsn
+	}
+	return recovBenchDSN
+}
+
+// insertRecovBenchDevice inserts a minimal whatsmeow_device row for the given JID.
+const recovBenchDeviceQuery = `
+	INSERT INTO whatsmeow_device (jid, registration_id, noise_key, identity_key,
+								  signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
+								  adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	ON CONFLICT (jid) DO NOTHING
+`
+
+func insertRecovBenchDevice(b *testing.B, db *sql.DB, jid string) {
+	b.Helper()
+	thirtyTwo := make([]byte, 32)
+	sixtyFour := make([]byte, 64)
+	_, err := db.ExecContext(context.Background(), recovBenchDeviceQuery,
+		jid, 1, thirtyTwo, thirtyTwo,
+		thirtyTwo, 1, sixtyFour,
+		thirtyTwo, thirtyTwo, sixtyFour, thirtyTwo, sixtyFour,
+	)
+	if err != nil {
+		b.Fatalf("insertRecovBenchDevice %s: %v", jid, err)
+	}
+}
+
+// BenchmarkSenderKeyRecovery_SmallPop times RecoverSenderKey against a small
+// donor population (1 donor, fmt_ver=2). Represents the common case when a
+// sibling account already has the key in the columnar form.
+func BenchmarkSenderKeyRecovery_SmallPop(b *testing.B) {
+	benchmarkSenderKeyRecovery(b, 1)
+}
+
+// BenchmarkSenderKeyRecovery_MedPop times RecoverSenderKey against a medium
+// donor population (10 donors with different senders LIKE-matched).
+func BenchmarkSenderKeyRecovery_MedPop(b *testing.B) {
+	benchmarkSenderKeyRecovery(b, 10)
+}
+
+// benchmarkSenderKeyRecovery is the shared recovery benchmark implementation.
+// nDonors controls how many fmt_ver=2 donor rows are seeded under account A
+// for the same group (same chat_id, different sender_id suffixes that all
+// LIKE-match the target senderBare). This exercises the per-row scan cost.
+func benchmarkSenderKeyRecovery(b *testing.B, nDonors int) {
+	b.Helper()
+	db, err := sql.Open("pgx", recovBenchDSNOrEnv())
+	if err != nil {
+		b.Skipf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	if err := db.PingContext(context.Background()); err != nil {
+		b.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Insert test device rows.
+	insertRecovBenchDevice(b, db, recovBenchJIDA)
+	insertRecovBenchDevice(b, db, recovBenchJIDB)
+	b.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(),
+			`DELETE FROM whatsmeow_device WHERE jid IN ($1,$2)`,
+			recovBenchJIDA, recovBenchJIDB)
+	})
+
+	// Clean any leftover sender_key rows from prior runs.
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		recovBenchJIDA, recovBenchJIDB, recovBenchGroup)
+
+	// Seed nDonors fmt_ver=2 rows under account A, each with a distinct device suffix.
+	// The LIKE pattern in recoveryScanQuery is senderBare||':%', so all suffixes match.
+	jidA, err := types.ParseJID(recovBenchJIDA)
+	if err != nil {
+		b.Fatalf("ParseJID A: %v", err)
+	}
+	containerA := NewWithDB(db, "postgres", nil)
+	storeA := NewSQLStore(containerA, jidA)
+
+	for i := 0; i < nDonors; i++ {
+		senderID := fmt.Sprintf("%s:%d", recovBenchSender, i)
+		chainKey := make([]byte, 32)
+		chainKey[0] = byte(i + 1)
+		pub33 := make([]byte, 33)
+		pub33[0] = 0x05
+		pub33[1] = byte(i + 1)
+		structure := &groupRecord.SenderKeyStructure{
+			SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+				{
+					KeyID: recovBenchKeyID,
+					SenderChainKey: &ratchet.SenderChainKeyStructure{
+						Iteration: uint32(i * 10),
+						ChainKey:  chainKey,
+					},
+					SigningKeyPublic:  pub33,
+					SigningKeyPrivate: nil, // received key — nil private
+				},
+			},
+		}
+		row := SenderKeyRow{Group: recovBenchGroup, User: senderID, Cols: decompose(structure)}
+		if err := storeA.PutManySenderKeys(ctx, []SenderKeyRow{row}); err != nil {
+			b.Fatalf("seed donor %d: %v", i, err)
+		}
+	}
+
+	// Set up account B's CachedSenderKeyStore (no flusher — write-through fallback).
+	jidB, err := types.ParseJID(recovBenchJIDB)
+	if err != nil {
+		b.Fatalf("ParseJID B: %v", err)
+	}
+	containerB := NewWithDB(db, "postgres", nil)
+	storeB := NewSQLStore(containerB, jidB)
+	byteCache, _ := lru.New[string, []byte](256)
+	devCache, _ := lru.New[string, []string](256)
+	csB := NewCachedSenderKeyStore(storeB, recovBenchJIDB, byteCache, devCache)
+
+	// targetSenderID and targetIter: recover the best donor (max iter <= target).
+	targetSenderID := recovBenchSender + ":0"
+	targetIter := uint32((nDonors-1)*10 + 5) // a value above all donor iters
+
+	// Warm-up: one recovery to ensure the row is in B's table.
+	_, _ = csB.RecoverSenderKey(ctx, recovBenchGroup, targetSenderID, recovBenchSender, recovBenchKeyID, targetIter)
+	// Remove B's row so each benchmark iteration does a fresh recovery write.
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		recovBenchJIDB, recovBenchGroup, targetSenderID)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// RecoverSenderKey: full path — SQL scan + Go donor-selection + PutManySenderKeys write.
+		ok, err := csB.RecoverSenderKey(ctx, recovBenchGroup, targetSenderID, recovBenchSender, recovBenchKeyID, targetIter)
+		if err != nil {
+			b.Fatalf("RecoverSenderKey: %v", err)
+		}
+		if !ok {
+			b.Fatal("RecoverSenderKey: expected donor found, got false")
+		}
+		// Remove B's written row so next iteration is independent.
+		b.StopTimer()
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			recovBenchJIDB, recovBenchGroup, targetSenderID)
+		b.StartTimer()
+	}
+}
+
+// _ ensures the store and types packages are referenced (avoids "imported and not used"
+// when the DB is unreachable and the bench skips before using them).
+var _ = store.SignalProtobufSerializer
+var _ = types.EmptyJID
