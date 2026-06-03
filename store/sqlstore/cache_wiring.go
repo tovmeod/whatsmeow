@@ -552,17 +552,29 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
 	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity, &c.caches.IdentityExplicitRemoves, c.caches.IdentityIndex)
 
-	// Phase 17.7-03: create a per-device write-back flusher. Each flusher holds
-	// a reference to the device's SQLStore (which carries the device JID for
-	// PutManySenderKeys). The flusher is started here and registered with the
-	// Container so closeSignalCaches can Stop() it before the DB closes.
+	// Phase 17.7-03: per-device write-back flusher, registered with the Container
+	// so closeSignalCaches can Stop() it before the DB closes.
+	//
+	// LEAK FIX (2026-06-03): attachCachedStores is re-invoked on EVERY
+	// Device.Save() (PutDevice -> initializeDevice), not just at first init.
+	// Creating + Start()ing a fresh flusher each time and overwriting the map
+	// entry orphaned the previous flusher's goroutine — which keeps ticking
+	// (1s NewTicker -> runFlush) forever instead of exiting. In prod this leaked
+	// ~6963 ticking goroutines, pushing heap past GOMEMLIMIT and spiking CPU.
+	// The flusher is a per-(Container,JID) singleton: reuse the existing one on
+	// re-wiring (same JID, same shared db; its dirty-set persists). Only the
+	// first attach for a JID constructs + Start()s it. Check+create under the
+	// mutex so concurrent saves for the same JID can't both create one.
 	senderKeyStore := NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices)
-	flusher := NewSenderKeyFlusher(innerStore, c.log, 0)
-	senderKeyStore.SetFlusher(flusher)
-	flusher.Start()
 	c.caches.senderKeyFlushersMu.Lock()
-	c.caches.senderKeyFlusherMap[jid] = flusher
+	flusher, exists := c.caches.senderKeyFlusherMap[jid]
+	if !exists {
+		flusher = NewSenderKeyFlusher(innerStore, c.log, 0)
+		c.caches.senderKeyFlusherMap[jid] = flusher
+		flusher.Start()
+	}
 	c.caches.senderKeyFlushersMu.Unlock()
+	senderKeyStore.SetFlusher(flusher)
 	device.SenderKeys = senderKeyStore
 
 	// Phase 17.8: wire decoded struct-LRU caches to the device. Both parsed
