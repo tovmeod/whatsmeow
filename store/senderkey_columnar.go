@@ -40,7 +40,7 @@ import (
 // every write, invisible to the no-JSON grep-gate since the JSON is inside
 // libsignal) into a BUILD ERROR. This is the primary guard for the phase's goal.
 //
-// The method carries *groupRecord.SenderKeyStructure (already imported in
+// The interface carries *groupRecord.SenderKeyStructure (already imported in
 // signal.go) so the interface bridge requires no sqlstore import in package store.
 // Callers MUST NOT call the whatsmeow SenderKeyStore.PutSenderKey on the same
 // entry after calling this method (the columnar path owns the flusher drain).
@@ -51,4 +51,14 @@ type SenderKeyColumnarStore interface {
 	// 17.7 write-back flusher. group and user are the whatsmeow JID strings used
 	// as the PG (chat_id, sender_id) key pair.
 	PutSenderKeyStructure(ctx context.Context, group, user string, s *groupRecord.SenderKeyStructure) error
+
+	// GetSenderKeyStructure reads a sender-key record in its decomposed columnar
+	// form. The impl branches strictly on fmt_ver:
+	//   fmt_ver=2  → recompose from columns (no JSON, no blob read)
+	//   fmt_ver=1/NULL → Deserialize the legacy sender_key blob (ALLOW-JSON-LEGACY-READ)
+	//   absent row → returns (nil, nil); LoadSenderKey builds an empty record
+	//
+	// The returned *SenderKeyStructure is READ-ONLY. The caller must call
+	// groupRecord.NewSenderKeyFromStruct to obtain a live record.
+	GetSenderKeyStructure(ctx context.Context, group, user string) (*groupRecord.SenderKeyStructure, error)
 }

@@ -59,9 +59,11 @@ func (a byteaArray) Value() (driver.Value, error) {
 			// nil element → bare NULL (unquoted) — SQL NULL
 			sb.WriteString("NULL")
 		} else {
-			// Non-nil element → "\\x<hex>" (quoted; backslash literal in the string)
+			// Non-nil element → "\\x<hex>" (quoted; double-backslash because PG's
+			// array input parser unescapes \\ → \ inside double-quoted elements,
+			// so \\x<hex> → \x<hex> passed to bytea input → hex format → binary bytes).
 			sb.WriteByte('"')
-			sb.WriteString(`\x`)
+			sb.WriteString(`\\x`) // two chars: backslash + backslash + x in the wire
 			sb.WriteString(hex.EncodeToString(elem))
 			sb.WriteByte('"')
 		}

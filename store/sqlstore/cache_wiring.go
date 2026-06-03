@@ -567,6 +567,17 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 		device.ParsedSKCache.Invalidate(key)
 	})
 
+	// Phase 17.9 Task 3: REPLACE-on-write coherence for the columnar read path.
+	// GetSenderKeyStructure reads DB columns that the async flusher has NOT yet
+	// drained after a PutSenderKeyStructure write. REPLACE with the in-hand
+	// structure at the write chokepoint so an immediate LoadSenderKey (including
+	// the recovery path's direct PutSenderKeyStructure) returns the freshly-written
+	// key without waiting for the async drain. MUST be a REPLACE, not invalidate
+	// (T-17.9-16; see CachedSenderKeyStore.parsedReplace field comment).
+	senderKeyStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
+		device.ParsedSKCache.StoreStruct(key, s)
+	})
+
 	// perf 260601-uuy: message-secret pair cache.
 	device.MsgSecrets = NewCachedMessageSecretStore(innerStore, jid, c.caches.MsgSecret, &c.caches.MsgSecretExplicitRemoves)
 }

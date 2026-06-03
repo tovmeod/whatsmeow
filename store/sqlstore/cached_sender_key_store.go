@@ -18,6 +18,16 @@ import (
 	"go.mau.fi/whatsmeow/store"
 )
 
+// senderKeyDecomposedReader is the local interface that *SQLStore satisfies to
+// provide the fmt_ver-branching columnar read path (getSenderKeyDecomposed).
+// Using a local interface avoids exposing getSenderKeyDecomposed as a public
+// method while enabling the cache layer to type-assert and call it without
+// importing sqlstore internals from package store. The getSenderKeyDecomposed
+// method is unexported; only sqlstore-internal callers use this interface.
+type senderKeyDecomposedReader interface {
+	getSenderKeyDecomposed(ctx context.Context, group, user string) (cols *senderKeyColumns, legacyBlob []byte, err error)
+}
+
 // CachedSenderKeyStore wraps an inner store.SenderKeyStore with a
 // process-shared *lru.Cache[string, []byte]. Cache key is the three-element
 // composite jid + "|" + group + "|" + user (RESEARCH Finding 7) — group and
@@ -52,6 +62,15 @@ type CachedSenderKeyStore struct {
 	// wasFailed=true recovery writes (Pitfall 4 / T-17.8-05 mitigation). Nil
 	// when no struct cache is wired (test scenarios, pre-attachCachedStores).
 	parsedInvalidate func(key string)
+
+	// Phase 17.9 (Task 3): REPLACE callback — set by SetParsedReplace, wired in
+	// cache_wiring.go. Fires at the PutSenderKeyStructure chokepoint to synchronously
+	// replace the cached *SenderKeyStructure with the in-hand structure BEFORE the
+	// async flusher drains the DB columns. REPLACE (not invalidate) is required
+	// because GetSenderKeyStructure reads DB columns that may not yet be drained;
+	// invalidate-then-Load would read pre-drain (nil) columns = silent decrypt failure
+	// on immediate read-after-write and recovery paths (T-17.9-16).
+	parsedReplace func(key string, s *groupRecord.SenderKeyStructure)
 
 	hits, misses uint64
 }
@@ -91,6 +110,16 @@ func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 // the next LoadSenderKey re-parses the recovered []byte (Pitfall 4 guard).
 func (c *CachedSenderKeyStore) SetParsedInvalidate(fn func(key string)) {
 	c.parsedInvalidate = fn
+}
+
+// SetParsedReplace attaches the Phase 17.9 struct-cache REPLACE callback.
+// Called by attachCachedStores alongside SetParsedInvalidate. The callback
+// fires at the PutSenderKeyStructure chokepoint (both normal ratchet-advance
+// and direct recovery writes) to synchronously replace the cached
+// *SenderKeyStructure before the async flusher drains the DB columns.
+// MUST be a REPLACE (not invalidate) — see parsedReplace field comment.
+func (c *CachedSenderKeyStore) SetParsedReplace(fn func(key string, s *groupRecord.SenderKeyStructure)) {
+	c.parsedReplace = fn
 }
 
 func (c *CachedSenderKeyStore) key(group, user string) string {
@@ -192,6 +221,48 @@ func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user str
 	return v, err
 }
 
+// GetSenderKeyStructure implements store.SenderKeyColumnarStore. It reads the
+// sender-key in its decomposed columnar form, branching strictly on fmt_ver
+// (T-17.9-12 discriminator guard):
+//
+//	fmt_ver=2  → recompose from columns (NEVER reads sender_key blob)
+//	fmt_ver=1/NULL → Deserialize the legacy sender_key blob
+//	absent row → returns (nil, nil) so LoadSenderKey builds an empty record
+//
+// The returned *SenderKeyStructure is READ-ONLY. The caller calls
+// NewSenderKeyFromStruct to obtain a live *SenderKey record.
+func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group, user string) (*groupRecord.SenderKeyStructure, error) {
+	r, ok := c.inner.(senderKeyDecomposedReader)
+	if !ok {
+		// inner does not implement the columnar reader (test stub / pre-wiring).
+		// Fall back to the legacy []byte path.
+		blob, err := c.inner.GetSenderKey(ctx, group, user)
+		if err != nil || blob == nil {
+			return nil, err
+		}
+		return store.SignalProtobufSerializer.SenderKeyRecord.Deserialize(blob) // ALLOW-JSON-LEGACY-READ
+	}
+
+	cols, legacyBlob, err := r.getSenderKeyDecomposed(ctx, group, user)
+	if err != nil {
+		return nil, err
+	}
+
+	if cols != nil {
+		// fmt_ver=2: recompose from columns. The sender_key blob is NOT read
+		// (it was not selected in the fmt_ver=2 branch of getSenderKeyDecomposed).
+		return recompose(cols), nil
+	}
+
+	if legacyBlob == nil {
+		// Absent row: no error, caller builds an empty record.
+		return nil, nil
+	}
+
+	// fmt_ver=1/NULL: Deserialize the legacy blob.
+	return store.SignalProtobufSerializer.SenderKeyRecord.Deserialize(legacyBlob) // ALLOW-JSON-LEGACY-READ
+}
+
 func (c *CachedSenderKeyStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
 	return c.putSenderKeyInternal(ctx, group, user, session, false)
 }
@@ -282,7 +353,18 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 		// every message, invisible to the no-JSON grep-gate (T-17.9-10 guard).
 		c.flusher.Enqueue(group, user, colsCopy, keyID, iter, false)
 
-		// PARSED-CACHE-REPLACE-PLAN04 marker: plan 04 inserts the replace callback here.
+		// Phase 17.9 Task 3: REPLACE-on-write coherence.
+		// GetSenderKeyStructure reads DB columns that the async flusher has NOT yet
+		// drained. An invalidate-then-Load would therefore miss the cache, read
+		// pre-drain (nil) columns, and silently return the wrong / empty key —
+		// the silent-decrypt-failure class this phase forbids (T-17.9-16).
+		// REPLACE with recompose(colsCopy): colsCopy is already deep-copied (disjoint
+		// from libsignal backing arrays); recompose produces the byte-identical
+		// structure GetSenderKeyStructure would later read from columns — NOT the
+		// raw s pointer which may alias libsignal backing arrays.
+		if c.parsedReplace != nil {
+			c.parsedReplace(c.key(group, user), recompose(colsCopy))
+		}
 
 		// Update device-set index (Phase 27 logic unchanged).
 		c.updateDeviceCache(group, user)
@@ -307,14 +389,17 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 			store.SignalProtobufSerializer.SenderKeyState)
 		var blob []byte
 		if sk != nil {
-			blob = sk.Serialize()
+			blob = sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
 		}
-		if err := c.inner.PutSenderKey(ctx, group, user, blob); err != nil { // ALLOW-JSON-DRAIN-BLOB (ultimate-fallback)
+		if err := c.inner.PutSenderKey(ctx, group, user, blob); err != nil {
 			return err
 		}
 	}
 
-	// PARSED-CACHE-REPLACE-PLAN04 marker (write-through path).
+	// Write-through path: also replace the parsed cache for coherence.
+	if c.parsedReplace != nil {
+		c.parsedReplace(c.key(group, user), recompose(colsCopy))
+	}
 
 	c.updateDeviceCache(group, user)
 	return nil

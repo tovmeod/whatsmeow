@@ -154,12 +154,28 @@ const (
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
 	deleteAllSenderKeysQuery      = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'`
+	// migratePNToLIDSenderKeysQuery copies sender-key rows from PN-format sender_id
+	// to LID-format sender_id. The copy ALWAYS sets fmt_ver=1 and NULLs all columnar
+	// columns (T-17.9-14): a fmt_ver=2 PN row would have valid columns, but copying
+	// those columns alongside the legacy blob under the new LID would allow future
+	// writes that arrive as fmt_ver=1 (legacy blobs) to leave stale columns for the
+	// LID sender — so we copy as legacy-only (fmt_ver=1, blob only, columns NULL).
+	// The next write to the LID row upgrades it to fmt_ver=2 via PutSenderKeyStructure.
 	migratePNToLIDSenderKeysQuery = `
-		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
-		SELECT our_jid, chat_id, replace(sender_id, $2, $3), sender_key
+		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, fmt_ver, sender_key,
+			st_key_id, st_chain_key_iteration, st_chain_key, st_signing_key_public, st_signing_key_private,
+			smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed)
+		SELECT our_jid, chat_id, replace(sender_id, $2, $3), 1, sender_key,
+			NULL, NULL, NULL, NULL, NULL,
+			NULL, NULL, NULL, NULL, NULL
 		FROM whatsmeow_sender_keys
 		WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'
-		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
+		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
+			fmt_ver=1,
+			sender_key=excluded.sender_key,
+			st_key_id=NULL, st_chain_key_iteration=NULL, st_chain_key=NULL,
+			st_signing_key_public=NULL, st_signing_key_private=NULL,
+			smk_state_idx=NULL, smk_iteration=NULL, smk_iv=NULL, smk_cipher_key=NULL, smk_seed=NULL
 	`
 )
 
@@ -546,8 +562,7 @@ func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) e
 				n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12, n+13, n+14, n+15)
 			c := row.Cols
 			// Recompose the legacy blob once per row at drain time (amortized ~1/N).
-			// This is the ONLY allowed Serialize per the phase's no-JSON-on-write goal. // ALLOW-JSON-DRAIN-BLOB
-			legacyBlob := recomposedBlob(c)
+			legacyBlob := recomposedBlob(c) // ALLOW-JSON-DRAIN-BLOB (via recomposedBlob → sk.Serialize())
 			args = append(args,
 				s.JID,                              // $1 our_jid
 				row.Group,                          // $2 chat_id
@@ -597,7 +612,7 @@ func recomposedBlob(c *senderKeyColumns) []byte {
 		// Log and return nil (which would make sender_key NULL in DB — a detectable anomaly).
 		return nil
 	}
-	return sk.Serialize()
+	return sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
 }
 
 func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []byte, err error) {
@@ -606,6 +621,82 @@ func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []
 		err = nil
 	}
 	return
+}
+
+// getSenderKeyColumnsQuery fetches fmt_ver + all columnar fields + the legacy
+// sender_key blob for one (our_jid, chat_id, sender_id) row.
+//
+// fmt_ver=2 ⇒ use the st_*/smk_* columns (recompose); never read sender_key.
+// fmt_ver=1/NULL ⇒ Deserialize the sender_key blob (ALLOW-JSON-LEGACY-READ).
+// absent row ⇒ sql.ErrNoRows ⇒ caller returns (nil, nil).
+const getSenderKeyColumnsQuery = `
+	SELECT fmt_ver,
+		st_key_id, st_chain_key_iteration, st_chain_key,
+		st_signing_key_public, st_signing_key_private,
+		smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed,
+		sender_key
+	FROM whatsmeow_sender_keys
+	WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3
+`
+
+// getSenderKeyDecomposed reads the columnar row for (group, user) and returns
+// either a *senderKeyColumns (for fmt_ver=2) or nil columns + a raw legacy blob
+// (for fmt_ver=1/NULL). The second return value is:
+//
+//	(cols != nil, nil, nil)   — fmt_ver=2, use recompose(cols)
+//	(nil, blob, nil)          — fmt_ver=1/NULL, use Deserialize(blob)
+//	(nil, nil, nil)           — absent row (no error)
+//	(nil, nil, err)           — DB error
+func (s *SQLStore) getSenderKeyDecomposed(ctx context.Context, group, user string) (cols *senderKeyColumns, legacyBlob []byte, err error) {
+	var (
+		fmtVer            *int16 // NULL fmt_ver → treat as legacy
+		stKeyID           int64Array
+		stChainKeyIter    int64Array
+		stChainKey        byteaArray
+		stSigningKeyPub   byteaArray
+		stSigningKeyPriv  byteaArray
+		smkStateIdx       int32Array
+		smkIteration      int64Array
+		smkIV             byteaArray
+		smkCipherKey      byteaArray
+		smkSeed           byteaArray
+		blob              []byte
+	)
+	qErr := s.db.QueryRow(ctx, getSenderKeyColumnsQuery, s.JID, group, user).Scan(
+		&fmtVer,
+		&stKeyID, &stChainKeyIter, &stChainKey,
+		&stSigningKeyPub, &stSigningKeyPriv,
+		&smkStateIdx, &smkIteration, &smkIV, &smkCipherKey, &smkSeed,
+		&blob,
+	)
+	if errors.Is(qErr, sql.ErrNoRows) {
+		return nil, nil, nil // absent row
+	}
+	if qErr != nil {
+		return nil, nil, qErr
+	}
+
+	// Strict fmt_ver discriminator (T-17.9-12):
+	// fmt_ver=2 ⇒ columns are canonical; never touch sender_key blob.
+	// fmt_ver=1 or NULL ⇒ legacy blob path.
+	if fmtVer != nil && *fmtVer == 2 {
+		return &senderKeyColumns{
+			fmtVer:              2,
+			stKeyID:             []int64(stKeyID),
+			stChainKeyIteration: []int64(stChainKeyIter),
+			stChainKey:          [][]byte(stChainKey),
+			stSigningKeyPublic:  [][]byte(stSigningKeyPub),
+			stSigningKeyPrivate: [][]byte(stSigningKeyPriv),
+			smkStateIdx:         []int32(smkStateIdx),
+			smkIteration:        []int64(smkIteration),
+			smkIV:               [][]byte(smkIV),
+			smkCipherKey:        [][]byte(smkCipherKey),
+			smkSeed:             [][]byte(smkSeed),
+		}, nil, nil
+	}
+
+	// Legacy: fmt_ver=1 or NULL — return the blob for Deserialize.
+	return nil, blob, nil
 }
 
 // GetSenderKeyDevices returns the device-qualified sender_id strings (e.g.
