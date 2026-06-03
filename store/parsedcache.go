@@ -61,16 +61,15 @@ func parsedCacheEnvCapOrDefault(key string, fallback int) int {
 // KAVTOV_CACHE_SESSION_CAP) so that struct-cache evictions and []byte-cache
 // evictions occur at the same working-set boundary.
 //
-// Phase 17.9 GC redesign: KAVTOV_CACHE_SENDERKEY_DECODED_CAP lowered from
-// 1_500_000 to 500_000 — right-sized to the ~275k hot fmt_ver=2 working set
-// + headroom so total warmed heap stays under GOMEMLIMIT. This is a companion
-// lever to the flat value-struct, not a bandaid: the flat struct removes the
-// per-entry pointer scan cost, and the cap removes the continuous-GC frequency
-// trigger (heap > GOMEMLIMIT) that the still-dense session cache shares. The
-// AUTHORITATIVE prod cap is sqlstore's signalSKParsedCacheCap (cache_wiring.go),
-// also lowered to 500_000; this package-level var is the store-package default
-// used by tests/standalone wiring. Env-overridable.
-var signalSKParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
+// KAVTOV_CACHE_SENDERKEY_DECODED_CAP = 1_500_000. Phase 17.9 briefly lowered
+// this to 500_000 to keep warmed heap under GOMEMLIMIT, but the flat
+// value-struct already makes a large cache GC-cheap, so the cap reduction only
+// cost cache hits (~72% warmed vs ~90% for the right-sized session cache).
+// Restored to 1_500_000 (2026-06-03), paired with GOMEMLIMIT=2500MiB. The
+// AUTHORITATIVE prod cap is sqlstore's signalSKParsedCacheCap (cache_wiring.go);
+// this package-level var is the store-package default for tests/standalone
+// wiring. Env-overridable.
+var signalSKParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
 var signalSessParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SESSION_DECODED_CAP", 250_000)
 
 // Process-global parsed-cache hit/miss counters. The parsed cache is a shared

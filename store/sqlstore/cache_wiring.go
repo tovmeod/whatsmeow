@@ -90,12 +90,15 @@ var (
 	// so evictions occur at the same working-set boundary (eviction of a parsed
 	// entry is silent — next Load re-populates from the []byte LRU).
 	//
-	// Phase 17.9 GC redesign: DECODED cap lowered 1_500_000 → 500_000 —
-	// right-sized to the ~275k hot fmt_ver=2 working set + headroom so total
-	// warmed heap stays under GOMEMLIMIT (companion lever to the flat
-	// value-struct cache, not a bandaid; env-overridable). This is the
-	// AUTHORITATIVE prod cap (wireSignalCaches builds the prod LRU from it).
-	signalSKParsedCacheCap   = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
+	// DECODED cap = 1_500_000. Phase 17.9 briefly lowered this to 500_000 as a
+	// "companion lever" to keep warmed heap under GOMEMLIMIT=1200MiB, but that
+	// was unnecessary once the flat value-struct cache made a large cache
+	// GC-cheap (cheap scans regardless of count), and it cost ~25% of sender-key
+	// reads as cache misses (warmed hit rate ~72% at 500k vs sessions' ~90% at
+	// their right-sized cap). Restored to 1_500_000 (2026-06-03), paired with
+	// GOMEMLIMIT raised to 2500MiB (systemd unit). This is the AUTHORITATIVE prod
+	// cap (wireSignalCaches builds the prod LRU from it); env-overridable.
+	signalSKParsedCacheCap   = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
 	signalSessParsedCacheCap = envCapOrDefault("KAVTOV_CACHE_SESSION_DECODED_CAP", 250_000)
 )
 
