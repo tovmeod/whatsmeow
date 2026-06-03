@@ -60,7 +60,7 @@ func TestCR01DeleteBeforeFlush(t *testing.T) {
 	k := group + "|" + user
 
 	// Enqueue an entry — it enters the dirty-set.
-	f.Enqueue(group, user, []byte("blob-CR01"), 1, 1, false)
+	f.Enqueue(group, user, testCols(1, 1), 1, 1, false)
 	if f.DirtyCount() != 1 {
 		t.Fatalf("DirtyCount before delete = %d, want 1", f.DirtyCount())
 	}
@@ -104,7 +104,7 @@ func TestCR02AckAfterFlush(t *testing.T) {
 	group, user := "group-CR02", "user-CR02"
 
 	// Enqueue one entry.
-	f.Enqueue(group, user, []byte("blob-CR02"), 1, 1, false)
+	f.Enqueue(group, user, testCols(1, 1), 1, 1, false)
 	if f.DirtyCount() != 1 {
 		t.Fatalf("DirtyCount before flush = %d, want 1", f.DirtyCount())
 	}
@@ -157,8 +157,8 @@ func TestCR03DeleteAllSessions(t *testing.T) {
 	groupB, userB := "group-CR03", "user-B"
 	kA := groupA + "|" + userA
 
-	f.Enqueue(groupA, userA, []byte("blob-A"), 1, 1, false)
-	f.Enqueue(groupB, userB, []byte("blob-B"), 1, 1, false)
+	f.Enqueue(groupA, userA, testCols(1, 1), 1, 1, false)
+	f.Enqueue(groupB, userB, testCols(1, 1), 1, 1, false)
 	if f.DirtyCount() != 2 {
 		t.Fatalf("DirtyCount before scoped delete = %d, want 2", f.DirtyCount())
 	}
@@ -218,17 +218,18 @@ func TestCR04MigrateBeforeFlush(t *testing.T) {
 
 	group, user := "group-CR04", "user-CR04"
 	k := group + "|" + user
-	blobHigh := []byte("blob-iter10")
-	blobStale := []byte("blob-iter5-stale")
+	colsHigh := testCols(1, 10)
+	colsStale := testCols(1, 5)
 
 	// Enqueue the high-iter entry (simulating the most-recent dirty write).
-	f.Enqueue(group, user, blobHigh, /*keyID=*/ 1, /*iter=*/ 10, false)
+	f.Enqueue(group, user, colsHigh, /*keyID=*/ 1, /*iter=*/ 10, false)
 
 	// Simulate a cache-miss re-population at a stale lower iteration.
 	// SKDM dedup must reject this (same keyID, iter 5 < highIter 10).
-	f.Enqueue(group, user, blobStale, /*keyID=*/ 1, /*iter=*/ 5, false)
+	f.Enqueue(group, user, colsStale, /*keyID=*/ 1, /*iter=*/ 5, false)
 
-	// Verify the dirty entry retains the high-iter blob.
+	// Verify the dirty entry retains the high-iter DTO.
+	// Phase 17.9: session → cols; no bytes.Equal; check highIter + cols pointer.
 	f.mu.Lock()
 	entry := f.dirty[k]
 	f.mu.Unlock()
@@ -239,22 +240,29 @@ func TestCR04MigrateBeforeFlush(t *testing.T) {
 	if entry.highIter != 10 {
 		t.Fatalf("CR-04: highIter = %d, want 10 (stale re-read must not overwrite)", entry.highIter)
 	}
-	if !bytes.Equal(entry.session, blobHigh) {
-		t.Fatalf("CR-04: dirty session = %q, want %q (stale blob must not overwrite high-iter blob)", entry.session, blobHigh)
+	// Confirm the dirty entry points to the high-iter cols DTO (not the stale one).
+	// We compare via the stChainKeyIteration field which encodes iter in our testCols helper.
+	if entry.cols == nil {
+		t.Fatal("CR-04: dirty entry cols is nil")
 	}
+	if len(entry.cols.stChainKeyIteration) == 0 || entry.cols.stChainKeyIteration[0] != 10 {
+		t.Fatalf("CR-04: dirty cols iteration = %v, want [10] (stale DTO must not overwrite high-iter DTO)", entry.cols.stChainKeyIteration)
+	}
+	_ = colsStale // stale DTO should not be in dirty entry
 }
 
 // ---------------------------------------------------------------------------
 // TestCR05BulkWriteReconcile
 //
-// CR-05 (17.5-REVIEW.md §CR-05): In write-back mode, PutSenderKey must NOT
-// call the inner store directly — all writes route through the flusher. There
-// is no "direct write bypass" that could silently overwrite a pending dirty entry.
+// CR-05 (17.5-REVIEW.md §CR-05): The columnar write-back path (PutSenderKeyStructure)
+// must NOT call inner.PutSenderKey synchronously — all columnar writes route
+// through the flusher. There is no "direct write bypass" that could silently
+// overwrite a pending dirty entry.
 //
-// N/A disposition: the write-back path (flusher attached) never calls
-// inner.PutSenderKey synchronously. This test asserts that architectural
-// invariant: after PutSenderKey via the cached store with a flusher attached,
-// inner.putCalls==0 and flusher.DirtyCount()==1.
+// Phase 17.9 update: PutSenderKey([]byte) is now always synchronous (legacy
+// fmt_ver=1 path). The no-bypass invariant applies to PutSenderKeyStructure
+// (the columnar path). This test is updated to call PutSenderKeyStructure and
+// assert that inner is NOT called (flusher enqueued; no synchronous inner call).
 // ---------------------------------------------------------------------------
 
 func TestCR05BulkWriteReconcile(t *testing.T) {
@@ -276,19 +284,24 @@ func TestCR05BulkWriteReconcile(t *testing.T) {
 	f := NewSenderKeyFlusher(flusherStore, waLog.Noop, 1000)
 	wrapper.SetFlusher(f)
 
-	// Call PutSenderKey — in write-back mode this must not reach inner.
-	if err := wrapper.PutSenderKey(ctx, "group-CR05", "user-CR05", []byte("blob-CR05")); err != nil {
-		t.Fatalf("PutSenderKey: %v", err)
+	// Build a minimal SenderKeyStructure to pass to PutSenderKeyStructure.
+	// The columnar path decomposes → enqueues to flusher (no inner call).
+	cols := testCols(1, 5)
+	structure := recompose(cols)
+
+	// Call PutSenderKeyStructure — columnar write-back must not reach inner.
+	if err := wrapper.PutSenderKeyStructure(ctx, "group-CR05", "user-CR05", structure); err != nil {
+		t.Fatalf("PutSenderKeyStructure: %v", err)
 	}
 
-	// INVARIANT: inner must not have been called (no bypass).
+	// INVARIANT: inner must not have been called (no bypass — flusher owns the write).
 	if n := inner.putCalls.Load(); n != 0 {
-		t.Fatalf("CR-05: inner.putCalls = %d, want 0 (write-back must not call inner directly)", n)
+		t.Fatalf("CR-05: inner.putCalls = %d, want 0 (columnar write-back must not call inner directly)", n)
 	}
 
 	// The flusher must have the entry as dirty.
 	if n := f.DirtyCount(); n != 1 {
-		t.Fatalf("CR-05: flusher.DirtyCount() = %d, want 1 (entry must be in dirty-set)", n)
+		t.Fatalf("CR-05: flusher.DirtyCount() = %d, want 1 (columnar entry must be in dirty-set)", n)
 	}
 }
 
@@ -336,18 +349,16 @@ func TestCR06CopyBytesIntegrity(t *testing.T) {
 // ---------------------------------------------------------------------------
 // TestEvictBeforeDrop
 //
-// New invariant: an LRU eviction of a dirty entry must re-enqueue that entry
-// to the flusher's dirty-set so it is never silently dropped.
+// Invariant: flusher dirty entries CANNOT be silently dropped by the []byte LRU
+// eviction. In phase 17.9, the columnar flusher (dirty-set holding *senderKeyColumns)
+// is entirely independent of the []byte SenderKey LRU — the eviction callback
+// no longer calls Enqueue (there is no matching dirty entry for legacy blobs).
 //
-// Design: the production eviction callback (cache_wiring.go) calls
-// flusher.Enqueue with the evicted blob. This test replicates that wiring
-// with a small-cap LRU (cap=10) and 15 Puts, verifying that all 15 entries
-// are present in the dirty-set after the 5 capacity evictions re-enqueue.
-//
-// NOTE: the eviction callback fires during cache.Add (under the LRU's internal
-// lock). It calls f.Enqueue, which acquires f.mu — NOT the LRU lock, so no
-// deadlock. The test builds the LRU with lru.NewWithEvict to replicate the
-// production eviction-callback path exactly.
+// This test verifies the structural independence: Enqueue 15 distinct columnar
+// entries to the flusher; add the same keys to a small-cap []byte LRU (triggering
+// evictions). The eviction callback is a counter-only no-op; all 15 flusher
+// entries survive because the flusher's dirty-set is not reachable from the
+// []byte LRU.
 // ---------------------------------------------------------------------------
 
 func TestEvictBeforeDrop(t *testing.T) {
@@ -357,34 +368,11 @@ func TestEvictBeforeDrop(t *testing.T) {
 	flusherStore := &mockFlushStore{}
 	f := NewSenderKeyFlusher(flusherStore, waLog.Noop, 10_000) // large flusher cap
 
-	// Build a small-cap LRU with an eviction callback that re-enqueues to the
-	// flusher — same pattern as wireSignalCaches in cache_wiring.go.
-	lruCache, err := lru.NewWithEvict[string, []byte](lruCap, func(cacheKey string, value []byte) {
-		// Parse "<jid>|<group>|<user>" cache key format (same as cache_wiring.go).
-		var jid, group, user string
-		afterJID := ""
-		for i, c := range cacheKey {
-			if c == '|' {
-				jid = cacheKey[:i]
-				afterJID = cacheKey[i+1:]
-				break
-			}
-		}
-		if jid == "" {
-			return
-		}
-		for i, c := range afterJID {
-			if c == '|' {
-				group = afterJID[:i]
-				user = afterJID[i+1:]
-				break
-			}
-		}
-		if group == "" || user == "" {
-			return
-		}
-		keyID, iter := extractSenderKeyMeta(value)
-		f.Enqueue(group, user, value, keyID, iter, false)
+	// Build a small-cap []byte LRU with a counter-only eviction callback — matching
+	// the phase 17.9 production eviction callback in cache_wiring.go (no Enqueue).
+	var evictionCount int64
+	lruCache, err := lru.NewWithEvict[string, []byte](lruCap, func(_ string, _ []byte) {
+		evictionCount++
 	})
 	if err != nil {
 		t.Fatalf("lru.NewWithEvict: %v", err)
@@ -392,38 +380,28 @@ func TestEvictBeforeDrop(t *testing.T) {
 
 	const testJID = "test-jid-evict"
 
-	// Insert 15 distinct entries into the LRU. The first 5 will be evicted as
-	// the cap of 10 is exceeded. The eviction callback re-enqueues them to f.
-	// The remaining 10 are still in the LRU; PutSenderKey would normally also
-	// enqueue them to f. To isolate the eviction path, we directly insert into
-	// both the LRU (triggering evictions) and the flusher.
+	// Insert 15 distinct entries: Enqueue each to the flusher (columnar dirty),
+	// then add a dummy blob to the []byte LRU (triggering evictions at cap=10).
+	// The eviction callback is a no-op — flusher dirty entries must survive.
 	for i := 0; i < total; i++ {
 		group := fmt.Sprintf("group-evict-%d", i)
 		user := fmt.Sprintf("user-evict-%d", i)
-		blob := []byte(fmt.Sprintf(`{"SenderKeyStates":[{"KeyID":1,"SenderChainKey":{"Iteration":%d}}]}`, i+1))
 		cacheKey := testJID + "|" + group + "|" + user
-
-		// Simulate what CachedSenderKeyStore.PutSenderKey does in write-back mode:
-		// 1. Enqueue to flusher (dirty the entry).
-		// 2. Add to LRU cache (may evict an older entry, which re-enqueues it).
-		//    The re-enqueue from eviction uses extractSenderKeyMeta(value) → same keyID+iter;
-		//    the SKDM dedup check compares with the existing entry: if iter+keyID matches the
-		//    already-dirty entry, the re-enqueue is a no-op (same iter, same keyID → dedup skip).
-		//    That is CORRECT — the entry is already dirty, so the eviction re-enqueue is redundant.
-		//    What matters is DirtyCount() after ALL 15 operations.
-		f.Enqueue(group, user, blob, 1, uint32(i+1), false)
-		lruCache.Add(cacheKey, copyBytes(blob))
+		// Enqueue columnar DTO to flusher.
+		f.Enqueue(group, user, testCols(1, uint32(i+1)), 1, uint32(i+1), false)
+		// Add dummy blob to []byte LRU — may evict older entries (counter-only callback).
+		lruCache.Add(cacheKey, []byte("legacy-blob"))
 	}
 
-	// All 15 entries must be in the flusher's dirty-set.
-	// The first 5 were evicted from the LRU; the eviction callback called
-	// Enqueue with the same blob but iter (i+1 for i in 0..4 = 1..5).
-	// Those 5 entries already existed in the dirty-set at the same iter/keyID,
-	// so SKDM dedup would skip them — but they are ALREADY DIRTY (from the
-	// direct Enqueue call above), so the invariant holds: no entry was dropped.
-	// The remaining 10 are dirty from the initial Enqueue calls.
+	// The []byte LRU cap (10) triggered 5 evictions. The eviction callback did NOT
+	// call Enqueue — so all 15 flusher entries must still be dirty.
 	if n := f.DirtyCount(); n != total {
-		t.Fatalf("TestEvictBeforeDrop: DirtyCount = %d, want %d (all entries must be in dirty-set after eviction)", n, total)
+		t.Fatalf("TestEvictBeforeDrop: DirtyCount = %d, want %d "+
+			"(flusher dirty-set must be independent of []byte LRU eviction)", n, total)
+	}
+	// Sanity: confirm evictions did fire (LRU cap was exercised).
+	if evictionCount < 5 {
+		t.Logf("expected at least 5 evictions from cap=%d LRU but got %d (LRU cap not exceeded?)", lruCap, evictionCount)
 	}
 }
 
@@ -451,7 +429,7 @@ func TestSynchronousShutdownDrain(t *testing.T) {
 	for i := 0; i < numEntries; i++ {
 		group := fmt.Sprintf("group-shutdown-%d", i)
 		user := fmt.Sprintf("user-shutdown-%d", i)
-		f.Enqueue(group, user, []byte(fmt.Sprintf("blob-%d", i)), 1, 1, false)
+		f.Enqueue(group, user, testCols(1, 1), 1, 1, false)
 	}
 
 	if n := f.DirtyCount(); n != numEntries {

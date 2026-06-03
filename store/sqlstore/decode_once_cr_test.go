@@ -428,7 +428,8 @@ func TestDecodeOnce_CR_TR03(t *testing.T) {
 	}
 
 	// Verify keyID survives the struct-cache round-trip.
-	gotKeyID, _ := extractSenderKeyMeta(got.Serialize())
+	// Phase 17.9: extractSenderKeyMeta now takes *senderKeyColumns; decompose the structure.
+	gotKeyID, _ := extractSenderKeyMeta(decompose(got.Structure()))
 	if gotKeyID != wantKeyID {
 		t.Errorf("TR-03: gotKeyID = %d, want %d "+
 			"(post-ratchet structure not preserved by struct cache)", gotKeyID, wantKeyID)
@@ -737,7 +738,8 @@ func TestDecodeOnce_CR_TR08(t *testing.T) {
 	}
 
 	// Verify the re-parsed result uses the new key (keyID=99).
-	gotKeyID, _ := extractSenderKeyMeta(got.Serialize())
+	// Phase 17.9: extractSenderKeyMeta now takes *senderKeyColumns; decompose the structure.
+	gotKeyID, _ := extractSenderKeyMeta(decompose(got.Structure()))
 	if gotKeyID != newKeyID {
 		t.Errorf("TR-08: gotKeyID = %d, want %d "+
 			"(next Load must re-parse from blobNew after invalidation)", gotKeyID, newKeyID)

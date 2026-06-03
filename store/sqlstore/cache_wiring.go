@@ -455,39 +455,27 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 		log.Errorf("Failed to construct IdentityCache (cap=%d): %v", signalIdentityCacheCap, err)
 		panic(err)
 	}
-	// Phase 17.7-03: SenderKey eviction callback re-enqueues dirty entries to
-	// the flusher before the LRU drops them — ensuring no dirty entry is
-	// silently lost on eviction (T-17.7-03-05 mitigation).
+	// Phase 17.7-03: SenderKey LRU eviction callback.
 	//
-	// Lock ordering: the LRU callback is called while the LRU's internal lock
-	// is held. The callback must NOT call PutSenderKey synchronously (which
-	// would acquire the LRU lock again → deadlock). It calls flusher.Enqueue
-	// directly, which only acquires f.mu (not the LRU lock).
+	// Phase 17.9 update: The []byte SenderKey LRU now holds ONLY legacy fmt_ver=1
+	// blobs (populated by PutSenderKey's synchronous write-through path) and
+	// cache-miss populated blobs from DB reads. The columnar flusher (fmt_ver=2)
+	// owns its dirty entries exclusively in the flusher's dirty-set — NOT in this
+	// []byte LRU. Therefore, eviction of a []byte entry does NOT imply there is a
+	// matching dirty entry in the flusher; attempting to re-enqueue would create a
+	// spurious flusher entry from a stale []byte blob (and calling
+	// extractSenderKeyMeta+Enqueue is no longer valid since Enqueue takes
+	// *senderKeyColumns, not []byte).
 	//
-	// The flusher pointer is captured by the closure via &c.caches — the same
-	// heap-address capture pattern used for the counter fields above.
-	c.caches.SenderKey, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(cacheKey string, value []byte) {
+	// The eviction callback is now ONLY an eviction counter. The flusher's own
+	// dirty-set is not affected by this LRU's eviction — the columnar path never
+	// writes to this []byte LRU (no c.cache.Add on the columnar path; T-17.9-10).
+	//
+	// Lock ordering note retained for audit: the LRU callback is called while the
+	// LRU's internal lock is held; the callback must NOT call PutSenderKey or any
+	// method that re-acquires the LRU lock.
+	c.caches.SenderKey, err = lru.NewWithEvict[string, []byte](signalSenderKeyCacheCap, func(_ string, _ []byte) {
 		atomic.AddUint64(&c.caches.SenderKeyCapacityEvictions, 1)
-		// Phase 17.7-03: re-enqueue the evicted value to the per-device flusher
-		// so it is not lost on LRU capacity eviction (T-17.7-03-05 mitigation).
-		//
-		// The callback MUST NOT call PutSenderKey (no DB round-trip in evict
-		// callback — design §6 Pitfall 2). It calls flusher.Enqueue directly,
-		// which only acquires f.mu (not the LRU lock).
-		//
-		// Cache key format: "<our_jid>|<chat_id>|<sender_id>"
-		if jid, after, ok := strings.Cut(cacheKey, "|"); ok {
-			if group, user, ok2 := strings.Cut(after, "|"); ok2 {
-				c.caches.senderKeyFlushersMu.RLock()
-				f := c.caches.senderKeyFlusherMap[jid]
-				c.caches.senderKeyFlushersMu.RUnlock()
-				if f != nil {
-					keyID, iter := extractSenderKeyMeta(value)
-					// wasFailed=false: eviction is not a failed-tuple recovery.
-					f.Enqueue(group, user, value, keyID, iter, false)
-				}
-			}
-		}
 	})
 	if err != nil {
 		log.Errorf("Failed to construct SenderKeyCache (cap=%d): %v", signalSenderKeyCacheCap, err)

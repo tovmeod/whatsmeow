@@ -8,11 +8,12 @@ package sqlstore
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 
 	"go.mau.fi/whatsmeow/store"
 )
@@ -56,6 +57,14 @@ type CachedSenderKeyStore struct {
 }
 
 var _ store.SenderKeyStore = (*CachedSenderKeyStore)(nil)
+
+// Compile-time assertion: CachedSenderKeyStore satisfies the fork-local
+// SenderKeyColumnarStore interface. If CachedSenderKeyStore.PutSenderKeyStructure
+// is removed or its signature drifts, this line becomes a BUILD ERROR, preventing
+// StoreSenderKey's type-assertion from silently falling back to keyRecord.Serialize()
+// (which would silently re-introduce JSON on every per-message write — invisible
+// to the no-JSON grep-gate since the JSON is inside libsignal). T-17.9-11 guard.
+var _ store.SenderKeyColumnarStore = (*CachedSenderKeyStore)(nil)
 
 // NewCachedSenderKeyStore constructs a wrapper over inner. jid is the device
 // JID (used as cache-key prefix). cache is a shared LRU constructed by the
@@ -102,49 +111,18 @@ func (c *CachedSenderKeyStore) Purge() {
 	c.cache.Purge()
 }
 
-// senderKeyBlob is a minimal struct for extracting the SKDM iteration from a
-// serialized sender-key session blob. Only the path we need is unmarshalled;
-// if parsing fails, iteration is treated as 0 (forces flush at next N-boundary
-// — safe, no data is lost).
-//
-// The JSON uses the exported Go field names verbatim (no json: tags on the
-// libsignal structs), so this struct also uses no json: tags — Go's default
-// field-name matching produces "SenderKeyStates", "SenderChainKey",
-// "Iteration". Verified against a real-blob round-trip in
-// extractIteration_RealBlob_test (flusher_test.go).
-type senderKeyBlob struct {
-	SenderKeyStates []struct {
-		KeyID          uint32
-		SenderChainKey struct {
-			Iteration uint32
-		}
-	}
-}
-
 // extractSenderKeyMeta reads the current KeyID and SenderChainKey.Iteration
-// from a sender-key session blob. Returns (0, 0) on any parse failure.
+// from a *senderKeyColumns DTO (the decomposed columnar form). Returns (0, 0)
+// on 0-state / nil input — the len==0 guard matches the old JSON parse path's
+// "empty SenderKeyStates" behavior (plan 02 note: JSON parse path removed).
+//
 // SenderKeyStates[0] is the most-recent state (libsignal prepends on
-// AddSenderKeyState).
-func extractSenderKeyMeta(session []byte) (keyID, iteration uint32) {
-	if len(session) == 0 {
+// AddSenderKeyState), corresponding to stKeyID[0] / stChainKeyIteration[0].
+func extractSenderKeyMeta(cols *senderKeyColumns) (keyID, iteration uint32) {
+	if cols == nil || len(cols.stKeyID) == 0 {
 		return 0, 0
 	}
-	var blob senderKeyBlob
-	if err := json.Unmarshal(session, &blob); err != nil {
-		return 0, 0
-	}
-	if len(blob.SenderKeyStates) == 0 {
-		return 0, 0
-	}
-	s := blob.SenderKeyStates[0]
-	return s.KeyID, s.SenderChainKey.Iteration
-}
-
-// extractIteration is a convenience wrapper used by cache_wiring.go eviction
-// callback where only the iteration is needed.
-func extractIteration(session []byte) uint32 {
-	_, iter := extractSenderKeyMeta(session)
-	return iter
+	return uint32(cols.stKeyID[0]), uint32(cols.stChainKeyIteration[0])
 }
 
 // ---------------------------------------------------------------------------
@@ -189,43 +167,34 @@ func (c *CachedSenderKeyStore) PutSenderKeyWithMeta(ctx context.Context, group, 
 }
 
 // putSenderKeyInternal is the shared implementation for PutSenderKey /
-// PutSenderKeyWithMeta.
+// PutSenderKeyWithMeta (the legacy []byte interface path).
 //
-// Phase 17.7-03: write-back mode. When a flusher is attached:
-//  - Updates the read cache immediately (LRU warm for subsequent decrypts).
-//  - Enqueues the dirty entry to the flusher (dedup + batched DB write).
-//  - Does NOT call inner.PutSenderKey synchronously.
+// Phase 17.9: the legacy []byte path ALWAYS writes synchronously to inner
+// (fmt_ver=1; no decompose, no flusher enqueue). The flusher is exclusively
+// owned by the columnar path (PutSenderKeyStructure). This preserves the
+// clean ownership split:
+//   - Legacy []byte in → legacy putSenderKeyQuery (fmt_ver=1 row) out.
+//   - Columnar *SenderKeyStructure in → fmt_ver=2 + all columns out (via flusher).
 //
-// When no flusher is attached (nil): falls back to the prior write-through
-// behavior (calls inner synchronously). This covers test scenarios and the
-// pre-wiring window during startup.
+// The []byte LRU cache (c.cache) is updated immediately for read-path warmth.
+// The wasFailed path still invalidates the parsed struct cache on recovery
+// writes that arrive as legacy blobs (Pitfall 4 / T-17.8-05).
+//
+// T-17.9-08 note: T-17.9-08 targets the PRODUCTION columnar path (which routes
+// through PutSenderKeyStructure → flusher). The legacy synchronous write here
+// is only reached by non-columnar callers (test stores, SKDM handler fallbacks).
 func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, user string, session []byte, wasFailed bool) error {
-	if c.flusher == nil {
-		// Write-through fallback (no flusher wired yet).
-		if err := c.inner.PutSenderKey(ctx, group, user, session); err != nil {
-			return err
-		}
-		c.cache.Add(c.key(group, user), copyBytes(session))
-		c.updateDeviceCache(group, user)
-		return nil
+	// Legacy path: always synchronous write to inner (fmt_ver=1; no decompose).
+	if err := c.inner.PutSenderKey(ctx, group, user, session); err != nil {
+		return err
 	}
-
-	// Write-back: update read cache and enqueue to flusher.
-	// Extract keyID and iteration for SKDM dedup. Both zero on parse failure →
-	// iteration-0 triggers flush at first N-boundary pass (safe fallback).
-	keyID, iter := extractSenderKeyMeta(session)
 
 	// Update the read cache immediately so subsequent GetSenderKey calls are warm.
 	c.cache.Add(c.key(group, user), copyBytes(session))
 
-	// Enqueue dirty entry (SKDM dedup logic lives in flusher.Enqueue).
-	c.flusher.Enqueue(group, user, session, keyID, iter, wasFailed)
-
 	// Phase 17.8: on a failed-tuple recovery write, invalidate the decoded
 	// struct cache so the next LoadSenderKey re-parses the recovered []byte
 	// instead of serving the pre-recovery struct (Pitfall 4 / T-17.8-05).
-	// Normal (wasFailed=false) stores do NOT invalidate here — the struct cache
-	// is already replaced by signal.go's StoreSenderKey via StoreStruct (Pitfall 2).
 	if wasFailed && c.parsedInvalidate != nil {
 		c.parsedInvalidate(c.key(group, user))
 	}
@@ -233,6 +202,73 @@ func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, 
 	// Update device-set index (Phase 27 logic unchanged).
 	c.updateDeviceCache(group, user)
 
+	return nil
+}
+
+// PutSenderKeyStructure implements store.SenderKeyColumnarStore. This is the
+// production columnar write path for fmt_ver=2 rows.
+//
+// It decomposes the libsignal *SenderKeyStructure into typed columns (no JSON),
+// derives keyID/iter from the DTO (len==0 guard: 0-state → (0,0)), and enqueues
+// to the write-back flusher. If the flusher is nil (pre-wiring / test scenarios),
+// it falls through to a synchronous PutManySenderKeys write instead (write-through
+// fallback that preserves the fmt_ver=2 column path).
+//
+// PARSED-CACHE-REPLACE-PLAN04: plan 04 Task 3 will wire a SetParsedReplace
+// callback here to atomically replace the parsed struct cache entry with the
+// in-hand structure at the point below where decompose + Enqueue complete. This
+// must be a REPLACE (not invalidate) because GetSenderKeyStructure reads DB
+// columns that the async flusher has not yet drained. The replace is a cache
+// write (not a DB write) — not a divergent write.
+func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group, user string, s *groupRecord.SenderKeyStructure) error {
+	cols := decompose(s)
+
+	// Derive keyID/iter from the DTO. Guard the 0-state shape so len==0 → (0,0)
+	// (mirroring the old extractSenderKeyMeta len==0 → (0,0) behavior; avoids panic).
+	keyID, iter := extractSenderKeyMeta(cols)
+
+	if c.flusher != nil {
+		// Write-back: enqueue DTO to flusher (dedup + batched async drain).
+		// DO NOT call c.cache.Add with a serialized blob — that would call
+		// NewSenderKeyFromStruct(...).Serialize() = libsignal-internal JSON on
+		// every message, invisible to the no-JSON grep-gate (T-17.9-10 guard).
+		c.flusher.Enqueue(group, user, cols, keyID, iter, false)
+
+		// PARSED-CACHE-REPLACE-PLAN04 marker: plan 04 inserts the replace callback here.
+
+		// Update device-set index (Phase 27 logic unchanged).
+		c.updateDeviceCache(group, user)
+		return nil
+	}
+
+	// Write-through fallback (flusher not yet wired: pre-wiring window or tests).
+	// Write a columnar row synchronously via PutManySenderKeys.
+	if putMany, ok := c.inner.(interface {
+		PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error
+	}); ok {
+		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Cols: cols}}); err != nil {
+			return err
+		}
+	} else {
+		// Ultimate fallback: inner does not support PutManySenderKeys (test stub).
+		// Build the blob from the structure and write via the legacy path.
+		// This path should not occur in production (inner is always *SQLStore there).
+		structure := recompose(cols)
+		sk, _ := groupRecord.NewSenderKeyFromStruct(structure,
+			store.SignalProtobufSerializer.SenderKeyRecord,
+			store.SignalProtobufSerializer.SenderKeyState)
+		var blob []byte
+		if sk != nil {
+			blob = sk.Serialize()
+		}
+		if err := c.inner.PutSenderKey(ctx, group, user, blob); err != nil { // ALLOW-JSON-DRAIN-BLOB (ultimate-fallback)
+			return err
+		}
+	}
+
+	// PARSED-CACHE-REPLACE-PLAN04 marker (write-through path).
+
+	c.updateDeviceCache(group, user)
 	return nil
 }
 
