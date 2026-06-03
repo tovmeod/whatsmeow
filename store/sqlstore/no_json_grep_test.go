@@ -10,8 +10,10 @@
 // sender-key read+write path (T-17.9-15). Two documented exceptions are permitted,
 // each identified by an explicit inline comment marker:
 //
-//   ALLOW-JSON-DRAIN-BLOB   — the once-per-drain legacy-blob Serialize in
-//                              recomposedBlob (called from PutManySenderKeys).
+//   ALLOW-JSON-DRAIN-BLOB   — the ultimate-fallback legacy-blob Serialize in
+//                              putSenderKeyInternal, taken only when the inner
+//                              store does not implement the columnar writer
+//                              (test stub / pre-wiring; never in production).
 //
 //   ALLOW-JSON-LEGACY-READ  — the fmt_ver=1/NULL dual-read fallback Deserialize
 //                              in GetSenderKeyStructure (the legacy blob path,
@@ -30,7 +32,7 @@
 //
 // Covered source files:
 //   - store/sqlstore/senderkey_columns.go          (whole file — decompose/recompose)
-//   - store/sqlstore/store.go                      (PutManySenderKeys, getSenderKeyDecomposed, recomposedBlob)
+//   - store/sqlstore/store.go                      (PutManySenderKeys, getSenderKeyDecomposed — column-only write, no blob)
 //   - store/sqlstore/cached_sender_key_store.go    (extractSenderKeyMeta, putSenderKeyInternal, PutSenderKey, PutSenderKeyStructure, GetSenderKeyStructure)
 //   - store/signal.go                              (StoreSenderKey, LoadSenderKey)
 //

@@ -517,29 +517,29 @@ func NewSenderKeyRow(group, user string, s *groupRecord.SenderKeyStructure) Send
 const senderKeyBatchChunkSize = 100
 
 // PutManySenderKeys upserts a batch of sender keys in their columnar form
-// (fmt_ver=2). For each row it writes all attribute-faithful columns PLUS the
-// legacy sender_key blob — the blob is recomposed once per row from row.Cols
-// (the single allowed Serialize per the phase invariant, amortized ~1/N and
-// off the per-message path). Both columns and blob are written in the same
-// statement so they CANNOT diverge (T-17.9-07 mitigation).
+// (fmt_ver=2). DUAL-READ ONLY (user decision 2026-06-03): it writes the
+// attribute-faithful columns + fmt_ver=2 and does NOT write the legacy
+// sender_key blob — no dual-write. An existing legacy row's blob is left
+// untouched (stale, never read under fmt_ver=2); a brand-new row's sender_key
+// is NULL (migration 17 dropped NOT NULL). There is no Serialize on this path.
 //
-// Column layout matches the migration 16 schema exactly:
+// Column layout (migration 16 schema; sender_key NOT written here):
 //   our_jid, chat_id, sender_id, fmt_ver, st_key_id, st_chain_key_iteration,
 //   st_chain_key, st_signing_key_public, st_signing_key_private,
-//   smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed, sender_key
+//   smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed
 //
-// ON CONFLICT updates ALL columns atomically (a partial update under fmt_ver=2
-// would leave stale arrays; T-17.9-09 mitigation for migratePNToLID safety).
+// ON CONFLICT updates ALL columnar columns atomically (a partial update under
+// fmt_ver=2 would leave stale arrays; T-17.9-09); sender_key is left as-is.
 //
 // Integer arrays (st_key_id, st_chain_key_iteration, smk_iteration) use
 // int64Array; state-index array (smk_state_idx) uses int32Array. Both are
 // driver.Valuer → PG text-format {1,2,...} — required under database/sql
 // because pgx-native []int64 handling is not available through the stdlib adapter.
 //
-// Binding: 15 params per row. Each chunk is one statement (atomic). First error stops.
+// Binding: 14 params per row. Each chunk is one statement (atomic). First error stops.
 // An empty or nil slice is a no-op.
 func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error {
-	const paramsPerRow = 15
+	const paramsPerRow = 14
 	for start := 0; start < len(keys); start += senderKeyBatchChunkSize {
 		end := start + senderKeyBatchChunkSize
 		if end > len(keys) {
@@ -551,18 +551,21 @@ func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) e
 		qb.WriteString("INSERT INTO whatsmeow_sender_keys " +
 			"(our_jid, chat_id, sender_id, fmt_ver, " +
 			"st_key_id, st_chain_key_iteration, st_chain_key, st_signing_key_public, st_signing_key_private, " +
-			"smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed, sender_key) VALUES ")
+			"smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed) VALUES ")
 		args := make([]any, 0, len(chunk)*paramsPerRow)
 		for i, row := range chunk {
 			if i > 0 {
 				qb.WriteByte(',')
 			}
 			n := i * paramsPerRow
-			fmt.Fprintf(&qb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-				n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12, n+13, n+14, n+15)
+			fmt.Fprintf(&qb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12, n+13, n+14)
 			c := row.Cols
-			// Recompose the legacy blob once per row at drain time (amortized ~1/N).
-			legacyBlob := recomposedBlob(c) // ALLOW-JSON-DRAIN-BLOB (via recomposedBlob → sk.Serialize())
+			// Dual-READ only (user decision 2026-06-03): write columns + fmt_ver=2
+			// and do NOT write the legacy sender_key blob. An existing legacy row's
+			// blob is left untouched (stale, never read under fmt_ver=2); a brand-new
+			// row gets sender_key=NULL (migration 17 dropped the NOT NULL). This
+			// removes the dual-write load and the last Serialize on the write path.
 			args = append(args,
 				s.JID,                              // $1 our_jid
 				row.Group,                          // $2 chat_id
@@ -578,7 +581,6 @@ func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) e
 				byteaArray(c.smkIV),                // $12 smk_iv bytea[]
 				byteaArray(c.smkCipherKey),         // $13 smk_cipher_key bytea[]
 				byteaArray(c.smkSeed),              // $14 smk_seed bytea[]
-				legacyBlob,                         // $15 sender_key bytea (legacy blob)
 			)
 		}
 		qb.WriteString(" ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET " +
@@ -587,32 +589,13 @@ func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) e
 			"st_chain_key=excluded.st_chain_key, st_signing_key_public=excluded.st_signing_key_public, " +
 			"st_signing_key_private=excluded.st_signing_key_private, " +
 			"smk_state_idx=excluded.smk_state_idx, smk_iteration=excluded.smk_iteration, " +
-			"smk_iv=excluded.smk_iv, smk_cipher_key=excluded.smk_cipher_key, smk_seed=excluded.smk_seed, " +
-			"sender_key=excluded.sender_key")
+			"smk_iv=excluded.smk_iv, smk_cipher_key=excluded.smk_cipher_key, smk_seed=excluded.smk_seed")
 
 		if _, err := s.db.Exec(ctx, qb.String(), args...); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// recomposedBlob recomposes the legacy JSON blob from a *senderKeyColumns DTO.
-// Called once per row at drain time (amortized ~1/N). The resulting blob is
-// written alongside the columns so legacy readers can still use it.
-// This is the ONLY call-site where Serialize is permitted (phase invariant). // ALLOW-JSON-DRAIN-BLOB
-func recomposedBlob(c *senderKeyColumns) []byte {
-	structure := recompose(c)
-	sk, err := groupRecord.NewSenderKeyFromStruct(structure,
-		store.SignalProtobufSerializer.SenderKeyRecord,
-		store.SignalProtobufSerializer.SenderKeyState)
-	if err != nil {
-		// recompose produces a valid structure from our own typed columns;
-		// NewSenderKeyFromStruct only fails on nil/invalid fields that we don't produce.
-		// Log and return nil (which would make sender_key NULL in DB — a detectable anomaly).
-		return nil
-	}
-	return sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
 }
 
 func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []byte, err error) {

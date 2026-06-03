@@ -265,7 +265,8 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 			t.Errorf("fmt_ver2 arm: want iter=10, got %v", iterDB)
 		}
 
-		// Verify the blob is NOT NULL and round-trips the signing keys.
+		// Dual-READ only: the recovered row is column-only, so the legacy
+		// sender_key blob must be NULL (recovery writes columns, never the blob).
 		var blob []byte
 		err = db.QueryRowContext(ctx,
 			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
@@ -274,34 +275,32 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read blob: %v", err)
 		}
-		if blob == nil {
-			t.Error("sender_key blob is NULL — recompose did not fire at drain")
-		}
-		// Deserialize the blob and compare signing keys against the donor structure.
 		if blob != nil {
-			recovered, err := pbSerializer.SenderKeyRecord.Deserialize(blob)
-			if err != nil {
-				t.Fatalf("Deserialize recovered blob: %v", err)
-			}
-			if len(recovered.SenderKeyStates) == 0 {
-				t.Fatal("recovered blob has 0 states")
-			}
-			donorState := donorStruct.SenderKeyStates[0]
-			recvState := recovered.SenderKeyStates[0]
-			if !bytes.Equal(donorState.SigningKeyPublic, recvState.SigningKeyPublic) {
-				t.Errorf("fmt_ver2 arm: SigningKeyPublic mismatch:\n  donor: %x\n  recv:  %x",
-					donorState.SigningKeyPublic, recvState.SigningKeyPublic)
-			}
-			if !bytes.Equal(donorState.SenderChainKey.ChainKey, recvState.SenderChainKey.ChainKey) {
-				t.Errorf("fmt_ver2 arm: ChainKey mismatch:\n  donor: %x\n  recv:  %x",
-					donorState.SenderChainKey.ChainKey, recvState.SenderChainKey.ChainKey)
-			}
-			normalDonor := normalizeSKNilPriv(donorState.SigningKeyPrivate)
-			normalRecv := normalizeSKNilPriv(recvState.SigningKeyPrivate)
-			if !reflect.DeepEqual(normalDonor, normalRecv) {
-				t.Errorf("fmt_ver2 arm: SigningKeyPrivate mismatch (nil-normalized):\n  donor: %x\n  recv:  %x",
-					normalDonor, normalRecv)
-			}
+			t.Errorf("sender_key blob = %d bytes, want NULL (recovery must write columns only, not the legacy blob)", len(blob))
+		}
+		// Recompose from the columns and compare signing keys against the donor.
+		recovered, err := csB.GetSenderKeyStructure(ctx, group, targetSenderID)
+		if err != nil || recovered == nil {
+			t.Fatalf("GetSenderKeyStructure (recovered): err=%v got=%v", err, recovered)
+		}
+		if len(recovered.SenderKeyStates) == 0 {
+			t.Fatal("recovered structure has 0 states")
+		}
+		donorState := donorStruct.SenderKeyStates[0]
+		recvState := recovered.SenderKeyStates[0]
+		if !bytes.Equal(donorState.SigningKeyPublic, recvState.SigningKeyPublic) {
+			t.Errorf("fmt_ver2 arm: SigningKeyPublic mismatch:\n  donor: %x\n  recv:  %x",
+				donorState.SigningKeyPublic, recvState.SigningKeyPublic)
+		}
+		if !bytes.Equal(donorState.SenderChainKey.ChainKey, recvState.SenderChainKey.ChainKey) {
+			t.Errorf("fmt_ver2 arm: ChainKey mismatch:\n  donor: %x\n  recv:  %x",
+				donorState.SenderChainKey.ChainKey, recvState.SenderChainKey.ChainKey)
+		}
+		normalDonor := normalizeSKNilPriv(donorState.SigningKeyPrivate)
+		normalRecv := normalizeSKNilPriv(recvState.SigningKeyPrivate)
+		if !reflect.DeepEqual(normalDonor, normalRecv) {
+			t.Errorf("fmt_ver2 arm: SigningKeyPrivate mismatch (nil-normalized):\n  donor: %x\n  recv:  %x",
+				normalDonor, normalRecv)
 		}
 		t.Logf("fmt_ver2 arm: PASS — donor iter=10, target=15, recovered iter=%d, fmt_ver=%d", iterDB.Int64, fmtVerDB.Int64)
 	})
@@ -358,14 +357,18 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		if !iterDB.Valid || iterDB.Int64 != 20 {
 			t.Errorf("legacy arm: want iter=20, got %v", iterDB)
 		}
-		// Verify not-NULL blob.
+		// Dual-READ only: even a legacy (fmt_ver=1) donor is recovered as a
+		// column-only fmt_ver=2 row, so the recovered blob must be NULL.
 		var blob []byte
 		err = db.QueryRowContext(ctx,
 			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
 			recoveryTestJIDB, group, targetSenderID,
 		).Scan(&blob)
-		if err != nil || blob == nil {
-			t.Errorf("legacy arm: sender_key blob is NULL or error: %v", err)
+		if err != nil {
+			t.Fatalf("legacy arm: read blob: %v", err)
+		}
+		if blob != nil {
+			t.Errorf("legacy arm: sender_key blob = %d bytes, want NULL (recovery writes columns only)", len(blob))
 		}
 		t.Logf("legacy arm: PASS — fmt_ver=1 donor iter=20, target=25, recovered iter=%d fmt_ver=%d", iterDB.Int64, fmtVerDB.Int64)
 	})

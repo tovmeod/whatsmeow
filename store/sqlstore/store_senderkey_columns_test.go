@@ -277,11 +277,11 @@ func TestSenderKeyColumnsSQL_FmtVer2IgnoresBlob(t *testing.T) {
 	}
 }
 
-// TestSenderKeyNoDivergence (d): write via the flusher drain → read columns
-// (getSenderKeyDecomposed via GetSenderKeyStructure) AND Deserialize the legacy
-// blob; assert both yield the same *SenderKeyStructure (single-drain dual-write
-// non-divergence proof, T-17.9-13).
-func TestSenderKeyNoDivergence(t *testing.T) {
+// TestSenderKeyColumnOnlyWrite (d): write via PutManySenderKeys → assert the
+// row is column-only (dual-READ, no dual-write): fmt_ver=2, the legacy
+// sender_key blob is NULL (NOT rewritten), and the columns recompose back to
+// the original *SenderKeyStructure (T-17.9-13).
+func TestSenderKeyColumnOnlyWrite(t *testing.T) {
 	inner, db := newBatchTestStore(t)
 	ctx := context.Background()
 
@@ -291,7 +291,23 @@ func TestSenderKeyNoDivergence(t *testing.T) {
 		t.Fatalf("PutManySenderKeys: %v", err)
 	}
 
-	// Read structure from columns via GetSenderKeyStructure.
+	// fmt_ver=2 with a NULL legacy blob: column-only write (no dual-write).
+	var fmtVer int
+	var blob []byte
+	err := db.QueryRowContext(ctx,
+		`SELECT fmt_ver, sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		testJID, "g4@g.us", "u4_1:0").Scan(&fmtVer, &blob)
+	if err != nil {
+		t.Fatalf("SELECT fmt_ver, sender_key: %v", err)
+	}
+	if fmtVer != 2 {
+		t.Errorf("fmt_ver = %d, want 2", fmtVer)
+	}
+	if blob != nil {
+		t.Errorf("sender_key blob = %d bytes, want NULL (dual-READ only: write must not rewrite the legacy blob)", len(blob))
+	}
+
+	// The columns must recompose back to the original structure.
 	byteCache, _ := lru.New[string, []byte](1024)
 	devCache, _ := lru.New[string, []string](1024)
 	cs := sqlstore.NewCachedSenderKeyStore(inner, testJID, byteCache, devCache)
@@ -300,23 +316,8 @@ func TestSenderKeyNoDivergence(t *testing.T) {
 	if err != nil || fromColumns == nil {
 		t.Fatalf("GetSenderKeyStructure (columns): err=%v got=%v", err, fromColumns)
 	}
-
-	// Read raw blob from DB and Deserialize.
-	var blob []byte
-	err = db.QueryRowContext(ctx,
-		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
-		testJID, "g4@g.us", "u4_1:0").Scan(&blob)
-	if err != nil || blob == nil {
-		t.Fatalf("SELECT sender_key: err=%v blob=%v", err, blob)
-	}
-	fromBlob, err := colTestSerializer.SenderKeyRecord.Deserialize(blob)
-	if err != nil {
-		t.Fatalf("Deserialize blob: %v", err)
-	}
-
-	// Both must produce the same *SenderKeyStructure (T-17.9-13 non-divergence).
-	if !reflect.DeepEqual(normalizeSKStructure(fromColumns), normalizeSKStructure(fromBlob)) {
-		t.Errorf("columns vs blob divergence:\n  fromColumns: %+v\n  fromBlob:    %+v", fromColumns, fromBlob)
+	if !reflect.DeepEqual(normalizeSKStructure(original), normalizeSKStructure(fromColumns)) {
+		t.Errorf("column round-trip mismatch:\n  original:    %+v\n  fromColumns: %+v", original, fromColumns)
 	}
 }
 

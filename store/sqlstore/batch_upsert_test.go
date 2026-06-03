@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"testing"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
@@ -150,23 +151,24 @@ func buildTestSenderKeyStructure(keyID uint32) *groupRecord.SenderKeyStructure {
 func readBackAndVerify(t *testing.T, s *sqlstore.SQLStore, group, user string, wantKeyID uint32) {
 	t.Helper()
 	ctx := context.Background()
-	got, err := s.GetSenderKey(ctx, group, user)
+	// Dual-READ only (no dual-write): column-only rows have no sender_key blob,
+	// so verify through the columnar read path (GetSenderKeyStructure), which is
+	// the production read path.
+	byteCache, _ := lru.New[string, []byte](1024)
+	devCache, _ := lru.New[string, []string](1024)
+	cs := sqlstore.NewCachedSenderKeyStore(s, testJID, byteCache, devCache)
+	structure, err := cs.GetSenderKeyStructure(ctx, group, user)
 	if err != nil {
-		t.Fatalf("GetSenderKey(%s,%s): %v", group, user, err)
+		t.Fatalf("GetSenderKeyStructure(%s,%s): %v", group, user, err)
 	}
-	if got == nil {
-		t.Fatalf("GetSenderKey(%s,%s): returned nil (row not found)", group, user)
-	}
-	// Deserialize blob back to structure and check keyID.
-	structure, err := pbSerializer.SenderKeyRecord.Deserialize(got)
-	if err != nil {
-		t.Fatalf("Deserialize blob for (%s,%s): %v", group, user, err)
+	if structure == nil {
+		t.Fatalf("GetSenderKeyStructure(%s,%s): returned nil (row not found)", group, user)
 	}
 	if len(structure.SenderKeyStates) == 0 {
-		t.Fatalf("no states in deserialized blob for (%s,%s)", group, user)
+		t.Fatalf("no states in recomposed structure for (%s,%s)", group, user)
 	}
 	if structure.SenderKeyStates[0].KeyID != wantKeyID {
-		t.Errorf("GetSenderKey(%s,%s) → keyID = %d, want %d", group, user, structure.SenderKeyStates[0].KeyID, wantKeyID)
+		t.Errorf("GetSenderKeyStructure(%s,%s) → keyID = %d, want %d", group, user, structure.SenderKeyStates[0].KeyID, wantKeyID)
 	}
 }
 
@@ -269,18 +271,15 @@ func TestBatchUpsertColumnRoundTrip(t *testing.T) {
 		t.Errorf("fmt_ver = %d, want 2", fmtVer)
 	}
 
-	// Verify the legacy blob deserializes back to the original structure.
-	// NOTE: st_* columns are NOT read back (that is plan 04); this test only
-	// verifies the recomposed sender_key blob round-trips through the JSON
-	// serializer correctly. Column-bind verification (byteaArray/int64Array
-	// against real DB BYTEA[]/BIGINT[] responses) is deferred to plan 04.
-	got, err := store.GetSenderKey(ctx, "555@g.us", "777_1:0")
-	if err != nil || got == nil {
-		t.Fatalf("GetSenderKey: err=%v got=%v", err, got)
-	}
-	structure, err := pbSerializer.SenderKeyRecord.Deserialize(got)
-	if err != nil {
-		t.Fatalf("Deserialize: %v", err)
+	// Dual-READ only: no sender_key blob is written. Verify the round-trip
+	// through the columnar read path (GetSenderKeyStructure → recompose from
+	// the st_* / smk_* columns), which is the production read path.
+	byteCache, _ := lru.New[string, []byte](1024)
+	devCache, _ := lru.New[string, []string](1024)
+	cs := sqlstore.NewCachedSenderKeyStore(store, testJID, byteCache, devCache)
+	structure, err := cs.GetSenderKeyStructure(ctx, "555@g.us", "777_1:0")
+	if err != nil || structure == nil {
+		t.Fatalf("GetSenderKeyStructure: err=%v got=%v", err, structure)
 	}
 	// Normalize nil/empty-slice differences (the JSON serializer converts nil Keys
 	// to [] on serialization; reflect.DeepEqual sees them as different).
