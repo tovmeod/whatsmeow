@@ -237,19 +237,36 @@ func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protoco
 	groupID := senderKeyName.GroupID()
 	senderString := senderKeyName.Sender().String()
 
-	// ONE serialize call — passed to PutSenderKey; no second serialize downstream (SC-3).
-	serialized := keyRecord.Serialize()
-
-	// Phase 17.8: update struct cache with post-ratchet structure.
+	// Phase 17.8: update struct cache with post-ratchet structure (write-side feed).
 	// cacheKey includes device JID prefix — required because ParsedSKCache is a
 	// shared process-level LRU; device scoping prevents cross-account collisions
 	// (matches CachedSenderKeyStore.key format). REPLACE, not invalidate — avoids
 	// stale-after-write against async flusher (Pitfall 2).
+	// NOTE: plan 04 wires the AUTHORITATIVE replace at the PutSenderKeyStructure
+	// chokepoint (which also covers the recovery path that never reaches this line);
+	// this StoreStruct then becomes a redundant same-structure replace (harmless).
 	if device.ID != nil && device.ParsedSKCache != nil {
 		cacheKey := device.ID.String() + "|" + groupID + "|" + senderString
 		device.ParsedSKCache.StoreStruct(cacheKey, keyRecord.Structure())
 	}
 
+	// Phase 17.9: columnar hot path — no Serialize on the per-message write.
+	// Type-assert device.SenderKeys to the fork-local optional interface.
+	// Structure() is JSON-free (in-memory only; no Marshal).
+	// DESIGN OVERRIDE: the columnar path uses a structure-carrying fork-local
+	// interface; whatsmeow's []byte SenderKeyStore is preserved for upstream-merge
+	// compatibility (DESIGN line 64 non-veto; line 11 hard goal).
+	if csk, ok := device.SenderKeys.(SenderKeyColumnarStore); ok {
+		err := csk.PutSenderKeyStructure(ctx, groupID, senderString, keyRecord.Structure())
+		if err != nil {
+			return fmt.Errorf("failed to store sender key from %s for %s: %w", senderString, groupID, err)
+		}
+		return nil
+	}
+
+	// Fallback: store does not implement SenderKeyColumnarStore (legacy / test stores).
+	// This is the ONLY remaining Serialize in StoreSenderKey; fires only for non-columnar stores.
+	serialized := keyRecord.Serialize()
 	err := device.SenderKeys.PutSenderKey(ctx, groupID, senderString, serialized)
 	if err != nil {
 		return fmt.Errorf("failed to store sender key from %s for %s: %w", senderString, groupID, err)
