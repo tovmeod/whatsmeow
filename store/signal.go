@@ -266,7 +266,7 @@ func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protoco
 
 	// Fallback: store does not implement SenderKeyColumnarStore (legacy / test stores).
 	// This is the ONLY remaining Serialize in StoreSenderKey; fires only for non-columnar stores.
-	serialized := keyRecord.Serialize()
+	serialized := keyRecord.Serialize() // ALLOW-JSON-LEGACY-READ (non-columnar store fallback: fires only on legacy/test stores, not production CachedSenderKeyStore)
 	err := device.SenderKeys.PutSenderKey(ctx, groupID, senderString, serialized)
 	if err != nil {
 		return fmt.Errorf("failed to store sender key from %s for %s: %w", senderString, groupID, err)
@@ -313,8 +313,8 @@ func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol
 			return groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState), nil
 		}
 
-		// Deserialize once: JSON → structure (legacy path only).
-		structure, err := SignalProtobufSerializer.SenderKeyRecord.Deserialize(rawKey)
+		// Deserialize once: JSON → structure (legacy path only — non-columnar store fallback).
+		structure, err := SignalProtobufSerializer.SenderKeyRecord.Deserialize(rawKey) // ALLOW-JSON-LEGACY-READ (non-columnar store fallback)
 		if err != nil {
 			return nil, fmt.Errorf("failed to deserialize sender key from %s for %s: %w", senderString, groupID, err)
 		}
