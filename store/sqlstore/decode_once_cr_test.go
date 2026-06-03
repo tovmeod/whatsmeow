@@ -47,7 +47,7 @@ type testDeviceHandles struct {
 	fakeSess    *fakeSessionStore
 	skStore     *CachedSenderKeyStore
 	skLRU       *lru.Cache[string, []byte]
-	skParsedLRU *lru.Cache[string, *groupRecord.SenderKeyStructure]
+	skParsedLRU *store.SKParsedLRU // Phase 17.9: flat value-struct LRU
 	sessParsLRU *lru.Cache[string, *librecord.SessionStructure]
 	testJID     string // the JID string (== device.ID.String())
 }
@@ -77,9 +77,9 @@ func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles
 	if err != nil {
 		t.Fatalf("lru.New devCache: %v", err)
 	}
-	skParsedLRU, err := lru.New[string, *groupRecord.SenderKeyStructure](lruCap)
+	skParsedLRU, err := store.NewSKParsedLRU(lruCap)
 	if err != nil {
-		t.Fatalf("lru.New skParsedLRU: %v", err)
+		t.Fatalf("NewSKParsedLRU: %v", err)
 	}
 	sessParsLRU, err := lru.New[string, *librecord.SessionStructure](lruCap)
 	if err != nil {
@@ -140,13 +140,19 @@ func makeSignalAddress(name string) *protocol.SignalAddress {
 // (all other fields identical to buildSenderKeyBlob(0)). Lets TR-03 and
 // TR-08 make an exact keyID assertion rather than just a non-nil check.
 func buildSenderKeyBlobKeyID(keyID uint32) []byte {
+	// Field name MUST match libsignal: the chain key is
+	// SenderChainKeyStructure.ChainKey, not "Seed". Keys is nil here (no skipped
+	// keys), so senderMsgKeyStruct is unused, but the chain key must be a valid
+	// 32-byte value or the flat-cache length guard refuses the structure.
 	type senderMsgKeyStruct struct {
 		Iteration uint32
+		IV        []byte
+		CipherKey []byte
 		Seed      []byte
 	}
 	type chainKeyStruct struct {
 		Iteration uint32
-		Seed      []byte
+		ChainKey  []byte
 	}
 	type senderKeyRecordStruct struct {
 		SenderKeyStates []struct {
@@ -184,7 +190,7 @@ func buildSenderKeyBlobKeyID(keyID uint32) []byte {
 	}{
 		{
 			KeyID:            keyID,
-			SenderChainKey:   chainKeyStruct{Iteration: 0, Seed: key32()},
+			SenderChainKey:   chainKeyStruct{Iteration: 0, ChainKey: key32()},
 			Keys:             nil,
 			SigningKeyPublic:  pub33(),
 			SigningKeyPrivate: key32(),

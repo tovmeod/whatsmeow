@@ -1,24 +1,14 @@
 // decode_once_bench_test.go — D-01/D-03 gate benchmark for Phase 17.8/17.9.
 //
-// Measures three arms for session records:
+// Measures these arms for session records:
 //   (a) Full parse JSON: NewSessionFromBytes (Deserialize JSON → NewSessionFromStructure)
-//   (a') Full parse Proto: proto blob → ProtoSessionSerializer.Deserialize → NewSessionFromStructure
 //   (b) Deserialize only JSON: pbSerializer.Session.Deserialize (JSON→SessionStructure)
-//   (b') Deserialize only Proto: ProtoSessionSerializer.Deserialize (proto→SessionStructure)
 //   (c) Graph rebuild only: NewSessionFromStructure (SessionStructure→*Session) [format-independent]
 //
 // Plus, for sender-key records:
 //   (d) Full parse JSON: NewSenderKeyFromBytes
-//   (d') Full parse Proto: proto blob → ProtoSenderKeySerializer.Deserialize → NewSenderKeyFromStruct
 //   (e) SenderKey Deserialize only JSON
-//   (e') SenderKey Deserialize only Proto
 //   (f) SenderKey graph rebuild only [format-independent]
-//
-// Each Proto arm setup (outside the timed loop) deserializes the JSON fixture to
-// the libsignal structure once, then ProtoSessionSerializer.Serialize / ProtoSenderKeySerializer.Serialize
-// to get the protobuf blob; the timed loop benchmarks proto Deserialize (and FullParse: + NewSessionFromStructure).
-//
-// D-01 decision: the _JSON vs _Proto pair fills the Req-1 comparison table (Plan 03).
 //
 // "Clone" via structure-cache means caching the *SessionStructure from (b) and
 // paying (c) per decrypt hit instead of (a). Only paths (b)+(c) decomposition
@@ -225,81 +215,6 @@ func BenchmarkSession_FullParse_JSON_2000Keys(b *testing.B) {
 	}
 }
 
-// ---------------- Session FullParse Proto arms (arm a') ----------------
-
-// BenchmarkSession_FullParse_Proto_0Keys is arm (a') with 0 skipped keys.
-// Setup: JSON→structure→protoSerialize once; timed loop: protoDeserialize+NewSessionFromStructure.
-func BenchmarkSession_FullParse_Proto_0Keys(b *testing.B) {
-	protoSer := &ProtoSessionSerializer{}
-	structure, err := pbSerializer.Session.Deserialize(sessionBlob0)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSessionSerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		s, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-		_, err = librecord.NewSessionFromStructure(s, protoSer, &ProtoStateSerializer{})
-		if err != nil {
-			b.Fatalf("NewSessionFromStructure failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkSession_FullParse_Proto_500Keys is arm (a') with 500 skipped keys.
-func BenchmarkSession_FullParse_Proto_500Keys(b *testing.B) {
-	protoSer := &ProtoSessionSerializer{}
-	structure, err := pbSerializer.Session.Deserialize(sessionBlob500)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSessionSerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		s, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-		_, err = librecord.NewSessionFromStructure(s, protoSer, &ProtoStateSerializer{})
-		if err != nil {
-			b.Fatalf("NewSessionFromStructure failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkSession_FullParse_Proto_2000Keys is arm (a') with 2000 skipped keys (worst case).
-func BenchmarkSession_FullParse_Proto_2000Keys(b *testing.B) {
-	protoSer := &ProtoSessionSerializer{}
-	structure, err := pbSerializer.Session.Deserialize(sessionBlob2000)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSessionSerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		s, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-		_, err = librecord.NewSessionFromStructure(s, protoSer, &ProtoStateSerializer{})
-		if err != nil {
-			b.Fatalf("NewSessionFromStructure failed: %v", err)
-		}
-	}
-}
-
 // ---------------- Session DeserializeOnly JSON arms (arm b) ----------------
 
 // BenchmarkSession_DeserializeOnly_JSON_0Keys is arm (b) with 0 skipped keys.
@@ -334,69 +249,6 @@ func BenchmarkSession_DeserializeOnly_JSON_2000Keys(b *testing.B) {
 		_, err := deserializeSessionOnly(blob)
 		if err != nil {
 			b.Fatalf("deserialize failed: %v", err)
-		}
-	}
-}
-
-// ---------------- Session DeserializeOnly Proto arms (arm b') ----------------
-
-// BenchmarkSession_DeserializeOnly_Proto_0Keys is arm (b') with 0 skipped keys.
-// Setup: JSON→structure→protoSerialize once; timed loop: protoDeserialize only.
-func BenchmarkSession_DeserializeOnly_Proto_0Keys(b *testing.B) {
-	protoSer := &ProtoSessionSerializer{}
-	structure, err := pbSerializer.Session.Deserialize(sessionBlob0)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSessionSerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkSession_DeserializeOnly_Proto_500Keys is arm (b') with 500 skipped keys.
-func BenchmarkSession_DeserializeOnly_Proto_500Keys(b *testing.B) {
-	protoSer := &ProtoSessionSerializer{}
-	structure, err := pbSerializer.Session.Deserialize(sessionBlob500)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSessionSerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkSession_DeserializeOnly_Proto_2000Keys is arm (b') with 2000 skipped keys.
-func BenchmarkSession_DeserializeOnly_Proto_2000Keys(b *testing.B) {
-	protoSer := &ProtoSessionSerializer{}
-	structure, err := pbSerializer.Session.Deserialize(sessionBlob2000)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSessionSerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
 		}
 	}
 }
@@ -458,13 +310,22 @@ func BenchmarkSession_GraphRebuild_2000Keys(b *testing.B) {
 // buildSenderKeyBlob constructs a synthetic sender-key blob with numKeys
 // skipped message keys in SenderKeyStates[0].
 func buildSenderKeyBlob(numKeys int) []byte {
+	// Field names MUST match libsignal's structure JSON keys: the chain key is
+	// SenderChainKeyStructure.ChainKey (NOT "Seed"), and a skipped message key is
+	// SenderMessageKeyStructure{Iteration,IV,CipherKey,Seed}. Earlier fixtures
+	// named the chain field "Seed" and omitted IV/CipherKey, yielding a structure
+	// with an empty chain key and empty IV/CipherKey — invalid lengths that the
+	// flat-cache length guard correctly refuses. Use real lengths (chainKey=32,
+	// iv=16, cipherKey=32, seed=32).
 	type senderMsgKeyStruct struct {
 		Iteration uint32
+		IV        []byte
+		CipherKey []byte
 		Seed      []byte
 	}
 	type chainKeyStruct struct {
 		Iteration uint32
-		Seed      []byte
+		ChainKey  []byte
 	}
 	type senderKeyStateStruct struct {
 		SenderKeyStateStructure struct {
@@ -502,10 +363,19 @@ func buildSenderKeyBlob(numKeys int) []byte {
 		return b
 	}
 
+	key16 := func() []byte {
+		b := make([]byte, 16)
+		for i := range b {
+			b[i] = byte(i + 7)
+		}
+		return b
+	}
 	msgKeys := make([]senderMsgKeyStruct, numKeys)
 	for i := range msgKeys {
 		msgKeys[i] = senderMsgKeyStruct{
 			Iteration: uint32(i),
+			IV:        key16(),
+			CipherKey: key32(),
 			Seed:      key32(),
 		}
 	}
@@ -522,7 +392,7 @@ func buildSenderKeyBlob(numKeys int) []byte {
 			KeyID: 1,
 			SenderChainKey: chainKeyStruct{
 				Iteration: uint32(numKeys),
-				Seed:      key32(),
+				ChainKey:  key32(),
 			},
 			Keys:             msgKeys,
 			SigningKeyPublic:  pub33(),
@@ -600,81 +470,6 @@ func BenchmarkSenderKey_FullParse_JSON_2000Keys(b *testing.B) {
 	}
 }
 
-// ---------------- SenderKey FullParse Proto arms (arm d') ----------------
-
-// BenchmarkSenderKey_FullParse_Proto_0Keys is arm (d') with 0 skipped keys.
-// Setup: JSON→structure→protoSerialize once; timed loop: protoDeserialize+NewSenderKeyFromStruct.
-func BenchmarkSenderKey_FullParse_Proto_0Keys(b *testing.B) {
-	protoSer := &ProtoSenderKeySerializer{}
-	structure, err := pbSerializer.SenderKeyRecord.Deserialize(senderKeyBlob0)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSenderKeySerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		s, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-		_, err = groupRecord.NewSenderKeyFromStruct(s, protoSer, &ProtoSenderKeyStateSerializer{})
-		if err != nil {
-			b.Fatalf("NewSenderKeyFromStruct failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkSenderKey_FullParse_Proto_500Keys is arm (d') with 500 skipped keys.
-func BenchmarkSenderKey_FullParse_Proto_500Keys(b *testing.B) {
-	protoSer := &ProtoSenderKeySerializer{}
-	structure, err := pbSerializer.SenderKeyRecord.Deserialize(senderKeyBlob500)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSenderKeySerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		s, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-		_, err = groupRecord.NewSenderKeyFromStruct(s, protoSer, &ProtoSenderKeyStateSerializer{})
-		if err != nil {
-			b.Fatalf("NewSenderKeyFromStruct failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkSenderKey_FullParse_Proto_2000Keys is arm (d') with 2000 skipped keys.
-func BenchmarkSenderKey_FullParse_Proto_2000Keys(b *testing.B) {
-	protoSer := &ProtoSenderKeySerializer{}
-	structure, err := pbSerializer.SenderKeyRecord.Deserialize(senderKeyBlob2000)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSenderKeySerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		s, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-		_, err = groupRecord.NewSenderKeyFromStruct(s, protoSer, &ProtoSenderKeyStateSerializer{})
-		if err != nil {
-			b.Fatalf("NewSenderKeyFromStruct failed: %v", err)
-		}
-	}
-}
-
 // ---------------- SenderKey DeserializeOnly JSON arms (arm e) ----------------
 
 func BenchmarkSenderKey_DeserializeOnly_JSON_0Keys(b *testing.B) {
@@ -706,68 +501,6 @@ func BenchmarkSenderKey_DeserializeOnly_JSON_2000Keys(b *testing.B) {
 		_, err := deserializeSenderKeyOnly(blob)
 		if err != nil {
 			b.Fatalf("deserialize failed: %v", err)
-		}
-	}
-}
-
-// ---------------- SenderKey DeserializeOnly Proto arms (arm e') ----------------
-
-// BenchmarkSenderKey_DeserializeOnly_Proto_0Keys is arm (e') with 0 skipped keys.
-func BenchmarkSenderKey_DeserializeOnly_Proto_0Keys(b *testing.B) {
-	protoSer := &ProtoSenderKeySerializer{}
-	structure, err := pbSerializer.SenderKeyRecord.Deserialize(senderKeyBlob0)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSenderKeySerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkSenderKey_DeserializeOnly_Proto_500Keys is arm (e') with 500 skipped keys.
-func BenchmarkSenderKey_DeserializeOnly_Proto_500Keys(b *testing.B) {
-	protoSer := &ProtoSenderKeySerializer{}
-	structure, err := pbSerializer.SenderKeyRecord.Deserialize(senderKeyBlob500)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSenderKeySerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkSenderKey_DeserializeOnly_Proto_2000Keys is arm (e') with 2000 skipped keys.
-func BenchmarkSenderKey_DeserializeOnly_Proto_2000Keys(b *testing.B) {
-	protoSer := &ProtoSenderKeySerializer{}
-	structure, err := pbSerializer.SenderKeyRecord.Deserialize(senderKeyBlob2000)
-	if err != nil {
-		b.Fatalf("setup JSON Deserialize failed: %v", err)
-	}
-	protoBlob := protoSer.Serialize(structure)
-	if len(protoBlob) == 0 {
-		b.Fatal("setup: ProtoSenderKeySerializer.Serialize returned empty")
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := protoSer.Deserialize(protoBlob)
-		if err != nil {
-			b.Fatalf("proto Deserialize failed: %v", err)
 		}
 	}
 }

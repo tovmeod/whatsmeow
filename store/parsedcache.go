@@ -59,7 +59,17 @@ func parsedCacheEnvCapOrDefault(key string, fallback int) int {
 // Sized to match the []byte LRU caps (KAVTOV_CACHE_SENDERKEY_CAP /
 // KAVTOV_CACHE_SESSION_CAP) so that struct-cache evictions and []byte-cache
 // evictions occur at the same working-set boundary.
-var signalSKParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
+//
+// Phase 17.9 GC redesign: KAVTOV_CACHE_SENDERKEY_DECODED_CAP lowered from
+// 1_500_000 to 500_000 — right-sized to the ~275k hot fmt_ver=2 working set
+// + headroom so total warmed heap stays under GOMEMLIMIT. This is a companion
+// lever to the flat value-struct, not a bandaid: the flat struct removes the
+// per-entry pointer scan cost, and the cap removes the continuous-GC frequency
+// trigger (heap > GOMEMLIMIT) that the still-dense session cache shares. The
+// AUTHORITATIVE prod cap is sqlstore's signalSKParsedCacheCap (cache_wiring.go),
+// also lowered to 500_000; this package-level var is the store-package default
+// used by tests/standalone wiring. Env-overridable.
+var signalSKParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
 var signalSessParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SESSION_DECODED_CAP", 250_000)
 
 // parsedSKCache is a process-level LRU of decoded *SenderKeyStructure values.
@@ -73,31 +83,67 @@ var signalSessParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SESSION_
 // or any other libsignal operation. LoadStruct holds no lock at all because
 // lru.Cache is goroutine-safe.
 type parsedSKCache struct {
-	lru *lru.Cache[string, *groupRecord.SenderKeyStructure]
+	lru *SKParsedLRU
 	mu  sync.Mutex
+}
+
+// SKParsedLRU is the concrete LRU type backing the parsed sender-key cache.
+// Phase 17.9 GC redesign: the value type is flatSenderKey (a near-pointer-free
+// value struct), NOT *groupRecord.SenderKeyStructure. flatSenderKey is
+// deliberately unexported (package-private crypto detail), so this exported
+// type alias + NewSKParsedLRU constructor are what package sqlstore uses to
+// construct and forward the LRU — sqlstore only constructs and hands off the
+// LRU, it never calls Get/Add on it (those happen here via flatFromStructure /
+// flatToStructure), so naming the unexported value type cross-package via the
+// alias is sound.
+type SKParsedLRU = lru.Cache[string, flatSenderKey]
+
+// NewSKParsedLRU constructs the parsed sender-key LRU. Used by cache_wiring.go
+// (package sqlstore) so it never has to name the unexported flatSenderKey type.
+func NewSKParsedLRU(capacity int) (*SKParsedLRU, error) {
+	return lru.New[string, flatSenderKey](capacity)
 }
 
 // NewParsedSKCache wraps a pre-constructed LRU. The LRU is constructed by
 // cache_wiring.go (plan 02) and injected here; parsedcache.go never owns LRU
 // construction.
-func NewParsedSKCache(cache *lru.Cache[string, *groupRecord.SenderKeyStructure]) *parsedSKCache {
+func NewParsedSKCache(cache *SKParsedLRU) *parsedSKCache {
 	return &parsedSKCache{lru: cache}
 }
 
-// LoadStruct returns the cached *SenderKeyStructure for key, or (nil, false)
-// on a miss. No lock is held; lru.Cache.Get is goroutine-safe. The returned
-// pointer is READ-ONLY — callers must not modify the struct.
+// LoadStruct rebuilds and returns the *SenderKeyStructure for key, or
+// (nil, false) on a miss. The cache stores a flatSenderKey BY VALUE; lru.Get
+// copies it out (no aliasing of the cached entry), and flatToStructure rebuilds
+// a fresh, independent *SenderKeyStructure. A malformed skipped tail makes
+// flatToStructure return nil, which is mapped to a clean miss (never a panic,
+// never a nil structure handed to NewSenderKeyFromStruct). No lock is held;
+// lru.Cache.Get is goroutine-safe.
 func (c *parsedSKCache) LoadStruct(key string) (*groupRecord.SenderKeyStructure, bool) {
-	return c.lru.Get(key)
+	f, ok := c.lru.Get(key)
+	if !ok {
+		return nil, false
+	}
+	s := flatToStructure(f)
+	if s == nil {
+		return nil, false
+	}
+	return s, true
 }
 
-// StoreStruct replaces the cached structure for key. Holds c.mu only for the
-// lru.Add call (not across any libsignal call). The passed-in pointer s must
-// have been produced by record.Structure() on the post-ratchet record — never
-// pass a pointer retrieved from a prior LoadStruct.
+// StoreStruct replaces the cached structure for key. The structure is converted
+// to its flat form first; if the length-validation guard refuses it
+// (flatFromStructure ok=false — wrong field length, 0 states, or > flatMaxStates),
+// the entry is left UNCACHED and the caller falls through to the uncached read
+// path (correct, just not cached). Holds c.mu only for the lru.Add call (not
+// across the conversion or any libsignal call). The passed-in pointer s must
+// have been produced by record.Structure() on the post-ratchet record.
 func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructure) {
+	f, ok := flatFromStructure(s)
+	if !ok {
+		return // refuse-to-cache: leave uncached, read path stays correct
+	}
 	c.mu.Lock()
-	c.lru.Add(key, s)
+	c.lru.Add(key, f)
 	c.mu.Unlock()
 }
 

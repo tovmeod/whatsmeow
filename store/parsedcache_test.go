@@ -20,10 +20,13 @@
 package store
 
 import (
+	"bytes"
+	"reflect"
 	"sync"
 	"testing"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	librecord "go.mau.fi/libsignal/state/record"
 )
@@ -34,11 +37,37 @@ import (
 
 func newSKCache(t *testing.T, cap int) *parsedSKCache {
 	t.Helper()
-	c, err := lru.New[string, *groupRecord.SenderKeyStructure](cap)
+	c, err := NewSKParsedLRU(cap)
 	if err != nil {
-		t.Fatalf("lru.New SenderKey: %v", err)
+		t.Fatalf("NewSKParsedLRU: %v", err)
 	}
 	return NewParsedSKCache(c)
+}
+
+// validSKStructure builds a minimal but length-valid *SenderKeyStructure that
+// passes flatFromStructure's refuse-to-cache guard (chainKey=32, signingPub=33,
+// signingPriv=32). Phase 17.9: the cache now stores a flat value-struct, so the
+// old &SenderKeyStructure{} (0 states) is rejected by the guard and would never
+// cache; tests must use a real structure.
+func validSKStructure(seed int) *groupRecord.SenderKeyStructure {
+	mk := func(n, b int) []byte {
+		out := make([]byte, n)
+		for i := range out {
+			out[i] = byte(b + i)
+		}
+		return out
+	}
+	return &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{{
+			KeyID: uint32(1000 + seed),
+			SenderChainKey: &ratchet.SenderChainKeyStructure{
+				Iteration: uint32(seed),
+				ChainKey:  mk(flatChainKeyLen, 0x10+seed),
+			},
+			SigningKeyPublic:  mk(flatSigningPubLen, 0x20+seed),
+			SigningKeyPrivate: mk(flatSigningPrivLen, 0x30+seed),
+		}},
+	}
 }
 
 func newSessCache(t *testing.T, cap int) *parsedSessionCache {
@@ -53,23 +82,25 @@ func newSessCache(t *testing.T, cap int) *parsedSessionCache {
 // ---------------------------------------------------------------------------
 // TestDecodedSKCacheHit
 //
-// SC-1: after StoreStruct(key, s), LoadStruct(key) returns the SAME pointer
-// (not a copy) with ok=true. Signal.go will call NewSenderKeyFromStruct on
-// this pointer without any deserialization — documented here.
+// SC-1: after StoreStruct(key, s), LoadStruct(key) returns a structure that is
+// VALUE-EQUAL to s with ok=true. Phase 17.9: the cache stores a flat value
+// struct and rebuilds a FRESH pointer on Load (no longer the same pointer), so
+// the assertion is reflect.DeepEqual, not pointer identity. Signal.go calls
+// NewSenderKeyFromStruct on this rebuilt structure.
 // ---------------------------------------------------------------------------
 
 func TestDecodedSKCacheHit(t *testing.T) {
 	cache := newSKCache(t, 128)
 	key := "group1|user1"
-	s := &groupRecord.SenderKeyStructure{}
+	s := validSKStructure(1)
 
 	cache.StoreStruct(key, s)
 	got, ok := cache.LoadStruct(key)
 	if !ok {
 		t.Fatal("LoadStruct after StoreStruct: want ok=true, got false")
 	}
-	if got != s {
-		t.Fatalf("LoadStruct returned different pointer: got %p, want %p", got, s)
+	if !reflect.DeepEqual(got, s) {
+		t.Fatalf("LoadStruct returned non-equal structure:\n got %+v\nwant %+v", got, s)
 	}
 }
 
@@ -108,7 +139,7 @@ func TestDecodedSKCacheStoreMutex(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s := &groupRecord.SenderKeyStructure{}
+			s := validSKStructure(2)
 			cache.StoreStruct(key, s)
 		}()
 	}
@@ -132,7 +163,7 @@ func TestDecodedSKCacheStoreMutex(t *testing.T) {
 func TestDecodedSKCacheInvalidate(t *testing.T) {
 	cache := newSKCache(t, 128)
 	key := "group-inv|user-inv"
-	s := &groupRecord.SenderKeyStructure{}
+	s := validSKStructure(3)
 
 	cache.StoreStruct(key, s)
 	cache.Invalidate(key)
@@ -202,41 +233,59 @@ func TestDecodedSessionCacheInvalidate(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestParsedCacheReadOnlyInvariant
+// TestParsedSKCacheRebuildIndependence
 //
-// Documents the read-only discipline: StoreStruct(key, s); retrieve via
-// LoadStruct; then call StoreStruct(key, retrieved) — treating the retrieved
-// pointer as if to "update" the cache. This is the exact anti-pattern callers
-// must avoid (they should call record.Structure() for a fresh pointer on the
-// Store path). The test verifies no panic occurs and the cache remains
-// readable. The -race detector enforces the mutation invariant at runtime: if
-// any caller modifies the cached struct while another goroutine reads it, race
-// detector flags it.
+// Phase 17.9: the cache stores a flat value-struct and rebuilds a FRESH,
+// independent *SenderKeyStructure on every LoadStruct. This test replaces the
+// old pointer-identity read-only-invariant test (whose premise — caching a
+// shared pointer — no longer holds). It asserts:
+//  1. Two LoadStruct calls return value-equal but DISTINCT pointers (rebuild).
+//  2. Re-storing a retrieved structure round-trips to a value-equal result.
+//  3. Mutating a retrieved structure's bytes does NOT corrupt the cache (the
+//     flat value-copy isolation that makes the old read-only discipline moot).
 // ---------------------------------------------------------------------------
 
-func TestParsedCacheReadOnlyInvariant(t *testing.T) {
+func TestParsedSKCacheRebuildIndependence(t *testing.T) {
 	cache := newSKCache(t, 128)
 	key := "group-ro|user-ro"
-	s := &groupRecord.SenderKeyStructure{}
+	s := validSKStructure(4)
 
 	cache.StoreStruct(key, s)
 
-	retrieved, ok := cache.LoadStruct(key)
+	a, ok := cache.LoadStruct(key)
 	if !ok {
 		t.Fatal("LoadStruct: want ok=true")
 	}
+	b, ok := cache.LoadStruct(key)
+	if !ok {
+		t.Fatal("second LoadStruct: want ok=true")
+	}
+	if a == b {
+		t.Fatal("LoadStruct returned the same pointer twice; expected a fresh rebuild each call")
+	}
+	if !reflect.DeepEqual(a, b) {
+		t.Fatalf("two rebuilds differ:\n a=%+v\n b=%+v", a, b)
+	}
 
-	// Re-storing the retrieved pointer is a no-op in terms of correctness
-	// (same pointer, same slot). Callers should NOT do this on the real Store
-	// path (they must use record.Structure() for a fresh pointer), but it must
-	// not corrupt or panic the cache.
-	cache.StoreStruct(key, retrieved)
+	// Mutate a's chain key in place; the cache (flat value copy) must be
+	// unaffected — a subsequent Load returns the original bytes.
+	origChainKey := append([]byte(nil), a.SenderKeyStates[0].SenderChainKey.ChainKey...)
+	a.SenderKeyStates[0].SenderChainKey.ChainKey[0] ^= 0xFF
+	c, ok := cache.LoadStruct(key)
+	if !ok {
+		t.Fatal("LoadStruct after mutation: want ok=true")
+	}
+	if !bytes.Equal(c.SenderKeyStates[0].SenderChainKey.ChainKey, origChainKey) {
+		t.Fatal("mutating a retrieved structure corrupted the cached entry")
+	}
 
-	got, ok := cache.LoadStruct(key)
+	// Re-storing a retrieved structure round-trips to a value-equal result.
+	cache.StoreStruct(key, c)
+	d, ok := cache.LoadStruct(key)
 	if !ok {
 		t.Fatal("LoadStruct after re-store: want ok=true")
 	}
-	if got != retrieved {
-		t.Fatalf("LoadStruct after re-store: got %p, want %p", got, retrieved)
+	if !reflect.DeepEqual(d, c) {
+		t.Fatalf("re-store round-trip differs:\n c=%+v\n d=%+v", c, d)
 	}
 }

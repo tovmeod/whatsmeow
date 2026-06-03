@@ -89,7 +89,13 @@ var (
 	// Phase 17.8: decoded struct-LRU caches. Sized to match the []byte LRU caps
 	// so evictions occur at the same working-set boundary (eviction of a parsed
 	// entry is silent — next Load re-populates from the []byte LRU).
-	signalSKParsedCacheCap   = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
+	//
+	// Phase 17.9 GC redesign: DECODED cap lowered 1_500_000 → 500_000 —
+	// right-sized to the ~275k hot fmt_ver=2 working set + headroom so total
+	// warmed heap stays under GOMEMLIMIT (companion lever to the flat
+	// value-struct cache, not a bandaid; env-overridable). This is the
+	// AUTHORITATIVE prod cap (wireSignalCaches builds the prod LRU from it).
+	signalSKParsedCacheCap   = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
 	signalSessParsedCacheCap = envCapOrDefault("KAVTOV_CACHE_SESSION_DECODED_CAP", 250_000)
 )
 
@@ -351,13 +357,18 @@ type signalCaches struct {
 	// queries warm) instead of the DB passthrough; invalidated by PutSenderKey
 	// when a sender's device set may have changed (a new SKDM).
 	SenderKeyDevices *lru.Cache[string, []string]
-	// Phase 17.8: decoded struct-LRU caches. Store *Structure pointers so
-	// LoadSenderKey / LoadSession hits call NewSenderKeyFromStruct /
-	// NewSessionFromStructure instead of JSON Deserialize + graph-rebuild.
-	// Keyed with the same jid-prefix as the []byte LRU (device scoping on
-	// the shared process-level LRU). Eviction is a silent no-op — next Load
-	// re-populates from the []byte LRU.
-	SKParsed      *lru.Cache[string, *groupRecord.SenderKeyStructure]
+	// Phase 17.8: decoded struct-LRU caches. LoadSenderKey / LoadSession hits
+	// call NewSenderKeyFromStruct / NewSessionFromStructure instead of JSON
+	// Deserialize + graph-rebuild. Keyed with the same jid-prefix as the []byte
+	// LRU (device scoping on the shared process-level LRU). Eviction is a silent
+	// no-op — next Load re-populates from the []byte LRU.
+	//
+	// Phase 17.9 GC redesign: SKParsed now stores the flat value-struct
+	// (store.flatSenderKey, via the store.SKParsedLRU alias) rather than
+	// *SenderKeyStructure, to remove the per-entry GC pointer-scan cost. The
+	// value type is unexported in package store; sqlstore only constructs and
+	// forwards the LRU (never Get/Add), so the exported alias suffices.
+	SKParsed      *store.SKParsedLRU
 	SessionParsed *lru.Cache[string, *librecord.SessionStructure]
 
 	// perf 260601-uuy: message-secret pair cache. Keyed
@@ -505,7 +516,7 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 
 	// Phase 17.8: decoded struct-LRU caches. lru.New (no eviction callback) —
 	// struct LRU eviction is a silent no-op; no flusher interaction needed.
-	c.caches.SKParsed, err = lru.New[string, *groupRecord.SenderKeyStructure](signalSKParsedCacheCap)
+	c.caches.SKParsed, err = store.NewSKParsedLRU(signalSKParsedCacheCap)
 	if err != nil {
 		log.Errorf("Failed to construct SKParsedCache (cap=%d): %v", signalSKParsedCacheCap, err)
 		panic(err)

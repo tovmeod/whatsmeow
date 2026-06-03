@@ -184,8 +184,9 @@ func newCohTestDevice(t *testing.T) (device *store.Device, cs *sqlstore.CachedSe
 	}
 	device.ID = &jid
 
-	// Wire ParsedSKCache (mirrors attachCachedStores).
-	skLRU, _ := lru.New[string, *groupRecord.SenderKeyStructure](1024)
+	// Wire ParsedSKCache (mirrors attachCachedStores). Phase 17.9: flat
+	// value-struct LRU via store.NewSKParsedLRU.
+	skLRU, _ := store.NewSKParsedLRU(1024)
 	device.ParsedSKCache = store.NewParsedSKCache(skLRU)
 
 	// Wire parsedReplace → device.ParsedSKCache.StoreStruct
