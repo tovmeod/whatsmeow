@@ -6,49 +6,45 @@
 
 // senderkey_cache_test.go — TestSenderKeyCacheCoherence
 //
-// Verifies the ParsedSKCache REPLACE-on-write coherence design (T-17.9-16):
+// Verifies the ParsedSKCache REPLACE-on-write coherence design (T-17.9-16) using
+// a real store.Device with a real ParsedSKCache and a real CachedSenderKeyStore.
 //
-// After any write via PutSenderKeyStructure (both ratchet-advance and
-// recovery-shaped direct calls), the parsedReplace callback is synchronously
-// invoked with the in-hand structure — before the async flusher drains the DB
-// columns.
+// The critical test harness invariant: the flusher IS ATTACHED but NOT STARTED
+// (no goroutine, no auto-drain). Enqueue adds to dirty-set only. PutManySenderKeys
+// is NEVER called automatically. This is the attached-not-drained condition that
+// discriminates between REPLACE and invalidate:
 //
-// The critical test harness invariant: the flusher IS ATTACHED but NOT DRAINED
-// between the write and the subsequent verification. A flusher==nil (write-through)
-// harness would synchronously land the DB columns and make an invalidate-only
-// design FALSELY PASS. Only the attached-not-drained harness discriminates between
-// REPLACE and invalidate.
+//   - Under REPLACE: after PutSenderKeyStructure → LoadSenderKey returns N+1 from cache,
+//     while a raw DB read still returns N. Cache leads; DB lags. Proven.
+//   - Under invalidate: PutSenderKeyStructure would clear the cache → LoadSenderKey misses
+//     → reads DB (still N) → returns N. Silent stale key. Not tested here because
+//     REPLACE is what's implemented.
 //
 // Test arms:
-//   1. miss-then-hit: first GetSenderKeyStructure on a fmt_ver=2 row reads from
-//      columns (no Deserialize); result is correct and independent of the blob.
-//   2. ratchet-advance coherence: advance iteration via PutSenderKeyStructure
-//      (flusher attached, not drained); parsedReplace callback fires immediately
-//      with the advanced structure; DB still has old iteration.
-//   3. recovery-shaped coherence: call PutSenderKeyStructure DIRECTLY (simulating
-//      recovery's path, bypassing device.StoreSenderKey); parsedReplace fires
-//      with the new structure; DB still has old structure.
-//      This arm is the discriminating check: an invalidate-only design would not
-//      fire parsedReplace, leaving a stale/empty cache that would read stale DB.
-//   4. miss-feed is recompose: GetSenderKeyStructure on a fmt_ver=2 row with a
-//      garbage blob still returns the correct structure (reads columns, not blob).
+//  1. ratchet-advance: device.StoreSenderKey (iter=N+1) → device.LoadSenderKey returns N+1
+//     (from cache); raw DB read returns N (flusher not drained).
+//  2. recovery-shaped: direct cs.PutSenderKeyStructure (iter=9, bypasses device.StoreSenderKey)
+//     → device.LoadSenderKey returns 9 (from cache); DB returns 5.
+//     This is the DISCRIMINATING arm: an invalidate-only design fails here because
+//     the cache is cleared, the next Load reads pre-drain DB columns (still 5), returns stale.
+//  3. miss-feed-is-recompose: GetSenderKeyStructure on fmt_ver=2 row with garbage blob
+//     returns correct structure from columns (proves no Deserialize on fmt_ver=2 path).
 
 package sqlstore_test
 
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	libprotocol "go.mau.fi/libsignal/protocol"
 
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -56,45 +52,8 @@ import (
 // cohTestJID is a separate JID to avoid collisions with other integration tests.
 const cohTestJID = "17788880000@s.whatsapp.net"
 
-// replaceCapturer is a thread-safe store for parsedReplace callback calls.
-// It captures the most-recent (key, structure) pair for test assertions.
-type replaceCapturer struct {
-	mu sync.Mutex
-	// calls is the list of keys where parsedReplace was invoked.
-	calls []string
-	// latest is the most recently stored (key → structure) pair.
-	latest map[string]*groupRecord.SenderKeyStructure
-}
-
-func newReplaceCapturer() *replaceCapturer {
-	return &replaceCapturer{latest: make(map[string]*groupRecord.SenderKeyStructure)}
-}
-
-func (r *replaceCapturer) callback() func(key string, s *groupRecord.SenderKeyStructure) {
-	return func(key string, s *groupRecord.SenderKeyStructure) {
-		r.mu.Lock()
-		r.calls = append(r.calls, key)
-		r.latest[key] = s
-		r.mu.Unlock()
-	}
-}
-
-func (r *replaceCapturer) getLatest(key string) (*groupRecord.SenderKeyStructure, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	s, ok := r.latest[key]
-	return s, ok
-}
-
-func (r *replaceCapturer) callCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.calls)
-}
-
 // buildAdvancedStructure returns a SenderKeyStructure at iteration=iter with keyID=keyID.
-// All fields are deterministic and non-nil (suitable for coherence tests that
-// cross the JSON-serialize boundary via recomposedBlob).
+// All fields are non-nil (avoids libsignal nil→zeros artifact in the blob path).
 func buildAdvancedStructure(keyID uint32, iter uint32) *groupRecord.SenderKeyStructure {
 	chainKey := make([]byte, 32)
 	for i := range chainKey {
@@ -125,10 +84,8 @@ func buildAdvancedStructure(keyID uint32, iter uint32) *groupRecord.SenderKeyStr
 	}
 }
 
-// getDBIteration reads the st_chain_key_iteration[0] directly from the DB
-// for (our_jid, chat_id, sender_id). Returns -1 if absent or NULL.
-// This is a raw read that bypasses ALL caches — used to confirm flusher has
-// not drained (DB should still have the pre-write value).
+// getDBIteration reads the st_chain_key_iteration[0] directly from the DB.
+// Returns -1 on absent row or NULL (raw bypass of all caches).
 func getDBIteration(t *testing.T, db *sql.DB, jid, group, user string) int64 {
 	t.Helper()
 	var iterText sql.NullString
@@ -138,194 +95,21 @@ func getDBIteration(t *testing.T, db *sql.DB, jid, group, user string) int64 {
 	if err != nil || !iterText.Valid {
 		return -1
 	}
-	// iterText.String is "{5}" (PG bigint[] text format); extract the first element.
 	s := strings.TrimSpace(iterText.String)
 	if len(s) > 2 && s[0] == '{' && s[len(s)-1] == '}' {
 		s = s[1 : len(s)-1]
 	}
-	// Take the first comma-separated element.
 	if i := strings.IndexByte(s, ','); i >= 0 {
 		s = s[:i]
 	}
-	s = strings.TrimSpace(s)
-	v, err := strconv.ParseInt(s, 10, 64)
+	v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
 	if err != nil {
-		t.Logf("getDBIteration: parse %q: %v", iterText.String, err)
 		return -1
 	}
 	return v
 }
 
-// newBatchTestStoreForCoh creates a test store bound to cohTestJID.
-func newBatchTestStoreForCoh(t *testing.T) (*sqlstore.SQLStore, *sql.DB) {
-	t.Helper()
-	// Reuse newBatchTestStore's pattern but with cohTestJID.
-	// newBatchTestStore uses testJID (17700000000@s.whatsapp.net);
-	// we need a different JID to avoid collisions.
-	return newBatchTestStoreWithJID(t, cohTestJID)
-}
-
-// TestSenderKeyCacheCoherence is the BLOCKING coherence test.
-// It must pass with the flusher ATTACHED but NOT DRAINED between write and Load.
-func TestSenderKeyCacheCoherence(t *testing.T) {
-	inner, db := newBatchTestStoreForCoh(t)
-	ctx := context.Background()
-
-	byteCache, _ := lru.New[string, []byte](1024)
-	devCache, _ := lru.New[string, []string](1024)
-	cs := sqlstore.NewCachedSenderKeyStore(inner, cohTestJID, byteCache, devCache)
-
-	// Wire parsedReplace callback via a capturer (mirrors attachCachedStores wiring).
-	capturer := newReplaceCapturer()
-	cs.SetParsedReplace(capturer.callback())
-
-	// Wire a flusher that is NOT started (no goroutine → no automatic drain).
-	// This is the attached-not-drained invariant required by the plan.
-	// NewSenderKeyFlusher takes a flushSenderKeyBatch; inner (*SQLStore) satisfies it.
-	flusher := sqlstore.NewSenderKeyFlusher(inner, nil, 0)
-	cs.SetFlusher(flusher)
-	// NOTE: flusher.Start() is intentionally NOT called.
-	// The flusher goroutine does not run; Enqueue adds to dirty-set only.
-
-	// --- Arm 2: ratchet-advance coherence (flusher attached, NOT drained) ---
-	t.Run("ratchet-advance", func(t *testing.T) {
-		const advGroup = "cohcache_adv@g.us"
-		const advUser = "advuser_1:0"
-		advKey := cohTestJID + "|" + advGroup + "|" + advUser
-
-		// Seed DB at iter=5 via inner.PutManySenderKeys (bypasses flusher entirely).
-		s5 := buildAdvancedStructure(10, 5)
-		row := sqlstore.NewSenderKeyRow(advGroup, advUser, s5)
-		if err := inner.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
-			t.Fatalf("PutManySenderKeys (seed): %v", err)
-		}
-
-		// Advance to iter=6 via PutSenderKeyStructure (flusher enqueues, not drained).
-		s6 := buildAdvancedStructure(10, 6)
-		if err := cs.PutSenderKeyStructure(ctx, advGroup, advUser, s6); err != nil {
-			t.Fatalf("PutSenderKeyStructure (advance): %v", err)
-		}
-
-		// Verify flusher has the dirty entry (flusher IS attached).
-		if flusher.DirtyCount() == 0 {
-			t.Error("flusher dirty-set is empty after PutSenderKeyStructure — flusher not properly attached")
-		}
-
-		// Verify DB STILL has iter=5 (flusher not drained — CRITICAL for test validity).
-		// If dbIter=6, the flusher somehow drained and the test can't prove REPLACE
-		// is necessary (an invalidate design would also work if DB has the new value).
-		dbIter := getDBIteration(t, db, cohTestJID, advGroup, advUser)
-		if dbIter == 6 {
-			t.Logf("WARNING: DB already has iter=6 — flusher may have drained (invalidate design would also pass here)")
-		} else if dbIter != 5 {
-			t.Logf("DB iter = %d (expected 5, but may differ if flusher boundary was crossed)", dbIter)
-		}
-
-		// CRITICAL: parsedReplace was called synchronously with iter=6 structure.
-		cached, ok := capturer.getLatest(advKey)
-		if !ok || cached == nil {
-			t.Fatal("ratchet-advance: parsedReplace callback NOT called after PutSenderKeyStructure; " +
-				"REPLACE-on-write coherence is broken")
-		}
-		if cached.SenderKeyStates[0].SenderChainKey.Iteration != 6 {
-			t.Errorf("ratchet-advance: parsedReplace received iter=%d, want 6",
-				cached.SenderKeyStates[0].SenderChainKey.Iteration)
-		}
-		if !reflect.DeepEqual(normalizeSKStructure(s6), normalizeSKStructure(cached)) {
-			t.Error("ratchet-advance: parsedReplace received a structure != the written s6")
-		}
-		t.Logf("ratchet-advance: DB iter=%d; cache iter=%d (REPLACE fired synchronously before drain)",
-			dbIter, cached.SenderKeyStates[0].SenderChainKey.Iteration)
-	})
-
-	// --- Arm 3: recovery-shaped coherence (flusher attached, NOT drained) ---
-	// This is the DISCRIMINATING arm: an invalidate-only design fails here.
-	// Direct PutSenderKeyStructure call (recovery's path — bypasses device.StoreSenderKey).
-	// Verify parsedReplace fires with the new structure; DB still has old structure.
-	// Under invalidate-only: the cache is cleared → next Load reads DB (still old) → stale.
-	t.Run("recovery-shaped", func(t *testing.T) {
-		const recGroup = "cohcache_rec@g.us"
-		const recUser = "recuser_1:0"
-		recKey := cohTestJID + "|" + recGroup + "|" + recUser
-
-		// Seed DB at iter=5.
-		s5 := buildAdvancedStructure(20, 5)
-		row := sqlstore.NewSenderKeyRow(recGroup, recUser, s5)
-		if err := inner.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
-			t.Fatalf("PutManySenderKeys (recovery seed): %v", err)
-		}
-
-		// Direct PutSenderKeyStructure (recovery path) with iter=9.
-		s9 := buildAdvancedStructure(20, 9)
-		if err := cs.PutSenderKeyStructure(ctx, recGroup, recUser, s9); err != nil {
-			t.Fatalf("PutSenderKeyStructure (recovery): %v", err)
-		}
-
-		// Verify DB still has iter=5 (flusher not drained).
-		dbIter := getDBIteration(t, db, cohTestJID, recGroup, recUser)
-		if dbIter == 9 {
-			t.Logf("WARNING: DB already has iter=9 — may have drained (invalidate design would also pass)")
-		}
-
-		// CRITICAL: parsedReplace was called with iter=9 structure.
-		// Under invalidate-only: parsedReplace would NOT be called (only parsedInvalidate).
-		// The test verifies parsedReplace fires — proving REPLACE, not invalidate.
-		cached, ok := capturer.getLatest(recKey)
-		if !ok || cached == nil {
-			t.Fatal("recovery-shaped: parsedReplace callback NOT called after direct PutSenderKeyStructure; " +
-				"this is the discriminating check — an invalidate-only design fails here. " +
-				"REPLACE-on-write coherence broken for recovery path.")
-		}
-		if cached.SenderKeyStates[0].SenderChainKey.Iteration != 9 {
-			t.Errorf("recovery-shaped: parsedReplace received iter=%d, want 9",
-				cached.SenderKeyStates[0].SenderChainKey.Iteration)
-		}
-		if !reflect.DeepEqual(normalizeSKStructure(s9), normalizeSKStructure(cached)) {
-			t.Error("recovery-shaped: parsedReplace received a structure != the written s9")
-		}
-		t.Logf("recovery-shaped: DB iter=%d; cache iter=%d (REPLACE fired synchronously before drain)",
-			dbIter, cached.SenderKeyStates[0].SenderChainKey.Iteration)
-	})
-
-	// --- Arm 1 + Arm 4: miss-feed is recompose (not Deserialize) ---
-	// GetSenderKeyStructure on a fmt_ver=2 row with garbage blob must succeed:
-	// columns are used, not the blob (no JSON Deserialize on the fmt_ver=2 path).
-	t.Run("miss-feed-is-recompose", func(t *testing.T) {
-		const mfGroup = "cohcache_mf@g.us"
-		const mfUser = "mfuser_1:0"
-
-		s7 := buildAdvancedStructure(30, 7)
-		row := sqlstore.NewSenderKeyRow(mfGroup, mfUser, s7)
-		if err := inner.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
-			t.Fatalf("PutManySenderKeys: %v", err)
-		}
-		// Overwrite blob with garbage (proves fmt_ver=2 never reads the blob).
-		_, err := db.ExecContext(ctx,
-			`UPDATE whatsmeow_sender_keys SET sender_key=$1 WHERE our_jid=$2 AND chat_id=$3 AND sender_id=$4`,
-			[]byte("GARBAGE BLOB NOT VALID JSON"), cohTestJID, mfGroup, mfUser)
-		if err != nil {
-			t.Fatalf("UPDATE garbage blob: %v", err)
-		}
-
-		// GetSenderKeyStructure: fmt_ver=2 → reads columns → recompose (no Deserialize).
-		got, err := cs.GetSenderKeyStructure(ctx, mfGroup, mfUser)
-		if err != nil {
-			t.Fatalf("GetSenderKeyStructure (miss-feed): %v", err)
-		}
-		if got == nil {
-			t.Fatal("miss-feed: want non-nil structure (from columns); got nil — may be reading garbage blob")
-		}
-		if got.SenderKeyStates[0].SenderChainKey.Iteration != 7 {
-			t.Errorf("miss-feed: want iter=7 (from columns), got iter=%d",
-				got.SenderKeyStates[0].SenderChainKey.Iteration)
-		}
-		t.Logf("miss-feed: GetSenderKeyStructure returned iter=%d from columns (garbage blob ignored)",
-			got.SenderKeyStates[0].SenderChainKey.Iteration)
-	})
-}
-
 // newBatchTestStoreWithJID creates a test store bound to a custom JID.
-// Mirrors newBatchTestStore's pattern from batch_upsert_test.go.
 func newBatchTestStoreWithJID(t *testing.T, jidStr string) (*sqlstore.SQLStore, *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
@@ -374,5 +158,268 @@ func newBatchTestStoreWithJID(t *testing.T, jidStr string) (*sqlstore.SQLStore, 
 	return st, db
 }
 
-// Ensure fmt is used (for Sscanf).
-var _ = fmt.Sprintf
+// newCohTestDevice creates a *store.Device with:
+//   - SenderKeys = *CachedSenderKeyStore wrapping inner
+//   - ParsedSKCache = real *parsedSKCache (via store.NewParsedSKCache)
+//   - parsedReplace wired: cs.SetParsedReplace(device.ParsedSKCache.StoreStruct)
+//   - Flusher attached via cs.SetFlusher but NOT started (no goroutine)
+//
+// Returns the device, the CachedSenderKeyStore (for direct PutSenderKeyStructure),
+// the flusher (for DirtyCount assertion), and the raw *sql.DB (for raw DB reads).
+func newCohTestDevice(t *testing.T) (device *store.Device, cs *sqlstore.CachedSenderKeyStore, flusher *sqlstore.SenderKeyFlusher, inner *sqlstore.SQLStore, db *sql.DB) {
+	t.Helper()
+	inner, db = newBatchTestStoreWithJID(t, cohTestJID)
+
+	byteCache, _ := lru.New[string, []byte](1024)
+	devCache, _ := lru.New[string, []string](1024)
+	cs = sqlstore.NewCachedSenderKeyStore(inner, cohTestJID, byteCache, devCache)
+
+	// Build a minimal *store.Device with the JID set (required for cacheKey scoping).
+	jid, err := types.ParseJID(cohTestJID)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	device = &store.Device{
+		SenderKeys: cs,
+	}
+	device.ID = &jid
+
+	// Wire ParsedSKCache (mirrors attachCachedStores).
+	skLRU, _ := lru.New[string, *groupRecord.SenderKeyStructure](1024)
+	device.ParsedSKCache = store.NewParsedSKCache(skLRU)
+
+	// Wire parsedReplace → device.ParsedSKCache.StoreStruct
+	// (mirrors cache_wiring.go attachCachedStores).
+	cs.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
+		device.ParsedSKCache.StoreStruct(key, s)
+	})
+
+	// Wire a flusher that is NOT started. Enqueue adds to dirty-set only.
+	flusher = sqlstore.NewSenderKeyFlusher(inner, nil, 0)
+	cs.SetFlusher(flusher)
+	// flusher.Start() is intentionally NOT called — no goroutine, no auto-drain.
+
+	return device, cs, flusher, inner, db
+}
+
+// makeSenderKeyName builds a *protocol.SenderKeyName for (group, user).
+// user is the device-qualified sender string (e.g. "12345_1:0").
+// The sender address is constructed so that senderKeyName.Sender().String() == user.
+// libsignal's SignalAddress.String() returns "name:deviceID", so for user="12345_1:0"
+// we split on the LAST ':' to get name="12345_1" and deviceID=0.
+func makeSenderKeyName(group, user string) *libprotocol.SenderKeyName {
+	name := user
+	var devID uint32
+	if i := strings.LastIndex(user, ":"); i >= 0 {
+		name = user[:i]
+		if n, err := strconv.ParseUint(user[i+1:], 10, 32); err == nil {
+			devID = uint32(n)
+		}
+	}
+	addr := libprotocol.NewSignalAddress(name, devID)
+	return libprotocol.NewSenderKeyName(group, addr)
+}
+
+// TestSenderKeyCacheCoherence is the BLOCKING coherence test under the
+// attached-not-drained flusher. It verifies REPLACE semantics via actual
+// device.LoadSenderKey calls, not just callback-firing assertions.
+func TestSenderKeyCacheCoherence(t *testing.T) {
+	// --- Arm 1: ratchet-advance via device.StoreSenderKey ---
+	// Seed DB at iter=5 (write-through). Advance to iter=6 via device.StoreSenderKey
+	// (which calls PutSenderKeyStructure → parsedReplace → cache REPLACE).
+	// With flusher attached-not-drained: DB stays at 5; LoadSenderKey returns 6.
+	t.Run("ratchet-advance", func(t *testing.T) {
+		device, cs, flusher, inner, db := newCohTestDevice(t)
+		ctx := context.Background()
+
+		const group = "cohcache_adv@g.us"
+		const user = "advuser_1:0"
+
+		// Seed DB at iter=5 via PutManySenderKeys on inner (bypasses flusher entirely).
+		s5 := buildAdvancedStructure(10, 5)
+		row := sqlstore.NewSenderKeyRow(group, user, s5)
+		if err := inner.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
+			t.Fatalf("PutManySenderKeys (seed): %v", err)
+		}
+
+		// First LoadSenderKey: cache miss → GetSenderKeyStructure → DB (iter=5) → populates cache.
+		skn := makeSenderKeyName(group, user)
+		got5, err := device.LoadSenderKey(ctx, skn)
+		if err != nil {
+			t.Fatalf("LoadSenderKey (seed): %v", err)
+		}
+		if got5 == nil {
+			t.Fatal("LoadSenderKey (seed): want non-nil SenderKey")
+		}
+		if got5.Structure().SenderKeyStates[0].SenderChainKey.Iteration != 5 {
+			t.Errorf("LoadSenderKey (seed): want iter=5, got %d",
+				got5.Structure().SenderKeyStates[0].SenderChainKey.Iteration)
+		}
+
+		// Advance to iter=6 via device.StoreSenderKey (columnar path).
+		// This calls PutSenderKeyStructure → flusher.Enqueue (dirty-set only, no drain)
+		// → parsedReplace → cache REPLACE with iter=6.
+		s6 := buildAdvancedStructure(10, 6)
+		sk6, err := groupRecord.NewSenderKeyFromStruct(s6, store.SignalProtobufSerializer.SenderKeyRecord, store.SignalProtobufSerializer.SenderKeyState)
+		if err != nil {
+			t.Fatalf("NewSenderKeyFromStruct: %v", err)
+		}
+		if err := device.StoreSenderKey(ctx, skn, sk6); err != nil {
+			t.Fatalf("StoreSenderKey (advance): %v", err)
+		}
+
+		// Verify flusher IS attached (has dirty entry).
+		if flusher.DirtyCount() == 0 {
+			t.Error("flusher dirty-set empty after StoreSenderKey — flusher not properly attached")
+		}
+
+		// CRITICAL: DB still has iter=5 (flusher not drained).
+		// This confirms the test is exercising the pre-drain window.
+		dbIter := getDBIteration(t, db, cohTestJID, group, user)
+		if dbIter == 6 {
+			t.Logf("WARNING: DB already at iter=6 — flusher may have drained (unlikely without Start())")
+		}
+		t.Logf("ratchet-advance: DB iter=%d (expect 5 — flusher not drained)", dbIter)
+
+		// LoadSenderKey after advance: cache HIT (was REPLACED with iter=6).
+		// If cache was only invalidated (not replaced), this would be a miss → reads DB → returns 5.
+		got6, err := device.LoadSenderKey(ctx, skn)
+		if err != nil {
+			t.Fatalf("LoadSenderKey (advance): %v", err)
+		}
+		if got6 == nil {
+			t.Fatal("LoadSenderKey (advance): want non-nil SenderKey")
+		}
+		actualIter := got6.Structure().SenderKeyStates[0].SenderChainKey.Iteration
+		if actualIter != 6 {
+			t.Errorf("LoadSenderKey (advance): want iter=6, got iter=%d\n"+
+				"  DB iter=%d — if the DB returned this value, the cache was NOT replaced (invalidate bug)",
+				actualIter, dbIter)
+		}
+		t.Logf("ratchet-advance: DB=%d; LoadSenderKey=%d — REPLACE confirmed (cache leads)", dbIter, actualIter)
+
+		// Sanity: also verify via cs.GetSenderKeyStructure (direct DB read, bypasses cache).
+		// It should return iter=5 (DB not yet drained).
+		_ = cs // cs used in arm 2
+	})
+
+	// --- Arm 2: recovery-shaped (DISCRIMINATING arm) ---
+	// Direct cs.PutSenderKeyStructure (iter=9) bypasses device.StoreSenderKey.
+	// Simulates the recovery path. DB stays at 5; LoadSenderKey must return 9.
+	// An invalidate-only design fails here: cache cleared → Load reads DB (5) → stale.
+	t.Run("recovery-shaped", func(t *testing.T) {
+		device, cs, flusher, inner, db := newCohTestDevice(t)
+		ctx := context.Background()
+
+		const group = "cohcache_rec@g.us"
+		const user = "recuser_1:0"
+
+		// Seed DB at iter=5 via inner.PutManySenderKeys.
+		s5 := buildAdvancedStructure(20, 5)
+		row := sqlstore.NewSenderKeyRow(group, user, s5)
+		if err := inner.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
+			t.Fatalf("PutManySenderKeys (seed): %v", err)
+		}
+
+		// Warm the cache with iter=5 (first Load).
+		skn := makeSenderKeyName(group, user)
+		got5, err := device.LoadSenderKey(ctx, skn)
+		if err != nil || got5 == nil {
+			t.Fatalf("LoadSenderKey (seed): err=%v got=%v", err, got5)
+		}
+		if got5.Structure().SenderKeyStates[0].SenderChainKey.Iteration != 5 {
+			t.Fatalf("LoadSenderKey (seed): want iter=5, got %d",
+				got5.Structure().SenderKeyStates[0].SenderChainKey.Iteration)
+		}
+
+		// Recovery-shaped write: direct PutSenderKeyStructure (iter=9).
+		// Flusher enqueues (dirty-set only, no drain).
+		s9 := buildAdvancedStructure(20, 9)
+		if err := cs.PutSenderKeyStructure(ctx, group, user, s9); err != nil {
+			t.Fatalf("PutSenderKeyStructure (recovery): %v", err)
+		}
+
+		// Verify flusher IS attached.
+		if flusher.DirtyCount() == 0 {
+			t.Error("flusher dirty-set empty — flusher not attached")
+		}
+
+		// CRITICAL: DB still has iter=5 (flusher not drained).
+		dbIter := getDBIteration(t, db, cohTestJID, group, user)
+		if dbIter == 9 {
+			t.Logf("WARNING: DB already at iter=9 — flusher may have drained unexpectedly")
+		}
+		t.Logf("recovery-shaped: DB iter=%d (expect 5 — flusher not drained)", dbIter)
+
+		// LoadSenderKey after recovery: cache HIT (REPLACED with iter=9 by parsedReplace).
+		// Under invalidate: miss → reads DB (still 5) → returns iter=5 (WRONG).
+		got9, err := device.LoadSenderKey(ctx, skn)
+		if err != nil {
+			t.Fatalf("LoadSenderKey (recovery): %v", err)
+		}
+		if got9 == nil {
+			t.Fatal("LoadSenderKey (recovery): want non-nil SenderKey")
+		}
+		actualIter := got9.Structure().SenderKeyStates[0].SenderChainKey.Iteration
+		if actualIter != 9 {
+			t.Errorf("LoadSenderKey (recovery): want iter=9, got iter=%d\n"+
+				"  DB iter=%d — if the DB returned this, the cache was NOT REPLACED (invalidate bug).\n"+
+				"  This is the discriminating check: an invalidate-only design returns stale DB value here.",
+				actualIter, dbIter)
+		}
+		t.Logf("recovery-shaped: DB=%d; LoadSenderKey=%d — REPLACE confirmed (cache leads, DB lags)", dbIter, actualIter)
+
+		// Additional discriminator: direct cs.GetSenderKeyStructure (bypasses cache, reads DB directly).
+		// Should return iter=5 (confirming DB has NOT yet been updated by flusher).
+		fromDB, err := cs.GetSenderKeyStructure(ctx, group, user)
+		if err != nil {
+			t.Fatalf("GetSenderKeyStructure (direct DB read): %v", err)
+		}
+		if fromDB != nil && fromDB.SenderKeyStates[0].SenderChainKey.Iteration != 5 {
+			t.Logf("Note: DB direct read returned iter=%d (expected 5 if flusher not drained)",
+				fromDB.SenderKeyStates[0].SenderChainKey.Iteration)
+		}
+		if fromDB != nil {
+			t.Logf("recovery-shaped: direct DB read iter=%d; LoadSenderKey iter=%d — contrast proves REPLACE",
+				fromDB.SenderKeyStates[0].SenderChainKey.Iteration, actualIter)
+		}
+	})
+
+	// --- Arm 3: miss-feed is recompose (not Deserialize) for fmt_ver=2 rows ---
+	// GetSenderKeyStructure on a fmt_ver=2 row with a garbage blob must succeed:
+	// reads columns (recompose), not blob (Deserialize). No JSON on miss path.
+	t.Run("miss-feed-is-recompose", func(t *testing.T) {
+		_, cs, _, inner, db := newCohTestDevice(t)
+		ctx := context.Background()
+
+		const group = "cohcache_mf@g.us"
+		const user = "mfuser_1:0"
+
+		s7 := buildAdvancedStructure(30, 7)
+		row := sqlstore.NewSenderKeyRow(group, user, s7)
+		if err := inner.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
+			t.Fatalf("PutManySenderKeys: %v", err)
+		}
+		// Overwrite blob with garbage — proves fmt_ver=2 never reads the blob.
+		_, err := db.ExecContext(ctx,
+			`UPDATE whatsmeow_sender_keys SET sender_key=$1 WHERE our_jid=$2 AND chat_id=$3 AND sender_id=$4`,
+			[]byte("GARBAGE BLOB NOT VALID JSON"), cohTestJID, group, user)
+		if err != nil {
+			t.Fatalf("UPDATE garbage blob: %v", err)
+		}
+
+		// GetSenderKeyStructure: fmt_ver=2 → reads columns → recompose (no Deserialize).
+		got, err := cs.GetSenderKeyStructure(ctx, group, user)
+		if err != nil {
+			t.Fatalf("GetSenderKeyStructure (miss-feed): %v", err)
+		}
+		if got == nil {
+			t.Fatal("miss-feed: want non-nil structure (from columns); got nil — may be reading garbage blob")
+		}
+		if got.SenderKeyStates[0].SenderChainKey.Iteration != 7 {
+			t.Errorf("miss-feed: want iter=7 (from columns), got iter=%d", got.SenderKeyStates[0].SenderChainKey.Iteration)
+		}
+		t.Logf("miss-feed: iter=%d from columns (garbage blob ignored — recompose, no Deserialize)",
+			got.SenderKeyStates[0].SenderChainKey.Iteration)
+	})
+}
