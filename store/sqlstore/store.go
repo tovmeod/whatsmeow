@@ -434,9 +434,20 @@ func (s *SQLStore) UploadedPreKeyCount(ctx context.Context) (count int, err erro
 
 const (
 	getSenderKeyQuery = `SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`
+	// putSenderKeyQuery writes a legacy fmt_ver=1 row. On conflict it sets
+	// fmt_ver=1 and nulls all columnar columns so a legacy write landing on a
+	// pre-existing fmt_ver=2 row does not leave stale st_* columns alongside a
+	// fresh blob (which would mislead the plan-04 columnar reader). This is the
+	// only safe definition of "legacy overwrites columnar" — the blob is fresh,
+	// the columns are NULL, fmt_ver=1 so the reader falls back to the blob path.
 	putSenderKeyQuery = `
-		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
+		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, fmt_ver, sender_key) VALUES ($1, $2, $3, 1, $4)
+		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
+			fmt_ver=1,
+			sender_key=excluded.sender_key,
+			st_key_id=NULL, st_chain_key_iteration=NULL, st_chain_key=NULL,
+			st_signing_key_public=NULL, st_signing_key_private=NULL,
+			smk_state_idx=NULL, smk_iteration=NULL, smk_iv=NULL, smk_cipher_key=NULL, smk_seed=NULL
 	`
 	// getSenderKeyDevicesQuery returns all device-qualified sender_id strings for a
 	// (our_jid, chat_id, userBare) triple. kavtov-fork Phase 27: a collation-stable

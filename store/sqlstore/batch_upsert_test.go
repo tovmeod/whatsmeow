@@ -270,6 +270,10 @@ func TestBatchUpsertColumnRoundTrip(t *testing.T) {
 	}
 
 	// Verify the legacy blob deserializes back to the original structure.
+	// NOTE: st_* columns are NOT read back (that is plan 04); this test only
+	// verifies the recomposed sender_key blob round-trips through the JSON
+	// serializer correctly. Column-bind verification (byteaArray/int64Array
+	// against real DB BYTEA[]/BIGINT[] responses) is deferred to plan 04.
 	got, err := store.GetSenderKey(ctx, "555@g.us", "777_1:0")
 	if err != nil || got == nil {
 		t.Fatalf("GetSenderKey: err=%v got=%v", err, got)
@@ -278,19 +282,34 @@ func TestBatchUpsertColumnRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Deserialize: %v", err)
 	}
-	if len(structure.SenderKeyStates) != len(original.SenderKeyStates) {
-		t.Fatalf("SenderKeyStates count: got %d, want %d", len(structure.SenderKeyStates), len(original.SenderKeyStates))
+	// Normalize nil/empty-slice differences (the JSON serializer converts nil Keys
+	// to [] on serialization; reflect.DeepEqual sees them as different).
+	// Confirmed: the only diff in this fixture is nil vs [] on the Keys field.
+	if !reflect.DeepEqual(normalizeSenderKeyStructure(original), normalizeSenderKeyStructure(structure)) {
+		t.Errorf("round-trip mismatch:\n  original:    %+v\n  roundtripped: %+v", original, structure)
 	}
-	// Check field-level equality for the first state.
-	// Full reflect.DeepEqual fails across package boundaries on nil-vs-empty-slice
-	// differences in nested structs — use field checks instead.
-	origState := original.SenderKeyStates[0]
-	gotState := structure.SenderKeyStates[0]
-	if gotState.KeyID != origState.KeyID {
-		t.Errorf("KeyID: got %d, want %d", gotState.KeyID, origState.KeyID)
+}
+
+// normalizeSenderKeyStructure normalizes nil-vs-empty-slice differences in a
+// *SenderKeyStructure for DeepEqual comparison. The JSON serializer converts
+// nil Keys to []... on write; Deserialize returns [] not nil.
+func normalizeSenderKeyStructure(sk *groupRecord.SenderKeyStructure) *groupRecord.SenderKeyStructure {
+	if sk == nil {
+		return nil
 	}
-	if gotState.SenderChainKey == nil || gotState.SenderChainKey.Iteration != origState.SenderChainKey.Iteration {
-		t.Errorf("SenderChainKey.Iteration: got %v, want %d", gotState.SenderChainKey, origState.SenderChainKey.Iteration)
+	result := &groupRecord.SenderKeyStructure{}
+	for _, st := range sk.SenderKeyStates {
+		ns := &groupRecord.SenderKeyStateStructure{
+			KeyID:            st.KeyID,
+			SigningKeyPublic:  st.SigningKeyPublic,
+			SigningKeyPrivate: st.SigningKeyPrivate,
+			SenderChainKey:   st.SenderChainKey,
+		}
+		// Normalize Keys: treat nil and [] as equivalent (both mean "no skipped keys").
+		if len(st.Keys) > 0 {
+			ns.Keys = st.Keys
+		}
+		result.SenderKeyStates = append(result.SenderKeyStates, ns)
 	}
-	_ = reflect.DeepEqual // keep import used
+	return result
 }
