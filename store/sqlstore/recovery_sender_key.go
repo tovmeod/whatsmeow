@@ -32,8 +32,6 @@ package sqlstore
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
@@ -300,15 +298,8 @@ var _ store.SenderKeyStore = (*SQLStore)(nil)
 // falling back to (false, nil) via the type-assertion above.
 var _ senderKeyRecoveryReader = (*SQLStore)(nil)
 
-// fmtVerDiscriminator guards the critical invariant: recovery MUST consult
+// fmtVerDiscriminator documents the critical invariant: recovery MUST consult
 // both fmt_ver=1 (legacy blob) and fmt_ver=2 (column) donors.
-// This comment is intentionally placed here (not as a runtime check) to
-// document that the recoveryScanQuery returns ALL rows regardless of fmt_ver,
-// and the Go loop above dispatches on fmtVer — no format is skipped.
+// recoveryScanQuery returns ALL rows regardless of fmt_ver; the Go loop in
+// findSenderKeyDonor dispatches on fmtVer — no format is skipped.
 // T-17.9-20 mitigation: recovery works before any backfill (fmt_ver=1 dominant).
-var _ = errors.New // force errors import used in error return paths
-
-// Sentinel to satisfy the sql.ErrNoRows import: the query loop does not
-// call Scan on absent rows, but the errors package is imported for the
-// compile-time assertion above.
-var _ = sql.ErrNoRows
