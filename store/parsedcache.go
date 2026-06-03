@@ -32,6 +32,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
@@ -71,6 +72,28 @@ func parsedCacheEnvCapOrDefault(key string, fallback int) int {
 // used by tests/standalone wiring. Env-overridable.
 var signalSKParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
 var signalSessParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SESSION_DECODED_CAP", 250_000)
+
+// Process-global parsed-cache hit/miss counters. The parsed cache is a shared
+// process-level LRU wrapped per-device, so global atomics (not per-wrapper
+// fields) give the true aggregate effectiveness. A "miss" is a cache lookup
+// that forced the columnar DB read + recompose; the hit ratio tells whether the
+// decode-once cache is actually earning its keep on the live access pattern.
+var (
+	skParsedHits, skParsedMisses     uint64
+	sessParsedHits, sessParsedMisses uint64
+)
+
+// SenderKeyParsedCacheStats returns the process-global hits and misses of the
+// parsed sender-key cache (LoadStruct). Exposed for DebugStats / observability.
+func SenderKeyParsedCacheStats() (hits, misses uint64) {
+	return atomic.LoadUint64(&skParsedHits), atomic.LoadUint64(&skParsedMisses)
+}
+
+// SessionParsedCacheStats returns the process-global hits and misses of the
+// parsed session cache (LoadStruct).
+func SessionParsedCacheStats() (hits, misses uint64) {
+	return atomic.LoadUint64(&sessParsedHits), atomic.LoadUint64(&sessParsedMisses)
+}
 
 // parsedSKCache is a process-level LRU of decoded *SenderKeyStructure values.
 // It sits in front of the []byte LRU (CachedSenderKeyStore) so that cache
@@ -121,12 +144,17 @@ func NewParsedSKCache(cache *SKParsedLRU) *parsedSKCache {
 func (c *parsedSKCache) LoadStruct(key string) (*groupRecord.SenderKeyStructure, bool) {
 	f, ok := c.lru.Get(key)
 	if !ok {
+		atomic.AddUint64(&skParsedMisses, 1)
 		return nil, false
 	}
 	s := flatToStructure(f)
 	if s == nil {
+		// Malformed tail treated as a miss (re-read from DB). Count as a miss
+		// so the rate reflects DB round-trips actually incurred.
+		atomic.AddUint64(&skParsedMisses, 1)
 		return nil, false
 	}
+	atomic.AddUint64(&skParsedHits, 1)
 	return s, true
 }
 
@@ -176,7 +204,13 @@ func NewParsedSessionCache(cache *lru.Cache[string, *librecord.SessionStructure]
 // a miss. No lock is held; lru.Cache.Get is goroutine-safe. The returned
 // pointer is READ-ONLY — callers must not modify the struct.
 func (c *parsedSessionCache) LoadStruct(key string) (*librecord.SessionStructure, bool) {
-	return c.lru.Get(key)
+	v, ok := c.lru.Get(key)
+	if ok {
+		atomic.AddUint64(&sessParsedHits, 1)
+	} else {
+		atomic.AddUint64(&sessParsedMisses, 1)
+	}
+	return v, ok
 }
 
 // StoreStruct replaces the cached structure for key. Holds c.mu only for the

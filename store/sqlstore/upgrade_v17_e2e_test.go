@@ -91,16 +91,47 @@ func TestUpgradeChainAppliesV17(t *testing.T) {
 		t.Errorf("sender_key is_nullable = %q, want YES — migration 17 (DROP NOT NULL) did not run via the embed/Upgrade path", isNullable)
 	}
 
-	// 3) The recorded version must have advanced past v16 (i.e. v17 applied).
+	// 3) The recorded version must have advanced to >= v18 (v17 + v18 applied).
 	var version int
 	if err := scratchDB.QueryRowContext(ctx,
 		`SELECT version FROM whatsmeow_version LIMIT 1`).Scan(&version); err != nil {
 		t.Fatalf("read whatsmeow_version: %v", err)
 	}
-	if version < 17 {
-		t.Errorf("recorded schema version = %d, want >= 17", version)
+	if version < 18 {
+		t.Errorf("recorded schema version = %d, want >= 18", version)
 	}
-	t.Logf("PASS: fresh-DB upgrade chain reached version %d; st_key_id present; sender_key nullable", version)
+
+	// 4) Migration 18: the sender_id column of the sender-key pkey index must use
+	// text_pattern_ops (enables the prefix-LIKE range seek). Verify the opclass.
+	var tpoCols int
+	if err := scratchDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM pg_index i
+		   JOIN pg_class c ON c.oid = i.indexrelid
+		   JOIN pg_opclass oc ON oc.oid = ANY(i.indclass::oid[])
+		  WHERE c.relname = 'whatsmeow_sender_keys_pkey'
+		    AND oc.opcname = 'text_pattern_ops'`).Scan(&tpoCols); err != nil {
+		t.Fatalf("check pkey opclass: %v", err)
+	}
+	if tpoCols == 0 {
+		t.Error("whatsmeow_sender_keys_pkey does not use text_pattern_ops — migration 18 did not run via the embed/Upgrade path")
+	}
+
+	// 5) ON CONFLICT (column inference) must still RESOLVE against the swapped
+	// unique index — the per-message upsert path depends on it. We use a fake
+	// our_jid, so the statement hits the our_jid->whatsmeow_device foreign key
+	// (23503); that's fine and EXPECTED — it proves arbiter inference succeeded
+	// and execution reached the FK check. The only failure we care about is
+	// "no unique or exclusion constraint matching" (42P10), which would mean the
+	// text_pattern_ops index can't be inferred.
+	_, err = scratchDB.ExecContext(ctx,
+		`INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, fmt_ver)
+		 VALUES ('e2e@x','g@g.us','s_1:0',2)
+		 ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET fmt_ver=excluded.fmt_ver`)
+	if err != nil && strings.Contains(err.Error(), "no unique or exclusion constraint matching") {
+		t.Errorf("ON CONFLICT could not infer the text_pattern_ops pkey: %v", err)
+	}
+
+	t.Logf("PASS: fresh-DB upgrade chain reached version %d; st_key_id present; sender_key nullable; pkey uses text_pattern_ops; ON CONFLICT works", version)
 }
 
 // swapDBName replaces the database path in a postgres DSN (the last /segment).
