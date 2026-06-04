@@ -752,6 +752,19 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	// kavtov-fork (P2a): total miss for this inbound (sender,device,group) tuple. Record it so a
 	// later KEY-path decrypt success for the same tuple is recognizable as convergence.
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
+	// Phase 17.11-03: non-blocking enqueue to the background cross-account recovery worker.
+	// The worker deduplicates via a negative-result cache so 375 miss/min does not stampede.
+	// recordFailedSenderKeyTuple is called BEFORE TryEnqueue — tuple is always recorded first.
+	// Do NOT gate on isFailedSenderKeyTuple here; the negative cache is the sole debounce.
+	if cli.Store.RecoveryWorker != nil {
+		cli.Store.RecoveryWorker.TryEnqueue(store.RecoveryTask{
+			Group:          chat.String(),
+			TargetSenderID: labeled,
+			SenderBare:     from.SignalAddressUser(),
+			TargetKeyID:    msg.KeyID(),
+			TargetIter:     msg.Iteration(),
+		})
+	}
 	return nil, signalerror.ErrNoSenderKeyForUser
 }
 
