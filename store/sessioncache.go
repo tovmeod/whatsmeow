@@ -124,8 +124,20 @@ func (device *Device) PutCachedSessions(ctx context.Context) error {
 	}
 	dirtySessions := make(map[string][]byte)
 	for addr, item := range cache.Iter() {
-		if item.Dirty {
-			dirtySessions[addr] = item.Record.Serialize()
+		if !item.Dirty {
+			continue
+		}
+		// Write flat (mirror StoreSession — D-04a). This batched send-path flush
+		// (send.go/sendfb.go) MUST use the same flat codec as the single-write
+		// StoreSession; otherwise every group/multi-recipient send silently
+		// re-introduces JSON sessions (the Stage-1 gap fixed here). Safety net:
+		// on refuse, drain to JSON so dual-read still reads it; Stage 3 removes
+		// this fallback once the gate covers this path too.
+		structure := item.Record.Structure()
+		if flat, ok := PackFlatSession(structure); ok {
+			dirtySessions[addr] = flat
+		} else {
+			dirtySessions[addr] = item.Record.Serialize() // ALLOW-JSON-DRAIN-BLOB-SESSION
 		}
 	}
 	if len(dirtySessions) > 0 {

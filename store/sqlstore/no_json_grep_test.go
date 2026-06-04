@@ -69,6 +69,7 @@ var senderKeyPathFiles = []string{
 	"store/sqlstore/store.go",
 	"store/sqlstore/cached_sender_key_store.go",
 	"store/sqlstore/cached_session_store.go", // Stage 1 gate: confirms no JSON in byte-cache layer
+	"store/sessioncache.go",                  // Stage 1 GAP FIX: batched send-path flush (PutCachedSessions) must write flat, not JSON
 }
 
 // senderKeySignalFilePath is store/signal.go, scanned for sender-key functions
