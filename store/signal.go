@@ -85,47 +85,14 @@ func (device *Device) ContainsPreKey(ctx context.Context, preKeyID uint32) (bool
 func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalAddress) (*record.Session, error) {
 	addrString := address.String()
 	// Context cache: send-path only (getCachedSession returns nil during decrypts).
-	// Preserve this check — it short-circuits before the struct-cache lookup
-	// for send-path contexts (RESEARCH Pitfall 6).
+	// Preserve this check — it short-circuits the byte-cache lookup for send-path
+	// contexts (RESEARCH Pitfall 6).
 	if sess := getCachedSession(ctx, addrString); sess != nil {
 		return sess, nil
 	}
 
-	// Phase 17.8: cacheKey includes device JID prefix so the shared struct LRU
-	// keeps each device's entries separate.
-	if device.ID != nil {
-		cacheKey := device.ID.String() + "|" + addrString
-		// 1. Check decoded structure cache (decode-once hit: ~375 ns, 20 allocs).
-		if device.ParsedSessionCache != nil {
-			if s, ok := device.ParsedSessionCache.LoadStruct(cacheKey); ok {
-				return record.NewSessionFromStructure(s, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
-			}
-		}
-
-		// 2. Cache miss: fetch []byte from byte-cache (CachedSessionStore LRU or DB).
-		rawSess, err := device.Sessions.GetSession(ctx, addrString)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load session with %s: %w", addrString, err)
-		}
-		if rawSess == nil {
-			return record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State), nil
-		}
-
-		// 3. Deserialize once: JSON → structure.
-		structure, err := SignalProtobufSerializer.Session.Deserialize(rawSess)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize session with %s: %w", addrString, err)
-		}
-		// 4. Populate struct cache (decode-once stored).
-		if device.ParsedSessionCache != nil {
-			device.ParsedSessionCache.StoreStruct(cacheKey, structure)
-		}
-
-		// 5. Build live record from structure.
-		return record.NewSessionFromStructure(structure, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
-	}
-
-	// Fallback: device.ID is nil (test or pre-init scenarios without a JID).
+	// Fetch raw bytes from byte-cache (CachedSessionStore LRU or DB).
+	// Stage 1: single-tier — no struct cache (D-04a removal).
 	rawSess, err := device.Sessions.GetSession(ctx, addrString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load session with %s: %w", addrString, err)
@@ -133,11 +100,19 @@ func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalA
 	if rawSess == nil {
 		return record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State), nil
 	}
-	sess, err := record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+
+	// Format detection: byte[0]=0x01 → flat, byte[0]=0x7B ('{') → JSON legacy read.
+	// Stage 1-2 dual-read: flat bytes written by Stage 1+; JSON blobs written before Stage 1.
+	var structure *record.SessionStructure
+	if len(rawSess) > 0 && rawSess[0] == 0x01 {
+		structure, err = UnpackFlatSession(rawSess)
+	} else {
+		structure, err = SignalProtobufSerializer.Session.Deserialize(rawSess) // ALLOW-JSON-DRAIN-BLOB-SESSION
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize session with %s: %w", addrString, err)
 	}
-	return sess, nil
+	return record.NewSessionFromStructure(structure, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
 }
 
 func (device *Device) GetSubDeviceSessions(ctx context.Context, name string) ([]uint32, error) {
@@ -147,32 +122,18 @@ func (device *Device) GetSubDeviceSessions(ctx context.Context, name string) ([]
 func (device *Device) StoreSession(ctx context.Context, address *protocol.SignalAddress, record *record.Session) error {
 	addrString := address.String()
 
-	// Phase 17.8: extract serialized bytes and post-ratchet structure BEFORE
-	// the putCachedSession branch so the struct cache is always updated
-	// regardless of which path takes the write (RESEARCH Pitfall 6, lines 447-449).
-	serialized := record.Serialize()
-	newStruct := record.Structure()
-	if device.ID != nil && device.ParsedSessionCache != nil {
-		cacheKey := device.ID.String() + "|" + addrString
-		device.ParsedSessionCache.StoreStruct(cacheKey, newStruct)
-
-		// Context cache: send-path only — preserve existing short-circuit.
-		// Struct cache already updated above before this branch.
-		if putCachedSession(ctx, addrString, record) {
-			return nil
-		}
-
-		err := device.Sessions.PutSession(ctx, addrString, serialized)
-		if err != nil {
-			// Roll back: struct cache advanced past DB; force re-fetch on next Load
-			// (session write-through coherence, RESEARCH lines 323-328).
-			device.ParsedSessionCache.Invalidate(cacheKey)
-			return fmt.Errorf("failed to store session with %s: %w", addrString, err)
-		}
-		return nil
+	// Stage 1: write flat bytes via PackFlatSession. No struct cache (D-04a).
+	// Safety net: if PackFlatSession refuses to encode (should not happen in
+	// production), fall back to JSON drain blob to avoid silent session loss.
+	structure := record.Structure()
+	flat, ok := PackFlatSession(structure)
+	var serialized []byte
+	if ok {
+		serialized = flat
+	} else {
+		serialized = record.Serialize() // ALLOW-JSON-DRAIN-BLOB-SESSION
 	}
 
-	// Fallback: device.ID is nil or no parsed cache wired (test or pre-init scenarios).
 	if putCachedSession(ctx, addrString, record) {
 		return nil
 	}
