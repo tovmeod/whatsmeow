@@ -11,8 +11,8 @@
 // Each test drives the integration through device.LoadSenderKey /
 // device.StoreSenderKey / device.LoadSession / device.StoreSession (public API).
 // Parsed-cache types live in package store; tests access them only via
-// device.ParsedSKCache / ParsedSessionCache exported methods. No direct
-// field reads into package store internals.
+// device.ParsedSKCache exported methods. No direct field reads into package
+// store internals. Phase 17.13: ParsedSessionCache removed (D-04a).
 //
 // Run: go test ./store/sqlstore/ -run TestDecodeOnce_CR -race -count=5
 
