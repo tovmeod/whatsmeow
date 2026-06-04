@@ -91,8 +91,9 @@ func simulateBatchedGuardedUpdate(sessions map[string][]byte, updates map[string
 
 // makeJSONBlob builds a JSON-encoded session blob from a SessionStructure
 // using the standard SignalProtobufSerializer's session Serialize method —
-// the same JSON path that the live driver's ALLOW-JSON-DRAIN-BLOB-SESSION
-// fallback (StoreSession) takes when PackFlatSession refuses.
+// the same JSON path that the Stage 1-2 driver used when PackFlatSession refused.
+// Stage 3: this path no longer exists in signal.go StoreSession; makeJSONBlob
+// is kept here for use in sweeper guard tests (verifying the predicate logic).
 // SignalProtobufSerializer.Session is a JSONSessionSerializer; Serialize
 // JSON-encodes the structure directly without requiring valid EC key bytes.
 func makeJSONBlob(s *record.SessionStructure) []byte {
