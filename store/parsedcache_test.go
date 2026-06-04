@@ -4,9 +4,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// parsedcache_test.go — Phase 17.8 plan 01.
+// parsedcache_test.go — Phase 17.8 plan 01, updated Phase 17.13.
 //
-// Unit tests for parsedSKCache and parsedSessionCache (parsedcache.go).
+// Unit tests for parsedSKCache (parsedcache.go).
+// Phase 17.13: parsedSessionCache removed (D-04a); session cache tests removed.
 //
 // Coverage:
 //   SC-1: hit path returns cached pointer without deserialization.
@@ -25,10 +26,8 @@ import (
 	"sync"
 	"testing"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
-	librecord "go.mau.fi/libsignal/state/record"
 )
 
 // ---------------------------------------------------------------------------
@@ -68,15 +67,6 @@ func validSKStructure(seed int) *groupRecord.SenderKeyStructure {
 			SigningKeyPrivate: mk(flatSigningPrivLen, 0x30+seed),
 		}},
 	}
-}
-
-func newSessCache(t *testing.T, cap int) *parsedSessionCache {
-	t.Helper()
-	c, err := lru.New[string, *librecord.SessionStructure](cap)
-	if err != nil {
-		t.Fatalf("lru.New Session: %v", err)
-	}
-	return NewParsedSessionCache(c)
 }
 
 // ---------------------------------------------------------------------------
@@ -164,64 +154,6 @@ func TestDecodedSKCacheInvalidate(t *testing.T) {
 	cache := newSKCache(t, 128)
 	key := "group-inv|user-inv"
 	s := validSKStructure(3)
-
-	cache.StoreStruct(key, s)
-	cache.Invalidate(key)
-
-	_, ok := cache.LoadStruct(key)
-	if ok {
-		t.Fatal("LoadStruct after Invalidate: want ok=false, got true")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestDecodedSessionCacheHit
-//
-// Mirror of TestDecodedSKCacheHit for parsedSessionCache.
-// ---------------------------------------------------------------------------
-
-func TestDecodedSessionCacheHit(t *testing.T) {
-	cache := newSessCache(t, 128)
-	key := "addr1"
-	s := &librecord.SessionStructure{}
-
-	cache.StoreStruct(key, s)
-	got, ok := cache.LoadStruct(key)
-	if !ok {
-		t.Fatal("LoadStruct after StoreStruct: want ok=true, got false")
-	}
-	if got != s {
-		t.Fatalf("LoadStruct returned different pointer: got %p, want %p", got, s)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestDecodedSessionCacheMiss
-//
-// Mirror of TestDecodedSKCacheMiss for parsedSessionCache.
-// ---------------------------------------------------------------------------
-
-func TestDecodedSessionCacheMiss(t *testing.T) {
-	cache := newSessCache(t, 128)
-	got, ok := cache.LoadStruct("addr-miss")
-	if ok {
-		t.Fatal("LoadStruct on empty session cache: want ok=false, got true")
-	}
-	if got != nil {
-		t.Fatalf("LoadStruct on empty session cache: want nil, got %p", got)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestDecodedSessionCacheInvalidate
-//
-// SC-6 (session): StoreStruct then Invalidate causes next LoadStruct to miss.
-// ---------------------------------------------------------------------------
-
-func TestDecodedSessionCacheInvalidate(t *testing.T) {
-	cache := newSessCache(t, 128)
-	key := "addr-inv"
-	s := &librecord.SessionStructure{}
 
 	cache.StoreStruct(key, s)
 	cache.Invalidate(key)

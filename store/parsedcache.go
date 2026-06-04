@@ -36,7 +36,6 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
-	librecord "go.mau.fi/libsignal/state/record"
 )
 
 // parsedCacheEnvCapOrDefault reads an integer env var and returns its value,
@@ -70,7 +69,6 @@ func parsedCacheEnvCapOrDefault(key string, fallback int) int {
 // this package-level var is the store-package default for tests/standalone
 // wiring. Env-overridable.
 var signalSKParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
-var signalSessParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SESSION_DECODED_CAP", 250_000)
 
 // Process-global parsed-cache hit/miss counters. The parsed cache is a shared
 // process-level LRU wrapped per-device, so global atomics (not per-wrapper
@@ -78,20 +76,13 @@ var signalSessParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SESSION_
 // that forced the columnar DB read + recompose; the hit ratio tells whether the
 // decode-once cache is actually earning its keep on the live access pattern.
 var (
-	skParsedHits, skParsedMisses     uint64
-	sessParsedHits, sessParsedMisses uint64
+	skParsedHits, skParsedMisses uint64
 )
 
 // SenderKeyParsedCacheStats returns the process-global hits and misses of the
 // parsed sender-key cache (LoadStruct). Exposed for DebugStats / observability.
 func SenderKeyParsedCacheStats() (hits, misses uint64) {
 	return atomic.LoadUint64(&skParsedHits), atomic.LoadUint64(&skParsedMisses)
-}
-
-// SessionParsedCacheStats returns the process-global hits and misses of the
-// parsed session cache (LoadStruct).
-func SessionParsedCacheStats() (hits, misses uint64) {
-	return atomic.LoadUint64(&sessParsedHits), atomic.LoadUint64(&sessParsedMisses)
 }
 
 // parsedSKCache is a process-level LRU of decoded *SenderKeyStructure values.
@@ -184,48 +175,3 @@ func (c *parsedSKCache) Invalidate(key string) {
 	c.mu.Unlock()
 }
 
-// parsedSessionCache is the session-record counterpart of parsedSKCache.
-// It caches decoded *SessionStructure values so that LoadSession hits avoid
-// JSON deserialization and the libsignal graph-rebuild (~375 ns / 20 allocs
-// at 0 skipped keys vs ~5,114 ns / 47 allocs for a full parse — D-03).
-type parsedSessionCache struct {
-	lru *lru.Cache[string, *librecord.SessionStructure]
-	mu  sync.Mutex
-}
-
-// NewParsedSessionCache wraps a pre-constructed LRU (constructed by
-// cache_wiring.go in plan 02 and injected here).
-func NewParsedSessionCache(cache *lru.Cache[string, *librecord.SessionStructure]) *parsedSessionCache {
-	return &parsedSessionCache{lru: cache}
-}
-
-// LoadStruct returns the cached *SessionStructure for key, or (nil, false) on
-// a miss. No lock is held; lru.Cache.Get is goroutine-safe. The returned
-// pointer is READ-ONLY — callers must not modify the struct.
-func (c *parsedSessionCache) LoadStruct(key string) (*librecord.SessionStructure, bool) {
-	v, ok := c.lru.Get(key)
-	if ok {
-		atomic.AddUint64(&sessParsedHits, 1)
-	} else {
-		atomic.AddUint64(&sessParsedMisses, 1)
-	}
-	return v, ok
-}
-
-// StoreStruct replaces the cached structure for key. Holds c.mu only for the
-// lru.Add call. The passed-in pointer s must have been produced by
-// record.Structure() on the post-ratchet record.
-func (c *parsedSessionCache) StoreStruct(key string, s *librecord.SessionStructure) {
-	c.mu.Lock()
-	c.lru.Add(key, s)
-	c.mu.Unlock()
-}
-
-// Invalidate removes the entry for key. D-04 hook — also called on StoreSession
-// rollback (when inner.PutSession fails) to prevent a phantom-write in the
-// struct cache that was never persisted to DB.
-func (c *parsedSessionCache) Invalidate(key string) {
-	c.mu.Lock()
-	c.lru.Remove(key)
-	c.mu.Unlock()
-}

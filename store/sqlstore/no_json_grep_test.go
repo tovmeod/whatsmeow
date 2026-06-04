@@ -7,19 +7,27 @@
 // no_json_grep_test.go — TestNoJSONOnSenderKeyPath
 //
 // Enforced grep-gate: zero .Serialize() / .Deserialize( calls on the per-message
-// sender-key read+write path (T-17.9-15). One documented exception is permitted,
-// identified by an explicit inline comment marker:
+// sender-key and session read+write path (T-17.9-15, T-17.13-10). Two documented
+// exceptions are permitted, identified by explicit inline comment markers:
 //
-//   ALLOW-JSON-DRAIN-BLOB   — the ultimate-fallback legacy-blob Serialize in
-//                              PutSenderKeyStructure, taken only when PackFlat
-//                              returns (nil, false) on a 0-state structure
-//                              (should not occur in production; safety net path).
+//   ALLOW-JSON-DRAIN-BLOB         — the ultimate-fallback legacy-blob Serialize in
+//                                    PutSenderKeyStructure, taken only when PackFlat
+//                                    returns (nil, false) on a 0-state structure
+//                                    (should not occur in production; safety net path).
+//   ALLOW-JSON-DRAIN-BLOB-SESSION — Stage 1-2 safety net: refuse-to-encode JSON drain
+//                                    fallback in StoreSession; JSON legacy read in
+//                                    LoadSession. Stage 3 closes both paths after
+//                                    backfill confirms zero JSON rows.
 //
 // Phase 17.11-05 change: ALLOW-JSON-LEGACY-READ removed. The getSenderKeyDecomposed
 // dual-read path (fmt_ver=1/NULL Deserialize) was deleted along with the columnar
 // columns in this plan. GetSenderKeyStructure now uses store.UnpackFlat(blob) only.
 // senderkey_columns.go was deleted; senderKeyColumns/decompose/recompose moved to
 // store.go (migration tool compat only; not on any live driver read path).
+//
+// Phase 17.13 change: session functions (StoreSession, LoadSession) added to the
+// gate. ALLOW-JSON-DRAIN-BLOB-SESSION marker added for the Stage 1-2 transition.
+// Session exemption comment removed.
 //
 // Why .Serialize()/.Deserialize( rather than json.Marshal/Unmarshal:
 // libsignal's "ProtoBufSerializer" is misnamed — it uses encoding/json for all
@@ -35,7 +43,8 @@
 // Covered source files:
 //   - store/sqlstore/store.go                      (PutManySenderKeys — flat bytea write, no blob)
 //   - store/sqlstore/cached_sender_key_store.go    (extractStructMeta, PutSenderKey, PutSenderKeyStructure, GetSenderKeyStructure)
-//   - store/signal.go                              (StoreSenderKey, LoadSenderKey)
+//   - store/sqlstore/cached_session_store.go       (Stage 1 gate: confirms no JSON calls in byte-cache layer)
+//   - store/signal.go                              (StoreSenderKey, LoadSenderKey, StoreSession, LoadSession)
 //
 // The gate passes NOW. Any future addition of .Serialize()/.Deserialize( to the
 // covered file set without an explicit ALLOW marker causes this test to FAIL,
@@ -56,19 +65,15 @@ import (
 // senderKeyPathFiles are the source files covered by the grep-gate.
 // Paths are relative to the module root (located via go/build or __file__).
 // The gate covers these files in their entirety — not a function-scoped list.
-//
-// Exception: store/signal.go also contains session functions (StoreSession,
-// LoadSession) which legitimately have Serialize/Deserialize. Those functions
-// are explicitly out of scope for this gate. We extract only the sender-key
-// function lines from signal.go via senderKeySignalFileFunctions below.
 var senderKeyPathFiles = []string{
 	"store/sqlstore/store.go",
 	"store/sqlstore/cached_sender_key_store.go",
+	"store/sqlstore/cached_session_store.go", // Stage 1 gate: confirms no JSON in byte-cache layer
 }
 
-// senderKeySignalFilePath is store/signal.go, scanned for only sender-key
-// functions (StoreSenderKey, LoadSenderKey). Session functions (StoreSession,
-// LoadSession) are out of scope for this gate.
+// senderKeySignalFilePath is store/signal.go, scanned for sender-key functions
+// (StoreSenderKey, LoadSenderKey) via senderKeySignalFuncPrefixes and for session
+// functions (StoreSession, LoadSession) via sessionSignalFuncPrefixes.
 const senderKeySignalFilePath = "store/signal.go"
 
 // senderKeySignalFuncPrefixes are the function name prefixes to include from
@@ -77,6 +82,13 @@ const senderKeySignalFilePath = "store/signal.go"
 var senderKeySignalFuncPrefixes = []string{
 	"func (device *Device) StoreSenderKey(",
 	"func (device *Device) LoadSenderKey(",
+}
+
+// sessionSignalFuncPrefixes are the session function name prefixes to include
+// from signal.go (Phase 17.13: session path now covered by this gate).
+var sessionSignalFuncPrefixes = []string{
+	"func (device *Device) StoreSession(",
+	"func (device *Device) LoadSession(",
 }
 
 // jsonCallPatterns are the substrings that indicate a JSON-bearing call on the
@@ -92,9 +104,12 @@ var jsonCallPatterns = []string{
 // ALLOW-JSON-DRAIN-BLOB: Serialize fallback in PutSenderKeyStructure when PackFlat fails.
 // ALLOW-JSON-LEGACY-READ: Serialize/Deserialize in store/signal.go for non-columnar store
 //   fallback (non-production path: fires only when CachedSenderKeyStore is not wired).
+// ALLOW-JSON-DRAIN-BLOB-SESSION: Stage 1-2 safety net in StoreSession/LoadSession;
+//   Stage 3 closes both paths after backfill confirms zero JSON rows.
 var allowMarkers = []string{
 	"ALLOW-JSON-DRAIN-BLOB",
 	"ALLOW-JSON-LEGACY-READ",
+	"ALLOW-JSON-DRAIN-BLOB-SESSION", // Stage 1-2: JSON drain fallback in StoreSession; JSON legacy read in LoadSession
 }
 
 // TestNoJSONOnSenderKeyPath asserts zero .Serialize()/.Deserialize( calls on
@@ -118,8 +133,9 @@ func TestNoJSONOnSenderKeyPath(t *testing.T) {
 
 	var violations []string
 	markerFound := map[string]bool{
-		"ALLOW-JSON-DRAIN-BLOB":  false,
-		"ALLOW-JSON-LEGACY-READ": false, // still present in store/signal.go non-columnar fallback
+		"ALLOW-JSON-DRAIN-BLOB":         false,
+		"ALLOW-JSON-LEGACY-READ":        false, // still present in store/signal.go non-columnar fallback
+		"ALLOW-JSON-DRAIN-BLOB-SESSION": false, // Stage 1-2: JSON paths in StoreSession/LoadSession
 	}
 
 	// Scan the whole-file entries.
@@ -143,7 +159,18 @@ func TestNoJSONOnSenderKeyPath(t *testing.T) {
 		checkLines(t, relPath, lines, &violations, markerFound)
 	}
 
-	// Gate: both ALLOW markers must be present.
+	// Scan only the session function bodies in signal.go (Phase 17.13: now in scope).
+	{
+		relPath := senderKeySignalFilePath
+		absPath := filepath.Join(moduleRoot, relPath)
+		lines, err := extractSenderKeyFunctionLines(absPath, sessionSignalFuncPrefixes)
+		if err != nil {
+			t.Fatalf("cannot extract session functions from %s: %v", relPath, err)
+		}
+		checkLines(t, relPath, lines, &violations, markerFound)
+	}
+
+	// Gate: all ALLOW markers must be present.
 	// If an exception line is removed (e.g. legacy blob dropped in a future plan),
 	// the marker disappears and this check trips — forcing an explicit update to
 	// the gate. This prevents a silent "no-op" grep-gate after cleanup.
@@ -163,7 +190,7 @@ func TestNoJSONOnSenderKeyPath(t *testing.T) {
 	}
 
 	if len(violations) == 0 && allMarkersFound(markerFound) {
-		t.Logf("PASS: zero unmarked .Serialize()/.Deserialize( on the per-message sender-key path; both ALLOW markers present")
+		t.Logf("PASS: zero unmarked .Serialize()/.Deserialize( on the per-message sender-key and session path; all ALLOW markers present")
 	}
 }
 
