@@ -58,6 +58,9 @@ type senderKeyRecoveryReader interface {
 // SenderKeyStateStructure whose KeyID == targetKeyID and
 // SenderChainKey.Iteration is the closest value <= targetIter across all donors.
 type donorSenderKeyState struct {
+	// OurJID is the donor account's JID (our_jid column), populated by
+	// scanFlatRows for D-08 donor-jid logging in TryInlineRecovery.
+	OurJID string
 	// KeyID of the matching SenderKeyState (== targetKeyID).
 	KeyID uint32
 	// SenderChainKey at the chosen iteration.
@@ -153,6 +156,7 @@ func scanFlatRows(rows interface {
 				}
 			}
 			best = &donorSenderKeyState{
+				OurJID:           ourJID,
 				KeyID:            st.KeyID,
 				Iteration:        donorIter,
 				ChainKey:         st.SenderChainKey.ChainKey,
@@ -304,6 +308,89 @@ func (c *CachedSenderKeyStore) RecoverSenderKey(ctx context.Context, group, targ
 	return true, nil
 }
 
+// TryInlineRecovery is the inline synchronous cross-account recovery entry-point
+// for CachedSenderKeyStore. It satisfies the store.SenderKeyInlineRecoverer
+// interface and is called directly from decryptGroupSenderKey in message.go on
+// a sender-key miss.
+//
+// Same donor-scan logic as RecoverSenderKey, but:
+//   - Returns (donorJID string, ok bool, err error) so the caller can log the
+//     donor's account JID in SENDER_KEY_RECOVERED (D-08).
+//   - Installs via PutSenderKeyStructure (warm parsedReplace cache) rather than
+//     recoverySyncWrite, because the inline retry constructs the cipher directly
+//     from the parsedReplace cache without calling GetSenderKeyDevices (D-03/D-04).
+//   - RecoverSenderKey is NOT removed in this plan (worker still calls it; deleted
+//     in Plan 02 together with the worker).
+//
+// Iteration-downgrade guard is identical to RecoverSenderKey (T-1712-01 mitigation).
+func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, targetSenderID, senderBare string, targetKeyID, targetIter uint32) (donorJID string, ok bool, err error) {
+	r, rOk := c.inner.(senderKeyRecoveryReader)
+	if !rOk {
+		// inner does not implement the recovery reader (test stub / pre-wiring).
+		return "", false, nil
+	}
+
+	donor, err := r.findSenderKeyDonor(ctx, group, senderBare, targetKeyID, targetIter)
+	if err != nil {
+		return "", false, err
+	}
+	if donor == nil {
+		return "", false, nil // no qualifying donor
+	}
+
+	// Iteration-downgrade guard (T-1712-01 mitigation):
+	// A concurrent inbound SKDM can advance the ratchet between findSenderKeyDonor
+	// and PutSenderKeyStructure. If the existing row already has the same KeyID at
+	// Iteration >= donor.Iteration, the donor is stale — skip the write to avoid
+	// clobbering the naturally-advanced key.
+	existing, err := c.GetSenderKeyStructure(ctx, group, targetSenderID)
+	if err != nil {
+		return "", false, err
+	}
+	if existing != nil {
+		for _, st := range existing.SenderKeyStates {
+			if st == nil || st.SenderChainKey == nil {
+				continue
+			}
+			if st.KeyID == donor.KeyID && st.SenderChainKey.Iteration >= donor.Iteration {
+				return "", false, nil // donor is not fresher; skip write
+			}
+		}
+	}
+
+	// Build a *SenderKeyStructure from the recipient-independent donor state.
+	skippedKeys := make([]*ratchet.SenderMessageKeyStructure, len(donor.SkippedKeys))
+	for i, smk := range donor.SkippedKeys {
+		skippedKeys[i] = &ratchet.SenderMessageKeyStructure{
+			Iteration: smk.Iteration,
+			IV:        smk.IV,
+			CipherKey: smk.CipherKey,
+			Seed:      smk.Seed,
+		}
+	}
+	structure := &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+			{
+				KeyID: donor.KeyID,
+				SenderChainKey: &ratchet.SenderChainKeyStructure{
+					Iteration: donor.Iteration,
+					ChainKey:  donor.ChainKey,
+				},
+				SigningKeyPublic:  donor.SigningKeyPublic,
+				SigningKeyPrivate: donor.SigningKeyPrivate,
+				Keys:              skippedKeys,
+			},
+		},
+	}
+
+	// Install via PutSenderKeyStructure (fires parsedReplace synchronously).
+	// The inline retry reads from the warm parsedReplace cache — no DB round-trip.
+	if err := c.PutSenderKeyStructure(ctx, group, targetSenderID, structure); err != nil {
+		return "", false, err
+	}
+	return donor.OurJID, true, nil
+}
+
 // Compile-time assertion: *SQLStore satisfies the upstream store.SenderKeyStore
 // interface (GetSenderKey, PutSenderKey, GetSenderKeyDevices). The columnar
 // additions live behind fork-local interfaces (senderKeyColumnarStore,
@@ -320,6 +407,11 @@ var _ store.SenderKeyStore = (*SQLStore)(nil)
 // line becomes a BUILD ERROR, preventing RecoverSenderKey from silently
 // falling back to (false, nil) via the type-assertion above.
 var _ senderKeyRecoveryReader = (*SQLStore)(nil)
+
+// Compile-time assertion: *CachedSenderKeyStore satisfies the new inline
+// recovery interface. If TryInlineRecovery is removed or its signature drifts,
+// this line becomes a BUILD ERROR, preventing silent nil-fallback at the call site.
+var _ store.SenderKeyInlineRecoverer = (*CachedSenderKeyStore)(nil)
 
 // flatRecoveryNote: post-upgrade-19 all sender_key values are PackFlat format.
 // findSenderKeyDonor uses store.UnpackFlat for all rows. The fast path

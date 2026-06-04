@@ -587,6 +587,9 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	c.caches.senderKeyFlushersMu.Unlock()
 	senderKeyStore.SetFlusher(flusher)
 	device.SenderKeys = senderKeyStore
+	// Phase 17.12: wire inline synchronous recovery. No goroutine, no map, no mutex —
+	// CachedSenderKeyStore satisfies SenderKeyInlineRecoverer directly.
+	device.InlineRecoverer = senderKeyStore
 
 	// Phase 17.11-03: per-device background recovery worker (per-JID singleton).
 	// Same pattern as the flusher singleton above: construct+Start only on first

@@ -155,6 +155,17 @@ type SenderKeyRecoveryWorker interface {
 	TryEnqueue(task RecoveryTask)
 }
 
+// SenderKeyInlineRecoverer is the interface for synchronous inline recovery.
+// Defined in package store (not sqlstore) so message.go can call it via
+// cli.Store.InlineRecoverer without importing sqlstore (package-boundary
+// constraint — same rationale as SenderKeyRecoveryWorker).
+// Implemented by *CachedSenderKeyStore (sqlstore). Set on Device by
+// attachCachedStores. Nil before wiring and in test environments;
+// message.go gates on nil before calling TryInlineRecovery.
+type SenderKeyInlineRecoverer interface {
+	TryInlineRecovery(ctx context.Context, group, targetSenderID, senderBare string, targetKeyID, targetIter uint32) (donorJID string, ok bool, err error)
+}
+
 type MessageSecretInsert struct {
 	Chat   types.JID
 	Sender types.JID
@@ -284,6 +295,10 @@ type Device struct {
 	// Nil before attachCachedStores wires it. message.go gates on nil before
 	// calling TryEnqueue — no-op when not wired (test environments, pre-init).
 	RecoveryWorker SenderKeyRecoveryWorker
+	// Phase 17.12: inline synchronous cross-account sender-key recovery.
+	// Nil before attachCachedStores wires it. message.go gates on nil before
+	// calling TryInlineRecovery — no-op when not wired (test environments, pre-init).
+	InlineRecoverer SenderKeyInlineRecoverer
 	AppStateKeys  AppStateSyncKeyStore
 	AppState      AppStateStore
 	Contacts      ContactStore
