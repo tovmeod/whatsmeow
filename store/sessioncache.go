@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/rs/zerolog"
 	"go.mau.fi/libsignal/state/record"
 
 	"go.mau.fi/util/exsync"
@@ -101,12 +100,33 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 			sessionRecord = record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
 		} else {
 			found = true
-			sessionRecord, err = record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+			// Phase 17.13 Stage 3: whatsmeow_sessions is flat-bytea (byte0=0x01).
+			// This send-path prefetch MUST decode with the same flat codec as the
+			// single-read path LoadSession (signal.go) and the write path
+			// PutCachedSessions — not the old record.NewSessionFromBytes (JSON).
+			// All prod rows are confirmed flat; a non-flat blob or a decode failure
+			// returns a wrapped error. NEVER silently drop the address: dropping it
+			// leaves the cache entry absent, hasCachedSession reports Found=false,
+			// ContainsSession short-circuits to false, and the send aborts with
+			// ErrNoSession → WhatsApp 479 (the exact bug this read-gap caused).
+			var structure *record.SessionStructure
+			if len(rawSess) > 0 && rawSess[0] == 0x01 {
+				structure, err = UnpackFlatSession(rawSess)
+				if err != nil {
+					return nil, ctx, fmt.Errorf("WithCachedSessions: failed to deserialize flat session with %s: %w", addr, err)
+				}
+			} else {
+				var byte0desc string
+				if len(rawSess) == 0 {
+					byte0desc = "empty blob"
+				} else {
+					byte0desc = fmt.Sprintf("byte0=0x%02x", rawSess[0])
+				}
+				return nil, ctx, fmt.Errorf("WithCachedSessions: non-flat session blob for %s (%s); JSON read path removed in Stage 3", addr, byte0desc)
+			}
+			sessionRecord, err = record.NewSessionFromStructure(structure, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
 			if err != nil {
-				zerolog.Ctx(ctx).Err(err).
-					Str("address", addr).
-					Msg("Failed to deserialize session")
-				continue
+				return nil, ctx, fmt.Errorf("WithCachedSessions: failed to build session record for %s: %w", addr, err)
 			}
 		}
 		existingSessions[addr] = found
