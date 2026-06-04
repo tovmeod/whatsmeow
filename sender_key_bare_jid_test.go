@@ -14,12 +14,18 @@
 package whatsmeow
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"go.mau.fi/libsignal/groups"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/protocol"
@@ -27,6 +33,7 @@ import (
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
@@ -409,4 +416,223 @@ func TestGroupSenderKeyDeviceMatchedRecovery(t *testing.T) {
 	if fake.getDevicesCalls != before+1 {
 		t.Fatalf("expected one enumerate per decrypt (Phase 27 device-tolerant loop): getDevicesCalls %d → %d, want +1", before, fake.getDevicesCalls)
 	}
+}
+
+// inlineTestDSN returns the test Postgres DSN (same convention as batchTestDSN
+// in sqlstore_test, but replicated here since that function is in a separate
+// package that cannot be imported from package whatsmeow).
+func inlineTestDSN() string {
+	if dsn := os.Getenv("TEST_DSN"); dsn != "" {
+		return dsn
+	}
+	if dsn := os.Getenv("KAVTOV_TEST_DSN"); dsn != "" {
+		return dsn
+	}
+	return "postgresql://kavtov_test:kavtov_test@localhost:5433/kavtov_test"
+}
+
+// insertInlineTestDevice inserts a minimal whatsmeow_device row so that
+// whatsmeow_sender_keys.our_jid FK constraints are satisfied.
+// Returns a cleanup function that removes the device row.
+func insertInlineTestDevice(t *testing.T, db *sql.DB, jid string) func() {
+	t.Helper()
+	const insertQ = `
+		INSERT INTO whatsmeow_device (jid, registration_id, noise_key, identity_key,
+									  signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
+									  adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		ON CONFLICT (jid) DO NOTHING
+	`
+	thirtyTwo := bytes.Repeat([]byte{0x11}, 32)
+	sixtyFour := bytes.Repeat([]byte{0x22}, 64)
+	_, err := db.ExecContext(context.Background(), insertQ,
+		jid, 1, thirtyTwo, thirtyTwo,
+		thirtyTwo, 1, sixtyFour,
+		thirtyTwo, thirtyTwo, sixtyFour, thirtyTwo, sixtyFour,
+	)
+	if err != nil {
+		t.Fatalf("insertInlineTestDevice %s: %v", jid, err)
+	}
+	return func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM whatsmeow_device WHERE jid=$1`, jid)
+	}
+}
+
+// TestInlineDecryptEquivalence is the BLOCKING gate for Phase 17.12 plan 01.
+//
+// It proves that:
+//  1. TryInlineRecovery finds a cross-account donor (B) and installs the key
+//     via PutSenderKeyStructure, firing parsedReplace on C's store.
+//  2. A direct-cipher retry (no GetSenderKeyDevices — warm parsedReplace hit)
+//     decrypts the original plaintext.
+//
+// 3-account scenario: Alice (sender), B (donor account — processed Alice's SKDM),
+// C (recovering account — no Alice key, calls TryInlineRecovery).
+//
+// Single shared *sql.DB: B and C rows differ only by our_jid; findSenderKeyDonor
+// finds B's row because it has no our_jid filter. This is the production path.
+//
+// BLOCKING: the test DB is reachable (confirmed UP). Any SKIP means the
+// harness is wrong (DSN / driver / device-row missing) — fix it; do not accept.
+func TestInlineDecryptEquivalence(t *testing.T) {
+	ctx := context.Background()
+
+	// Open the test DB.
+	db, err := sql.Open("pgx", inlineTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	// Separate JIDs to avoid collision with recovery_sender_key_test.go JIDs.
+	const (
+		inlineTestJIDB = "17799990031@s.whatsapp.net" // donor account (has Alice key)
+		inlineTestJIDC = "17799990032@s.whatsapp.net" // recovering account (no Alice key)
+	)
+
+	cleanupB := insertInlineTestDevice(t, db, inlineTestJIDB)
+	cleanupC := insertInlineTestDevice(t, db, inlineTestJIDC)
+	t.Cleanup(func() {
+		cleanupB()
+		cleanupC()
+		db.Close()
+	})
+
+	const (
+		group     = "inlinedecrypt_test_group@g.us"
+		plaintext = "inline recovery decrypt equivalence proof"
+	)
+
+	// Step 1: Alice generates real SKDM + skmsg.
+	skdmBytes, skmsgBytes := aliceCrypto(ctx, t, group, []byte(plaintext))
+
+	// Step 2: B processes Alice's SKDM. B needs a real *CachedSenderKeyStore
+	// backed by *SQLStore (no flusher — write-through fallback writes to DB
+	// immediately so findSenderKeyDonor sees the row).
+	jidBParsed, err := types.ParseJID(inlineTestJIDB)
+	if err != nil {
+		t.Fatalf("ParseJID B: %v", err)
+	}
+	containerB := sqlstore.NewWithDB(db, "postgres", nil)
+	innerB := sqlstore.NewSQLStore(containerB, jidBParsed)
+	byteB, _ := lru.New[string, []byte](256)
+	devB, _ := lru.New[string, []string](256)
+	csBStore := sqlstore.NewCachedSenderKeyStore(innerB, inlineTestJIDB, byteB, devB)
+
+	// Wire parsedReplace on B's store (needed by PutSenderKeyStructure coherence
+	// path, but the parsed cache object itself doesn't matter for B — only C
+	// needs the warm-cache assertion to hold).
+	skLRUB, _ := store.NewSKParsedLRU(256)
+	parsedB := store.NewParsedSKCache(skLRUB)
+	csBStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
+		parsedB.StoreStruct(key, s)
+	})
+
+	// Build a Device for B so builder.Process routes writes through csBStore.
+	// aliceAddr is "alice:0", so the key is stored under sender_id="alice:0".
+	deviceB := &store.Device{
+		SenderKeys: csBStore,
+		Log:        waLog.Noop,
+		ID:         &jidBParsed,
+		ParsedSKCache: parsedB,
+	}
+
+	// Clean up leftover rows from previous test runs.
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		inlineTestJIDB, inlineTestJIDC, group)
+
+	// Process Alice's SKDM into B's store (same path as handleSenderKeyDistributionMessage).
+	aliceAddr := protocol.NewSignalAddress("alice", 0)
+	aliceSKName := protocol.NewSenderKeyName(group, aliceAddr)
+	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(skdmBytes, store.SignalProtobufSerializer.SenderKeyDistributionMessage)
+	if err != nil {
+		t.Fatalf("parse SKDM: %v", err)
+	}
+	builderB := groups.NewGroupSessionBuilder(deviceB, store.SignalProtobufSerializer)
+	if err := builderB.Process(ctx, aliceSKName, sdkMsg); err != nil {
+		t.Fatalf("B builder.Process: %v", err)
+	}
+	t.Logf("B processed Alice SKDM — key stored under our_jid=%s", inlineTestJIDB)
+
+	// Step 3: Build C's CachedSenderKeyStore on the SAME shared DB.
+	// C has NO Alice key. C's parsedReplace is wired into a real ParsedSKCache
+	// so that after TryInlineRecovery's PutSenderKeyStructure, the warm-cache
+	// hit in LoadSenderKey during the cipher.Decrypt retry succeeds.
+	jidCParsed, err := types.ParseJID(inlineTestJIDC)
+	if err != nil {
+		t.Fatalf("ParseJID C: %v", err)
+	}
+	containerC := sqlstore.NewWithDB(db, "postgres", nil)
+	innerC := sqlstore.NewSQLStore(containerC, jidCParsed)
+	byteC, _ := lru.New[string, []byte](256)
+	devC, _ := lru.New[string, []string](256)
+	csC := sqlstore.NewCachedSenderKeyStore(innerC, inlineTestJIDC, byteC, devC)
+
+	skLRUC, _ := store.NewSKParsedLRU(256)
+	parsedC := store.NewParsedSKCache(skLRUC)
+	csC.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
+		parsedC.StoreStruct(key, s)
+	})
+
+	deviceC := &store.Device{
+		SenderKeys:    csC,
+		InlineRecoverer: csC,
+		Log:           waLog.Noop,
+		ID:            &jidCParsed,
+		ParsedSKCache: parsedC,
+	}
+
+	// Step 4: Call TryInlineRecovery on C.
+	// labeled = Alice's signal address string ("alice:0")
+	// senderBare = "alice" (from SignalAddressUser, device-stripped)
+	// keyID and iter come from the SKDM (parsed from skmsg).
+	parsedSKDM, err := protocol.NewSenderKeyDistributionMessageFromBytes(skdmBytes, store.SignalProtobufSerializer.SenderKeyDistributionMessage)
+	if err != nil {
+		t.Fatalf("re-parse SKDM for keyID: %v", err)
+	}
+	aliceKeyID := parsedSKDM.ID()
+
+	labeled := aliceSKName.Sender().String() // "alice:0"
+	senderBare := "alice"
+
+	donorJID, ok, recErr := deviceC.InlineRecoverer.TryInlineRecovery(
+		ctx, group, labeled, senderBare, aliceKeyID, 0)
+	if recErr != nil {
+		t.Fatalf("TryInlineRecovery: %v", recErr)
+	}
+	if !ok {
+		t.Fatal("TryInlineRecovery returned ok=false — donor not found; B's key should be in shared DB")
+	}
+	if donorJID == "" {
+		t.Fatal("TryInlineRecovery returned empty donorJID on success")
+	}
+	t.Logf("TryInlineRecovery succeeded: donorJID=%s", donorJID)
+
+	// Step 5: Direct-cipher retry — construct cipher under labeled, Decrypt skmsg.
+	// This validates the warm parsedReplace hit (D-04 safe: no DB round-trip).
+	sep := strings.LastIndex(labeled, ":")
+	devIDStr := labeled[sep+1:]
+	devIDVal, err := strconv.ParseUint(devIDStr, 10, 32)
+	if err != nil {
+		t.Fatalf("parse device id from labeled %q: %v", labeled, err)
+	}
+	retryName := protocol.NewSenderKeyName(group, protocol.NewSignalAddress(labeled[:sep], uint32(devIDVal)))
+	retryCipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(deviceC, store.SignalProtobufSerializer), retryName, deviceC)
+
+	skmsg, err := protocol.NewSenderKeyMessageFromBytes(skmsgBytes, store.SignalProtobufSerializer.SenderKeyMessage)
+	if err != nil {
+		t.Fatalf("parse skmsg: %v", err)
+	}
+	decrypted, decErr := retryCipher.Decrypt(ctx, skmsg)
+	if decErr != nil {
+		t.Fatalf("cipher.Decrypt after TryInlineRecovery: %v", decErr)
+	}
+	if string(decrypted) != plaintext {
+		t.Fatalf("decrypted plaintext mismatch: got %q want %q", decrypted, plaintext)
+	}
+	t.Logf("PASS: TestInlineDecryptEquivalence — donor=%s, decrypted=%q", donorJID, decrypted)
 }

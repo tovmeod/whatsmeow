@@ -800,3 +800,102 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		t.Logf("round-trip: PASS — PackFlat/UnpackFlat round-trip at DB level, keyID=%d iter=%d", rtKeyID, rtIter)
 	})
 }
+
+// TestInlineRecoveryIterationGuard asserts the iteration-downgrade protection
+// for TryInlineRecovery (the inline path added in Phase 17.12).
+//
+// If (group, targetSenderID) already has a row with the same KeyID at
+// Iteration >= donor.Iteration, TryInlineRecovery must return ("", false, nil)
+// and leave the existing row untouched.
+//
+// Uses only helpers already present in this file (recoveryTestJIDA/B,
+// insertRecoveryTestDevice, newRecoveryTestStoreB, insertFlatBlobRow).
+// Does NOT copy insertRecoveryWorkerTestDevice or recoveryWorkerTestJIDA/B
+// from recovery_worker_test.go (same package; top-level redeclaration would
+// break compilation until Plan 02 deletes recovery_worker_test.go wholesale).
+func TestInlineRecoveryIterationGuard(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		group        = "recovinline_iterguard_group@g.us"
+		bareUser     = "55512340021_1"
+		donorSuffix  = ":5"
+		targetSuffix = ":0"
+		targetKeyID  = uint32(3)
+	)
+	donorSenderID  := bareUser + donorSuffix
+	targetSenderID := bareUser + targetSuffix
+
+	ctx := context.Background()
+
+	// Clean up any leftover rows.
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		recoveryTestJIDA, recoveryTestJIDB, group)
+
+	// Seed donor account A at KeyID=3, Iteration=50.
+	donorStruct := buildDonorStructure(targetKeyID, 50, 0xAA)
+	insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+	// Seed B's target row at KeyID=3, Iteration=100 (fresher than the donor).
+	existingStruct := buildDonorStructure(targetKeyID, 100, 0xBB)
+	insertFlatBlobRow(t, db, recoveryTestJIDB, group, targetSenderID, existingStruct)
+
+	// Build the recovering-account store (no running flusher — iteration guard
+	// fires before the write, so async vs sync doesn't affect this test).
+	csB := newRecoveryTestStoreB(t, db)
+
+	// Wire parsedReplace so PutSenderKeyStructure's callback fires.
+	// Needed because TryInlineRecovery calls c.GetSenderKeyStructure (which reads
+	// the struct cache if warm) and must correctly see the existing B row.
+	// The parsedReplace callback here is a no-op (just wires the field).
+	csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure) {})
+
+	// Attempt inline recovery with donor at iter=50, existing at iter=100.
+	// targetIter=60 (donor=50 <= 60 so donor qualifies by forward-only filter),
+	// but existing iter=100 >= donor iter=50 for same KeyID=3 → guard must fire.
+	donorJID, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, 60)
+	if err != nil {
+		t.Fatalf("TryInlineRecovery: %v", err)
+	}
+	if ok {
+		t.Fatalf("TryInlineRecovery returned true — expected false (iteration guard should have fired), donorJID=%q", donorJID)
+	}
+	if donorJID != "" {
+		t.Errorf("expected empty donorJID on guard-fired false return, got %q", donorJID)
+	}
+
+	// Verify the DB row is still at Iteration=100 (not overwritten by donor iter=50).
+	var blobDB []byte
+	err = db.QueryRowContext(ctx,
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		recoveryTestJIDB, group, targetSenderID,
+	).Scan(&blobDB)
+	if err != nil {
+		t.Fatalf("read B row sender_key: %v", err)
+	}
+	unpackedB, uErr := store.UnpackFlat(blobDB)
+	if uErr != nil || unpackedB == nil || len(unpackedB.SenderKeyStates) == 0 {
+		t.Fatalf("UnpackFlat B row: err=%v got=%v", uErr, unpackedB)
+	}
+	iterFromBlob := unpackedB.SenderKeyStates[0].SenderChainKey.Iteration
+	if iterFromBlob != 100 {
+		t.Errorf("DB row iteration = %d, want 100 (must not be downgraded by donor iter=50)", iterFromBlob)
+	}
+	t.Logf("PASS: iteration guard fired — TryInlineRecovery returned (empty, false, nil), DB row preserved at iter=%d", iterFromBlob)
+}
