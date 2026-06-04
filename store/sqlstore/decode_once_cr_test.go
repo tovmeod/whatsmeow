@@ -48,17 +48,17 @@ type testDeviceHandles struct {
 	skStore     *CachedSenderKeyStore
 	skLRU       *lru.Cache[string, []byte]
 	skParsedLRU *store.SKParsedLRU // Phase 17.9: flat value-struct LRU
-	sessParsLRU *lru.Cache[string, *librecord.SessionStructure]
-	testJID     string // the JID string (== device.ID.String())
+	testJID string // the JID string (== device.ID.String())
 }
 
 // buildTestDeviceWithParsedCache constructs a *store.Device fully wired with
-// parsedSKCache, parsedSessionCache, and a CachedSenderKeyStore. The device
+// parsedSKCache and a CachedSenderKeyStore. Phase 17.13: parsedSessionCache
+// removed (D-04a); only sender-key struct cache is wired. The device
 // JID and the CachedSenderKeyStore JID are identical (required by TR-08
 // key-matching invariant). A flusher is attached (required by TR-08 wasFailed
 // path) but not Started so no goroutine races the test.
 //
-// lruCap controls the capacity of all four LRUs; pass a small value (e.g. 2)
+// lruCap controls the capacity of the LRUs; pass a small value (e.g. 2)
 // to exercise eviction in TR-05.
 func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles {
 	t.Helper()
@@ -81,11 +81,6 @@ func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles
 	if err != nil {
 		t.Fatalf("NewSKParsedLRU: %v", err)
 	}
-	sessParsLRU, err := lru.New[string, *librecord.SessionStructure](lruCap)
-	if err != nil {
-		t.Fatalf("lru.New sessParsLRU: %v", err)
-	}
-
 	// Build the CachedSenderKeyStore. jid string must match device.ID.String()
 	// so that c.key(group,user) == the device struct-cache cacheKey (TR-08).
 	jidStr := jid.String()
@@ -105,7 +100,6 @@ func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles
 	}
 
 	d.ParsedSKCache = store.NewParsedSKCache(skParsedLRU)
-	d.ParsedSessionCache = store.NewParsedSessionCache(sessParsLRU)
 
 	// Wire wasFailed invalidation callback (mirrors attachCachedStores exactly).
 	skStore.SetParsedInvalidate(func(key string) {
@@ -119,7 +113,6 @@ func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles
 		skStore:     skStore,
 		skLRU:       skCache,
 		skParsedLRU: skParsedLRU,
-		sessParsLRU: sessParsLRU,
 		testJID:     jidStr,
 	}
 }
@@ -274,21 +267,25 @@ func buildFlatSenderKeyBlob(numKeys int) []byte {
 	return blob
 }
 
-// seedSessStructCache calls LoadSession to populate the session struct cache.
-func seedSessStructCache(t *testing.T, h *testDeviceHandles, addrName string, blob []byte) *librecord.Session {
+// seedSessStore seeds the fake session store with blob for addrName, then
+// calls LoadSession once to warm the byte-cache (CachedSessionStore). Returns
+// the loaded session.
+// Phase 17.13: struct cache removed (D-04a); this helper no longer seeds a
+// struct cache, only the byte-level store.
+func seedSessStore(t *testing.T, h *testDeviceHandles, addrName string, blob []byte) *librecord.Session {
 	t.Helper()
 	ctx := context.Background()
 
 	// fakeSessionStore keyed by address string "name:deviceID"
 	addr := addrName + ":0"
 	if err := h.fakeSess.PutSession(ctx, addr, blob); err != nil {
-		t.Fatalf("seedSessStructCache fakeSess.PutSession: %v", err)
+		t.Fatalf("seedSessStore fakeSess.PutSession: %v", err)
 	}
 
 	sig := makeSignalAddress(addrName)
 	sess, err := h.device.LoadSession(ctx, sig)
 	if err != nil {
-		t.Fatalf("seedSessStructCache LoadSession: %v", err)
+		t.Fatalf("seedSessStore LoadSession: %v", err)
 	}
 	return sess
 }
@@ -595,7 +592,10 @@ func TestDecodeOnce_CR_TR05(t *testing.T) {
 // TR-06: Session: LoadSession + StoreSession concurrent on same address.
 //
 // Mirror of TR-01 for sessions.
-// SC-2 coverage: session struct cache is race-free under concurrent access.
+// Phase 17.13: struct cache removed (D-04a). The race-free invariant now
+// applies to the flat-bytes path (CachedSessionStore + transient decode).
+// SC-2 coverage: concurrent session Load/Store is race-free; each Load
+// returns an independent *Session object.
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR06(t *testing.T) {
@@ -606,8 +606,8 @@ func TestDecodeOnce_CR_TR06(t *testing.T) {
 	addrName := "15550002001"
 	blob := buildSessionBlob(0)
 
-	// Pre-populate session struct cache.
-	seedSessStructCache(t, h, addrName, blob)
+	// Seed the byte-level store and warm the byte-cache.
+	seedSessStore(t, h, addrName, blob)
 
 	sig := makeSignalAddress(addrName)
 
@@ -667,10 +667,12 @@ func TestDecodeOnce_CR_TR06(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TR-07: Session: StoreSession fails (inner.PutSession error) → struct cache
-// is invalidated; next LoadSession re-fetches from inner store.
+// TR-07: Session: StoreSession fails (inner.PutSession error) → error
+// propagated; next LoadSession re-fetches from inner store.
 //
-// SC-7 coverage: StoreSession rollback via ParsedSessionCache.Invalidate.
+// Phase 17.13: struct cache removed (D-04a). No Invalidate call — no struct
+// cache to roll back. Test verifies: error is returned, and subsequent
+// LoadSession succeeds from the original (un-overwritten) store.
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR07(t *testing.T) {
@@ -680,8 +682,8 @@ func TestDecodeOnce_CR_TR07(t *testing.T) {
 	addrName := "15550002002"
 	blob := buildSessionBlob(0)
 
-	// Pre-populate session struct cache so an entry exists before the failed Store.
-	seedSessStructCache(t, h, addrName, blob)
+	// Seed the byte-level store with the original blob.
+	seedSessStore(t, h, addrName, blob)
 
 	sig := makeSignalAddress(addrName)
 
@@ -705,15 +707,9 @@ func TestDecodeOnce_CR_TR07(t *testing.T) {
 		t.Errorf("TR-07: storeErr = %v, want to wrap %v", storeErr, injectedErr)
 	}
 
-	// Struct cache must be invalidated after the rollback.
-	// Assert: struct-LRU is empty (the single entry was removed by Invalidate).
-	if n := h.sessParsLRU.Len(); n != 0 {
-		t.Errorf("TR-07: sessParsLRU.Len() = %d, want 0 "+
-			"(Invalidate must fire on PutSession error — rollback failed)", n)
-	}
-
-	// Next LoadSession must fall through to the inner store (not serve the
-	// pre-Store struct cache entry). Clear putErr so the Load succeeds.
+	// Next LoadSession must re-fetch from the inner store (the putCachedSession
+	// path did not take, since the context cache is nil during non-send paths).
+	// Clear putErr so the Load succeeds.
 	h.fakeSess.putErr = nil
 
 	got, err := h.device.LoadSession(ctx, sig)

@@ -26,7 +26,6 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
-	librecord "go.mau.fi/libsignal/state/record"
 
 	"go.mau.fi/whatsmeow/store"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -98,8 +97,7 @@ var (
 	// their right-sized cap). Restored to 1_500_000 (2026-06-03), paired with
 	// GOMEMLIMIT raised to 2500MiB (systemd unit). This is the AUTHORITATIVE prod
 	// cap (wireSignalCaches builds the prod LRU from it); env-overridable.
-	signalSKParsedCacheCap   = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
-	signalSessParsedCacheCap = envCapOrDefault("KAVTOV_CACHE_SESSION_DECODED_CAP", 250_000)
+	signalSKParsedCacheCap = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
 )
 
 // ---------------------------------------------------------------------------
@@ -371,8 +369,7 @@ type signalCaches struct {
 	// *SenderKeyStructure, to remove the per-entry GC pointer-scan cost. The
 	// value type is unexported in package store; sqlstore only constructs and
 	// forwards the LRU (never Get/Add), so the exported alias suffices.
-	SKParsed      *store.SKParsedLRU
-	SessionParsed *lru.Cache[string, *librecord.SessionStructure]
+	SKParsed *store.SKParsedLRU
 
 	// perf 260601-uuy: message-secret pair cache. Keyed
 	// jid|chat.ToNonAD()|sender.ToNonAD()|message_id → (secret, realSender).
@@ -524,12 +521,6 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 		log.Errorf("Failed to construct SKParsedCache (cap=%d): %v", signalSKParsedCacheCap, err)
 		panic(err)
 	}
-	c.caches.SessionParsed, err = lru.New[string, *librecord.SessionStructure](signalSessParsedCacheCap)
-	if err != nil {
-		log.Errorf("Failed to construct SessionParsedCache (cap=%d): %v", signalSessParsedCacheCap, err)
-		panic(err)
-	}
-
 	// Phase 17.5.1 WR-01: cancelled by Container.Close (via
 	// closeSignalCaches) so emitMetricsLoop exits before logger/db
 	// teardown.
@@ -587,7 +578,6 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	// caches use the same shared LRU (constructed in wireSignalCaches) but are
 	// accessed via thin wrappers that enforce the Store-time mutex discipline.
 	device.ParsedSKCache = store.NewParsedSKCache(c.caches.SKParsed)
-	device.ParsedSessionCache = store.NewParsedSessionCache(c.caches.SessionParsed)
 
 	// Inject the wasFailed invalidation callback into the senderKeyStore so
 	// that PutSenderKeyWithMeta(wasFailed=true) recovery paths invalidate the
