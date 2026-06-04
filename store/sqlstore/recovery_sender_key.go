@@ -1,10 +1,11 @@
-// Copyright (c) 2026 Kavtov Platform (Phase 17.9)
+// Copyright (c) 2026 Kavtov Platform (Phase 17.9 / Phase 17.11)
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// recovery_sender_key.go — cross-account sender-key recovery (Phase 17.9 plan 05)
+// recovery_sender_key.go — cross-account sender-key recovery (Phase 17.9 plan 05,
+// sync-write fix + iteration guard Phase 17.11 plan 02)
 //
 // When an account is missing a sender-key state, find a usable donor across ALL
 // accounts: match by key_id (the real crypto identifier), device-tolerant on the
@@ -17,14 +18,19 @@
 //     forward; you cannot go back). Reject such donors.
 //   - Recipient-independent: signing keys + sender chain key/iter are not tied to
 //     the recipient. Write the recovered state under the recovering account's own
-//     (our_jid, chat_id, target_sender_id) via PutSenderKeyStructure (flusher +
-//     parsed-cache coherent, no raw INSERT, no NULL-blob).
+//     (our_jid, chat_id, target_sender_id) via recoverySyncWrite (synchronous
+//     PutManySenderKeys + parsed-cache coherence, no async flusher, no raw INSERT,
+//     no NULL-blob). See R7 in 17.11-RESEARCH.md for the async-drain race analysis.
 //   - Both fmt_ver=1 (legacy blob) and fmt_ver=2 (column) donors are consulted.
 //     At deploy, most rows are fmt_ver=1 (no backfill yet), so column-only scan
 //     would miss nearly all donors. Recovery parses fmt_ver=1 blobs here — this
 //     is allowed (recovery is off the per-message hot path; explicitly outside the
 //     no-JSON grep-gate of plan 04 which covers senderkey_columns.go, store.go,
 //     cached_sender_key_store.go, signal.go — NOT this file).
+//   - No iteration downgrade: if the existing row for (group, targetSenderID) has
+//     the same KeyID at Iteration >= donor.Iteration, the write is skipped. The
+//     background-worker TOCTOU window means a native SKDM can advance the ratchet
+//     between the donor scan and the write; the guard prevents clobbering it.
 //
 // No recovery index is added (DESIGN-DECISIONS line 56: measure-first).
 
@@ -212,7 +218,7 @@ func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare str
 // CachedSenderKeyStore. It finds a donor via findSenderKeyDonor (across all
 // accounts, key_id-anchored, device-tolerant, forward-only closest iter) and,
 // if found, persists the recipient-independent state onto the recovering account's
-// own (our_jid, group, targetSenderID) via PutSenderKeyStructure.
+// own (our_jid, group, targetSenderID) via recoverySyncWrite.
 //
 // Parameters:
 //   - group: the chat/group JID string (chat_id)
@@ -223,11 +229,12 @@ func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare str
 //   - targetKeyID: the key_id the message names
 //   - targetIter: the chain_key_iteration the recovering account needs
 //
-// Returns (true, nil) on success, (false, nil) when no qualifying donor exists,
-// or (false, err) on a DB or write error.
+// Returns (true, nil) on success, (false, nil) when no qualifying donor exists or
+// the iteration guard fires, or (false, err) on a DB or write error.
 //
-// The write goes through PutSenderKeyStructure which is the flusher + parsed-cache
-// coherence chokepoint (plan 04 Task 3). No raw INSERT, no NULL-blob.
+// The write goes through recoverySyncWrite (synchronous PutManySenderKeys) to
+// guarantee DB visibility before GetSenderKeyDevices cold-reads on the next decrypt
+// attempt. No raw INSERT, no NULL-blob, no async flusher involvement.
 func (c *CachedSenderKeyStore) RecoverSenderKey(ctx context.Context, group, targetSenderID, senderBare string, targetKeyID, targetIter uint32) (bool, error) {
 	r, ok := c.inner.(senderKeyRecoveryReader)
 	if !ok {
@@ -241,6 +248,26 @@ func (c *CachedSenderKeyStore) RecoverSenderKey(ctx context.Context, group, targ
 	}
 	if donor == nil {
 		return false, nil // no qualifying donor
+	}
+
+	// Iteration-downgrade guard (T-1711-04 mitigation):
+	// The background-worker TOCTOU window means a native SKDM can advance the
+	// ratchet between the donor scan and this write. If the existing row already
+	// has the same KeyID at Iteration >= donor.Iteration, the donor is stale —
+	// skip the write to avoid clobbering the naturally-advanced key.
+	existing, err := c.GetSenderKeyStructure(ctx, group, targetSenderID)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil {
+		for _, st := range existing.SenderKeyStates {
+			if st == nil || st.SenderChainKey == nil {
+				continue
+			}
+			if st.KeyID == donor.KeyID && st.SenderChainKey.Iteration >= donor.Iteration {
+				return false, nil // donor is not fresher; skip write
+			}
+		}
 	}
 
 	// Build a *SenderKeyStructure from the recipient-independent donor state.
@@ -271,11 +298,11 @@ func (c *CachedSenderKeyStore) RecoverSenderKey(ctx context.Context, group, targ
 		},
 	}
 
-	// Persist through the columnar write-back entrypoint (flusher + parsed-cache
-	// coherence chokepoint). The recovered row is stored under the recovering
-	// account's own our_jid (inner is bound to the recovering JID) + targetSenderID.
-	// Result: fmt_ver=2 row with all columns + recomposed legacy blob (no NULL-blob).
-	if err := c.PutSenderKeyStructure(ctx, group, targetSenderID, structure); err != nil {
+	// Persist via synchronous write (recoverySyncWrite) — bypasses the async
+	// flusher so the row is in DB before updateDeviceCache evicts the cache entry.
+	// The recovered row is stored under the recovering account's own our_jid
+	// (inner is bound to the recovering JID) + targetSenderID. No NULL-blob.
+	if err := c.recoverySyncWrite(ctx, group, targetSenderID, structure); err != nil {
 		return false, err
 	}
 	return true, nil
