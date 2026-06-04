@@ -747,24 +747,43 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	if senderKeyMissShouldSample() {
 		have = extractSenderKeyHave(ctx, cli.Store.SenderKeys, chat.String(), devices, msg.KeyID())
 	}
+	// Phase 17.12: attempt inline synchronous cross-account donor recovery (D-01, D-02).
+	// SENDERKEY_MISS and recordFailedSenderKeyTuple are ONLY emitted on the fail-open
+	// path to avoid false positives when recovery succeeds (Pitfall 2 / D-07).
+	if cli.Store.InlineRecoverer != nil {
+		donorJID, recovered, recErr := cli.Store.InlineRecoverer.TryInlineRecovery(
+			ctx, chat.String(), labeled, from.SignalAddressUser(), msg.KeyID(), msg.Iteration())
+		if recErr != nil {
+			cli.Log.Warnf("inline recovery error group=%s sender=%s keyID=%d: %v",
+				from.SignalAddressUser(), chat.String(), msg.KeyID(), recErr)
+			// fall through to fail-open (D-07)
+		} else if recovered {
+			// Donor installed into ParsedSKCache — retry decrypt directly under labeled.
+			// MUST NOT call GetSenderKeyDevices: flusher has not ticked; DB row absent;
+			// warm parsedReplace cache is the only source. (RESEARCH Constraint 2)
+			sep := strings.LastIndex(labeled, ":")
+			devID, _ := strconv.ParseUint(labeled[sep+1:], 10, 32)
+			name := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(labeled[:sep], uint32(devID)))
+			cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
+			plaintext, decErr := cipher.Decrypt(ctx, msg)
+			if decErr == nil {
+				cli.clearFailedSenderKeyTuple(labeled, chat.String())
+				cli.Log.Infof("SENDER_KEY_RECOVERED donor_jid=%s group=%s sender=%s keyid=%d iter=%d",
+					donorJID, chat.String(), from.SignalAddressUser(), msg.KeyID(), msg.Iteration())
+				return plaintext, nil
+			}
+			// Donor installed but decrypt still failed — fall through to fail-open.
+			// Do NOT call clearFailedSenderKeyTuple (RESEARCH OQ#3).
+			cli.Log.Warnf("inline recovery installed donor but decrypt failed group=%s sender=%s: %v",
+				chat.String(), from.SignalAddressUser(), decErr)
+		}
+	}
+	// D-07: fail-open path (no donor found, query error, or donor-installed-but-failed).
+	// kavtov-fork (P2a): record the failed tuple so a later KEY-path success is
+	// recognizable as convergence (SENDER_KEY_CONVERGED log).
 	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d have=[%s]",
 		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration(), have)
-	// kavtov-fork (P2a): total miss for this inbound (sender,device,group) tuple. Record it so a
-	// later KEY-path decrypt success for the same tuple is recognizable as convergence.
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
-	// Phase 17.11-03: non-blocking enqueue to the background cross-account recovery worker.
-	// The worker deduplicates via a negative-result cache so 375 miss/min does not stampede.
-	// recordFailedSenderKeyTuple is called BEFORE TryEnqueue — tuple is always recorded first.
-	// Do NOT gate on isFailedSenderKeyTuple here; the negative cache is the sole debounce.
-	if cli.Store.RecoveryWorker != nil {
-		cli.Store.RecoveryWorker.TryEnqueue(store.RecoveryTask{
-			Group:          chat.String(),
-			TargetSenderID: labeled,
-			SenderBare:     from.SignalAddressUser(),
-			TargetKeyID:    msg.KeyID(),
-			TargetIter:     msg.Iteration(),
-		})
-	}
 	return nil, signalerror.ErrNoSenderKeyForUser
 }
 
