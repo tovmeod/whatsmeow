@@ -440,3 +440,263 @@ func TestFlatSenderKeyDecryptEquivalenceWithSkipped(t *testing.T) {
 	// gate that proves the packed skipped tail carries byte-exact key material.
 	decryptEquivalence(t, sender, structure, ciphertexts[0], plaintexts[0])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 17.11-01: PackFlat / UnpackFlat — full-record unbounded on-disk codec
+// ---------------------------------------------------------------------------
+
+// roundTrippedFlat rebuilds a *SenderKey from a structure run through PackFlat/UnpackFlat.
+// Parallel to roundTripped but exercises the new exported codec (different from the
+// cache path flatFromStructure/flatToStructure used by the existing roundTripped helper).
+func roundTrippedFlat(t *testing.T, structure *groupRecord.SenderKeyStructure) *groupRecord.SenderKey {
+	t.Helper()
+	packed, ok := PackFlat(structure)
+	if !ok {
+		t.Fatal("PackFlat refused the post-ratchet structure")
+	}
+	rebuilt, err := UnpackFlat(packed)
+	if err != nil {
+		t.Fatalf("UnpackFlat returned error for valid structure: %v", err)
+	}
+	rec, err := groupRecord.NewSenderKeyFromStruct(rebuilt, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
+	if err != nil {
+		t.Fatalf("NewSenderKeyFromStruct(roundtrippedFlat): %v", err)
+	}
+	return rec
+}
+
+// TestFlatFullRecordRoundTrip is the primary property test for PackFlat/UnpackFlat.
+// Table-driven over state counts including >flatMaxStates (7, 10) and skip counts
+// (0, 1, 3). DeepEqual proves bit-exact structural round-trip. The nil-vs-[]byte{}
+// private-key distinction is checked explicitly.
+func TestFlatFullRecordRoundTrip(t *testing.T) {
+	stateCounts := []int{1, 5, 6, 7, 10}
+	skipCounts := []int{0, 1, 3}
+	for _, ns := range stateCounts {
+		for _, sk := range skipCounts {
+			for _, withPriv := range []bool{true, false} {
+				orig := makeStructure(ns, sk, withPriv)
+				packed, ok := PackFlat(orig)
+				if !ok {
+					t.Errorf("PackFlat refused valid structure (states=%d skipped=%d priv=%v)", ns, sk, withPriv)
+					continue
+				}
+				got, err := UnpackFlat(packed)
+				if err != nil {
+					t.Errorf("UnpackFlat returned error (states=%d skipped=%d priv=%v): %v", ns, sk, withPriv, err)
+					continue
+				}
+				if !reflect.DeepEqual(got, orig) {
+					t.Errorf("round-trip mismatch (states=%d skipped=%d priv=%v):\n got %+v\nwant %+v", ns, sk, withPriv, got, orig)
+					continue
+				}
+				// Explicit nil-vs-[]byte{} guard on the private key.
+				for i, st := range got.SenderKeyStates {
+					if withPriv {
+						if st.SigningKeyPrivate == nil {
+							t.Errorf("state %d: private key became nil when withPriv=true (states=%d)", i, ns)
+						}
+					} else {
+						if st.SigningKeyPrivate != nil {
+							t.Errorf("state %d: private key is %v; want nil (states=%d)", i, st.SigningKeyPrivate, ns)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestFlatUnboundedStates proves PackFlat/UnpackFlat accept state counts beyond
+// flatMaxStates (6) — specifically 7, 10, and 255. This is the core invariant
+// distinguishing the on-disk codec from the cache codec.
+func TestFlatUnboundedStates(t *testing.T) {
+	for _, ns := range []int{7, 10, 255} {
+		orig := makeStructure(ns, 0, true)
+		packed, ok := PackFlat(orig)
+		if !ok {
+			t.Errorf("PackFlat refused %d-state structure (expected no cap beyond flatMaxStates)", ns)
+			continue
+		}
+		got, err := UnpackFlat(packed)
+		if err != nil {
+			t.Errorf("UnpackFlat error for %d-state structure: %v", ns, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, orig) {
+			t.Errorf("round-trip mismatch for %d states", ns)
+		}
+		// Confirm flatFromStructure refuses the same count (proving PackFlat is unbounded).
+		if ns > flatMaxStates {
+			if _, ok2 := flatFromStructure(orig); ok2 {
+				t.Errorf("expected flatFromStructure to refuse %d states (flatMaxStates=%d)", ns, flatMaxStates)
+			}
+		}
+	}
+}
+
+// TestFlatFullRecordDecryptEquivalence proves the PackFlat/UnpackFlat codec
+// preserves exact crypto material: a ciphertext encrypted with a sender key
+// decrypts correctly from a structure serialized with PackFlat and parsed back
+// with UnpackFlat. Zero-skip case (the common 83% path).
+func TestFlatFullRecordDecryptEquivalence(t *testing.T) {
+	ctx := context.Background()
+	groupID := "test-group-packflat"
+	sender := protocol.NewSenderKeyName(groupID, protocol.NewSignalAddress("carol", 1))
+
+	// Sender side: create the session and encrypt.
+	senderStore := newMemSenderKeyStore()
+	senderBuilder := groups.NewGroupSessionBuilder(senderStore, SignalProtobufSerializer)
+	senderCipher := groups.NewGroupCipher(senderBuilder, sender, senderStore)
+	skdm, err := senderBuilder.Create(ctx, sender)
+	if err != nil {
+		t.Fatalf("builder.Create: %v", err)
+	}
+	plaintext := []byte("hello group, PackFlat zero-skip path")
+	ct, err := senderCipher.Encrypt(ctx, plaintext)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	skMsg := ct.(*protocol.SenderKeyMessage)
+
+	// Receiver side: process the SKDM (creates a received key with nil private).
+	recvStore := newMemSenderKeyStore()
+	recvBuilder := groups.NewGroupSessionBuilder(recvStore, SignalProtobufSerializer)
+	if err := recvBuilder.Process(ctx, sender, skdm); err != nil {
+		t.Fatalf("builder.Process: %v", err)
+	}
+	recvRec, err := recvStore.LoadSenderKey(ctx, sender)
+	if err != nil {
+		t.Fatalf("LoadSenderKey: %v", err)
+	}
+	structure := recvRec.Structure()
+
+	// Sanity: received key has nil private.
+	if structure.SenderKeyStates[0].SigningKeyPrivate != nil {
+		t.Fatal("expected received key to have nil SigningKeyPrivate")
+	}
+
+	// decryptEquivalenceFlat mirrors decryptEquivalence but uses roundTrippedFlat
+	// (PackFlat/UnpackFlat) instead of roundTripped (flatFromStructure/flatToStructure).
+	keyID := skMsg.KeyID()
+	iter := skMsg.Iteration()
+	origCT := append([]byte(nil), skMsg.Ciphertext()...)
+	sig := skMsg.Signature()
+	freshMsg := func() *protocol.SenderKeyMessage {
+		m, mErr := protocol.NewSenderKeyMessageFromStruct(&protocol.SenderKeyMessageStructure{
+			Version:    protocol.CurrentVersion,
+			ID:         keyID,
+			Iteration:  iter,
+			CipherText: append([]byte(nil), origCT...),
+			Signature:  sig[:],
+		}, SignalProtobufSerializer.SenderKeyMessage)
+		if mErr != nil {
+			t.Fatalf("rebuild SenderKeyMessage: %v", mErr)
+		}
+		return m
+	}
+
+	decryptWith := func(label string, rec *groupRecord.SenderKey) []byte {
+		st := newMemSenderKeyStore()
+		_ = st.StoreSenderKey(ctx, sender, rec)
+		builder := groups.NewGroupSessionBuilder(st, SignalProtobufSerializer)
+		cipher := groups.NewGroupCipher(builder, sender, st)
+		pt, decErr := cipher.Decrypt(ctx, freshMsg())
+		if decErr != nil {
+			t.Fatalf("Decrypt(%s): %v", label, decErr)
+		}
+		return pt
+	}
+
+	direct, err := groupRecord.NewSenderKeyFromStruct(structure, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
+	if err != nil {
+		t.Fatalf("NewSenderKeyFromStruct(direct): %v", err)
+	}
+	rt := roundTrippedFlat(t, structure)
+
+	ptDirect := decryptWith("direct", direct)
+	ptRT := decryptWith("PackFlat-roundtripped", rt)
+
+	if string(ptDirect) != string(plaintext) {
+		t.Fatalf("direct decrypt plaintext mismatch: got %q want %q", ptDirect, plaintext)
+	}
+	if string(ptRT) != string(ptDirect) {
+		t.Fatalf("PackFlat round-tripped decrypt differs from direct: got %q want %q", ptRT, ptDirect)
+	}
+}
+
+// TestFlatUnpackMalformed asserts that UnpackFlat returns a non-nil error and
+// never panics for all categories of malformed input: short buffer, zero nStates,
+// buffer truncated mid-states, truncated skipped count, and out-of-range stateIdx.
+func TestFlatUnpackMalformed(t *testing.T) {
+	t.Run("empty_buffer", func(t *testing.T) {
+		_, err := UnpackFlat([]byte{})
+		if err == nil {
+			t.Fatal("expected error for empty buffer")
+		}
+	})
+	t.Run("zero_nStates", func(t *testing.T) {
+		// nStates=0 is never valid PackFlat output — must error.
+		_, err := UnpackFlat([]byte{0x00, 0x00, 0x00, 0x00, 0x00})
+		if err == nil {
+			t.Fatal("expected error for nStates=0")
+		}
+	})
+	t.Run("truncated_after_nStates", func(t *testing.T) {
+		// nStates=1 but only 5 bytes total — far short of 1+106+4 = 111.
+		_, err := UnpackFlat([]byte{0x01, 0x00, 0x00, 0x00, 0x00})
+		if err == nil {
+			t.Fatal("expected error for truncated buffer (only 5 bytes for 1 state)")
+		}
+	})
+	t.Run("missing_skipped_count", func(t *testing.T) {
+		// nStates=1, full 106-byte state, but no skipped-count bytes (need 4).
+		// Total = 1 + 106 = 107 bytes; need at least 111.
+		buf := make([]byte, 1+perStateLen)
+		buf[0] = 1 // nStates=1
+		// Fill in a valid-length state (all zeros — lengths pass because we just
+		// need the buffer to have the right size, not valid keys for this test).
+		// 107 bytes total < 111 needed → truncation error.
+		_, err := UnpackFlat(buf)
+		if err == nil {
+			t.Fatal("expected error for buffer missing skipped-count bytes")
+		}
+	})
+	t.Run("skipped_count_mismatch", func(t *testing.T) {
+		// Build a valid 1-state PackFlat buffer, then corrupt the skipped count
+		// to claim there are 99 records when the buffer has 0 actual records.
+		orig := makeStructure(1, 0, true)
+		packed, ok := PackFlat(orig)
+		if !ok {
+			t.Fatal("PackFlat refused valid structure in malformed test setup")
+		}
+		// The skipped count is at offset 1+perStateLen (the last 4 bytes for 0 count).
+		// Set count=99 → the tail is only 4 bytes but would need 4+99*85 = 8419 bytes.
+		countOff := 1 + perStateLen
+		packed[countOff+0] = 0
+		packed[countOff+1] = 0
+		packed[countOff+2] = 0
+		packed[countOff+3] = 99
+		_, err := UnpackFlat(packed)
+		if err == nil {
+			t.Fatal("expected error for skipped count mismatch")
+		}
+	})
+	t.Run("skipped_stateIdx_out_of_range", func(t *testing.T) {
+		// Build a valid 1-state PackFlat buffer with 1 skipped key, then corrupt
+		// the stateIdx to point to state 9 (only 1 state exists → out of range).
+		orig := makeStructure(1, 1, true)
+		packed, ok := PackFlat(orig)
+		if !ok {
+			t.Fatal("PackFlat refused 1-state 1-skipped structure in malformed test setup")
+		}
+		// Skipped tail starts at offset 1+perStateLen.
+		// Layout: [u32 count=1][u8 stateIdx][u32 iter][16 iv][32 cipherKey][32 seed]
+		stateIdxOff := 1 + perStateLen + 4 // +4 for u32 count
+		packed[stateIdxOff] = 9            // stateIdx=9 is out of range for 1 state
+		_, err := UnpackFlat(packed)
+		if err == nil {
+			t.Fatal("expected error for out-of-range stateIdx in skipped tail")
+		}
+	})
+}

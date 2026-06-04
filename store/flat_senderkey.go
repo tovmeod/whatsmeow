@@ -224,6 +224,141 @@ func packSkipped(s *groupRecord.SenderKeyStructure) ([]byte, bool) {
 	return buf, true
 }
 
+// perStateLen is the fixed on-wire size per state in the PackFlat format:
+// u32 keyID + u32 chainIter + 32 chainKey + 33 signingPub + u8 hasPriv + 32 signingPriv = 106 bytes.
+const perStateLen = 4 + 4 + flatChainKeyLen + flatSigningPubLen + 1 + flatSigningPrivLen // 106
+
+// flatHeaderOff is the byte offset of state[0].KeyID in a PackFlat buffer.
+// state[0].KeyID is at bytes [1..4] (after the u8 nStates header).
+// Used by the R8 byte-prefilter in the donor scan.
+const flatHeaderOff = 1
+
+// PackFlat serializes a *SenderKeyStructure to a self-complete []byte for storage.
+// Unlike flatFromStructure, PackFlat supports unbounded state count (up to 255 states,
+// limited only by u8 nStates). Exported for use by sqlstore and migration tool
+// (package boundary — lowercase would not compile from sqlstore or main packages).
+//
+// Returns (nil, false) when:
+//   - len(states) == 0 or > 255
+//   - any state has the wrong chainKey / signingPub / signingPriv length
+//   - any skipped key has the wrong iv / cipherKey / seed length
+func PackFlat(s *groupRecord.SenderKeyStructure) ([]byte, bool) {
+	n := len(s.SenderKeyStates)
+	if n == 0 || n > 255 {
+		return nil, false
+	}
+
+	buf := make([]byte, 1+n*perStateLen)
+	buf[0] = uint8(n)
+	off := 1
+	for _, st := range s.SenderKeyStates {
+		ck := st.SenderChainKey.ChainKey
+		pub := st.SigningKeyPublic
+		priv := st.SigningKeyPrivate
+		if len(ck) != flatChainKeyLen || len(pub) != flatSigningPubLen {
+			return nil, false
+		}
+		if priv != nil && len(priv) != flatSigningPrivLen {
+			return nil, false
+		}
+		binary.BigEndian.PutUint32(buf[off:off+4], st.KeyID)
+		off += 4
+		binary.BigEndian.PutUint32(buf[off:off+4], st.SenderChainKey.Iteration)
+		off += 4
+		off += copy(buf[off:off+flatChainKeyLen], ck)
+		off += copy(buf[off:off+flatSigningPubLen], pub)
+		if priv != nil {
+			buf[off] = 1
+			off++
+			off += copy(buf[off:off+flatSigningPrivLen], priv)
+		} else {
+			buf[off] = 0
+			off++
+			off += flatSigningPrivLen // signingPriv is zeroed (make initializes to 0)
+		}
+	}
+
+	// Append the skipped-key tail. packSkipped returns nil when there are no
+	// skipped keys (not a 4-zero-byte slice) — substitute the explicit count=0
+	// header so UnpackFlat always finds the 4-byte count prefix.
+	skipped, ok := packSkipped(s)
+	if !ok {
+		return nil, false
+	}
+	if skipped == nil {
+		buf = append(buf, 0, 0, 0, 0)
+	} else {
+		buf = append(buf, skipped...)
+	}
+
+	return buf, true
+}
+
+// UnpackFlat deserializes a PackFlat []byte back to a *SenderKeyStructure.
+// Fully bounds-checked: returns (nil, error) on any truncation or malformed input.
+// Never panics. Exported for use by sqlstore and migration tool (cross-package).
+//
+// Caller treats a non-nil error as a cache/DB miss and falls through to uncached path.
+func UnpackFlat(b []byte) (*groupRecord.SenderKeyStructure, error) {
+	if len(b) < 1 {
+		return nil, fmt.Errorf("UnpackFlat: buffer too short for nStates header (%d bytes)", len(b))
+	}
+	n := int(b[0])
+	if n == 0 {
+		return nil, fmt.Errorf("UnpackFlat: nStates=0 is not valid PackFlat output")
+	}
+	minLen := 1 + n*perStateLen + 4
+	if len(b) < minLen {
+		return nil, fmt.Errorf("UnpackFlat: buffer too short: need %d bytes for %d states, have %d", minLen, n, len(b))
+	}
+
+	states := make([]*groupRecord.SenderKeyStateStructure, n)
+	off := 1
+	for i := 0; i < n; i++ {
+		keyID := binary.BigEndian.Uint32(b[off : off+4])
+		off += 4
+		chainIter := binary.BigEndian.Uint32(b[off : off+4])
+		off += 4
+
+		chainKey := make([]byte, flatChainKeyLen)
+		off += copy(chainKey, b[off:off+flatChainKeyLen])
+
+		signingPub := make([]byte, flatSigningPubLen)
+		off += copy(signingPub, b[off:off+flatSigningPubLen])
+
+		hasPriv := b[off]
+		off++
+		var signingPriv []byte
+		if hasPriv != 0 {
+			signingPriv = make([]byte, flatSigningPrivLen)
+			off += copy(signingPriv, b[off:off+flatSigningPrivLen])
+		} else {
+			off += flatSigningPrivLen // skip zeroed bytes
+		}
+
+		states[i] = &groupRecord.SenderKeyStateStructure{
+			KeyID: keyID,
+			SenderChainKey: &ratchet.SenderChainKeyStructure{
+				Iteration: chainIter,
+				ChainKey:  chainKey,
+			},
+			SigningKeyPublic:  signingPub,
+			SigningKeyPrivate: signingPriv, // nil when !hasPriv
+		}
+	}
+
+	// Decode the skipped-key tail. After the state records, the remaining bytes
+	// are the packed skipped tail (4-byte count + records). unpackSkipped accepts
+	// an empty/nil slice as a no-op, but PackFlat always writes the 4-byte count
+	// header, so we pass the full tail slice.
+	tail := b[1+n*perStateLen:]
+	if err := unpackSkipped(tail, states); err != nil {
+		return nil, fmt.Errorf("UnpackFlat: skipped tail: %w", err)
+	}
+
+	return &groupRecord.SenderKeyStructure{SenderKeyStates: states}, nil
+}
+
 // unpackSkipped decodes the packed skipped tail and routes each key back to its
 // owning state's Keys slice. It is fully bounds-checked: a malformed tail (short
 // buffer, count/length mismatch, or out-of-range stateIdx) returns an error and
