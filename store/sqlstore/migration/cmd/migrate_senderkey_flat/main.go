@@ -70,19 +70,27 @@ import (
 )
 
 const (
-	// newTableDDL creates the flat-schema destination table.
-	// The TPO-class unique index matches the existing table per RESEARCH R3.
+	// newTableDDL creates the flat-schema destination table without any unique
+	// constraint. The uniqueness enforcement is added by newTableIndexDDL
+	// (a CREATE UNIQUE INDEX with text_pattern_ops on sender_id, matching
+	// migration 18's replacement of the original PK). PostgreSQL does not accept
+	// operator-class names inside a table-level UNIQUE or PRIMARY KEY constraint
+	// — opclasses are index-level only. The index is created BEFORE the insert
+	// loop so that ON CONFLICT (our_jid, chat_id, sender_id) has an arbiter to
+	// infer against (verified: text_pattern_ops supports column-inference for
+	// ON CONFLICT, per migration 18 comment "ON CONFLICT ... still resolves it").
 	newTableDDL = `
 CREATE TABLE IF NOT EXISTS whatsmeow_sender_keys_new (
     our_jid   TEXT NOT NULL,
     chat_id   TEXT NOT NULL,
     sender_id TEXT NOT NULL,
-    sender_key BYTEA NOT NULL,
-    UNIQUE (our_jid, chat_id, sender_id text_pattern_ops)
+    sender_key BYTEA NOT NULL
 )`
 
-	// newTableIndexDDL creates the unique index explicitly (it may already exist
-	// from the UNIQUE constraint above, but a named index is easier to inspect).
+	// newTableIndexDDL creates the TPO-class unique index (mirrors the mechanism
+	// of migration 18 which replaced the default-collation PK with a
+	// text_pattern_ops unique index on the existing table). This must be created
+	// BEFORE the insert loop so ON CONFLICT can infer its arbiter.
 	newTableIndexDDL = `
 CREATE UNIQUE INDEX IF NOT EXISTS whatsmeow_sender_keys_new_pkey
     ON whatsmeow_sender_keys_new (our_jid, chat_id, sender_id text_pattern_ops)`
@@ -101,7 +109,9 @@ FROM whatsmeow_sender_keys
 ORDER BY our_jid, chat_id, sender_id
 LIMIT $1 OFFSET $2`
 
-	// insertQuery writes one converted row to the new table.
+	// insertQuery writes one converted row to the new table. The arbiter index
+	// (whatsmeow_sender_keys_new_pkey) is created before the loop, so
+	// ON CONFLICT can resolve the unique violation from a resume/re-run.
 	insertQuery = `
 INSERT INTO whatsmeow_sender_keys_new (our_jid, chat_id, sender_id, sender_key)
 VALUES ($1, $2, $3, $4)
@@ -195,6 +205,17 @@ func main() {
 			slog.Error("batch read failed", "offset", offset, "error", err)
 			os.Exit(1)
 		}
+
+		// pendingInsert holds a (our_jid, chat_id, sender_id, packed) tuple
+		// after the DeepEqual gate passes. Inserts are accumulated while the
+		// rows cursor is open, then flushed after rows.Close() — pgx does not
+		// allow Exec on the same single connection while rows are being scanned
+		// ("conn busy").
+		type pendingInsert struct {
+			ourJID, chatID, senderID string
+			packed                   []byte
+		}
+		var pending []pendingInsert
 
 		batchCount := 0
 		for rows.Next() {
@@ -329,12 +350,7 @@ func main() {
 			convertedRows++
 
 			if !*verifyOnly {
-				if _, err := conn.Exec(ctx, insertQuery, ourJID, chatID, senderID, packed); err != nil {
-					slog.Error("insert failed",
-						"our_jid", ourJID, "chat_id", chatID, "sender_id", senderID,
-						"error", err)
-					os.Exit(1)
-				}
+				pending = append(pending, pendingInsert{ourJID, chatID, senderID, packed})
 			}
 		}
 		rows.Close()
@@ -342,6 +358,18 @@ func main() {
 			slog.Error("rows error after batch", "offset", offset, "error", err)
 			os.Exit(1)
 		}
+
+		// Flush pending inserts now that the rows cursor is closed.
+		// pgx requires the connection to be idle (not scanning) before Exec.
+		for _, ins := range pending {
+			if _, err := conn.Exec(ctx, insertQuery, ins.ourJID, ins.chatID, ins.senderID, ins.packed); err != nil {
+				slog.Error("insert failed",
+					"our_jid", ins.ourJID, "chat_id", ins.chatID, "sender_id", ins.senderID,
+					"error", err)
+				os.Exit(1)
+			}
+		}
+		pending = pending[:0]
 
 		offset += batchCount
 		if batchCount < batchLimit {
@@ -373,23 +401,36 @@ func main() {
 	}
 }
 
-// setupNewTable creates whatsmeow_sender_keys_new if it does not already exist.
+// setupNewTable creates whatsmeow_sender_keys_new and the TPO unique index if
+// they do not already exist. The index is created BEFORE the insert loop so
+// that ON CONFLICT (our_jid, chat_id, sender_id) has an arbiter to infer
+// against (PostgreSQL requires the arbiter to exist at INSERT time). Creating
+// the index on an empty table is instant. A re-run on a partially-migrated
+// table also benefits: the index already exists (IF NOT EXISTS no-ops),
+// inserts conflict-update rather than insert-duplicate.
 func setupNewTable(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, newTableDDL); err != nil {
 		return fmt.Errorf("CREATE TABLE IF NOT EXISTS whatsmeow_sender_keys_new: %w", err)
 	}
-	slog.Info("destination table ready", "table", "whatsmeow_sender_keys_new")
+	slog.Info("destination table created or already exists", "table", "whatsmeow_sender_keys_new")
+
+	// Index creation BEFORE inserts — required for ON CONFLICT arbiter.
+	slog.Info("creating unique index on whatsmeow_sender_keys_new (before insert loop)")
+	indexStart := time.Now()
+	if _, err := conn.Exec(ctx, newTableIndexDDL); err != nil {
+		return fmt.Errorf("CREATE UNIQUE INDEX IF NOT EXISTS whatsmeow_sender_keys_new_pkey: %w", err)
+	}
+	slog.Info("index ready", "elapsed", time.Since(indexStart).String())
 	return nil
 }
 
-// createIndex creates the named unique index on whatsmeow_sender_keys_new.
-func createIndex(ctx context.Context, conn *pgx.Conn) error {
-	slog.Info("creating unique index on whatsmeow_sender_keys_new")
-	start := time.Now()
-	if _, err := conn.Exec(ctx, newTableIndexDDL); err != nil {
-		return fmt.Errorf("CREATE UNIQUE INDEX: %w", err)
-	}
-	slog.Info("index created", "elapsed", time.Since(start).String())
+// createIndex is intentionally empty after moving index creation to setupNewTable.
+// It is kept to avoid restructuring the main loop; it logs a no-op reminder.
+func createIndex(_ context.Context, _ *pgx.Conn) error {
+	// Index was already created in setupNewTable before the insert loop.
+	// This function exists only to keep the main-loop structure symmetric with
+	// the verify-only path. No work needed.
+	slog.Info("post-loop index step: index was already created before the insert loop (no-op)")
 	return nil
 }
 
