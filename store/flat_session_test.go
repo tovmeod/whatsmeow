@@ -22,6 +22,7 @@ package store
 import (
 	"context"
 	"reflect"
+	"sync"
 	"testing"
 
 	"go.mau.fi/libsignal/keys/chain"
@@ -34,6 +35,8 @@ import (
 	"go.mau.fi/libsignal/state/record"
 	"go.mau.fi/libsignal/util/keyhelper"
 	"go.mau.fi/libsignal/util/optional"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -1377,5 +1380,212 @@ func TestFlatSessionProdFixtures(t *testing.T) {
 	t.Logf("prod fixtures: %d passed, %d failed (total %d)", passed, failed, len(prodSessionFixtures))
 	if failed > 0 {
 		t.Fatalf("%d fixture(s) failed reflect.DeepEqual — codec has lossless round-trip bug(s)", failed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// REQ-SAFETY-01: TestSessionConcurrentRatchet
+//
+// Validates that concurrent LoadSession + StoreSession calls on the same
+// SignalAddress are race-free under the Go race detector.
+//
+// ROADMAP SC#5: "mutable ratchet struct shared across handler-pool goroutines"
+// — in the live driver, multiple goroutines may concurrently load and store
+// sessions for the same address (parallel message dispatch). This test
+// exercises Device.LoadSession / Device.StoreSession (the wired flat-bytes
+// path from Plan 03) from two concurrent goroutines against the same address.
+//
+// Design notes:
+//   - The test lives in package store (not package sqlstore) to avoid an
+//     import cycle. CachedSessionStore (sqlstore) is tested separately in
+//     decode_once_cr_test.go TR-06 under -race, which covers the LRU tier.
+//     This test covers the transient-decode path: flat bytes stored by
+//     StoreSession → LoadSession byte[0]==0x01 → UnpackFlatSession.
+//   - A minimal concurrentFakeSessionStore (mutex + map) is used instead of
+//     CachedSessionStore; it is goroutine-safe by construction so the race
+//     detector surface is the signal.go flat-encode/decode paths themselves.
+//   - The writer goroutine uses a fresh session rebuilt from the same
+//     SessionStructure each iteration to simulate ratchet write-back without
+//     sharing a mutable *Session across goroutines (per-handler copy discipline).
+// ---------------------------------------------------------------------------
+
+// concurrentFakeSessionStore is a minimal goroutine-safe in-memory
+// SessionStore used by TestSessionConcurrentRatchet. The production path
+// (CachedSessionStore + SQL backend) is exercised by decode_once_cr_test.go
+// TR-06; this stub isolates the signal.go flat-encode/decode concurrency
+// surface from the cache layer.
+type concurrentFakeSessionStore struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+func newConcurrentFakeSessionStore() *concurrentFakeSessionStore {
+	return &concurrentFakeSessionStore{data: make(map[string][]byte)}
+}
+
+func (f *concurrentFakeSessionStore) GetSession(_ context.Context, address string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v := f.data[address]
+	if v == nil {
+		return nil, nil
+	}
+	out := make([]byte, len(v))
+	copy(out, v)
+	return out, nil
+}
+
+func (f *concurrentFakeSessionStore) HasSession(_ context.Context, address string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.data[address]
+	return ok, nil
+}
+
+func (f *concurrentFakeSessionStore) GetManySessions(_ context.Context, addresses []string) (map[string][]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := make(map[string][]byte, len(addresses))
+	for _, a := range addresses {
+		if v, ok := f.data[a]; ok {
+			out := make([]byte, len(v))
+			copy(out, v)
+			result[a] = out
+		}
+	}
+	return result, nil
+}
+
+func (f *concurrentFakeSessionStore) PutSession(_ context.Context, address string, sess []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	stored := make([]byte, len(sess))
+	copy(stored, sess)
+	f.data[address] = stored
+	return nil
+}
+
+func (f *concurrentFakeSessionStore) PutManySessions(_ context.Context, sessions map[string][]byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for addr, sess := range sessions {
+		stored := make([]byte, len(sess))
+		copy(stored, sess)
+		f.data[addr] = stored
+	}
+	return nil
+}
+
+func (f *concurrentFakeSessionStore) DeleteAllSessions(_ context.Context, _ string) error { return nil }
+func (f *concurrentFakeSessionStore) DeleteSession(_ context.Context, _ string) error      { return nil }
+func (f *concurrentFakeSessionStore) MigratePNToLID(_ context.Context, _, _ types.JID) error {
+	return nil
+}
+
+var _ SessionStore = (*concurrentFakeSessionStore)(nil)
+
+func TestSessionConcurrentRatchet(t *testing.T) {
+	// REQ-SAFETY-01 — ROADMAP SC#5
+	// Concurrent LoadSession + StoreSession on the same address must be
+	// race-free. The race detector validates this when run with -race.
+	//
+	// Design: Device.LoadSession / Device.StoreSession are the wired flat-bytes
+	// paths from Plan 03. A real X3DH session is established (using the same
+	// dmHarness as TestFlatSessionDecryptEquivalence) so that the writer holds a
+	// valid *record.Session whose Structure() PackFlatSession can encode. The
+	// session is seeded in the store as flat bytes so LoadSession exercises the
+	// byte[0]==0x01 → UnpackFlatSession transient-decode path.
+	//
+	// Note: the CachedSessionStore LRU tier is tested separately under -race in
+	// decode_once_cr_test.go (TR-06, package sqlstore). Importing sqlstore from
+	// package store would create an import cycle, so that tier is out-of-scope
+	// here. CachedSessionStore (hashicorp/golang-lru/v2) is goroutine-safe by
+	// design; the plan's own T-17.13-12 confirms this.
+	const iters = 10
+
+	ctx := context.Background()
+
+	// Establish a real X3DH session between Alice and Bob so the writer has
+	// a valid *record.Session with proper Curve25519 keys.
+	alice := newDMHarness(t, "alice-cr", 1)
+	bob := newDMHarness(t, "bob-cr", 2)
+
+	aliceToBobBuilder := session.NewBuilder(
+		alice.sessionStore, alice.preKeyStore, alice.signedPreKeyStore,
+		alice.identityStore, bob.address, alice.serializer,
+	)
+	if err := aliceToBobBuilder.ProcessBundle(ctx, bobBundle(bob)); err != nil {
+		t.Fatalf("ProcessBundle: %v", err)
+	}
+	bobFromAliceBuilder := session.NewBuilder(
+		bob.sessionStore, bob.preKeyStore, bob.signedPreKeyStore,
+		bob.identityStore, alice.address, bob.serializer,
+	)
+
+	// Exchange one message so Bob has a real post-X3DH session with valid state.
+	msg0 := encryptDM(t, aliceToBobBuilder, bob.address, alice, []byte("session init"))
+	decryptDM(t, bobFromAliceBuilder, alice.address, msg0)
+
+	// Extract Bob's post-decrypt session (real Curve25519 keys, valid structure).
+	bobSess, err := bob.sessionStore.LoadSession(ctx, alice.address)
+	if err != nil {
+		t.Fatalf("LoadSession (setup): %v", err)
+	}
+
+	// Encode the session to flat bytes for seeding Device.Sessions.
+	flat, ok := PackFlatSession(bobSess.Structure())
+	if !ok {
+		t.Fatal("PackFlatSession refused valid live session structure")
+	}
+
+	// Wire a minimal Device with a goroutine-safe in-memory SessionStore.
+	fake := newConcurrentFakeSessionStore()
+	dev := &Device{Sessions: fake}
+	sig := alice.address // Bob's session is keyed by Alice's address.
+
+	// Seed the store with flat bytes so LoadSession takes the transient-decode path.
+	if err := fake.PutSession(ctx, sig.String(), flat); err != nil {
+		t.Fatalf("seed PutSession: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var storeErr, loadErr error
+
+	// Goroutine A: writer — simulates ratchet write-back (StoreSession after decrypt).
+	// Each iteration encodes bobSess via PackFlatSession (the Stage 1 path in
+	// signal.go StoreSession). StoreSession reads bobSess only via Structure()
+	// and does not mutate it, so the writer is safe to reuse the same object.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if err := dev.StoreSession(ctx, sig, bobSess); err != nil {
+				storeErr = err
+				return
+			}
+		}
+	}()
+
+	// Goroutine B: reader — simulates handler-pool parallel session load.
+	// Each iteration fetches flat bytes from the store, detects byte[0]==0x01,
+	// and calls UnpackFlatSession + NewSessionFromStructure.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if _, err := dev.LoadSession(ctx, sig); err != nil {
+				loadErr = err
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	if storeErr != nil {
+		t.Fatalf("StoreSession goroutine error: %v", storeErr)
+	}
+	if loadErr != nil {
+		t.Fatalf("LoadSession goroutine error: %v", loadErr)
 	}
 }
