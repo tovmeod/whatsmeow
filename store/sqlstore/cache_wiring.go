@@ -411,12 +411,6 @@ type signalCaches struct {
 	senderKeyFlushersMu sync.RWMutex
 	senderKeyFlusherMap map[string]*SenderKeyFlusher // key: JID string
 
-	// Phase 17.11-03: per-device background cross-account recovery workers.
-	// Per-JID singleton (same pattern as senderKeyFlusherMap) to avoid goroutine
-	// leaks on Device.Save() re-wiring. Stopped by closeSignalCaches.
-	recoveryWorkersMu  sync.Mutex
-	recoveryWorkerMap  map[string]*SenderKeyRecoveryWorker // key: JID string
-
 	// Phase 17.5.1 WR-01: cancellable ctx for emitMetricsLoop. Cancelled
 	// by Container.Close() (via closeSignalCaches) so the metrics
 	// goroutine cleanly exits and does not race with logger teardown
@@ -454,8 +448,6 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 	// Phase 17.7-03: initialize the JID→flusher map before constructing the
 	// SenderKey LRU so the eviction callback can safely read from it.
 	c.caches.senderKeyFlusherMap = make(map[string]*SenderKeyFlusher)
-	// Phase 17.11-03: initialize the JID→recovery-worker map.
-	c.caches.recoveryWorkerMap = make(map[string]*SenderKeyRecoveryWorker)
 
 	c.caches.Session, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(key string, _ []byte) {
 		atomic.AddUint64(&c.caches.SessionCapacityEvictions, 1)
@@ -591,20 +583,6 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	// CachedSenderKeyStore satisfies SenderKeyInlineRecoverer directly.
 	device.InlineRecoverer = senderKeyStore
 
-	// Phase 17.11-03: per-device background recovery worker (per-JID singleton).
-	// Same pattern as the flusher singleton above: construct+Start only on first
-	// attach for a JID; Device.Save() re-wiring reuses the existing worker to
-	// prevent goroutine leaks (T-1711-12, same class of bug as the flusher leak).
-	c.caches.recoveryWorkersMu.Lock()
-	worker, workerExists := c.caches.recoveryWorkerMap[jid]
-	if !workerExists {
-		worker = NewSenderKeyRecoveryWorker(senderKeyStore, c.log)
-		c.caches.recoveryWorkerMap[jid] = worker
-		worker.Start()
-	}
-	c.caches.recoveryWorkersMu.Unlock()
-	device.RecoveryWorker = worker
-
 	// Phase 17.8: wire decoded struct-LRU caches to the device. Both parsed
 	// caches use the same shared LRU (constructed in wireSignalCaches) but are
 	// accessed via thin wrappers that enforce the Store-time mutex discipline.
@@ -650,15 +628,6 @@ func closeSignalCaches(c *Container) {
 	c.caches.senderKeyFlushersMu.Unlock()
 	for _, f := range flusherMap {
 		f.Stop()
-	}
-	// Phase 17.11-03: stop all per-device recovery workers. Stop() signals the
-	// drain goroutine to exit and waits for it. Remaining queued tasks are dropped
-	// (the next message from the same sender will re-enqueue).
-	c.caches.recoveryWorkersMu.Lock()
-	recoveryWorkerMap := c.caches.recoveryWorkerMap
-	c.caches.recoveryWorkersMu.Unlock()
-	for _, w := range recoveryWorkerMap {
-		w.Stop()
 	}
 }
 

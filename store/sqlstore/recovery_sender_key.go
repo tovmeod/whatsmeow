@@ -5,11 +5,12 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 // recovery_sender_key.go — cross-account sender-key recovery (Phase 17.9 plan 05,
-// sync-write fix + iteration guard Phase 17.11 plan 02)
+// iteration guard Phase 17.11 plan 02, inline path Phase 17.12)
 //
-// When an account is missing a sender-key state, find a usable donor across ALL
-// accounts: match by key_id (the real crypto identifier), device-tolerant on the
-// sender's device suffix, picking the closest chain_key_iteration <= target.
+// When an account is missing a sender-key state, TryInlineRecovery finds a usable
+// donor across ALL accounts: match by key_id (the real crypto identifier),
+// device-tolerant on the sender's device suffix, picking the closest
+// chain_key_iteration <= target.
 //
 // Correctness invariants:
 //   - Anchor on key_id (not device suffix): same key_id ⇒ same key, decryptable
@@ -18,9 +19,10 @@
 //     forward; you cannot go back). Reject such donors.
 //   - Recipient-independent: signing keys + sender chain key/iter are not tied to
 //     the recipient. Write the recovered state under the recovering account's own
-//     (our_jid, chat_id, target_sender_id) via recoverySyncWrite (synchronous
-//     PutManySenderKeys + parsed-cache coherence, no async flusher, no raw INSERT,
-//     no NULL-blob). See R7 in 17.11-RESEARCH.md for the async-drain race analysis.
+//     (our_jid, chat_id, target_sender_id) via PutSenderKeyStructure (fires
+//     parsedReplace synchronously). The inline retry reads from the warm
+//     parsedReplace cache — no DB round-trip needed. No async flusher, no raw
+//     INSERT, no NULL-blob.
 //   - Both fmt_ver=1 (legacy blob) and fmt_ver=2 (column) donors are consulted.
 //     At deploy, most rows are fmt_ver=1 (no backfill yet), so column-only scan
 //     would miss nearly all donors. Recovery parses fmt_ver=1 blobs here — this
@@ -28,9 +30,9 @@
 //     no-JSON grep-gate of plan 04 which covers senderkey_columns.go, store.go,
 //     cached_sender_key_store.go, signal.go — NOT this file).
 //   - No iteration downgrade: if the existing row for (group, targetSenderID) has
-//     the same KeyID at Iteration >= donor.Iteration, the write is skipped. The
-//     background-worker TOCTOU window means a native SKDM can advance the ratchet
-//     between the donor scan and the write; the guard prevents clobbering it.
+//     the same KeyID at Iteration >= donor.Iteration, the write is skipped. A
+//     concurrent inbound SKDM can advance the ratchet between findSenderKeyDonor
+//     and PutSenderKeyStructure; the guard prevents clobbering it.
 //
 // No recovery index is added (DESIGN-DECISIONS line 56: measure-first).
 
@@ -214,115 +216,20 @@ func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare str
 	return scanFlatRows(fbRows, targetKeyID, targetIter, nil)
 }
 
-// RecoverSenderKey is the cross-account recovery entry-point for
-// CachedSenderKeyStore. It finds a donor via findSenderKeyDonor (across all
-// accounts, key_id-anchored, device-tolerant, forward-only closest iter) and,
-// if found, persists the recipient-independent state onto the recovering account's
-// own (our_jid, group, targetSenderID) via recoverySyncWrite.
-//
-// Parameters:
-//   - group: the chat/group JID string (chat_id)
-//   - targetSenderID: the device-qualified sender_id under which to store the
-//     recovered state in the recovering account (e.g. "12345_1:0") — NOT the
-//     donor's sender_id
-//   - senderBare: the device-stripped sender user (LIKE prefix for donor scan)
-//   - targetKeyID: the key_id the message names
-//   - targetIter: the chain_key_iteration the recovering account needs
-//
-// Returns (true, nil) on success, (false, nil) when no qualifying donor exists or
-// the iteration guard fires, or (false, err) on a DB or write error.
-//
-// The write goes through recoverySyncWrite (synchronous PutManySenderKeys) to
-// guarantee DB visibility before GetSenderKeyDevices cold-reads on the next decrypt
-// attempt. No raw INSERT, no NULL-blob, no async flusher involvement.
-func (c *CachedSenderKeyStore) RecoverSenderKey(ctx context.Context, group, targetSenderID, senderBare string, targetKeyID, targetIter uint32) (bool, error) {
-	r, ok := c.inner.(senderKeyRecoveryReader)
-	if !ok {
-		// inner does not implement the recovery reader (test stub / pre-wiring).
-		return false, nil
-	}
-
-	donor, err := r.findSenderKeyDonor(ctx, group, senderBare, targetKeyID, targetIter)
-	if err != nil {
-		return false, err
-	}
-	if donor == nil {
-		return false, nil // no qualifying donor
-	}
-
-	// Iteration-downgrade guard (T-1711-04 mitigation):
-	// The background-worker TOCTOU window means a native SKDM can advance the
-	// ratchet between the donor scan and this write. If the existing row already
-	// has the same KeyID at Iteration >= donor.Iteration, the donor is stale —
-	// skip the write to avoid clobbering the naturally-advanced key.
-	existing, err := c.GetSenderKeyStructure(ctx, group, targetSenderID)
-	if err != nil {
-		return false, err
-	}
-	if existing != nil {
-		for _, st := range existing.SenderKeyStates {
-			if st == nil || st.SenderChainKey == nil {
-				continue
-			}
-			if st.KeyID == donor.KeyID && st.SenderChainKey.Iteration >= donor.Iteration {
-				return false, nil // donor is not fresher; skip write
-			}
-		}
-	}
-
-	// Build a *SenderKeyStructure from the recipient-independent donor state.
-	// Use only the single matching state — the recovering account gets a fresh
-	// single-state record (the minimal needed state; libsignal AddSenderKeyState
-	// prepends new states to the front, so having one state here is correct).
-	skippedKeys := make([]*ratchet.SenderMessageKeyStructure, len(donor.SkippedKeys))
-	for i, smk := range donor.SkippedKeys {
-		skippedKeys[i] = &ratchet.SenderMessageKeyStructure{
-			Iteration: smk.Iteration,
-			IV:        smk.IV,
-			CipherKey: smk.CipherKey,
-			Seed:      smk.Seed,
-		}
-	}
-	structure := &groupRecord.SenderKeyStructure{
-		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
-			{
-				KeyID: donor.KeyID,
-				SenderChainKey: &ratchet.SenderChainKeyStructure{
-					Iteration: donor.Iteration,
-					ChainKey:  donor.ChainKey, // ChainKey field — NOT Seed
-				},
-				SigningKeyPublic:  donor.SigningKeyPublic,
-				SigningKeyPrivate: donor.SigningKeyPrivate, // nil preserved (received key)
-				Keys:              skippedKeys,
-			},
-		},
-	}
-
-	// Persist via synchronous write (recoverySyncWrite) — bypasses the async
-	// flusher so the row is in DB before updateDeviceCache evicts the cache entry.
-	// The recovered row is stored under the recovering account's own our_jid
-	// (inner is bound to the recovering JID) + targetSenderID. No NULL-blob.
-	if err := c.recoverySyncWrite(ctx, group, targetSenderID, structure); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// TryInlineRecovery is the inline synchronous cross-account recovery entry-point
-// for CachedSenderKeyStore. It satisfies the store.SenderKeyInlineRecoverer
+// TryInlineRecovery is the cross-account recovery entry-point for
+// CachedSenderKeyStore. It satisfies the store.SenderKeyInlineRecoverer
 // interface and is called directly from decryptGroupSenderKey in message.go on
 // a sender-key miss.
 //
-// Same donor-scan logic as RecoverSenderKey, but:
 //   - Returns (donorJID string, ok bool, err error) so the caller can log the
 //     donor's account JID in SENDER_KEY_RECOVERED (D-08).
-//   - Installs via PutSenderKeyStructure (warm parsedReplace cache) rather than
-//     recoverySyncWrite, because the inline retry constructs the cipher directly
-//     from the parsedReplace cache without calling GetSenderKeyDevices (D-03/D-04).
-//   - RecoverSenderKey is NOT removed in this plan (worker still calls it; deleted
-//     in Plan 02 together with the worker).
+//   - Installs via PutSenderKeyStructure (warm parsedReplace cache). The inline
+//     retry constructs the cipher directly from the parsedReplace cache without
+//     calling GetSenderKeyDevices (D-03/D-04).
 //
-// Iteration-downgrade guard is identical to RecoverSenderKey (T-1712-01 mitigation).
+// Iteration-downgrade guard (T-1712-01 mitigation): a concurrent inbound SKDM
+// can advance the ratchet between findSenderKeyDonor and PutSenderKeyStructure;
+// the guard prevents clobbering a naturally-advanced key.
 func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, targetSenderID, senderBare string, targetKeyID, targetIter uint32) (donorJID string, ok bool, err error) {
 	r, rOk := c.inner.(senderKeyRecoveryReader)
 	if !rOk {

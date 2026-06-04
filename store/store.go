@@ -133,32 +133,10 @@ type DeviceContainer interface {
 	DeleteDevice(ctx context.Context, store *Device) error
 }
 
-// RecoveryTask describes a cross-account sender-key recovery attempt. Produced
-// by the decryptGroupSenderKey miss site in message.go and consumed by the
-// per-account background SenderKeyRecoveryWorker.
-type RecoveryTask struct {
-	Group          string // group JID string (chat_id)
-	TargetSenderID string // device-qualified sender_id (e.g. "12345_1:0")
-	SenderBare     string // device-stripped sender for LIKE donor scan (from.SignalAddressUser())
-	TargetKeyID    uint32 // key_id this message needs
-	TargetIter     uint32 // chain_key_iteration this message needs
-}
-
-// SenderKeyRecoveryWorker is the interface that the background recovery worker
-// satisfies. Defined in package store (not sqlstore) so message.go can enqueue
-// tasks via cli.Store.RecoveryWorker without importing sqlstore, avoiding a
-// circular dependency. The concrete implementation lives in store/sqlstore.
-//
-// TryEnqueue is non-blocking: if the worker's channel is full it drops the task.
-// The decrypt hot path must never block on recovery.
-type SenderKeyRecoveryWorker interface {
-	TryEnqueue(task RecoveryTask)
-}
-
 // SenderKeyInlineRecoverer is the interface for synchronous inline recovery.
 // Defined in package store (not sqlstore) so message.go can call it via
 // cli.Store.InlineRecoverer without importing sqlstore (package-boundary
-// constraint — same rationale as SenderKeyRecoveryWorker).
+// constraint — message.go only imports store, not sqlstore).
 // Implemented by *CachedSenderKeyStore (sqlstore). Set on Device by
 // attachCachedStores. Nil before wiring and in test environments;
 // message.go gates on nil before calling TryInlineRecovery.
@@ -291,10 +269,6 @@ type Device struct {
 	// Phase 17.8: decode-once struct-LRU caches. Wired by attachCachedStores.
 	ParsedSKCache      *parsedSKCache
 	ParsedSessionCache *parsedSessionCache
-	// Phase 17.11-03: background cross-account sender-key recovery worker.
-	// Nil before attachCachedStores wires it. message.go gates on nil before
-	// calling TryEnqueue — no-op when not wired (test environments, pre-init).
-	RecoveryWorker SenderKeyRecoveryWorker
 	// Phase 17.12: inline synchronous cross-account sender-key recovery.
 	// Nil before attachCachedStores wires it. message.go gates on nil before
 	// calling TryInlineRecovery — no-op when not wired (test environments, pre-init).

@@ -6,7 +6,8 @@
 
 // recovery_sender_key_test.go — TestRecoverSenderKeyCrossAccount + TestRecoveryScanQueryFlat
 //
-// TestRecoverSenderKeyCrossAccount verifies cross-account sender-key recovery (plan 05):
+// TestRecoverSenderKeyCrossAccount verifies cross-account sender-key recovery
+// via TryInlineRecovery (plan 05):
 //
 //  1. fmt_ver=2 donor arm: seed account A with a columnar row, recover into B.
 //  2. fmt_ver=1 legacy-blob donor arm: seed account A with a legacy blob row,
@@ -78,7 +79,7 @@ func insertRecoveryTestDevice(t *testing.T, db *sql.DB, jid string) func() {
 
 // newRecoveryTestStoreB creates a CachedSenderKeyStore for the recovering account B.
 // The CachedSenderKeyStore wraps an inner *SQLStore (bound to B's JID) and is the
-// entry-point for RecoverSenderKey (which calls PutSenderKeyStructure internally).
+// entry-point for TryInlineRecovery (which calls PutSenderKeyStructure internally).
 // No flusher is wired — the write-through fallback fires PutManySenderKeys directly,
 // which produces a fmt_ver=2 row with a recomposed blob immediately.
 //
@@ -243,12 +244,12 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		}
 
 		// Recover into B with targetIter=15 (donor=10 ≤ 15 → accepted).
-		ok, err := csB.RecoverSenderKey(ctx, group, targetSenderID, bareUser, targetKeyID, 15)
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, 15)
 		if err != nil {
-			t.Fatalf("RecoverSenderKey: %v", err)
+			t.Fatalf("TryInlineRecovery: %v", err)
 		}
 		if !ok {
-			t.Fatal("RecoverSenderKey: expected true (donor found), got false")
+			t.Fatal("TryInlineRecovery: expected true (donor found), got false")
 		}
 
 		// Verify the recovered row via UnpackFlat (post-upgrade-19: no columnar columns).
@@ -306,12 +307,12 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		// Recover into B with targetIter=25 (donor=20 ≤ 25 → accepted).
-		ok, err := csB.RecoverSenderKey(ctx, group, targetSenderID, bareUser, targetKeyID, 25)
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, 25)
 		if err != nil {
-			t.Fatalf("RecoverSenderKey (flat arm): %v", err)
+			t.Fatalf("TryInlineRecovery (flat arm): %v", err)
 		}
 		if !ok {
-			t.Fatal("RecoverSenderKey (flat arm): expected true (donor found via UnpackFlat), got false")
+			t.Fatal("TryInlineRecovery (flat arm): expected true (donor found via UnpackFlat), got false")
 		}
 
 		// Verify the recovered row via UnpackFlat.
@@ -356,9 +357,9 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		}
 
 		// Attempt recovery with targetIter=25 (donor=30 > 25 → reject).
-		ok, err := csB.RecoverSenderKey(ctx, group, targetSenderID, bareUser, targetKeyID, 25)
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, 25)
 		if err != nil {
-			t.Fatalf("RecoverSenderKey (forward-only arm): %v", err)
+			t.Fatalf("TryInlineRecovery (forward-only arm): %v", err)
 		}
 		if ok {
 			t.Error("forward-only arm: expected false (donor iter=30 > target=25 rejected), got true")
@@ -406,9 +407,9 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		}
 
 		// Recover into B with targetIter=15. Best donor = iter=12.
-		ok, err := csB.RecoverSenderKey(ctx, group, targetSenderID, bareUser, targetKeyID, 15)
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, 15)
 		if err != nil {
-			t.Fatalf("RecoverSenderKey (closest-iter arm): %v", err)
+			t.Fatalf("TryInlineRecovery (closest-iter arm): %v", err)
 		}
 		if !ok {
 			t.Fatal("closest-iter arm: expected true (two donors), got false")
@@ -464,9 +465,9 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 			t.Fatalf("seed A (wrong-key-id arm): %v", err)
 		}
 
-		ok, err := csB.RecoverSenderKey(ctx, group, targetSenderID, bareUser, targetKeyID, 10)
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, 10)
 		if err != nil {
-			t.Fatalf("RecoverSenderKey (wrong-key-id): %v", err)
+			t.Fatalf("TryInlineRecovery (wrong-key-id): %v", err)
 		}
 		if ok {
 			t.Error("wrong-key-id arm: expected false (donor keyID=99 ≠ target 42), got true")
@@ -614,7 +615,7 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 	}
 
 	// Arm 1 — fast path: single-state donor, state[0].KeyID=77, iter=15.
-	// RecoverSenderKey with targetKeyID=77, targetIter=20 should find this donor
+	// TryInlineRecovery with targetKeyID=77, targetIter=20 should find this donor
 	// via the fast path (sk_keyid0 = 77 = targetKeyID).
 	t.Run("fast_path_single_state", func(t *testing.T) {
 		_, _ = db.ExecContext(ctx,
@@ -641,9 +642,9 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache)
 
 		targetSenderID := flatBareUser + ":0"
-		ok, err := csB.RecoverSenderKey(ctx, flatGroup, targetSenderID, flatBareUser, fastTargetKeyID, fastTargetIter)
+		_, ok, err := csB.TryInlineRecovery(ctx, flatGroup, targetSenderID, flatBareUser, fastTargetKeyID, fastTargetIter)
 		if err != nil {
-			t.Fatalf("fast-path arm: RecoverSenderKey: %v", err)
+			t.Fatalf("fast-path arm: TryInlineRecovery: %v", err)
 		}
 		if !ok {
 			t.Fatal("fast-path arm: expected true (donor found via sk_keyid0 fast path), got false")
@@ -714,9 +715,9 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache)
 
 		targetSenderID := flatBareUser + ":0"
-		ok, err := csB.RecoverSenderKey(ctx, flatGroup, targetSenderID, flatBareUser, fallbackTarget, fallbackTargetIter)
+		_, ok, err := csB.TryInlineRecovery(ctx, flatGroup, targetSenderID, flatBareUser, fallbackTarget, fallbackTargetIter)
 		if err != nil {
-			t.Fatalf("fallback-path arm: RecoverSenderKey: %v", err)
+			t.Fatalf("fallback-path arm: TryInlineRecovery: %v", err)
 		}
 		if !ok {
 			t.Fatal("fallback-path arm: expected true (donor found via LIKE fallback scan), got false")
@@ -810,9 +811,6 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 //
 // Uses only helpers already present in this file (recoveryTestJIDA/B,
 // insertRecoveryTestDevice, newRecoveryTestStoreB, insertFlatBlobRow).
-// Does NOT copy insertRecoveryWorkerTestDevice or recoveryWorkerTestJIDA/B
-// from recovery_worker_test.go (same package; top-level redeclaration would
-// break compilation until Plan 02 deletes recovery_worker_test.go wholesale).
 func TestInlineRecoveryIterationGuard(t *testing.T) {
 	db, err := sql.Open("pgx", batchTestDSN())
 	if err != nil {

@@ -368,56 +368,6 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 	return devices, nil
 }
 
-// recoverySyncWrite writes a recovered SenderKeyStructure to the DB
-// synchronously — bypassing the async flusher — so the row is present in the
-// DB before updateDeviceCache evicts the device-set cache entry. This is the
-// correct write path for RecoverSenderKey: recovery runs from a background
-// worker (off the hot decrypt path), so a synchronous DB write is acceptable.
-//
-// Why this must bypass the flusher (R7 coherence invariant):
-//   With the async Enqueue path, updateDeviceCache evicts the cached empty-set
-//   for (group, senderBare), but the row has not yet landed in the DB. The next
-//   GetSenderKeyDevices cold-reads DB — finds nothing — and returns [] again,
-//   making the recovery invisible until the flusher tick fires (~1 second). The
-//   sync-write path guarantees the row is in DB before the evict, so the next
-//   cold read finds targetSenderID immediately.
-//
-// parsedReplace fires after the synchronous write, keeping the struct cache warm
-// so LoadSenderKey serves the recovered key on the first request without a DB
-// round-trip.
-func (c *CachedSenderKeyStore) recoverySyncWrite(
-	ctx context.Context, group, targetSenderID string,
-	structure *groupRecord.SenderKeyStructure,
-) error {
-	// Encode to flat binary (PackFlat owns its buffer — no aliasing of structure).
-	blob, ok := store.PackFlat(structure)
-	if !ok {
-		return nil // 0-state structure: nothing to write (caller's invariant should prevent this)
-	}
-
-	// Synchronous write to DB — not via the flusher.
-	if putMany, ok := c.inner.(interface {
-		PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error
-	}); ok {
-		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: targetSenderID, Blob: blob}}); err != nil {
-			return err
-		}
-	}
-
-	// Struct-cache coherence: replace parsed entry so LoadSenderKey serves the
-	// recovered key immediately without a DB round-trip.
-	if c.parsedReplace != nil {
-		c.parsedReplace(c.key(group, targetSenderID), structure)
-	}
-
-	// Device-cache: evict so the next GetSenderKeyDevices cold-reads from DB.
-	// Row is now in DB → cold read will find targetSenderID. This is the key
-	// difference from the async path: row in DB BEFORE evict (not after).
-	c.updateDeviceCache(group, targetSenderID)
-
-	return nil
-}
-
 // senderKeyUserBare strips the device qualifier from a device-qualified
 // sender_id ("<user>:<dev>" → "<user>"). Used to key the device-set cache.
 func senderKeyUserBare(user string) string {
