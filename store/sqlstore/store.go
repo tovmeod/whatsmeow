@@ -510,6 +510,67 @@ func NewSenderKeyRow(group, user string, s *groupRecord.SenderKeyStructure) Send
 	return SenderKeyRow{Group: group, User: user, Cols: decompose(s)}
 }
 
+// ExportedSenderKeyColumns carries the columnar sender-key fields in native Go
+// slice types so the migration tool (package main) and test code can pass scanned
+// PG column values to ExportRecompose without naming the unexported senderKeyColumns
+// type or the unexported int64Array / byteaArray / int32Array scanner wrappers.
+//
+// All fields map 1-to-1 to the corresponding senderKeyColumns fields:
+//   - StKeyID              ↔ stKeyID              (one int64 per state)
+//   - StChainKeyIteration  ↔ stChainKeyIteration  (one int64 per state)
+//   - StChainKey           ↔ stChainKey            (one []byte per state)
+//   - StSigningKeyPublic   ↔ stSigningKeyPublic    (one []byte per state)
+//   - StSigningKeyPrivate  ↔ stSigningKeyPrivate   (nil element = NULL = received key)
+//   - SmkStateIdx          ↔ smkStateIdx           (one int32 per skipped key)
+//   - SmkIteration         ↔ smkIteration          (one int64 per skipped key)
+//   - SmkIV                ↔ smkIV                 (one []byte per skipped key)
+//   - SmkCipherKey         ↔ smkCipherKey          (one []byte per skipped key)
+//   - SmkSeed              ↔ smkSeed               (one []byte per skipped key)
+//
+// Intended for test code and migration utilities that need to call ExportRecompose
+// (the fmt_ver=2 decode path) without access to the unexported columnar types.
+type ExportedSenderKeyColumns struct {
+	StKeyID             []int64
+	StChainKeyIteration []int64
+	StChainKey          [][]byte
+	StSigningKeyPublic  [][]byte
+	StSigningKeyPrivate [][]byte // nil element → nil SigningKeyPrivate (received key)
+	SmkStateIdx         []int32
+	SmkIteration        []int64
+	SmkIV               [][]byte
+	SmkCipherKey        [][]byte
+	SmkSeed             [][]byte
+}
+
+// ExportRecompose reconstructs a *groupRecord.SenderKeyStructure from the
+// exported columnar representation. It wraps the unexported recompose() function
+// so the migration tool and test code can decode fmt_ver=2 rows without reaching
+// into unexported sqlstore internals.
+//
+// Source-of-truth mandate: for fmt_ver=2 rows, columns carry the live key state
+// (Phase 17.7 write-back advances them on every ratchet); the sender_key blob was
+// frozen at Phase 17.9 migration time and MUST NOT be used as the decode source.
+// ExportRecompose is the correct decode path for fmt_ver=2; Deserialize(blob) is
+// correct only for fmt_ver=NULL/1.
+//
+// Intended for test code and migration utilities (same audience as NewSenderKeyRow).
+func ExportRecompose(cols *ExportedSenderKeyColumns) *groupRecord.SenderKeyStructure {
+	c := &senderKeyColumns{
+		fmtVer:              2,
+		stKeyID:             cols.StKeyID,
+		stChainKeyIteration: cols.StChainKeyIteration,
+		stChainKey:          cols.StChainKey,
+		stSigningKeyPublic:  cols.StSigningKeyPublic,
+		stSigningKeyPrivate: cols.StSigningKeyPrivate,
+		smkStateIdx:         cols.SmkStateIdx,
+		smkIteration:        cols.SmkIteration,
+		smkIV:               cols.SmkIV,
+		smkCipherKey:        cols.SmkCipherKey,
+		smkSeed:             cols.SmkSeed,
+	}
+	return recompose(c)
+}
+
 // senderKeyBatchChunkSize bounds how many rows go into one multi-row INSERT.
 // 100 rows × 15 params = 1500 bind params per statement, far below Postgres'
 // 65535 limit (T-17.7-02-02). Tunable later from the flusher (plan 03) based
