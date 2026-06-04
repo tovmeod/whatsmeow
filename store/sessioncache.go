@@ -127,18 +127,15 @@ func (device *Device) PutCachedSessions(ctx context.Context) error {
 		if !item.Dirty {
 			continue
 		}
-		// Write flat (mirror StoreSession — D-04a). This batched send-path flush
-		// (send.go/sendfb.go) MUST use the same flat codec as the single-write
-		// StoreSession; otherwise every group/multi-recipient send silently
-		// re-introduces JSON sessions (the Stage-1 gap fixed here). Safety net:
-		// on refuse, drain to JSON so dual-read still reads it; Stage 3 removes
-		// this fallback once the gate covers this path too.
+		// Stage 3: write flat only (mirror StoreSession — D-04a). No JSON fallback.
+		// This batched send-path flush (send.go/sendfb.go) MUST use the same flat
+		// codec as the single-write StoreSession. On refuse (codec bug), return error.
 		structure := item.Record.Structure()
-		if flat, ok := PackFlatSession(structure); ok {
-			dirtySessions[addr] = flat
-		} else {
-			dirtySessions[addr] = item.Record.Serialize() // ALLOW-JSON-DRAIN-BLOB-SESSION
+		flat, ok := PackFlatSession(structure)
+		if !ok {
+			return fmt.Errorf("PutCachedSessions: PackFlatSession refused for %s: codec bug", addr)
 		}
+		dirtySessions[addr] = flat
 	}
 	if len(dirtySessions) > 0 {
 		err := device.Sessions.PutManySessions(ctx, dirtySessions)

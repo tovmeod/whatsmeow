@@ -28,6 +28,8 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
+	"go.mau.fi/libsignal/keys/chain"
+	"go.mau.fi/libsignal/keys/message"
 	librecord "go.mau.fi/libsignal/state/record"
 	"go.mau.fi/libsignal/protocol"
 	"go.mau.fi/whatsmeow/store"
@@ -265,6 +267,103 @@ func buildFlatSenderKeyBlob(numKeys int) []byte {
 		panic("buildFlatSenderKeyBlob: PackFlat returned nil")
 	}
 	return blob
+}
+
+// buildFlatSessionBlob returns a PackFlatSession-encoded session blob with
+// numKeys skipped message keys in the first receiver chain.
+// Stage 3: LoadSession accepts only flat blobs (byte[0]=0x01); JSON blobs are
+// rejected. Use this helper wherever the CR tests previously used buildSessionBlob.
+func buildFlatSessionBlob(numKeys int) []byte {
+	pub33 := func(seed byte) []byte {
+		b := make([]byte, 33)
+		b[0] = 0x05
+		for i := 1; i < 33; i++ {
+			b[i] = seed + byte(i)
+		}
+		return b
+	}
+	priv32 := func(seed byte) []byte {
+		b := make([]byte, 32)
+		for i := range b {
+			b[i] = seed + byte(i+1)
+		}
+		return b
+	}
+	key32 := func(seed byte) []byte {
+		b := make([]byte, 32)
+		for i := range b {
+			b[i] = seed + byte(i+2)
+		}
+		return b
+	}
+
+	var msgKeys []*message.KeysStructure
+	for k := 0; k < numKeys; k++ {
+		iv := make([]byte, 16)
+		ck := make([]byte, 32)
+		mk := make([]byte, 32)
+		for i := range iv {
+			iv[i] = byte(k + i)
+		}
+		for i := range ck {
+			ck[i] = byte(k + i + 1)
+		}
+		for i := range mk {
+			mk[i] = byte(k + i + 2)
+		}
+		msgKeys = append(msgKeys, &message.KeysStructure{
+			CipherKey: ck,
+			MacKey:    mk,
+			IV:        iv,
+			Index:     uint32(k),
+		})
+	}
+
+	senderChain := &librecord.ChainStructure{
+		SenderRatchetKeyPublic:  pub33(0x01),
+		SenderRatchetKeyPrivate: priv32(0x02),
+		ChainKey:                &chain.KeyStructure{Key: key32(0x03), Index: 0},
+		MessageKeys:             nil,
+	}
+	receiverChain := &librecord.ChainStructure{
+		SenderRatchetKeyPublic:  pub33(0x11),
+		SenderRatchetKeyPrivate: priv32(0x12),
+		ChainKey:                &chain.KeyStructure{Key: key32(0x13), Index: uint32(numKeys)},
+		MessageKeys:             msgKeys,
+	}
+
+	state := &librecord.StateStructure{
+		SessionVersion:       3,
+		LocalIdentityPublic:  pub33(0x20),
+		RemoteIdentityPublic: pub33(0x30),
+		RootKey:              key32(0x40),
+		SenderBaseKey:        pub33(0x50),
+		SenderChain:          senderChain,
+		ReceiverChains:       []*librecord.ChainStructure{receiverChain},
+		LocalRegistrationID:  12345,
+		RemoteRegistrationID: 67890,
+	}
+
+	ss := &librecord.SessionStructure{
+		SessionState:   state,
+		PreviousStates: nil,
+	}
+
+	blob, ok := store.PackFlatSession(ss)
+	if !ok {
+		panic("buildFlatSessionBlob: PackFlatSession returned !ok (codec bug in test helper)")
+	}
+	return blob
+}
+
+// fullParseFlatSession parses a flat-encoded session blob into a *librecord.Session.
+// Stage 3 equivalent of fullParseSession (which used JSON); used by CR tests.
+func fullParseFlatSession(blob []byte) (*librecord.Session, error) {
+	structure, err := store.UnpackFlatSession(blob)
+	if err != nil {
+		return nil, err
+	}
+	return librecord.NewSessionFromStructure(structure, store.SignalProtobufSerializer.Session, store.SignalProtobufSerializer.State)
 }
 
 // seedSessStore seeds the fake session store with blob for addrName, then
@@ -604,7 +703,7 @@ func TestDecodeOnce_CR_TR06(t *testing.T) {
 	ctx := context.Background()
 
 	addrName := "15550002001"
-	blob := buildSessionBlob(0)
+	blob := buildFlatSessionBlob(0) // Stage 3: flat blobs only; JSON rejected by LoadSession
 
 	// Seed the byte-level store and warm the byte-cache.
 	seedSessStore(t, h, addrName, blob)
@@ -616,11 +715,11 @@ func TestDecodeOnce_CR_TR06(t *testing.T) {
 	var storeErr error
 
 	// 1 writer: StoreSession with a fresh session object from blob2.
-	blob2 := buildSessionBlob(10)
+	blob2 := buildFlatSessionBlob(10) // Stage 3: flat blobs only
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		s2, err := fullParseSession(blob2)
+		s2, err := fullParseFlatSession(blob2)
 		if err != nil {
 			storeErr = err
 			return
@@ -680,7 +779,7 @@ func TestDecodeOnce_CR_TR07(t *testing.T) {
 	ctx := context.Background()
 
 	addrName := "15550002002"
-	blob := buildSessionBlob(0)
+	blob := buildFlatSessionBlob(0) // Stage 3: flat blobs only; JSON rejected by LoadSession
 
 	// Seed the byte-level store with the original blob.
 	seedSessStore(t, h, addrName, blob)
@@ -692,10 +791,10 @@ func TestDecodeOnce_CR_TR07(t *testing.T) {
 	h.fakeSess.putErr = injectedErr
 
 	// Build a new session to pass to StoreSession.
-	newBlob := buildSessionBlob(5)
-	newSess, err := fullParseSession(newBlob)
+	newBlob := buildFlatSessionBlob(5) // Stage 3: flat blobs only
+	newSess, err := fullParseFlatSession(newBlob)
 	if err != nil {
-		t.Fatalf("TR-07: fullParseSession newBlob: %v", err)
+		t.Fatalf("TR-07: fullParseFlatSession newBlob: %v", err)
 	}
 
 	// StoreSession must return the error from PutSession.
