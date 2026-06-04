@@ -715,7 +715,7 @@ func benchmarkSenderKeyRecovery(b *testing.B, nDonors int) {
 	targetIter := uint32((nDonors-1)*10 + 5) // a value above all donor iters
 
 	// Warm-up: one recovery to ensure the row is in B's table.
-	_, _ = csB.RecoverSenderKey(ctx, recovBenchGroup, targetSenderID, recovBenchSender, recovBenchKeyID, targetIter)
+	_, _, _ = csB.TryInlineRecovery(ctx, recovBenchGroup, targetSenderID, recovBenchSender, recovBenchKeyID, targetIter)
 	// Remove B's row so each benchmark iteration does a fresh recovery write.
 	_, _ = db.ExecContext(ctx,
 		`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
@@ -723,13 +723,13 @@ func benchmarkSenderKeyRecovery(b *testing.B, nDonors int) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		// RecoverSenderKey: full path — SQL scan + Go donor-selection + PutManySenderKeys write.
-		ok, err := csB.RecoverSenderKey(ctx, recovBenchGroup, targetSenderID, recovBenchSender, recovBenchKeyID, targetIter)
+		// TryInlineRecovery: full path — SQL scan + Go donor-selection + PutSenderKeyStructure write.
+		_, ok, err := csB.TryInlineRecovery(ctx, recovBenchGroup, targetSenderID, recovBenchSender, recovBenchKeyID, targetIter)
 		if err != nil {
-			b.Fatalf("RecoverSenderKey: %v", err)
+			b.Fatalf("TryInlineRecovery: %v", err)
 		}
 		if !ok {
-			b.Fatal("RecoverSenderKey: expected donor found, got false")
+			b.Fatal("TryInlineRecovery: expected donor found, got false")
 		}
 		// Remove B's written row so next iteration is independent.
 		b.StopTimer()
