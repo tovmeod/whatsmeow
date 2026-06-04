@@ -101,24 +101,16 @@ func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalA
 		return record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State), nil
 	}
 
-	// Format detection: byte[0]=0x01 → flat (Stage 3: only valid format).
-	// Stage 3: JSON-read path removed after backfill confirmed zero JSON rows.
-	// A non-flat blob returns a wrapped error — never panics, never silently drops.
+	// Format detection: byte[0]=0x01 → flat, byte[0]=0x7B ('{') → JSON legacy read.
+	// Stage 1-2 dual-read: flat bytes written by Stage 1+; JSON blobs written before Stage 1.
 	var structure *record.SessionStructure
 	if len(rawSess) > 0 && rawSess[0] == 0x01 {
 		structure, err = UnpackFlatSession(rawSess)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize session with %s: %w", addrString, err)
-		}
 	} else {
-		// Non-flat blob: JSON-read path removed in Stage 3. All prod rows confirmed flat.
-		var byte0desc string
-		if len(rawSess) == 0 {
-			byte0desc = "empty blob"
-		} else {
-			byte0desc = fmt.Sprintf("byte0=0x%02x", rawSess[0])
-		}
-		return nil, fmt.Errorf("LoadSession: non-flat session blob for %s (%s); JSON read path removed in Stage 3", addrString, byte0desc)
+		structure, err = SignalProtobufSerializer.Session.Deserialize(rawSess) // ALLOW-JSON-DRAIN-BLOB-SESSION
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize session with %s: %w", addrString, err)
 	}
 	return record.NewSessionFromStructure(structure, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
 }
@@ -130,14 +122,17 @@ func (device *Device) GetSubDeviceSessions(ctx context.Context, name string) ([]
 func (device *Device) StoreSession(ctx context.Context, address *protocol.SignalAddress, record *record.Session) error {
 	addrString := address.String()
 
-	// Stage 3: write flat bytes via PackFlatSession only. No JSON fallback.
-	// If PackFlatSession refuses (codec bug), return a wrapped error — no silent session loss.
+	// Stage 1: write flat bytes via PackFlatSession. No struct cache (D-04a).
+	// Safety net: if PackFlatSession refuses to encode (should not happen in
+	// production), fall back to JSON drain blob to avoid silent session loss.
 	structure := record.Structure()
 	flat, ok := PackFlatSession(structure)
-	if !ok {
-		return fmt.Errorf("PackFlatSession refused to encode session with %s: codec bug", addrString)
+	var serialized []byte
+	if ok {
+		serialized = flat
+	} else {
+		serialized = record.Serialize() // ALLOW-JSON-DRAIN-BLOB-SESSION
 	}
-	serialized := flat
 
 	if putCachedSession(ctx, addrString, record) {
 		return nil

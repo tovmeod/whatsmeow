@@ -29,10 +29,10 @@
 // # Correctness boundary (CORRECTNESS-CRITICAL)
 //
 // PackFlatSession ENFORCES the per-field byte-length invariant rather than
-// assuming it. A wrong length returns (nil, false) — the caller MUST return an
-// error (codec bug) rather than dropping the session silently. A DM session has
-// no replayable genesis; PackFlatSession refuse + drop = permanent session loss
-// (RESEARCH Pitfall 6). Stage 3: StoreSession returns an error on (nil, false).
+// assuming it. A wrong length returns (nil, false) — the caller MUST fall back
+// to JSON serialization (ALLOW-JSON-DRAIN-BLOB-SESSION safety net in signal.go)
+// rather than dropping the session. A DM session has no replayable genesis;
+// PackFlatSession refuse + drop = permanent session loss (RESEARCH Pitfall 6).
 //
 // UnpackFlatSession is fully bounds-checked: every variable-length segment
 // checks len(b) >= off+fieldLen before reading. Returns (nil, error) on any
