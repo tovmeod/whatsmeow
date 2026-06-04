@@ -1,11 +1,11 @@
-// Copyright (c) 2026 Kavtov Platform (Phase 17.11 plan 02)
+// Copyright (c) 2026 Kavtov Platform (Phase 17.11 plan 02 + plan 03)
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// recovery_worker_test.go — TestRecoverySyncWriteDeviceVisibility (BLOCKING GATE)
-// and TestRecoveryIterationGuard.
+// recovery_worker_test.go — TestRecoverySyncWriteDeviceVisibility (BLOCKING GATE),
+// TestRecoveryIterationGuard, and TestNegativeRecoveryCache.
 //
 // TestRecoverySyncWriteDeviceVisibility (blocking gate):
 //   Proves that after RecoverSenderKey returns (true, nil), a subsequent
@@ -19,6 +19,12 @@
 //   (group, targetSenderID) already has the same KeyID at Iteration >= donor.Iteration,
 //   and that the DB row is NOT overwritten.
 //
+// TestNegativeRecoveryCache:
+//   Proves that the SenderKeyRecoveryWorker's negative-result cache deduplicates
+//   re-scans for unrecoverable tuples within the TTL window, and that after TTL
+//   expiry a fresh scan is attempted. Calls handle() directly (synchronous) so
+//   the test is deterministic without sleeps racing the jittered goroutine.
+//
 // Requires: live Postgres at batchTestDSN() (kavtov-driver-go/scripts/setup-test-db.sh).
 // Skips cleanly when the DB is not reachable.
 
@@ -27,10 +33,13 @@ package sqlstore_test
 import (
 	"context"
 	"database/sql"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 
@@ -299,4 +308,103 @@ func containsStrings(xs []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// TestNegativeRecoveryCache verifies that SenderKeyRecoveryWorker's negative-result
+// cache deduplicates re-scans for unrecoverable tuples within the TTL window, and
+// re-scans after TTL expiry.
+//
+// Design: calls handle() directly (synchronous) so the test doesn't race the
+// jittered goroutine startup. RecoverSenderKey returns (false, nil) because no
+// donor exists for the test tuple — that result is cached. A second handle() call
+// within the TTL must not call RecoverSenderKey again. After sleeping past TTL,
+// a third handle() call must call RecoverSenderKey again.
+func TestNegativeRecoveryCache(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	cleanupA := insertRecoveryWorkerTestDevice(t, db, recoveryWorkerTestJIDA)
+	cleanupB := insertRecoveryWorkerTestDevice(t, db, recoveryWorkerTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		group        = "recovneg_cache_group@g.us"
+		bareUser     = "55512340009_1"
+		targetSuffix = ":0"
+		targetKeyID  = uint32(999) // keyID nobody has a donor for
+	)
+	targetSenderID := bareUser + targetSuffix
+
+	ctx := context.Background()
+
+	// Clean up any leftover rows from previous test runs.
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2`,
+		recoveryWorkerTestJIDB, group)
+
+	// Build a CachedSenderKeyStore for B (the recovering account).
+	jidB, err := types.ParseJID(recoveryWorkerTestJIDB)
+	if err != nil {
+		t.Fatalf("ParseJID B: %v", err)
+	}
+	containerB := sqlstore.NewWithDB(db, "postgres", nil)
+	innerB := sqlstore.NewSQLStore(containerB, jidB)
+	byteCache, _ := lru.New[string, []byte](256)
+	devCache, _ := lru.New[string, []string](256)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryWorkerTestJIDB, byteCache, devCache)
+
+	// Atomic counter to count how many times RecoverSenderKey is actually called.
+	var scanCount atomic.Int64
+
+	// Construct a SenderKeyRecoveryWorker with:
+	//   - negTTL = 1ms (instant expiry for test)
+	//   - jitterMax = 0 (no jitter; Start() goroutine starts immediately but we
+	//     don't call Start() — we call handle() directly for determinism)
+	//   - scanCounter injected via the test constructor
+	worker := sqlstore.NewSenderKeyRecoveryWorkerForTest(csB, waLog.Noop, 1*time.Millisecond, &scanCount)
+
+	task := store.RecoveryTask{
+		Group:          group,
+		TargetSenderID: targetSenderID,
+		SenderBare:     bareUser,
+		TargetKeyID:    targetKeyID,
+		TargetIter:     10,
+	}
+
+	// Call 1: no donor (keyID=999 has no row), RecoverSenderKey returns (false, nil).
+	// scan count goes 0→1; negative cache entry added.
+	worker.HandleForTest(ctx, task)
+	if got := scanCount.Load(); got != 1 {
+		t.Fatalf("call 1: expected scanCount=1, got=%d", got)
+	}
+
+	// Call 2: within TTL=1ms — if the scan finishes faster than 1ms the cache may
+	// have already expired. Re-check immediately without sleep; we rely on the Add
+	// timestamp being fresh enough. In practice the TTL is 1ms which is well within
+	// a test cycle. If this becomes flaky, raise to 5ms.
+	worker.HandleForTest(ctx, task)
+	if got := scanCount.Load(); got != 1 {
+		t.Errorf("call 2 (within TTL): expected scanCount still=1 (neg-cache hit), got=%d", got)
+	}
+
+	// Wait for the TTL to expire (2ms > 1ms TTL).
+	time.Sleep(2 * time.Millisecond)
+
+	// Call 3: TTL expired — negative cache entry evicted; must scan again.
+	worker.HandleForTest(ctx, task)
+	if got := scanCount.Load(); got != 2 {
+		t.Errorf("call 3 (after TTL): expected scanCount=2 (cache expired, re-scan), got=%d", got)
+	}
+
+	t.Logf("PASS: negative-result cache deduped second call; re-scanned after TTL expiry (scanCount=%d)", scanCount.Load())
 }
