@@ -13,16 +13,26 @@
 //   - REQ-CODEC-04: Bounds-checked decode (malformed blobs return error, never panic)
 //
 // Plus FuzzUnpackFlatSession for D-01 (fuzzed codec).
+//
+// REQ-CODEC-05: TestFlatSessionDecryptEquivalence (added Plan 02)
+// REQ-CODEC-06: TestFlatSessionProdFixtures (added Plan 02 — skip-guarded until prod fixtures provided)
 
 package store
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
 	"go.mau.fi/libsignal/keys/chain"
+	"go.mau.fi/libsignal/keys/identity"
 	"go.mau.fi/libsignal/keys/message"
+	"go.mau.fi/libsignal/keys/prekey"
+	"go.mau.fi/libsignal/protocol"
+	"go.mau.fi/libsignal/serialize"
+	"go.mau.fi/libsignal/session"
 	"go.mau.fi/libsignal/state/record"
+	"go.mau.fi/libsignal/util/keyhelper"
 	"go.mau.fi/libsignal/util/optional"
 )
 
@@ -767,4 +777,605 @@ func FuzzUnpackFlatSession(f *testing.F) {
 		}()
 		UnpackFlatSession(b) //nolint:errcheck — fuzz target only cares about no panic
 	})
+}
+
+// ---------------------------------------------------------------------------
+// REQ-CODEC-05: TestFlatSessionDecryptEquivalence
+//
+// Proves that a full X3DH session round-tripped through PackFlatSession +
+// UnpackFlatSession + record.NewSessionFromStructure decrypts messages
+// identically to the original session — including after a ratchet advance and
+// with accumulated skipped keys.
+//
+// Uses libsignal's session/Builder + session/Cipher (DM path, not group).
+// Does NOT touch any prod DB — entirely in-memory with generated keys.
+// ---------------------------------------------------------------------------
+
+// dmHarness holds the four in-memory stores and session builder for one DM peer.
+type dmHarness struct {
+	serializer        *serialize.Serializer
+	sessionStore      *dmInMemorySession
+	preKeyStore       *dmInMemoryPreKey
+	signedPreKeyStore *dmInMemorySignedPreKey
+	identityStore     *dmInMemoryIdentityKey
+	address           *protocol.SignalAddress
+	identityKP        *identity.KeyPair
+	registrationID    uint32
+	preKeys           []*record.PreKey
+	signedPreKey      *record.SignedPreKey
+	builder           *session.Builder
+}
+
+// ---------------------------------------------------------------------------
+// Inline minimal in-memory store implementations (package tests is importable,
+// but we inline to avoid an external test dependency on an internal package).
+// ---------------------------------------------------------------------------
+
+type dmInMemorySession struct {
+	sessions   map[string]*record.Session
+	serializer *serialize.Serializer
+}
+
+func newDMInMemorySession(s *serialize.Serializer) *dmInMemorySession {
+	return &dmInMemorySession{sessions: make(map[string]*record.Session), serializer: s}
+}
+
+func (m *dmInMemorySession) LoadSession(ctx context.Context, addr *protocol.SignalAddress) (*record.Session, error) {
+	if s, ok := m.sessions[addr.String()]; ok {
+		return s, nil
+	}
+	s := record.NewSession(m.serializer.Session, m.serializer.State)
+	m.sessions[addr.String()] = s
+	return s, nil
+}
+
+func (m *dmInMemorySession) StoreSession(ctx context.Context, addr *protocol.SignalAddress, sess *record.Session) error {
+	m.sessions[addr.String()] = sess
+	return nil
+}
+
+func (m *dmInMemorySession) ContainsSession(ctx context.Context, addr *protocol.SignalAddress) (bool, error) {
+	_, ok := m.sessions[addr.String()]
+	return ok, nil
+}
+
+func (m *dmInMemorySession) DeleteSession(ctx context.Context, addr *protocol.SignalAddress) error {
+	delete(m.sessions, addr.String())
+	return nil
+}
+
+func (m *dmInMemorySession) DeleteAllSessions(ctx context.Context) error {
+	m.sessions = make(map[string]*record.Session)
+	return nil
+}
+
+func (m *dmInMemorySession) GetSubDeviceSessions(ctx context.Context, name string) ([]uint32, error) {
+	return nil, nil
+}
+
+type dmInMemoryPreKey struct {
+	store map[uint32]*record.PreKey
+}
+
+func newDMInMemoryPreKey() *dmInMemoryPreKey {
+	return &dmInMemoryPreKey{store: make(map[uint32]*record.PreKey)}
+}
+
+func (m *dmInMemoryPreKey) LoadPreKey(ctx context.Context, id uint32) (*record.PreKey, error) {
+	return m.store[id], nil
+}
+
+func (m *dmInMemoryPreKey) StorePreKey(ctx context.Context, id uint32, pk *record.PreKey) error {
+	m.store[id] = pk
+	return nil
+}
+
+func (m *dmInMemoryPreKey) ContainsPreKey(ctx context.Context, id uint32) (bool, error) {
+	_, ok := m.store[id]
+	return ok, nil
+}
+
+func (m *dmInMemoryPreKey) RemovePreKey(ctx context.Context, id uint32) error {
+	delete(m.store, id)
+	return nil
+}
+
+type dmInMemorySignedPreKey struct {
+	store map[uint32]*record.SignedPreKey
+}
+
+func newDMInMemorySignedPreKey() *dmInMemorySignedPreKey {
+	return &dmInMemorySignedPreKey{store: make(map[uint32]*record.SignedPreKey)}
+}
+
+func (m *dmInMemorySignedPreKey) LoadSignedPreKey(ctx context.Context, id uint32) (*record.SignedPreKey, error) {
+	return m.store[id], nil
+}
+
+func (m *dmInMemorySignedPreKey) LoadSignedPreKeys(ctx context.Context) ([]*record.SignedPreKey, error) {
+	result := make([]*record.SignedPreKey, 0, len(m.store))
+	for _, v := range m.store {
+		result = append(result, v)
+	}
+	return result, nil
+}
+
+func (m *dmInMemorySignedPreKey) StoreSignedPreKey(ctx context.Context, id uint32, spk *record.SignedPreKey) error {
+	m.store[id] = spk
+	return nil
+}
+
+func (m *dmInMemorySignedPreKey) ContainsSignedPreKey(ctx context.Context, id uint32) (bool, error) {
+	_, ok := m.store[id]
+	return ok, nil
+}
+
+func (m *dmInMemorySignedPreKey) RemoveSignedPreKey(ctx context.Context, id uint32) error {
+	delete(m.store, id)
+	return nil
+}
+
+type dmInMemoryIdentityKey struct {
+	trustedKeys    map[string]*identity.Key
+	identityKP     *identity.KeyPair
+	registrationID uint32
+}
+
+func newDMInMemoryIdentityKey(kp *identity.KeyPair, regID uint32) *dmInMemoryIdentityKey {
+	return &dmInMemoryIdentityKey{
+		trustedKeys:    make(map[string]*identity.Key),
+		identityKP:     kp,
+		registrationID: regID,
+	}
+}
+
+func (m *dmInMemoryIdentityKey) GetIdentityKeyPair() *identity.KeyPair {
+	return m.identityKP
+}
+
+func (m *dmInMemoryIdentityKey) GetLocalRegistrationID() uint32 {
+	return m.registrationID
+}
+
+func (m *dmInMemoryIdentityKey) SaveIdentity(ctx context.Context, addr *protocol.SignalAddress, key *identity.Key) error {
+	m.trustedKeys[addr.String()] = key
+	return nil
+}
+
+func (m *dmInMemoryIdentityKey) IsTrustedIdentity(ctx context.Context, addr *protocol.SignalAddress, key *identity.Key) (bool, error) {
+	trusted := m.trustedKeys[addr.String()]
+	return trusted == nil || trusted.Fingerprint() == key.Fingerprint(), nil
+}
+
+// ---------------------------------------------------------------------------
+// newDMHarness creates a fully initialised DM peer (4 stores + builder).
+// ---------------------------------------------------------------------------
+
+func newDMHarness(t *testing.T, name string, deviceID uint32) *dmHarness {
+	t.Helper()
+	s := serialize.NewProtoBufSerializer()
+
+	kp, err := keyhelper.GenerateIdentityKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateIdentityKeyPair: %v", err)
+	}
+	regID := keyhelper.GenerateRegistrationID()
+
+	preKeys, err := keyhelper.GeneratePreKeys(1, 10, s.PreKeyRecord)
+	if err != nil {
+		t.Fatalf("GeneratePreKeys: %v", err)
+	}
+	spk, err := keyhelper.GenerateSignedPreKey(kp, 0, s.SignedPreKeyRecord)
+	if err != nil {
+		t.Fatalf("GenerateSignedPreKey: %v", err)
+	}
+
+	sessionStore := newDMInMemorySession(s)
+	preKeyStore := newDMInMemoryPreKey()
+	signedPreKeyStore := newDMInMemorySignedPreKey()
+	identityStore := newDMInMemoryIdentityKey(kp, regID)
+
+	ctx := context.Background()
+	for _, pk := range preKeys {
+		_ = preKeyStore.StorePreKey(ctx, pk.ID().Value, record.NewPreKey(pk.ID().Value, pk.KeyPair(), s.PreKeyRecord))
+	}
+	_ = signedPreKeyStore.StoreSignedPreKey(ctx, spk.ID(), record.NewSignedPreKey(
+		spk.ID(), spk.Timestamp(), spk.KeyPair(), spk.Signature(), s.SignedPreKeyRecord,
+	))
+
+	addr := protocol.NewSignalAddress(name, deviceID)
+	b := session.NewBuilder(sessionStore, preKeyStore, signedPreKeyStore, identityStore, addr, s)
+
+	return &dmHarness{
+		serializer:        s,
+		sessionStore:      sessionStore,
+		preKeyStore:       preKeyStore,
+		signedPreKeyStore: signedPreKeyStore,
+		identityStore:     identityStore,
+		address:           addr,
+		identityKP:        kp,
+		registrationID:    regID,
+		preKeys:           preKeys,
+		signedPreKey:      spk,
+		builder:           b,
+	}
+}
+
+// bobBundle builds a prekey.Bundle from Bob's public material that Alice uses to
+// establish a session towards Bob.
+func bobBundle(bob *dmHarness) *prekey.Bundle {
+	return prekey.NewBundle(
+		bob.registrationID,
+		bob.address.DeviceID(),
+		bob.preKeys[0].ID(),
+		bob.signedPreKey.ID(),
+		bob.preKeys[0].KeyPair().PublicKey(),
+		bob.signedPreKey.KeyPair().PublicKey(),
+		bob.signedPreKey.Signature(),
+		bob.identityKP.PublicKey(),
+	)
+}
+
+// encryptDM encrypts a plaintext message from src towards dstAddr and returns the
+// raw on-wire ciphertext bytes plus the type marker.
+func encryptDM(t *testing.T, srcBuilder *session.Builder, dstAddr *protocol.SignalAddress, src *dmHarness, plain []byte) protocol.CiphertextMessage {
+	t.Helper()
+	ctx := context.Background()
+	cipher := session.NewCipher(srcBuilder, dstAddr)
+	msg, err := cipher.Encrypt(ctx, plain)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	// Re-serialise to mimic wire transit (same as libsignal tests pattern).
+	s := src.serializer
+	switch msg.(type) {
+	case *protocol.PreKeySignalMessage:
+		m, err2 := protocol.NewPreKeySignalMessageFromBytes(msg.Serialize(), s.PreKeySignalMessage, s.SignalMessage)
+		if err2 != nil {
+			t.Fatalf("PreKeySignalMessageFromBytes: %v", err2)
+		}
+		return m
+	default:
+		m, err2 := protocol.NewSignalMessageFromBytes(msg.Serialize(), s.SignalMessage)
+		if err2 != nil {
+			t.Fatalf("SignalMessageFromBytes: %v", err2)
+		}
+		return m
+	}
+}
+
+// decryptDM decrypts a CiphertextMessage using dstBuilder towards srcAddr.
+func decryptDM(t *testing.T, dstBuilder *session.Builder, srcAddr *protocol.SignalAddress, msg protocol.CiphertextMessage) []byte {
+	t.Helper()
+	ctx := context.Background()
+	cipher := session.NewCipher(dstBuilder, srcAddr)
+	switch m := msg.(type) {
+	case *protocol.PreKeySignalMessage:
+		plain, err := cipher.DecryptMessage(ctx, m)
+		if err != nil {
+			t.Fatalf("DecryptMessage(PreKey): %v", err)
+		}
+		return plain
+	default:
+		plain, err := cipher.Decrypt(ctx, m.(*protocol.SignalMessage))
+		if err != nil {
+			t.Fatalf("Decrypt(Signal): %v", err)
+		}
+		return plain
+	}
+}
+
+// swapBobSession replaces Bob's session for aliceAddr with one rebuilt from
+// the flat-round-tripped structure of his current session. It returns the
+// structure before the round-trip so callers can assert skipped-key counts.
+func swapBobSession(t *testing.T, bob *dmHarness, aliceAddr *protocol.SignalAddress) *record.SessionStructure {
+	t.Helper()
+	ctx := context.Background()
+
+	sess, err := bob.sessionStore.LoadSession(ctx, aliceAddr)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	structure := sess.Structure()
+
+	flat, ok := PackFlatSession(structure)
+	if !ok {
+		t.Fatal("PackFlatSession refused valid live session structure")
+	}
+	structure2, err := UnpackFlatSession(flat)
+	if err != nil {
+		t.Fatalf("UnpackFlatSession: %v", err)
+	}
+	if !reflect.DeepEqual(structure, structure2) {
+		t.Fatal("round-trip DeepEqual failed on live session structure")
+	}
+
+	rebuilt, err := record.NewSessionFromStructure(structure2, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
+	if err != nil {
+		t.Fatalf("NewSessionFromStructure: %v", err)
+	}
+	if err := bob.sessionStore.StoreSession(ctx, aliceAddr, rebuilt); err != nil {
+		t.Fatalf("StoreSession(rebuilt): %v", err)
+	}
+	return structure
+}
+
+// TestFlatSessionDecryptEquivalence proves that the flat codec is semantically
+// correct under real Double-Ratchet crypto:
+//
+//  1. First-message decrypt: Alice sends msg[0] → Bob receives it. Bob's session
+//     is round-tripped (Pack→Unpack→NewSessionFromStructure) BEFORE the decrypt.
+//     Decrypt from the rebuilt session must yield the original plaintext.
+//
+//  2. Ratchet-advance decrypt: after decrypting msg[0] from the rebuilt session,
+//     Alice sends msg[1]. Bob's (now-ratcheted) session is round-tripped again.
+//     Decrypt msg[1] from the re-rebuilt session must succeed.
+//
+//  3. Skipped-key path: Alice sends msgs 0..4. Bob decrypts msg[4] first (forces
+//     the ratchet forward and accumulates skipped keys for 0..3). Bob's session
+//     (with skipped keys) is round-tripped. Decrypting the still-skipped msg[0]
+//     from the rebuilt session must succeed — proving the skipped-key tail is
+//     preserved byte-exact through the codec.
+//
+// This test satisfies REQ-CODEC-05 (D-09 decrypt-equivalence gate).
+func TestFlatSessionDecryptEquivalence(t *testing.T) {
+	ctx := context.Background()
+
+	// -----------------------------------------------------------------------
+	// Sub-test 1: first-message decrypt from round-tripped session
+	// -----------------------------------------------------------------------
+	t.Run("first_message_decrypt", func(t *testing.T) {
+		alice := newDMHarness(t, "alice", 1)
+		bob := newDMHarness(t, "bob", 2)
+
+		// Alice establishes session towards Bob via X3DH.
+		aliceToBobBuilder := session.NewBuilder(
+			alice.sessionStore, alice.preKeyStore, alice.signedPreKeyStore,
+			alice.identityStore, bob.address, alice.serializer,
+		)
+		if err := aliceToBobBuilder.ProcessBundle(ctx, bobBundle(bob)); err != nil {
+			t.Fatalf("ProcessBundle: %v", err)
+		}
+		// Bob's builder (will receive messages from Alice).
+		bobFromAliceBuilder := session.NewBuilder(
+			bob.sessionStore, bob.preKeyStore, bob.signedPreKeyStore,
+			bob.identityStore, alice.address, bob.serializer,
+		)
+
+		plaintext := []byte("hello flat session codec")
+		msg0 := encryptDM(t, aliceToBobBuilder, bob.address, alice, plaintext)
+
+		// Swap Bob's session to the flat-round-tripped version BEFORE decrypt.
+		// At this point Bob has no session yet (it will be created by DecryptMessage).
+		// The first decrypt (PreKeySignalMessage) creates Bob's session from the
+		// prekey bundle — there is nothing to round-trip before it. So we decrypt
+		// first, then round-trip, then verify with msg1.
+		got0 := decryptDM(t, bobFromAliceBuilder, alice.address, msg0)
+		if string(got0) != string(plaintext) {
+			t.Fatalf("first decrypt: got %q, want %q", got0, plaintext)
+		}
+
+		// Now Bob has a session. Round-trip it.
+		swapBobSession(t, bob, alice.address)
+
+		// Send a second message — Bob must decrypt from the rebuilt session.
+		plaintext1 := []byte("second message after ratchet advance")
+		msg1 := encryptDM(t, aliceToBobBuilder, bob.address, alice, plaintext1)
+		got1 := decryptDM(t, bobFromAliceBuilder, alice.address, msg1)
+		if string(got1) != string(plaintext1) {
+			t.Fatalf("post-round-trip second message: got %q, want %q", got1, plaintext1)
+		}
+	})
+
+	// -----------------------------------------------------------------------
+	// Sub-test 2: ratchet-advance — capture session after first decrypt,
+	// round-trip it, then send three more messages verifying each.
+	// -----------------------------------------------------------------------
+	t.Run("ratchet_advance", func(t *testing.T) {
+		alice := newDMHarness(t, "alice-ra", 1)
+		bob := newDMHarness(t, "bob-ra", 2)
+
+		aliceToBobBuilder := session.NewBuilder(
+			alice.sessionStore, alice.preKeyStore, alice.signedPreKeyStore,
+			alice.identityStore, bob.address, alice.serializer,
+		)
+		if err := aliceToBobBuilder.ProcessBundle(ctx, bobBundle(bob)); err != nil {
+			t.Fatalf("ProcessBundle: %v", err)
+		}
+		bobFromAliceBuilder := session.NewBuilder(
+			bob.sessionStore, bob.preKeyStore, bob.signedPreKeyStore,
+			bob.identityStore, alice.address, bob.serializer,
+		)
+
+		// Establish the session (Bob processes Alice's first message).
+		msg0 := encryptDM(t, aliceToBobBuilder, bob.address, alice, []byte("setup"))
+		decryptDM(t, bobFromAliceBuilder, alice.address, msg0)
+
+		// Round-trip Bob's session after establishment.
+		swapBobSession(t, bob, alice.address)
+
+		// Decrypt three more messages, each advancing the ratchet, verifying
+		// the session survives repeated round-trips.
+		for i := 1; i <= 3; i++ {
+			plain := []byte("ratchet step message")
+			msg := encryptDM(t, aliceToBobBuilder, bob.address, alice, plain)
+			got := decryptDM(t, bobFromAliceBuilder, alice.address, msg)
+			if string(got) != string(plain) {
+				t.Fatalf("ratchet step %d: got %q want %q", i, got, plain)
+			}
+			// Round-trip after each step.
+			swapBobSession(t, bob, alice.address)
+		}
+	})
+
+	// -----------------------------------------------------------------------
+	// Sub-test 3: skipped-key path — Alice sends 5 messages; Bob decrypts the
+	// LAST one first (msg[4]), accumulating skipped keys for 0..3. Bob's session
+	// is round-tripped. Decrypting msg[0] from the rebuilt session must succeed.
+	// -----------------------------------------------------------------------
+	t.Run("skipped_keys_preserved", func(t *testing.T) {
+		alice := newDMHarness(t, "alice-sk", 1)
+		bob := newDMHarness(t, "bob-sk", 2)
+
+		aliceToBobBuilder := session.NewBuilder(
+			alice.sessionStore, alice.preKeyStore, alice.signedPreKeyStore,
+			alice.identityStore, bob.address, alice.serializer,
+		)
+		if err := aliceToBobBuilder.ProcessBundle(ctx, bobBundle(bob)); err != nil {
+			t.Fatalf("ProcessBundle: %v", err)
+		}
+		bobFromAliceBuilder := session.NewBuilder(
+			bob.sessionStore, bob.preKeyStore, bob.signedPreKeyStore,
+			bob.identityStore, alice.address, bob.serializer,
+		)
+
+		const nMsgs = 5
+		plaintexts := make([][]byte, nMsgs)
+		msgs := make([]protocol.CiphertextMessage, nMsgs)
+		for i := 0; i < nMsgs; i++ {
+			plaintexts[i] = []byte("skipped message " + string(rune('0'+i)))
+			msgs[i] = encryptDM(t, aliceToBobBuilder, bob.address, alice, plaintexts[i])
+		}
+
+		// Bob decrypts the LAST message first — this processes the PreKeySignalMessage
+		// (msg[0]) implicitly as part of the session bootstrap, but since the Signal
+		// protocol chain is ratcheted forward to the last message counter, keys 0..3
+		// are accumulated as skipped keys.
+		// Actually: msg[0] is a PreKeySignalMessage; subsequent msgs[1..4] are
+		// SignalMessages. Bob must first process msg[0] to initialise the session,
+		// then skip ahead by decrypting msg[4].
+		got0 := decryptDM(t, bobFromAliceBuilder, alice.address, msgs[0])
+		if string(got0) != string(plaintexts[0]) {
+			t.Fatalf("msg[0] decrypt: got %q want %q", got0, plaintexts[0])
+		}
+		// Now decrypt msg[4] — this advances the ratchet and accumulates skipped
+		// keys for counter positions 1, 2, 3 (msg[1], msg[2], msg[3]).
+		got4 := decryptDM(t, bobFromAliceBuilder, alice.address, msgs[4])
+		if string(got4) != string(plaintexts[4]) {
+			t.Fatalf("msg[4] decrypt: got %q want %q", got4, plaintexts[4])
+		}
+
+		// Verify skipped keys are present in Bob's session structure.
+		bobSess, err := bob.sessionStore.LoadSession(ctx, alice.address)
+		if err != nil {
+			t.Fatalf("LoadSession: %v", err)
+		}
+		structure := bobSess.Structure()
+		totalSkipped := 0
+		for _, rc := range structure.SessionState.ReceiverChains {
+			totalSkipped += len(rc.MessageKeys)
+		}
+		if totalSkipped == 0 {
+			t.Fatal("expected accumulated skipped keys after out-of-order decrypt — skipped-key test would prove nothing")
+		}
+		t.Logf("skipped keys accumulated: %d", totalSkipped)
+
+		// Round-trip Bob's session (with skipped keys).
+		swapBobSession(t, bob, alice.address)
+
+		// Decrypt the skipped messages from the rebuilt session — keys must be intact.
+		got1 := decryptDM(t, bobFromAliceBuilder, alice.address, msgs[1])
+		if string(got1) != string(plaintexts[1]) {
+			t.Fatalf("skipped msg[1] from rebuilt session: got %q want %q", got1, plaintexts[1])
+		}
+		got2 := decryptDM(t, bobFromAliceBuilder, alice.address, msgs[2])
+		if string(got2) != string(plaintexts[2]) {
+			t.Fatalf("skipped msg[2] from rebuilt session: got %q want %q", got2, plaintexts[2])
+		}
+		got3 := decryptDM(t, bobFromAliceBuilder, alice.address, msgs[3])
+		if string(got3) != string(plaintexts[3]) {
+			t.Fatalf("skipped msg[3] from rebuilt session: got %q want %q", got3, plaintexts[3])
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// REQ-CODEC-06: TestFlatSessionProdFixtures
+//
+// Validates the flat codec against real prod-sampled session blobs:
+// fat-tail (2000-key chains), median, and random sessions.
+//
+// This test is skip-guarded when no fixtures are present (prodSessionFixtures
+// is nil). Fixtures are NOT committed to git (live DM crypto material — T-17.13-05).
+//
+// To activate: see 17.13-02-PLAN.md Task 2 checkpoint for the fixture
+// extraction SQL and the operator steps to populate prodSessionFixtures.
+//
+// Once populated, run:
+//
+//	go test -run TestFlatSessionProdFixtures ./store/ -v
+//
+// Expected output: all fixtures pass reflect.DeepEqual. Any failure indicates
+// a lossless round-trip bug in the codec for that session shape.
+// ---------------------------------------------------------------------------
+
+// prodSessionFixtures holds real prod-sampled session blobs in their original
+// JSON (or flat) encoding. Each entry is a raw []byte as read from the
+// whatsmeow_sessions.session column.
+//
+// IMPORTANT: do NOT commit populated values of this variable. After completing
+// the prod-fixture verification, remove the blobs and commit only the empty
+// slice. (T-17.13-05 — fixture blobs are opaque DM crypto material.)
+var prodSessionFixtures [][]byte // populated by operator: see Task 2 checkpoint
+
+func TestFlatSessionProdFixtures(t *testing.T) {
+	if len(prodSessionFixtures) == 0 {
+		t.Skip("no prod fixtures — run Task 2 checkpoint to populate prodSessionFixtures")
+	}
+
+	passed := 0
+	failed := 0
+	for i, blob := range prodSessionFixtures {
+		// Decode the blob using the same serializer as the live driver.
+		// prod blobs are JSON (byte[0] == 0x7B); after Stage 1 deploy some may
+		// already be flat (byte[0] == 0x01). Handle both.
+		var structure *record.SessionStructure
+		var decodeErr error
+		if len(blob) > 0 && blob[0] == flatSessionMagic {
+			structure, decodeErr = UnpackFlatSession(blob)
+		} else {
+			structure, decodeErr = SignalProtobufSerializer.Session.Deserialize(blob)
+		}
+		if decodeErr != nil {
+			t.Errorf("fixture[%d]: decode error: %v", i, decodeErr)
+			failed++
+			continue
+		}
+
+		// Pack the decoded structure to flat bytes.
+		flat, ok := PackFlatSession(structure)
+		if !ok {
+			t.Errorf("fixture[%d]: PackFlatSession refused structure (possible prod edge case)", i)
+			failed++
+			continue
+		}
+
+		// Unpack back to structure2 and assert byte-exact round-trip.
+		structure2, err := UnpackFlatSession(flat)
+		if err != nil {
+			t.Errorf("fixture[%d]: UnpackFlatSession error: %v", i, err)
+			failed++
+			continue
+		}
+
+		if !reflect.DeepEqual(structure, structure2) {
+			// Log details to help diagnose the mismatch.
+			t.Errorf("fixture[%d]: reflect.DeepEqual mismatch after pack→unpack", i)
+			t.Logf("  original PreviousStates count: %d", len(structure.PreviousStates))
+			if structure.SessionState != nil {
+				t.Logf("  original ReceiverChains count: %d", len(structure.SessionState.ReceiverChains))
+				t.Logf("  original SenderChain MessageKeys: %d", len(structure.SessionState.SenderChain.MessageKeys))
+				t.Logf("  original PendingPreKey: %v", structure.SessionState.PendingPreKey != nil)
+				t.Logf("  original PendingKeyExchange: %v", structure.SessionState.PendingKeyExchange != nil)
+			}
+			failed++
+			continue
+		}
+		passed++
+	}
+
+	t.Logf("prod fixtures: %d passed, %d failed (total %d)", passed, failed, len(prodSessionFixtures))
+	if failed > 0 {
+		t.Fatalf("%d fixture(s) failed reflect.DeepEqual — codec has lossless round-trip bug(s)", failed)
+	}
 }
