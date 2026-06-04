@@ -14,11 +14,6 @@
 //                                    PutSenderKeyStructure, taken only when PackFlat
 //                                    returns (nil, false) on a 0-state structure
 //                                    (should not occur in production; safety net path).
-//   ALLOW-JSON-DRAIN-BLOB-SESSION — Stage 1-2 safety net: refuse-to-encode JSON drain
-//                                    fallback in StoreSession; JSON legacy read in
-//                                    LoadSession. Stage 3 closes both paths after
-//                                    backfill confirms zero JSON rows.
-//
 // Phase 17.11-05 change: ALLOW-JSON-LEGACY-READ removed. The getSenderKeyDecomposed
 // dual-read path (fmt_ver=1/NULL Deserialize) was deleted along with the columnar
 // columns in this plan. GetSenderKeyStructure now uses store.UnpackFlat(blob) only.
@@ -26,7 +21,7 @@
 // store.go (migration tool compat only; not on any live driver read path).
 //
 // Phase 17.13 change: session functions (StoreSession, LoadSession) added to the
-// gate. ALLOW-JSON-DRAIN-BLOB-SESSION marker added for the Stage 1-2 transition.
+// gate. Stage 3: JSON session paths permanently closed; no drain markers remain.
 // Session exemption comment removed.
 //
 // Why .Serialize()/.Deserialize( rather than json.Marshal/Unmarshal:
@@ -105,12 +100,10 @@ var jsonCallPatterns = []string{
 // ALLOW-JSON-DRAIN-BLOB: Serialize fallback in PutSenderKeyStructure when PackFlat fails.
 // ALLOW-JSON-LEGACY-READ: Serialize/Deserialize in store/signal.go for non-columnar store
 //   fallback (non-production path: fires only when CachedSenderKeyStore is not wired).
-// ALLOW-JSON-DRAIN-BLOB-SESSION: Stage 1-2 safety net in StoreSession/LoadSession;
-//   Stage 3 closes both paths after backfill confirms zero JSON rows.
+// Stage 3: JSON session drain markers removed — session paths permanently flat-only.
 var allowMarkers = []string{
 	"ALLOW-JSON-DRAIN-BLOB",
 	"ALLOW-JSON-LEGACY-READ",
-	"ALLOW-JSON-DRAIN-BLOB-SESSION", // Stage 1-2: JSON drain fallback in StoreSession; JSON legacy read in LoadSession
 }
 
 // TestNoJSONOnSenderKeyPath asserts zero .Serialize()/.Deserialize( calls on
@@ -134,9 +127,8 @@ func TestNoJSONOnSenderKeyPath(t *testing.T) {
 
 	var violations []string
 	markerFound := map[string]bool{
-		"ALLOW-JSON-DRAIN-BLOB":         false,
-		"ALLOW-JSON-LEGACY-READ":        false, // still present in store/signal.go non-columnar fallback
-		"ALLOW-JSON-DRAIN-BLOB-SESSION": false, // Stage 1-2: JSON paths in StoreSession/LoadSession
+		"ALLOW-JSON-DRAIN-BLOB":  false,
+		"ALLOW-JSON-LEGACY-READ": false, // still present in store/signal.go non-columnar fallback
 	}
 
 	// Scan the whole-file entries.
