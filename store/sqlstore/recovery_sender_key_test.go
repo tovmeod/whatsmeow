@@ -1,12 +1,12 @@
-// Copyright (c) 2026 Kavtov Platform (Phase 17.9)
+// Copyright (c) 2026 Kavtov Platform (Phase 17.9 / Phase 17.11)
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// recovery_sender_key_test.go — TestRecoverSenderKeyCrossAccount
+// recovery_sender_key_test.go — TestRecoverSenderKeyCrossAccount + TestRecoveryScanQueryFlat
 //
-// Verifies the cross-account sender-key recovery (plan 05):
+// TestRecoverSenderKeyCrossAccount verifies cross-account sender-key recovery (plan 05):
 //
 //  1. fmt_ver=2 donor arm: seed account A with a columnar row, recover into B.
 //  2. fmt_ver=1 legacy-blob donor arm: seed account A with a legacy blob row,
@@ -16,10 +16,19 @@
 //  5. Copy correctness: the recovered row under B is fmt_ver=2 with the correct
 //     recipient-independent fields (signing keys + chain key/iter). No NULL-blob.
 //
+// TestRecoveryScanQueryFlat (Phase 17.11 plan 05) verifies the flat two-path donor scan:
+//
+//  1. Fast-path arm: single-state donor whose state[0].KeyID == targetKeyID → sk_keyid0
+//     index scan finds it; UnpackFlat returns correct KeyID/Iteration.
+//  2. Fallback arm: multi-state donor whose targetKeyID is in state[1] only → fast path
+//     returns no donor (sk_keyid0 = state[0] mismatch); LIKE-only fallback scans all states
+//     and finds it; UnpackFlat returns correct KeyID/Iteration.
+//  3. Both arms are DB-backed — SKIP means the test PG is unreachable (GATE FAILURE).
+//
 // All arms use a donor device suffix DIFFERENT from the recovering account's
 // target sender_id to verify the device-tolerant (bare-user LIKE) behavior.
 //
-// Requires: a live Postgres DB at the test DSN (setup-test-db.sh applied schema).
+// Requires: a live Postgres DB at the test DSN (setup-test-db.sh applied schema + upgrade 19).
 // Skips cleanly when the DB is not reachable.
 
 package sqlstore_test
@@ -36,6 +45,7 @@ import (
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
 
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -512,5 +522,331 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 			t.Error("wrong-key-id arm: expected false (donor keyID=99 ≠ target 42), got true")
 		}
 		t.Logf("wrong-key-id arm: PASS — keyID mismatch → no recovery")
+	})
+}
+
+// -----------------------------------------------------------------------
+// TestRecoveryScanQueryFlat — Phase 17.11 plan 05 flat two-path scan gate
+// -----------------------------------------------------------------------
+//
+// BLOCKING gate (must be --- PASS, never --- SKIP, when the test DB is reachable):
+//
+//  Arm 1 — fast path: single-state donor, state[0].KeyID == targetKeyID.
+//    recoveryScanQueryFast (chat_id + sk_keyid0=$targetKeyID + LIKE) finds the donor.
+//    UnpackFlat returns correct KeyID and Iteration.
+//
+//  Arm 2 — fallback path: two-state donor, targetKeyID is in state[1] only.
+//    recoveryScanQueryFast misses (sk_keyid0 = state[0].KeyID ≠ targetKeyID).
+//    recoveryScanQuery (LIKE-only, all states) finds the donor in state[1].
+//    UnpackFlat returns correct KeyID and Iteration.
+//
+// Both arms insert flat PackFlat blobs directly via SQL (not via the columnar
+// PutManySenderKeys path — the columnar columns no longer exist after upgrade 19).
+// The test is DB-backed; any SKIP is a gate failure.
+func TestRecoveryScanQueryFlat(t *testing.T) {
+	ctx := context.Background()
+
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	// Verify upgrade 19 has been applied (sk_keyid0 column must exist).
+	var hasFlatSchema bool
+	err = db.QueryRowContext(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name='whatsmeow_sender_keys' AND column_name='sk_keyid0'
+		)`,
+	).Scan(&hasFlatSchema)
+	if err != nil {
+		db.Close()
+		t.Fatalf("schema check: %v", err)
+	}
+	if !hasFlatSchema {
+		db.Close()
+		t.Skip("upgrade 19 not applied to test DB — run setup-test-db.sh with upgrade 19 first")
+	}
+
+	// Two JIDs for flat scan test (separate from cross-account test JIDs).
+	const (
+		flatTestJIDA = "17799990011@s.whatsapp.net"
+		flatTestJIDB = "17799990012@s.whatsapp.net"
+	)
+
+	// Insert both test device rows.
+	cleanupA := insertRecoveryTestDevice(t, db, flatTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, flatTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		flatGroup    = "recovtest_flat@g.us"
+		flatBareUser = "55599871234_2"
+	)
+
+	// buildFlatDonorStructure creates a multi-state structure where:
+	//   state[0].KeyID = state0KeyID, state[1].KeyID = state1KeyID
+	// This lets us test the two-path scan: fast path filters by sk_keyid0 (state[0])
+	// while targetKeyID in state[1] only is found by the fallback LIKE-only path.
+	buildFlatDonorStructure := func(state0KeyID, state1KeyID uint32, iter0, iter1 uint32, tag byte) *groupRecord.SenderKeyStructure {
+		makeChainKey := func(base byte) []byte {
+			ck := make([]byte, 32)
+			for i := range ck {
+				ck[i] = base + byte(i)
+			}
+			return ck
+		}
+		makePub := func(base byte) []byte {
+			p := make([]byte, 33)
+			p[0] = 0x05
+			for i := 1; i < 33; i++ {
+				p[i] = base + byte(i)
+			}
+			return p
+		}
+		makePriv := func(base byte) []byte {
+			p := make([]byte, 32)
+			for i := range p {
+				p[i] = base + 0x80 + byte(i)
+			}
+			return p
+		}
+		states := []*groupRecord.SenderKeyStateStructure{
+			{
+				KeyID: state0KeyID,
+				SenderChainKey: &ratchet.SenderChainKeyStructure{
+					Iteration: iter0,
+					ChainKey:  makeChainKey(tag),
+				},
+				SigningKeyPublic:  makePub(tag),
+				SigningKeyPrivate: makePriv(tag),
+			},
+		}
+		if state1KeyID != 0 {
+			states = append(states, &groupRecord.SenderKeyStateStructure{
+				KeyID: state1KeyID,
+				SenderChainKey: &ratchet.SenderChainKeyStructure{
+					Iteration: iter1,
+					ChainKey:  makeChainKey(tag + 0x10),
+				},
+				SigningKeyPublic:  makePub(tag + 0x10),
+				SigningKeyPrivate: makePriv(tag + 0x10),
+			})
+		}
+		return &groupRecord.SenderKeyStructure{SenderKeyStates: states}
+	}
+
+	// insertFlatRow inserts a PackFlat blob directly via SQL, bypassing the
+	// columnar PutManySenderKeys path (which no longer exists in flat schema).
+	insertFlatRow := func(t *testing.T, ourJID, senderID string, s *groupRecord.SenderKeyStructure) {
+		t.Helper()
+		packed, ok := store.PackFlat(s)
+		if !ok {
+			t.Fatalf("PackFlat failed for %s", senderID)
+		}
+		_, err := db.ExecContext(ctx,
+			`INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
+			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key`,
+			ourJID, flatGroup, senderID, packed,
+		)
+		if err != nil {
+			t.Fatalf("insertFlatRow %s: %v", senderID, err)
+		}
+	}
+
+	// Arm 1 — fast path: single-state donor, state[0].KeyID=77, iter=15.
+	// RecoverSenderKey with targetKeyID=77, targetIter=20 should find this donor
+	// via the fast path (sk_keyid0 = 77 = targetKeyID).
+	t.Run("fast_path_single_state", func(t *testing.T) {
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+			flatTestJIDA, flatTestJIDB, flatGroup)
+
+		const (
+			fastTargetKeyID = uint32(77)
+			fastTargetIter  = uint32(20)
+			fastDonorIter   = uint32(15)
+		)
+
+		// Single-state donor: state[0].KeyID=77, iter=15.
+		donorStruct := buildFlatDonorStructure(fastTargetKeyID, 0, fastDonorIter, 0, 0xAA)
+		donorSenderID := flatBareUser + ":3"
+		insertFlatRow(t, flatTestJIDA, donorSenderID, donorStruct)
+
+		// Recover into B: targetKeyID=77, targetIter=20 (donor=15 ≤ 20 → accepted).
+		flatJIDB, _ := types.ParseJID(flatTestJIDB)
+		containerB := sqlstore.NewWithDB(db, "postgres", nil)
+		innerB := sqlstore.NewSQLStore(containerB, flatJIDB)
+		byteCache, _ := lru.New[string, []byte](256)
+		devCache, _ := lru.New[string, []string](256)
+		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache)
+
+		targetSenderID := flatBareUser + ":0"
+		ok, err := csB.RecoverSenderKey(ctx, flatGroup, targetSenderID, flatBareUser, fastTargetKeyID, fastTargetIter)
+		if err != nil {
+			t.Fatalf("fast-path arm: RecoverSenderKey: %v", err)
+		}
+		if !ok {
+			t.Fatal("fast-path arm: expected true (donor found via sk_keyid0 fast path), got false")
+		}
+
+		// Verify: UnpackFlat on the recovered row returns correct KeyID + Iteration.
+		var blob []byte
+		err = db.QueryRowContext(ctx,
+			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			flatTestJIDB, flatGroup, targetSenderID,
+		).Scan(&blob)
+		if err != nil || blob == nil {
+			t.Fatalf("fast-path arm: read recovered sender_key: err=%v blob=%v", err, blob)
+		}
+		unpacked, uErr := store.UnpackFlat(blob)
+		if uErr != nil {
+			t.Fatalf("fast-path arm: UnpackFlat: %v", uErr)
+		}
+		if len(unpacked.SenderKeyStates) == 0 {
+			t.Fatal("fast-path arm: UnpackFlat returned 0 states")
+		}
+		gotSt := unpacked.SenderKeyStates[0]
+		if gotSt.KeyID != fastTargetKeyID {
+			t.Errorf("fast-path arm: KeyID want %d got %d", fastTargetKeyID, gotSt.KeyID)
+		}
+		if gotSt.SenderChainKey.Iteration != fastDonorIter {
+			t.Errorf("fast-path arm: Iteration want %d got %d", fastDonorIter, gotSt.SenderChainKey.Iteration)
+		}
+
+		// Verify the ChainKey matches the donor's state[0] chain key.
+		donorState0 := donorStruct.SenderKeyStates[0]
+		if !bytes.Equal(gotSt.SenderChainKey.ChainKey, donorState0.SenderChainKey.ChainKey) {
+			t.Errorf("fast-path arm: ChainKey mismatch:\n  donor: %x\n  got:   %x",
+				donorState0.SenderChainKey.ChainKey, gotSt.SenderChainKey.ChainKey)
+		}
+		t.Logf("fast-path arm: PASS — sk_keyid0 fast path found donor keyID=%d iter=%d", gotSt.KeyID, gotSt.SenderChainKey.Iteration)
+	})
+
+	// Arm 2 — fallback path: two-state donor, targetKeyID is in state[1] only.
+	// The fast path (sk_keyid0 = state[0].KeyID = 88) misses targetKeyID=99.
+	// The LIKE-only fallback scans all states and finds targetKeyID=99 in state[1].
+	t.Run("fallback_path_state1_only", func(t *testing.T) {
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+			flatTestJIDA, flatTestJIDB, flatGroup)
+
+		const (
+			state0KeyID     = uint32(88) // state[0] — does NOT match targetKeyID
+			fallbackTarget  = uint32(99) // state[1] — DOES match targetKeyID
+			state0Iter      = uint32(5)
+			state1Iter      = uint32(12)
+			fallbackTargetIter = uint32(20) // targetIter > both donors → accepted
+		)
+
+		// Two-state donor: state[0].KeyID=88 (fast-path miss), state[1].KeyID=99 (fallback hit).
+		donorStruct := buildFlatDonorStructure(state0KeyID, fallbackTarget, state0Iter, state1Iter, 0xBB)
+		donorSenderID := flatBareUser + ":4"
+		insertFlatRow(t, flatTestJIDA, donorSenderID, donorStruct)
+
+		// Recover into B: targetKeyID=99, targetIter=20.
+		// Fast path: sk_keyid0 = state[0].KeyID = 88 ≠ 99 → no fast-path donor.
+		// Fallback: LIKE scan finds the row, Go decodes both states, finds keyID=99 in state[1].
+		flatJIDB, _ := types.ParseJID(flatTestJIDB)
+		containerB := sqlstore.NewWithDB(db, "postgres", nil)
+		innerB := sqlstore.NewSQLStore(containerB, flatJIDB)
+		byteCache, _ := lru.New[string, []byte](256)
+		devCache, _ := lru.New[string, []string](256)
+		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache)
+
+		targetSenderID := flatBareUser + ":0"
+		ok, err := csB.RecoverSenderKey(ctx, flatGroup, targetSenderID, flatBareUser, fallbackTarget, fallbackTargetIter)
+		if err != nil {
+			t.Fatalf("fallback-path arm: RecoverSenderKey: %v", err)
+		}
+		if !ok {
+			t.Fatal("fallback-path arm: expected true (donor found via LIKE fallback scan), got false")
+		}
+
+		// Verify the recovered row: UnpackFlat should return a structure with
+		// KeyID=99 (the matching state from state[1]) and Iteration=12.
+		var blob []byte
+		err = db.QueryRowContext(ctx,
+			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			flatTestJIDB, flatGroup, targetSenderID,
+		).Scan(&blob)
+		if err != nil || blob == nil {
+			t.Fatalf("fallback-path arm: read recovered sender_key: err=%v blob=%v", err, blob)
+		}
+		unpacked, uErr := store.UnpackFlat(blob)
+		if uErr != nil {
+			t.Fatalf("fallback-path arm: UnpackFlat: %v", uErr)
+		}
+		if len(unpacked.SenderKeyStates) == 0 {
+			t.Fatal("fallback-path arm: UnpackFlat returned 0 states")
+		}
+		gotSt := unpacked.SenderKeyStates[0]
+		if gotSt.KeyID != fallbackTarget {
+			t.Errorf("fallback-path arm: KeyID want %d got %d", fallbackTarget, gotSt.KeyID)
+		}
+		if gotSt.SenderChainKey.Iteration != state1Iter {
+			t.Errorf("fallback-path arm: Iteration want %d got %d", state1Iter, gotSt.SenderChainKey.Iteration)
+		}
+
+		// Verify ChainKey belongs to state[1] (tag=0xBB+0x10=0xCB).
+		donorState1 := donorStruct.SenderKeyStates[1]
+		if !bytes.Equal(gotSt.SenderChainKey.ChainKey, donorState1.SenderChainKey.ChainKey) {
+			t.Errorf("fallback-path arm: ChainKey mismatch (expected state[1] chain key):\n  donor state[1]: %x\n  got:            %x",
+				donorState1.SenderChainKey.ChainKey, gotSt.SenderChainKey.ChainKey)
+		}
+		t.Logf("fallback-path arm: PASS — LIKE fallback found keyID=%d in state[1], recovered iter=%d", gotSt.KeyID, gotSt.SenderChainKey.Iteration)
+	})
+
+	// Arm 3 — round-trip: insert flat blob, verify UnpackFlat returns correct structure.
+	// This verifies the flat codec (PackFlat/UnpackFlat) end-to-end at the DB level.
+	t.Run("flat_round_trip", func(t *testing.T) {
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+			flatTestJIDA, flatTestJIDB, flatGroup)
+
+		const (
+			rtKeyID = uint32(55)
+			rtIter  = uint32(7)
+		)
+		rtStruct := buildFlatDonorStructure(rtKeyID, 0, rtIter, 0, 0xDD)
+		senderID := flatBareUser + ":6"
+		insertFlatRow(t, flatTestJIDA, senderID, rtStruct)
+
+		var blob []byte
+		err := db.QueryRowContext(ctx,
+			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			flatTestJIDA, flatGroup, senderID,
+		).Scan(&blob)
+		if err != nil || blob == nil {
+			t.Fatalf("round-trip: read sender_key: err=%v blob=%v", err, blob)
+		}
+
+		unpacked, uErr := store.UnpackFlat(blob)
+		if uErr != nil {
+			t.Fatalf("round-trip: UnpackFlat: %v", uErr)
+		}
+
+		// Normalize and DeepEqual
+		normState := func(s *groupRecord.SenderKeyStructure) *groupRecord.SenderKeyStructure {
+			for _, st := range s.SenderKeyStates {
+				if st.Keys == nil {
+					st.Keys = nil // nil stays nil
+				}
+			}
+			return s
+		}
+		if !reflect.DeepEqual(normState(rtStruct), normState(unpacked)) {
+			t.Errorf("round-trip: DeepEqual failed\n  orig:     %+v\n  unpacked: %+v", rtStruct, unpacked)
+		}
+		t.Logf("round-trip: PASS — PackFlat/UnpackFlat round-trip at DB level, keyID=%d iter=%d", rtKeyID, rtIter)
 	})
 }
