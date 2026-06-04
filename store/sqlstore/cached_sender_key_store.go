@@ -18,14 +18,13 @@ import (
 	"go.mau.fi/whatsmeow/store"
 )
 
-// senderKeyDecomposedReader is the local interface that *SQLStore satisfies to
-// provide the fmt_ver-branching columnar read path (getSenderKeyDecomposed).
-// Using a local interface avoids exposing getSenderKeyDecomposed as a public
-// method while enabling the cache layer to type-assert and call it without
-// importing sqlstore internals from package store. The getSenderKeyDecomposed
-// method is unexported; only sqlstore-internal callers use this interface.
-type senderKeyDecomposedReader interface {
-	getSenderKeyDecomposed(ctx context.Context, group, user string) (cols *senderKeyColumns, legacyBlob []byte, err error)
+// senderKeyFlatReader is the local interface that *SQLStore satisfies to
+// provide the flat read path (GetSenderKeyFlat). Using a local interface avoids
+// exposing GetSenderKeyFlat as part of the upstream store.SenderKeyStore while
+// enabling the cache layer to type-assert and call it without importing sqlstore
+// internals from package store.
+type senderKeyFlatReader interface {
+	GetSenderKeyFlat(ctx context.Context, group, user string) ([]byte, error)
 }
 
 // CachedSenderKeyStore wraps an inner store.SenderKeyStore with a
@@ -140,56 +139,18 @@ func (c *CachedSenderKeyStore) Purge() {
 	c.cache.Purge()
 }
 
-// deepCopyCols returns a new *senderKeyColumns with all byte-slice payloads
-// copied (the spine int64/int32 slices are already fresh from decompose;
-// only the [][]byte fields alias the libsignal structure's backing arrays).
-// Called before Enqueue to ensure the async flusher holds its own copies.
-func deepCopyCols(c *senderKeyColumns) *senderKeyColumns {
-	if c == nil {
-		return nil
-	}
-	cp := &senderKeyColumns{
-		fmtVer:              c.fmtVer,
-		stKeyID:             c.stKeyID,             // int64 — value types; fresh from decompose
-		stChainKeyIteration: c.stChainKeyIteration, // int64 — value types; fresh from decompose
-	}
-	cp.stChainKey = deepCopyByteSlices(c.stChainKey)
-	cp.stSigningKeyPublic = deepCopyByteSlices(c.stSigningKeyPublic)
-	cp.stSigningKeyPrivate = deepCopyByteSlices(c.stSigningKeyPrivate) // nil elements preserved
-	cp.smkStateIdx = c.smkStateIdx                                     // int32 — value types; fresh from decompose
-	cp.smkIteration = c.smkIteration                                   // int64 — value types; fresh from decompose
-	cp.smkIV = deepCopyByteSlices(c.smkIV)
-	cp.smkCipherKey = deepCopyByteSlices(c.smkCipherKey)
-	cp.smkSeed = deepCopyByteSlices(c.smkSeed)
-	return cp
-}
-
-// deepCopyByteSlices copies the outer slice and copies the bytes of each
-// non-nil inner slice. nil elements are preserved as nil (needed for
-// stSigningKeyPrivate where nil = received key / no private key present).
-func deepCopyByteSlices(ss [][]byte) [][]byte {
-	if ss == nil {
-		return nil
-	}
-	out := make([][]byte, len(ss))
-	for i, b := range ss {
-		out[i] = copyBytes(b) // copyBytes returns nil when b is nil
-	}
-	return out
-}
-
-// extractSenderKeyMeta reads the current KeyID and SenderChainKey.Iteration
-// from a *senderKeyColumns DTO (the decomposed columnar form). Returns (0, 0)
-// on 0-state / nil input — the len==0 guard matches the old JSON parse path's
-// "empty SenderKeyStates" behavior (plan 02 note: JSON parse path removed).
-//
-// SenderKeyStates[0] is the most-recent state (libsignal prepends on
-// AddSenderKeyState), corresponding to stKeyID[0] / stChainKeyIteration[0].
-func extractSenderKeyMeta(cols *senderKeyColumns) (keyID, iteration uint32) {
-	if cols == nil || len(cols.stKeyID) == 0 {
+// extractStructMeta reads the current KeyID and SenderChainKey.Iteration
+// from a *SenderKeyStructure. Returns (0, 0) on nil or 0-state input.
+// SenderKeyStates[0] is the most-recent state (libsignal prepends on AddSenderKeyState).
+func extractStructMeta(s *groupRecord.SenderKeyStructure) (keyID, iteration uint32) {
+	if s == nil || len(s.SenderKeyStates) == 0 || s.SenderKeyStates[0] == nil {
 		return 0, 0
 	}
-	return uint32(cols.stKeyID[0]), uint32(cols.stChainKeyIteration[0])
+	st := s.SenderKeyStates[0]
+	if st.SenderChainKey == nil {
+		return st.KeyID, 0
+	}
+	return st.KeyID, st.SenderChainKey.Iteration
 }
 
 // ---------------------------------------------------------------------------
@@ -222,45 +183,33 @@ func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user str
 }
 
 // GetSenderKeyStructure implements store.SenderKeyColumnarStore. It reads the
-// sender-key in its decomposed columnar form, branching strictly on fmt_ver
-// (T-17.9-12 discriminator guard):
-//
-//	fmt_ver=2  → recompose from columns (NEVER reads sender_key blob)
-//	fmt_ver=1/NULL → Deserialize the legacy sender_key blob
-//	absent row → returns (nil, nil) so LoadSenderKey builds an empty record
+// flat sender_key bytea and decodes it with store.UnpackFlat. Post-upgrade-19
+// all rows carry a PackFlat blob; absent rows return (nil, nil) so LoadSenderKey
+// builds an empty record.
 //
 // The returned *SenderKeyStructure is READ-ONLY. The caller calls
 // NewSenderKeyFromStruct to obtain a live *SenderKey record.
 func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group, user string) (*groupRecord.SenderKeyStructure, error) {
-	r, ok := c.inner.(senderKeyDecomposedReader)
+	r, ok := c.inner.(senderKeyFlatReader)
 	if !ok {
-		// inner does not implement the columnar reader (test stub / pre-wiring).
+		// inner does not implement the flat reader (test stub / pre-wiring).
 		// Fall back to the legacy []byte path.
 		blob, err := c.inner.GetSenderKey(ctx, group, user)
 		if err != nil || blob == nil {
 			return nil, err
 		}
-		return store.SignalProtobufSerializer.SenderKeyRecord.Deserialize(blob) // ALLOW-JSON-LEGACY-READ
+		return store.UnpackFlat(blob)
 	}
 
-	cols, legacyBlob, err := r.getSenderKeyDecomposed(ctx, group, user)
+	blob, err := r.GetSenderKeyFlat(ctx, group, user)
 	if err != nil {
 		return nil, err
 	}
-
-	if cols != nil {
-		// fmt_ver=2: recompose from columns. The sender_key blob is NOT read
-		// (it was not selected in the fmt_ver=2 branch of getSenderKeyDecomposed).
-		return recompose(cols), nil
-	}
-
-	if legacyBlob == nil {
+	if blob == nil {
 		// Absent row: no error, caller builds an empty record.
 		return nil, nil
 	}
-
-	// fmt_ver=1/NULL: Deserialize the legacy blob.
-	return store.SignalProtobufSerializer.SenderKeyRecord.Deserialize(legacyBlob) // ALLOW-JSON-LEGACY-READ
+	return store.UnpackFlat(blob)
 }
 
 func (c *CachedSenderKeyStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
@@ -315,55 +264,44 @@ func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, 
 }
 
 // PutSenderKeyStructure implements store.SenderKeyColumnarStore. This is the
-// production columnar write path for fmt_ver=2 rows.
+// production flat write path (post-upgrade-19).
 //
-// It decomposes the libsignal *SenderKeyStructure into typed columns (no JSON),
-// derives keyID/iter from the DTO (len==0 guard: 0-state → (0,0)), and enqueues
+// It encodes the libsignal *SenderKeyStructure into a PackFlat bytea (no JSON,
+// no columnar columns), derives keyID/iter from the structure, and enqueues
 // to the write-back flusher. If the flusher is nil (pre-wiring / test scenarios),
-// it falls through to a synchronous PutManySenderKeys write instead (write-through
-// fallback that preserves the fmt_ver=2 column path).
+// it falls through to a synchronous PutManySenderKeys write instead.
 //
-// PARSED-CACHE-REPLACE-PLAN04: plan 04 Task 3 will wire a SetParsedReplace
-// callback here to atomically replace the parsed struct cache entry with the
-// in-hand structure at the point below where decompose + Enqueue complete. This
-// must be a REPLACE (not invalidate) because GetSenderKeyStructure reads DB
-// columns that the async flusher has not yet drained. The replace is a cache
-// write (not a DB write) — not a divergent write.
+// T-17.9-10 guard: PackFlat does not call Serialize() or any JSON path.
+// T-17.9-16 REPLACE-on-write coherence: parsedReplace fires with the in-hand
+// structure so LoadSenderKey returns the fresh key before the flusher drains.
 func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group, user string, s *groupRecord.SenderKeyStructure) error {
-	cols := decompose(s)
+	// Encode to flat binary. PackFlat makes its own copies of all byte fields,
+	// so the blob is disjoint from the libsignal structure's backing arrays.
+	blob, ok := store.PackFlat(s)
+	if !ok {
+		// 0-state or invalid structure — fall back to legacy PutSenderKey (safety net).
+		sk, _ := groupRecord.NewSenderKeyFromStruct(s,
+			store.SignalProtobufSerializer.SenderKeyRecord,
+			store.SignalProtobufSerializer.SenderKeyState)
+		var legacyBlob []byte
+		if sk != nil {
+			legacyBlob = sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
+		}
+		return c.inner.PutSenderKey(ctx, group, user, legacyBlob)
+	}
 
-	// Deep-copy byte payloads before handing the DTO to the async flusher.
-	// decompose() allocates fresh spine arrays (stKeyID, stChainKeyIteration)
-	// but the byte-slice payloads (stChainKey[i], stSigningKeyPublic[i], etc.)
-	// are slice-header aliases into the libsignal SenderKeyState's backing arrays.
-	// If the Signal ratchet mutates those backing arrays in place before the async
-	// drain fires, the flusher's DTO would hold post-advance bytes with pre-advance
-	// keyID/iter scalars — a divergence that T-17.9-07 exists to prevent. Copying
-	// here is cheap (≤5 states, small []byte, noscan — no GC concern).
-	colsCopy := deepCopyCols(cols)
-
-	// Derive keyID/iter from the DTO. Guard the 0-state shape so len==0 → (0,0)
-	// (mirroring the old extractSenderKeyMeta len==0 → (0,0) behavior; avoids panic).
-	keyID, iter := extractSenderKeyMeta(colsCopy)
+	// Derive keyID/iter from the structure (0-state → (0,0)).
+	keyID, iter := extractStructMeta(s)
 
 	if c.flusher != nil {
-		// Write-back: enqueue DTO to flusher (dedup + batched async drain).
-		// DO NOT call c.cache.Add with a serialized blob — that would call
-		// NewSenderKeyFromStruct(...).Serialize() = libsignal-internal JSON on
-		// every message, invisible to the no-JSON grep-gate (T-17.9-10 guard).
-		c.flusher.Enqueue(group, user, colsCopy, keyID, iter, false)
+		// Write-back: enqueue flat blob to flusher (dedup + batched async drain).
+		c.flusher.Enqueue(group, user, blob, keyID, iter, false)
 
-		// Phase 17.9 Task 3: REPLACE-on-write coherence.
-		// GetSenderKeyStructure reads DB columns that the async flusher has NOT yet
-		// drained. An invalidate-then-Load would therefore miss the cache, read
-		// pre-drain (nil) columns, and silently return the wrong / empty key —
-		// the silent-decrypt-failure class this phase forbids (T-17.9-16).
-		// REPLACE with recompose(colsCopy): colsCopy is already deep-copied (disjoint
-		// from libsignal backing arrays); recompose produces the byte-identical
-		// structure GetSenderKeyStructure would later read from columns — NOT the
-		// raw s pointer which may alias libsignal backing arrays.
+		// REPLACE-on-write coherence (T-17.9-16): replace the parsed cache entry
+		// with the in-hand structure so LoadSenderKey returns the fresh key before
+		// the async flusher drains the DB row.
 		if c.parsedReplace != nil {
-			c.parsedReplace(c.key(group, user), recompose(colsCopy))
+			c.parsedReplace(c.key(group, user), s)
 		}
 
 		// Update device-set index (Phase 27 logic unchanged).
@@ -372,25 +310,16 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 	}
 
 	// Write-through fallback (flusher not yet wired: pre-wiring window or tests).
-	// Write a columnar row synchronously via PutManySenderKeys.
+	// Write a flat row synchronously via PutManySenderKeys.
 	if putMany, ok := c.inner.(interface {
 		PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error
 	}); ok {
-		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Cols: colsCopy}}); err != nil {
+		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Blob: blob}}); err != nil {
 			return err
 		}
 	} else {
 		// Ultimate fallback: inner does not support PutManySenderKeys (test stub).
-		// Build the blob from the structure and write via the legacy path.
 		// This path should not occur in production (inner is always *SQLStore there).
-		structure := recompose(colsCopy)
-		sk, _ := groupRecord.NewSenderKeyFromStruct(structure,
-			store.SignalProtobufSerializer.SenderKeyRecord,
-			store.SignalProtobufSerializer.SenderKeyState)
-		var blob []byte
-		if sk != nil {
-			blob = sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
-		}
 		if err := c.inner.PutSenderKey(ctx, group, user, blob); err != nil {
 			return err
 		}
@@ -398,7 +327,7 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 
 	// Write-through path: also replace the parsed cache for coherence.
 	if c.parsedReplace != nil {
-		c.parsedReplace(c.key(group, user), recompose(colsCopy))
+		c.parsedReplace(c.key(group, user), s)
 	}
 
 	c.updateDeviceCache(group, user)
@@ -460,23 +389,25 @@ func (c *CachedSenderKeyStore) recoverySyncWrite(
 	ctx context.Context, group, targetSenderID string,
 	structure *groupRecord.SenderKeyStructure,
 ) error {
-	cols := decompose(structure)
-	colsCopy := deepCopyCols(cols)
+	// Encode to flat binary (PackFlat owns its buffer — no aliasing of structure).
+	blob, ok := store.PackFlat(structure)
+	if !ok {
+		return nil // 0-state structure: nothing to write (caller's invariant should prevent this)
+	}
 
 	// Synchronous write to DB — not via the flusher.
 	if putMany, ok := c.inner.(interface {
 		PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error
 	}); ok {
-		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: targetSenderID, Cols: colsCopy}}); err != nil {
+		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: targetSenderID, Blob: blob}}); err != nil {
 			return err
 		}
 	}
 
 	// Struct-cache coherence: replace parsed entry so LoadSenderKey serves the
-	// recovered key immediately without a DB round-trip (same as PutSenderKeyStructure
-	// write-through path; replicate here because we bypass that path entirely).
+	// recovered key immediately without a DB round-trip.
 	if c.parsedReplace != nil {
-		c.parsedReplace(c.key(group, targetSenderID), recompose(colsCopy))
+		c.parsedReplace(c.key(group, targetSenderID), structure)
 	}
 
 	// Device-cache: evict so the next GetSenderKeyDevices cold-reads from DB.

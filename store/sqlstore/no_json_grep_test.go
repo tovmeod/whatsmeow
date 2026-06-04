@@ -7,17 +7,19 @@
 // no_json_grep_test.go — TestNoJSONOnSenderKeyPath
 //
 // Enforced grep-gate: zero .Serialize() / .Deserialize( calls on the per-message
-// sender-key read+write path (T-17.9-15). Two documented exceptions are permitted,
-// each identified by an explicit inline comment marker:
+// sender-key read+write path (T-17.9-15). One documented exception is permitted,
+// identified by an explicit inline comment marker:
 //
 //   ALLOW-JSON-DRAIN-BLOB   — the ultimate-fallback legacy-blob Serialize in
-//                              putSenderKeyInternal, taken only when the inner
-//                              store does not implement the columnar writer
-//                              (test stub / pre-wiring; never in production).
+//                              PutSenderKeyStructure, taken only when PackFlat
+//                              returns (nil, false) on a 0-state structure
+//                              (should not occur in production; safety net path).
 //
-//   ALLOW-JSON-LEGACY-READ  — the fmt_ver=1/NULL dual-read fallback Deserialize
-//                              in GetSenderKeyStructure (the legacy blob path,
-//                              not the migrated fmt_ver=2 path).
+// Phase 17.11-05 change: ALLOW-JSON-LEGACY-READ removed. The getSenderKeyDecomposed
+// dual-read path (fmt_ver=1/NULL Deserialize) was deleted along with the columnar
+// columns in this plan. GetSenderKeyStructure now uses store.UnpackFlat(blob) only.
+// senderkey_columns.go was deleted; senderKeyColumns/decompose/recompose moved to
+// store.go (migration tool compat only; not on any live driver read path).
 //
 // Why .Serialize()/.Deserialize( rather than json.Marshal/Unmarshal:
 // libsignal's "ProtoBufSerializer" is misnamed — it uses encoding/json for all
@@ -31,9 +33,8 @@
 // function-scoped list silently misses a new entrypoint.
 //
 // Covered source files:
-//   - store/sqlstore/senderkey_columns.go          (whole file — decompose/recompose)
-//   - store/sqlstore/store.go                      (PutManySenderKeys, getSenderKeyDecomposed — column-only write, no blob)
-//   - store/sqlstore/cached_sender_key_store.go    (extractSenderKeyMeta, putSenderKeyInternal, PutSenderKey, PutSenderKeyStructure, GetSenderKeyStructure)
+//   - store/sqlstore/store.go                      (PutManySenderKeys — flat bytea write, no blob)
+//   - store/sqlstore/cached_sender_key_store.go    (extractStructMeta, PutSenderKey, PutSenderKeyStructure, GetSenderKeyStructure)
 //   - store/signal.go                              (StoreSenderKey, LoadSenderKey)
 //
 // The gate passes NOW. Any future addition of .Serialize()/.Deserialize( to the
@@ -61,7 +62,6 @@ import (
 // are explicitly out of scope for this gate. We extract only the sender-key
 // function lines from signal.go via senderKeySignalFileFunctions below.
 var senderKeyPathFiles = []string{
-	"store/sqlstore/senderkey_columns.go",
 	"store/sqlstore/store.go",
 	"store/sqlstore/cached_sender_key_store.go",
 }
@@ -89,6 +89,9 @@ var jsonCallPatterns = []string{
 
 // allowMarkers are the inline comment markers that permit a JSON call.
 // A line containing one of these markers (as a substring) is an allowed exception.
+// ALLOW-JSON-DRAIN-BLOB: Serialize fallback in PutSenderKeyStructure when PackFlat fails.
+// ALLOW-JSON-LEGACY-READ: Serialize/Deserialize in store/signal.go for non-columnar store
+//   fallback (non-production path: fires only when CachedSenderKeyStore is not wired).
 var allowMarkers = []string{
 	"ALLOW-JSON-DRAIN-BLOB",
 	"ALLOW-JSON-LEGACY-READ",
@@ -99,12 +102,12 @@ var allowMarkers = []string{
 //
 // The test FAILS if:
 //   - Any pattern is found on a non-comment line without an ALLOW marker.
-//   - Either ALLOW marker is MISSING from the covered files (prevents a future
-//     cleanup from silently making the marker-check vacuous — i.e. the gate
-//     must detect when an exception line is removed without updating the gate).
+//   - The ALLOW-JSON-DRAIN-BLOB marker is MISSING from the covered files (prevents
+//     a future cleanup from silently making the marker-check vacuous — i.e. the
+//     gate must detect when an exception line is removed without updating the gate).
 //
 // The test PASSES when:
-//   - Both ALLOW markers appear exactly in the covered files (each on a call line).
+//   - ALLOW-JSON-DRAIN-BLOB appears in the covered files (on a Serialize() call line).
 //   - No other .Serialize()/.Deserialize( appears in the covered files (comment-stripped).
 func TestNoJSONOnSenderKeyPath(t *testing.T) {
 	// Locate the module root from this test file's location.
@@ -116,7 +119,7 @@ func TestNoJSONOnSenderKeyPath(t *testing.T) {
 	var violations []string
 	markerFound := map[string]bool{
 		"ALLOW-JSON-DRAIN-BLOB":  false,
-		"ALLOW-JSON-LEGACY-READ": false,
+		"ALLOW-JSON-LEGACY-READ": false, // still present in store/signal.go non-columnar fallback
 	}
 
 	// Scan the whole-file entries.

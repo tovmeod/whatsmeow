@@ -84,29 +84,24 @@ func buildAdvancedStructure(keyID uint32, iter uint32) *groupRecord.SenderKeyStr
 	}
 }
 
-// getDBIteration reads the st_chain_key_iteration[0] directly from the DB.
-// Returns -1 on absent row or NULL (raw bypass of all caches).
+// getDBIteration reads the SenderChainKey.Iteration of state[0] directly from
+// the flat sender_key blob in the DB. Returns -1 on absent row, NULL blob, or
+// decode error (raw bypass of all caches).
+// Post-upgrade-19: all rows are PackFlat; st_chain_key_iteration is gone.
 func getDBIteration(t *testing.T, db *sql.DB, jid, group, user string) int64 {
 	t.Helper()
-	var iterText sql.NullString
+	var blob []byte
 	err := db.QueryRowContext(context.Background(),
-		`SELECT st_chain_key_iteration::text FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
-		jid, group, user).Scan(&iterText)
-	if err != nil || !iterText.Valid {
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		jid, group, user).Scan(&blob)
+	if err != nil || blob == nil {
 		return -1
 	}
-	s := strings.TrimSpace(iterText.String)
-	if len(s) > 2 && s[0] == '{' && s[len(s)-1] == '}' {
-		s = s[1 : len(s)-1]
-	}
-	if i := strings.IndexByte(s, ','); i >= 0 {
-		s = s[:i]
-	}
-	v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	if err != nil {
+	s, uErr := store.UnpackFlat(blob)
+	if uErr != nil || s == nil || len(s.SenderKeyStates) == 0 || s.SenderKeyStates[0] == nil || s.SenderKeyStates[0].SenderChainKey == nil {
 		return -1
 	}
-	return v
+	return int64(s.SenderKeyStates[0].SenderChainKey.Iteration)
 }
 
 // newBatchTestStoreWithJID creates a test store bound to a custom JID.
@@ -386,11 +381,13 @@ func TestSenderKeyCacheCoherence(t *testing.T) {
 		}
 	})
 
-	// --- Arm 3: miss-feed is recompose (not Deserialize) for fmt_ver=2 rows ---
-	// GetSenderKeyStructure on a fmt_ver=2 row with a garbage blob must succeed:
-	// reads columns (recompose), not blob (Deserialize). No JSON on miss path.
-	t.Run("miss-feed-is-recompose", func(t *testing.T) {
-		_, cs, _, inner, db := newCohTestDevice(t)
+	// --- Arm 3: flat-read round-trip — UnpackFlat on valid PackFlat blob ---
+	// Post-upgrade-19: GetSenderKeyStructure reads the sender_key bytea and
+	// calls store.UnpackFlat. This arm verifies the flat round-trip: write a
+	// PackFlat blob via PutManySenderKeys, read back via GetSenderKeyStructure,
+	// confirm iter matches. No JSON, no columnar columns.
+	t.Run("flat-read-round-trip", func(t *testing.T) {
+		_, cs, _, inner, _ := newCohTestDevice(t)
 		ctx := context.Background()
 
 		const group = "cohcache_mf@g.us"
@@ -401,26 +398,18 @@ func TestSenderKeyCacheCoherence(t *testing.T) {
 		if err := inner.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
 			t.Fatalf("PutManySenderKeys: %v", err)
 		}
-		// Overwrite blob with garbage — proves fmt_ver=2 never reads the blob.
-		_, err := db.ExecContext(ctx,
-			`UPDATE whatsmeow_sender_keys SET sender_key=$1 WHERE our_jid=$2 AND chat_id=$3 AND sender_id=$4`,
-			[]byte("GARBAGE BLOB NOT VALID JSON"), cohTestJID, group, user)
-		if err != nil {
-			t.Fatalf("UPDATE garbage blob: %v", err)
-		}
 
-		// GetSenderKeyStructure: fmt_ver=2 → reads columns → recompose (no Deserialize).
+		// GetSenderKeyStructure: reads flat blob → store.UnpackFlat (no Deserialize, no recompose).
 		got, err := cs.GetSenderKeyStructure(ctx, group, user)
 		if err != nil {
-			t.Fatalf("GetSenderKeyStructure (miss-feed): %v", err)
+			t.Fatalf("GetSenderKeyStructure (flat-read): %v", err)
 		}
 		if got == nil {
-			t.Fatal("miss-feed: want non-nil structure (from columns); got nil — may be reading garbage blob")
+			t.Fatal("flat-read: want non-nil structure; got nil")
 		}
 		if got.SenderKeyStates[0].SenderChainKey.Iteration != 7 {
-			t.Errorf("miss-feed: want iter=7 (from columns), got iter=%d", got.SenderKeyStates[0].SenderChainKey.Iteration)
+			t.Errorf("flat-read: want iter=7, got iter=%d", got.SenderKeyStates[0].SenderChainKey.Iteration)
 		}
-		t.Logf("miss-feed: iter=%d from columns (garbage blob ignored — recompose, no Deserialize)",
-			got.SenderKeyStates[0].SenderChainKey.Iteration)
+		t.Logf("flat-read: iter=%d (PackFlat/UnpackFlat round-trip, no JSON)", got.SenderKeyStates[0].SenderChainKey.Iteration)
 	})
 }

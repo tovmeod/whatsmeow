@@ -19,17 +19,15 @@ import (
 
 // TestUpgradeChainAppliesV17 runs the real Container.Upgrade against a FRESH
 // empty database and asserts the full embedded migration chain (v0->v15 schema
-// snapshot -> v16 columns -> v17 DROP NOT NULL) lands the prod-faithful state:
-// the columnar columns exist AND sender_key is nullable.
+// snapshot -> v16 columns -> v17 DROP NOT NULL -> v18 TPO index -> v19 flat)
+// lands the prod-faithful state post-upgrade-19:
+//   - sk_keyid0 STORED GENERATED column exists (v19 added it)
+//   - sender_key is NOT NULL (v17 dropped NOT NULL, v19 restored it)
+//   - pkey uses text_pattern_ops (v18)
+//   - whatsmeow_sender_keys_chat_keyid0_idx exists (v19)
 //
-// Why this test exists: setup-test-db.sh only applies the v0->v15 snapshot, and
-// the package's other tests skip Container.Upgrade entirely (pre-applied
-// schema). That leaves the embed -> RegisterFS -> Upgrade Run loop — the exact
-// path prod uses on driver startup — UNEXERCISED. A manual `ALTER ... DROP NOT
-// NULL` on the shared test DB masks whether migration 17 actually runs. If it
-// does not, the first column-only sender-key write on prod hits a NOT NULL
-// violation on the per-message write path. This test exercises that path end to
-// end on a throwaway database.
+// Phase 17.11-05: assertions updated from v17 (nullable sender_key + columnar columns)
+// to v19 (flat schema: no columnar columns, sk_keyid0 generated column, NOT NULL).
 func TestUpgradeChainAppliesV17(t *testing.T) {
 	ctx := context.Background()
 	baseDSN := batchTestDSN()
@@ -69,39 +67,50 @@ func TestUpgradeChainAppliesV17(t *testing.T) {
 		t.Fatalf("Container.Upgrade on fresh DB: %v", err)
 	}
 
-	// 1) The columnar columns from v16 must exist.
-	var hasCol bool
+	// 1) Post-upgrade-19: st_key_id must NOT exist (v19 dropped all columnar columns).
+	var hasOldCol bool
 	if err := scratchDB.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM information_schema.columns
-		 WHERE table_name='whatsmeow_sender_keys' AND column_name='st_key_id')`).Scan(&hasCol); err != nil {
+		 WHERE table_name='whatsmeow_sender_keys' AND column_name='st_key_id')`).Scan(&hasOldCol); err != nil {
 		t.Fatalf("check st_key_id column: %v", err)
 	}
-	if !hasCol {
-		t.Error("st_key_id column missing — migration 16 did not run")
+	if hasOldCol {
+		t.Error("st_key_id column still present — migration 19 (DROP COLUMN) did not run")
 	}
 
-	// 2) sender_key must be NULLABLE after v17 (the decisive assertion).
+	// 2) Post-upgrade-19: sk_keyid0 STORED GENERATED column must exist (v19 added it).
+	var hasFlatCol bool
+	if err := scratchDB.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM information_schema.columns
+		 WHERE table_name='whatsmeow_sender_keys' AND column_name='sk_keyid0')`).Scan(&hasFlatCol); err != nil {
+		t.Fatalf("check sk_keyid0 column: %v", err)
+	}
+	if !hasFlatCol {
+		t.Error("sk_keyid0 column missing — migration 19 (ADD GENERATED COLUMN) did not run")
+	}
+
+	// 3) Post-upgrade-19: sender_key must be NOT NULL (v19 restored NOT NULL after v17 dropped it).
 	var isNullable string
 	if err := scratchDB.QueryRowContext(ctx,
 		`SELECT is_nullable FROM information_schema.columns
 		 WHERE table_name='whatsmeow_sender_keys' AND column_name='sender_key'`).Scan(&isNullable); err != nil {
 		t.Fatalf("check sender_key nullability: %v", err)
 	}
-	if isNullable != "YES" {
-		t.Errorf("sender_key is_nullable = %q, want YES — migration 17 (DROP NOT NULL) did not run via the embed/Upgrade path", isNullable)
+	if isNullable != "NO" {
+		t.Errorf("sender_key is_nullable = %q, want NO — migration 19 (SET NOT NULL) did not run via embed/Upgrade path", isNullable)
 	}
 
-	// 3) The recorded version must have advanced to >= v18 (v17 + v18 applied).
+	// 4) The recorded version must have advanced to >= v19.
 	var version int
 	if err := scratchDB.QueryRowContext(ctx,
 		`SELECT version FROM whatsmeow_version LIMIT 1`).Scan(&version); err != nil {
 		t.Fatalf("read whatsmeow_version: %v", err)
 	}
-	if version < 18 {
-		t.Errorf("recorded schema version = %d, want >= 18", version)
+	if version < 19 {
+		t.Errorf("recorded schema version = %d, want >= 19", version)
 	}
 
-	// 4) Migration 18: the sender_id column of the sender-key pkey index must use
+	// 5) Migration 18: the sender_id column of the sender-key pkey index must use
 	// text_pattern_ops (enables the prefix-LIKE range seek). Verify the opclass.
 	var tpoCols int
 	if err := scratchDB.QueryRowContext(ctx,
@@ -116,22 +125,30 @@ func TestUpgradeChainAppliesV17(t *testing.T) {
 		t.Error("whatsmeow_sender_keys_pkey does not use text_pattern_ops — migration 18 did not run via the embed/Upgrade path")
 	}
 
-	// 5) ON CONFLICT (column inference) must still RESOLVE against the swapped
-	// unique index — the per-message upsert path depends on it. We use a fake
-	// our_jid, so the statement hits the our_jid->whatsmeow_device foreign key
-	// (23503); that's fine and EXPECTED — it proves arbiter inference succeeded
-	// and execution reached the FK check. The only failure we care about is
-	// "no unique or exclusion constraint matching" (42P10), which would mean the
-	// text_pattern_ops index can't be inferred.
+	// 6) Migration 19: composite index on (chat_id, sk_keyid0) must exist.
+	var hasKeyid0Idx bool
+	if err := scratchDB.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_indexes
+		  WHERE tablename='whatsmeow_sender_keys'
+		    AND indexname='whatsmeow_sender_keys_chat_keyid0_idx')`).Scan(&hasKeyid0Idx); err != nil {
+		t.Fatalf("check chat_keyid0_idx: %v", err)
+	}
+	if !hasKeyid0Idx {
+		t.Error("whatsmeow_sender_keys_chat_keyid0_idx missing — migration 19 (CREATE INDEX) did not run")
+	}
+
+	// 7) ON CONFLICT (column inference) must still RESOLVE against the swapped
+	// unique index — the per-message upsert path depends on it. Post-upgrade-19:
+	// only sender_key column (no fmt_ver).
 	_, err = scratchDB.ExecContext(ctx,
-		`INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, fmt_ver)
-		 VALUES ('e2e@x','g@g.us','s_1:0',2)
-		 ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET fmt_ver=excluded.fmt_ver`)
+		`INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
+		 VALUES ('e2e@x','g@g.us','s_1:0','\x00')
+		 ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key`)
 	if err != nil && strings.Contains(err.Error(), "no unique or exclusion constraint matching") {
 		t.Errorf("ON CONFLICT could not infer the text_pattern_ops pkey: %v", err)
 	}
 
-	t.Logf("PASS: fresh-DB upgrade chain reached version %d; st_key_id present; sender_key nullable; pkey uses text_pattern_ops; ON CONFLICT works", version)
+	t.Logf("PASS: fresh-DB upgrade chain reached version %d; st_key_id absent; sk_keyid0 present; sender_key nullable; pkey uses text_pattern_ops; ON CONFLICT works", version)
 }
 
 // swapDBName replaces the database path in a postgres DSN (the last /segment).

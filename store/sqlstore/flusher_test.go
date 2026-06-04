@@ -26,6 +26,9 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
+
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
@@ -52,7 +55,7 @@ func (m *mockFlushStore) PutManySenderKeys(_ context.Context, keys []SenderKeyRo
 		return err
 	}
 	for _, k := range keys {
-		m.rows = append(m.rows, SenderKeyRow{Group: k.Group, User: k.User, Cols: k.Cols})
+		m.rows = append(m.rows, SenderKeyRow{Group: k.Group, User: k.User, Blob: k.Blob})
 	}
 	return nil
 }
@@ -72,31 +75,55 @@ func newTestFlusher(t *testing.T, cap int) (*SenderKeyFlusher, *mockFlushStore) 
 	return f, store
 }
 
-// testCols returns a minimal *senderKeyColumns with one state for use in flusher
-// unit tests. keyID and iter populate stKeyID[0] and stChainKeyIteration[0]
-// respectively — the fields extractSenderKeyMeta reads for SKDM dedup.
-// Other fields are zero-valued (valid for structural tests; not used in DB writes
-// in these pure in-memory flusher tests).
-func testCols(keyID, iter uint32) *senderKeyColumns {
-	return &senderKeyColumns{
-		fmtVer:              2,
-		stKeyID:             []int64{int64(keyID)},
-		stChainKeyIteration: []int64{int64(iter)},
-		stChainKey:          [][]byte{make([]byte, 32)},
-		stSigningKeyPublic:  [][]byte{make([]byte, 33)},
-		stSigningKeyPrivate: [][]byte{nil},
+// testBlob returns a minimal PackFlat blob with one state for use in flusher
+// unit tests. keyID and iter encode into the blob header bytes.
+// Requires valid byte lengths for chainKey (32) and signingPub (33).
+func testBlob(keyID, iter uint32) []byte {
+	chainKey := make([]byte, 32)
+	sigPub := make([]byte, 33)
+	sigPub[0] = 0x05
+	sigPriv := make([]byte, 32)
+	s := testStructure(keyID, iter, chainKey, sigPub, sigPriv)
+	blob, _ := packFlatForTest(s)
+	return blob
+}
+
+// packFlatForTest is a local alias so flusher tests don't import the store package.
+// It calls the package-level store.PackFlat indirectly via NewSenderKeyRow.
+func packFlatForTest(s *groupRecord.SenderKeyStructure) ([]byte, bool) {
+	row := NewSenderKeyRow("g", "u", s)
+	return row.Blob, row.Blob != nil
+}
+
+// testStructure builds a minimal SenderKeyStructure for keyID/iter.
+func testStructure(keyID, iter uint32, chainKey, sigPub, sigPriv []byte) *groupRecord.SenderKeyStructure {
+	return &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+			{
+				KeyID: keyID,
+				SenderChainKey: &ratchet.SenderChainKeyStructure{
+					Iteration: iter,
+					ChainKey:  chainKey,
+				},
+				SigningKeyPublic:  sigPub,
+				SigningKeyPrivate: sigPriv,
+			},
+		},
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestExtractSenderKeyMeta_FromCols
-// Phase 17.9: extractSenderKeyMeta now takes *senderKeyColumns (not []byte).
-// Verify it reads stKeyID[0] / stChainKeyIteration[0] correctly.
+// TestExtractStructMeta
+// Phase 17.11-05: extractSenderKeyMeta replaced by extractStructMeta.
+// Verify it reads KeyID/Iteration from *SenderKeyStructure correctly.
 // ---------------------------------------------------------------------------
 
 func TestExtractSenderKeyMeta_FromCols(t *testing.T) {
-	cols := testCols(7, 42)
-	keyID, iter := extractSenderKeyMeta(cols)
+	chainKey := make([]byte, 32)
+	sigPub := make([]byte, 33)
+	sigPub[0] = 0x05
+	s := testStructure(7, 42, chainKey, sigPub, make([]byte, 32))
+	keyID, iter := extractStructMeta(s)
 	if keyID != 7 {
 		t.Errorf("keyID = %d, want 7", keyID)
 	}
@@ -106,16 +133,16 @@ func TestExtractSenderKeyMeta_FromCols(t *testing.T) {
 }
 
 func TestExtractSenderKeyMeta_NilCols(t *testing.T) {
-	keyID, iter := extractSenderKeyMeta(nil)
+	keyID, iter := extractStructMeta(nil)
 	if keyID != 0 || iter != 0 {
-		t.Errorf("nil cols: got keyID=%d iter=%d, want 0,0", keyID, iter)
+		t.Errorf("nil structure: got keyID=%d iter=%d, want 0,0", keyID, iter)
 	}
 }
 
 func TestExtractSenderKeyMeta_ZeroStateCols(t *testing.T) {
-	// 0-state DTO: len(stKeyID)==0 → (0,0) guard.
-	cols := &senderKeyColumns{fmtVer: 2}
-	keyID, iter := extractSenderKeyMeta(cols)
+	// 0-state structure: len(SenderKeyStates)==0 → (0,0) guard.
+	s := &groupRecord.SenderKeyStructure{}
+	keyID, iter := extractStructMeta(s)
 	if keyID != 0 || iter != 0 {
 		t.Errorf("zero-state cols: got keyID=%d iter=%d, want 0,0", keyID, iter)
 	}
@@ -131,14 +158,14 @@ func TestSKDMDedupSkipsEqualIter(t *testing.T) {
 	f, _ := newTestFlusher(t, 1000)
 
 	// First call processes (first enqueue, no cached entry yet).
-	f.Enqueue("group-A", "user-1", testCols(1, 5), 1, 5, false)
+	f.Enqueue("group-A", "user-1", testBlob(1, 5), 1, 5, false)
 	processed1 := f.processedCount.Load()
 	if processed1 != 1 {
 		t.Fatalf("after first Enqueue: processedCount = %d, want 1", processed1)
 	}
 
 	// Second call with same keyID=1 iter=5 must be skipped.
-	f.Enqueue("group-A", "user-1", testCols(1, 5), 1, 5, false)
+	f.Enqueue("group-A", "user-1", testBlob(1, 5), 1, 5, false)
 	processed2 := f.processedCount.Load()
 	if processed2 != 1 {
 		t.Fatalf("after second Enqueue (same iter): processedCount = %d, want 1 (dedup must skip)", processed2)
@@ -157,13 +184,13 @@ func TestSKDMDedupSkipsEqualIter(t *testing.T) {
 func TestSKDMDedupProcessesHigherIter(t *testing.T) {
 	f, _ := newTestFlusher(t, 1000)
 
-	f.Enqueue("group-B", "user-2", testCols(1, 5), 1, 5, false)
+	f.Enqueue("group-B", "user-2", testBlob(1, 5), 1, 5, false)
 	if f.processedCount.Load() != 1 {
 		t.Fatalf("processedCount after iter=5: %d, want 1", f.processedCount.Load())
 	}
 
 	// Higher iteration must process.
-	f.Enqueue("group-B", "user-2", testCols(1, 6), 1, 6, false)
+	f.Enqueue("group-B", "user-2", testBlob(1, 6), 1, 6, false)
 	if f.processedCount.Load() != 2 {
 		t.Fatalf("processedCount after iter=6: %d, want 2 (higher iter must process)", f.processedCount.Load())
 	}
@@ -191,11 +218,11 @@ func TestSKDMDedupKeyIDRotationAlwaysProcesses(t *testing.T) {
 	f, _ := newTestFlusher(t, 1000)
 
 	// Seed with keyID=1, iter=500.
-	f.Enqueue("group-K", "user-K", testCols(1, 500), 1, 500, false)
+	f.Enqueue("group-K", "user-K", testBlob(1, 500), 1, 500, false)
 	before := f.processedCount.Load()
 
 	// New keyID=2 with low iter=1 — rotation must process despite iter < highIter.
-	f.Enqueue("group-K", "user-K", testCols(2, 1), 2, 1, false)
+	f.Enqueue("group-K", "user-K", testBlob(2, 1), 2, 1, false)
 	after := f.processedCount.Load()
 	if after <= before {
 		t.Fatalf("keyID rotation: processedCount did not increase: before=%d after=%d (new generation must always process)", before, after)
@@ -225,11 +252,11 @@ func TestSKDMDedupBypassFailedTuple(t *testing.T) {
 	f, _ := newTestFlusher(t, 1000)
 
 	// Seed with keyID=1, iter=5.
-	f.Enqueue("group-C", "user-3", testCols(1, 5), 1, 5, false)
+	f.Enqueue("group-C", "user-3", testBlob(1, 5), 1, 5, false)
 	before := f.processedCount.Load()
 
 	// Same keyID=1, iter=5 but wasFailed=true — must bypass dedup.
-	f.Enqueue("group-C", "user-3", testCols(1, 5), 1, 5, true)
+	f.Enqueue("group-C", "user-3", testBlob(1, 5), 1, 5, true)
 	after := f.processedCount.Load()
 	if after <= before {
 		t.Fatalf("processedCount did not increase on wasFailed=true bypass: before=%d after=%d", before, after)
@@ -247,7 +274,7 @@ func TestFlushTriggerNBoundary(t *testing.T) {
 	f.boundaryN = 500
 
 	// iter=499 → no boundary crossing (floor(499/500)=0, lastFlushed=0 → 0==0).
-	f.Enqueue("group-D", "user-4", testCols(1, 499), 1, 499, false)
+	f.Enqueue("group-D", "user-4", testBlob(1, 499), 1, 499, false)
 	select {
 	case <-f.flushCh:
 		t.Fatal("flushCh received signal for iter=499 but floor(499/500)=0, no boundary crossed")
@@ -256,7 +283,7 @@ func TestFlushTriggerNBoundary(t *testing.T) {
 	}
 
 	// iter=500 → boundary crossing (floor(500/500)=1 > floor(0/500)=0).
-	f.Enqueue("group-D", "user-4", testCols(1, 500), 1, 500, false)
+	f.Enqueue("group-D", "user-4", testBlob(1, 500), 1, 500, false)
 	select {
 	case <-f.flushCh:
 		// correct — boundary signal received
@@ -279,7 +306,7 @@ func TestEvictEnqueues(t *testing.T) {
 	var iter uint32 = 1
 
 	// Enqueue (as the PutSenderKeyStructure path would).
-	f.Enqueue(group, user, testCols(keyID, iter), keyID, iter, false)
+	f.Enqueue(group, user, testBlob(keyID, iter), keyID, iter, false)
 
 	// After re-enqueue, the entry must be in the dirty-set.
 	f.mu.Lock()
@@ -303,7 +330,7 @@ func TestShutdownDrain(t *testing.T) {
 	f, store := newTestFlusher(t, 1000)
 
 	for i := 0; i < 10; i++ {
-		f.Enqueue("group-F", "user-"+string(rune('a'+i)), testCols(1, 1), 1, 1, false)
+		f.Enqueue("group-F", "user-"+string(rune('a'+i)), testBlob(1, 1), 1, 1, false)
 	}
 
 	// Drain must write all 10 entries.
@@ -349,7 +376,7 @@ func TestInlineSyncValve(t *testing.T) {
 		f.dirty[k] = &dirtyEntry{
 			group:    "group-G",
 			user:     string(rune('a' + i)),
-			cols:     testCols(1, 1),
+			blob:     testBlob(1, 1),
 			highIter: 1,
 			keyID:    1,
 		}
@@ -359,7 +386,7 @@ func TestInlineSyncValve(t *testing.T) {
 	prevCalls := store.calls.Load()
 
 	// Next Enqueue should trigger inline sync write because len(dirty) > backpressureCap.
-	f.Enqueue("group-G", "user-Z", testCols(1, 999), 1, 999, false)
+	f.Enqueue("group-G", "user-Z", testBlob(1, 999), 1, 999, false)
 
 	// Wait briefly for the inline write to complete (it's synchronous but we
 	// need to account for any scheduling).
@@ -393,7 +420,7 @@ func TestFlusherRace_ConcurrentEnqueueDrain(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < opsPerGoroutine; j++ {
-				f.Enqueue("group", "user-"+string(rune('a'+i%26)), testCols(1, uint32(j+1)), 1, uint32(j+1), false)
+				f.Enqueue("group", "user-"+string(rune('a'+i%26)), testBlob(1, uint32(j+1)), 1, uint32(j+1), false)
 			}
 		}()
 	}
@@ -413,8 +440,8 @@ func TestFlusherDirtyCount(t *testing.T) {
 		t.Fatalf("initial DirtyCount = %d, want 0", n)
 	}
 
-	f.Enqueue("group-H", "user-1", testCols(1, 1), 1, 1, false)
-	f.Enqueue("group-H", "user-2", testCols(1, 1), 1, 1, false)
+	f.Enqueue("group-H", "user-1", testBlob(1, 1), 1, 1, false)
+	f.Enqueue("group-H", "user-2", testBlob(1, 1), 1, 1, false)
 
 	if n := f.DirtyCount(); n != 2 {
 		t.Fatalf("after 2 Enqueues: DirtyCount = %d, want 2", n)

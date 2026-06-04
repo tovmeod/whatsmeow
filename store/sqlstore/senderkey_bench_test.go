@@ -693,7 +693,7 @@ func benchmarkSenderKeyRecovery(b *testing.B, nDonors int) {
 				},
 			},
 		}
-		row := SenderKeyRow{Group: recovBenchGroup, User: senderID, Cols: decompose(structure)}
+		row := NewSenderKeyRow(recovBenchGroup, senderID, structure)
 		if err := storeA.PutManySenderKeys(ctx, []SenderKeyRow{row}); err != nil {
 			b.Fatalf("seed donor %d: %v", i, err)
 		}

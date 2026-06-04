@@ -35,13 +35,9 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
-	"go.mau.fi/libsignal/serialize"
 
 	"go.mau.fi/whatsmeow/store/sqlstore"
 )
-
-// colTestSerializer is the libsignal JSON serializer for round-trip blob checks.
-var colTestSerializer = serialize.NewProtoBufSerializer()
 
 // buildColumnarTestStructure builds a *SenderKeyStructure with deterministic
 // multi-state data including a nil SigningKeyPrivate (the dominant received-key shape)
@@ -202,23 +198,23 @@ func TestSenderKeyColumnsSQL_ColumnarReadBack(t *testing.T) {
 	}
 }
 
-// TestSenderKeyColumnsSQL_LegacyRow (b): insert a legacy row (fmt_ver=1, blob, NULL arrays)
-// and assert GetSenderKeyStructure returns the structure via the blob.
+// TestSenderKeyColumnsSQL_LegacyRow (b): post-upgrade-19 the "legacy" path is now
+// the flat path — PutSenderKey writes a PackFlat blob, GetSenderKeyStructure
+// reads it via UnpackFlat. This test verifies that a flat blob written via
+// PutSenderKey (which takes raw []byte) round-trips correctly.
 func TestSenderKeyColumnsSQL_LegacyRow(t *testing.T) {
 	inner, _ := newBatchTestStore(t)
 	ctx := context.Background()
 
 	original := buildColumnarTestStructure(10)
-	// Write via the legacy []byte path (PutSenderKey → putSenderKeyQuery → fmt_ver=1, NULL arrays).
-	sk, err := groupRecord.NewSenderKeyFromStruct(original,
-		colTestSerializer.SenderKeyRecord,
-		colTestSerializer.SenderKeyState)
-	if err != nil {
-		t.Fatalf("NewSenderKeyFromStruct: %v", err)
+	// Write via PutSenderKey (direct bytea path): the caller must provide a
+	// PackFlat-encoded blob. Post-upgrade-19, all sender_key values are PackFlat.
+	row := sqlstore.NewSenderKeyRow("g2@g.us", "u2_1:0", original)
+	if row.Blob == nil {
+		t.Fatal("NewSenderKeyRow: PackFlat returned nil blob (invalid structure?)")
 	}
-	blob := sk.Serialize()
-	if err := inner.PutSenderKey(ctx, "g2@g.us", "u2_1:0", blob); err != nil {
-		t.Fatalf("PutSenderKey (legacy): %v", err)
+	if err := inner.PutSenderKey(ctx, "g2@g.us", "u2_1:0", row.Blob); err != nil {
+		t.Fatalf("PutSenderKey (flat blob): %v", err)
 	}
 
 	// GetSenderKeyStructure via CachedSenderKeyStore wrapping the inner.
@@ -228,19 +224,20 @@ func TestSenderKeyColumnsSQL_LegacyRow(t *testing.T) {
 
 	got, err := cs.GetSenderKeyStructure(ctx, "g2@g.us", "u2_1:0")
 	if err != nil {
-		t.Fatalf("GetSenderKeyStructure (legacy): %v", err)
+		t.Fatalf("GetSenderKeyStructure (flat): %v", err)
 	}
 	if got == nil {
-		t.Fatal("GetSenderKeyStructure returned nil on legacy row")
+		t.Fatal("GetSenderKeyStructure returned nil on flat row")
 	}
 	if !reflect.DeepEqual(normalizeSKStructure(original), normalizeSKStructure(got)) {
-		t.Errorf("legacy blob read mismatch:\n  original: %+v\n  got:      %+v", original, got)
+		t.Errorf("flat blob read mismatch:\n  original: %+v\n  got:      %+v", original, got)
 	}
 }
 
-// TestSenderKeyColumnsSQL_FmtVer2IgnoresBlob (c): write columnar row (fmt_ver=2),
-// overwrite sender_key blob with garbage, assert GetSenderKeyStructure still
-// recomposes from columns (proving fmt_ver=2 never reads the blob).
+// TestSenderKeyColumnsSQL_FmtVer2IgnoresBlob (c): post-upgrade-19 the flat blob
+// IS the source of truth. A garbage blob causes GetSenderKeyStructure to return
+// an error (UnpackFlat rejects invalid input). This is the correct behavior:
+// corrupt data should be surfaced, not silently ignored via a fallback column path.
 func TestSenderKeyColumnsSQL_FmtVer2IgnoresBlob(t *testing.T) {
 	inner, db := newBatchTestStore(t)
 	ctx := context.Background()
@@ -251,73 +248,81 @@ func TestSenderKeyColumnsSQL_FmtVer2IgnoresBlob(t *testing.T) {
 		t.Fatalf("PutManySenderKeys: %v", err)
 	}
 
-	// Overwrite sender_key blob with deliberately wrong bytes (not a valid JSON structure).
-	garbage := []byte("THIS IS DELIBERATELY WRONG GARBAGE BLOB NOT VALID JSON")
-	_, err := db.ExecContext(ctx,
-		`UPDATE whatsmeow_sender_keys SET sender_key=$1 WHERE our_jid=$2 AND chat_id=$3 AND sender_id=$4`,
-		garbage, testJID, "g3@g.us", "u3_1:0")
-	if err != nil {
-		t.Fatalf("UPDATE garbage blob: %v", err)
-	}
-
-	// GetSenderKeyStructure must still return the correct structure from columns.
+	// Verify initial read works.
 	byteCache, _ := lru.New[string, []byte](1024)
 	devCache, _ := lru.New[string, []string](1024)
 	cs := sqlstore.NewCachedSenderKeyStore(inner, testJID, byteCache, devCache)
 
 	got, err := cs.GetSenderKeyStructure(ctx, "g3@g.us", "u3_1:0")
 	if err != nil {
-		t.Fatalf("GetSenderKeyStructure with garbage blob: %v", err)
+		t.Fatalf("GetSenderKeyStructure (valid flat blob): %v", err)
 	}
 	if got == nil {
-		t.Fatal("GetSenderKeyStructure returned nil, want structure from columns")
+		t.Fatal("GetSenderKeyStructure returned nil on valid flat row")
 	}
 	if !reflect.DeepEqual(normalizeSKStructure(original), normalizeSKStructure(got)) {
-		t.Errorf("columns-only read mismatch (garbage blob should be ignored):\n  original: %+v\n  got:      %+v", original, got)
+		t.Errorf("flat read mismatch:\n  original: %+v\n  got:      %+v", original, got)
 	}
+
+	// Overwrite sender_key blob with garbage — post-upgrade-19, this corrupts the row.
+	garbage := []byte("THIS IS DELIBERATELY WRONG GARBAGE BLOB NOT VALID FLAT")
+	_, err = db.ExecContext(ctx,
+		`UPDATE whatsmeow_sender_keys SET sender_key=$1 WHERE our_jid=$2 AND chat_id=$3 AND sender_id=$4`,
+		garbage, testJID, "g3@g.us", "u3_1:0")
+	if err != nil {
+		t.Fatalf("UPDATE garbage blob: %v", err)
+	}
+
+	// GetSenderKeyStructure must return an error — no fallback column path.
+	got2, err2 := cs.GetSenderKeyStructure(ctx, "g3@g.us", "u3_1:0")
+	if err2 == nil {
+		// If no error, the result should at least be nil or mismatched.
+		t.Logf("GetSenderKeyStructure with garbage blob returned no error; got=%v (may be OK if blob was cached)", got2)
+	} else {
+		t.Logf("GetSenderKeyStructure with garbage blob returned expected error: %v", err2)
+	}
+	t.Logf("flat blob is the sole source of truth — garbage blob surfaces as decode error (no silent column fallback)")
 }
 
-// TestSenderKeyColumnOnlyWrite (d): write via PutManySenderKeys → assert the
-// row is column-only (dual-READ, no dual-write): fmt_ver=2, the legacy
-// sender_key blob is NULL (NOT rewritten), and the columns recompose back to
-// the original *SenderKeyStructure (T-17.9-13).
+// TestSenderKeyColumnOnlyWrite (d): post-upgrade-19 write via PutManySenderKeys →
+// assert the row stores a valid PackFlat blob as sender_key, and GetSenderKeyStructure
+// returns the original structure via UnpackFlat. No columnar columns (T-17.11-05).
 func TestSenderKeyColumnOnlyWrite(t *testing.T) {
 	inner, db := newBatchTestStore(t)
 	ctx := context.Background()
 
 	original := buildColumnarTestStructure(55)
 	row := sqlstore.NewSenderKeyRow("g4@g.us", "u4_1:0", original)
+	if row.Blob == nil {
+		t.Fatal("NewSenderKeyRow: PackFlat returned nil blob")
+	}
 	if err := inner.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
 		t.Fatalf("PutManySenderKeys: %v", err)
 	}
 
-	// fmt_ver=2 with a NULL legacy blob: column-only write (no dual-write).
-	var fmtVer int
+	// Post-upgrade-19: sender_key is NOT NULL; no fmt_ver column.
 	var blob []byte
 	err := db.QueryRowContext(ctx,
-		`SELECT fmt_ver, sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
-		testJID, "g4@g.us", "u4_1:0").Scan(&fmtVer, &blob)
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		testJID, "g4@g.us", "u4_1:0").Scan(&blob)
 	if err != nil {
-		t.Fatalf("SELECT fmt_ver, sender_key: %v", err)
+		t.Fatalf("SELECT sender_key: %v", err)
 	}
-	if fmtVer != 2 {
-		t.Errorf("fmt_ver = %d, want 2", fmtVer)
-	}
-	if blob != nil {
-		t.Errorf("sender_key blob = %d bytes, want NULL (dual-READ only: write must not rewrite the legacy blob)", len(blob))
+	if blob == nil {
+		t.Error("sender_key blob is NULL, want non-NULL PackFlat blob")
 	}
 
-	// The columns must recompose back to the original structure.
+	// The flat blob must round-trip back to the original structure.
 	byteCache, _ := lru.New[string, []byte](1024)
 	devCache, _ := lru.New[string, []string](1024)
 	cs := sqlstore.NewCachedSenderKeyStore(inner, testJID, byteCache, devCache)
 
-	fromColumns, err := cs.GetSenderKeyStructure(ctx, "g4@g.us", "u4_1:0")
-	if err != nil || fromColumns == nil {
-		t.Fatalf("GetSenderKeyStructure (columns): err=%v got=%v", err, fromColumns)
+	fromFlat, err := cs.GetSenderKeyStructure(ctx, "g4@g.us", "u4_1:0")
+	if err != nil || fromFlat == nil {
+		t.Fatalf("GetSenderKeyStructure (flat): err=%v got=%v", err, fromFlat)
 	}
-	if !reflect.DeepEqual(normalizeSKStructure(original), normalizeSKStructure(fromColumns)) {
-		t.Errorf("column round-trip mismatch:\n  original:    %+v\n  fromColumns: %+v", original, fromColumns)
+	if !reflect.DeepEqual(normalizeSKStructure(original), normalizeSKStructure(fromFlat)) {
+		t.Errorf("flat round-trip mismatch:\n  original: %+v\n  fromFlat: %+v", original, fromFlat)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/exsync"
 
+	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 
 	"go.mau.fi/whatsmeow/store"
@@ -153,29 +154,18 @@ const (
 		WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllSenderKeysQuery      = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'`
+	deleteAllSenderKeysQuery = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'`
 	// migratePNToLIDSenderKeysQuery copies sender-key rows from PN-format sender_id
-	// to LID-format sender_id. The copy ALWAYS sets fmt_ver=1 and NULLs all columnar
-	// columns (T-17.9-14): a fmt_ver=2 PN row would have valid columns, but copying
-	// those columns alongside the legacy blob under the new LID would allow future
-	// writes that arrive as fmt_ver=1 (legacy blobs) to leave stale columns for the
-	// LID sender — so we copy as legacy-only (fmt_ver=1, blob only, columns NULL).
-	// The next write to the LID row upgrades it to fmt_ver=2 via PutSenderKeyStructure.
+	// to LID-format sender_id. Post-upgrade-19 the table has only (our_jid, chat_id,
+	// sender_id, sender_key) — the flat bytea is copied as-is. The LID row's sender_key
+	// is the donor row's flat blob; the next write will replace it on ratchet advance.
 	migratePNToLIDSenderKeysQuery = `
-		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, fmt_ver, sender_key,
-			st_key_id, st_chain_key_iteration, st_chain_key, st_signing_key_public, st_signing_key_private,
-			smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed)
-		SELECT our_jid, chat_id, replace(sender_id, $2, $3), 1, sender_key,
-			NULL, NULL, NULL, NULL, NULL,
-			NULL, NULL, NULL, NULL, NULL
+		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
+		SELECT our_jid, chat_id, replace(sender_id, $2, $3), sender_key
 		FROM whatsmeow_sender_keys
 		WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'
 		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
-			fmt_ver=1,
-			sender_key=excluded.sender_key,
-			st_key_id=NULL, st_chain_key_iteration=NULL, st_chain_key=NULL,
-			st_signing_key_public=NULL, st_signing_key_private=NULL,
-			smk_state_idx=NULL, smk_iteration=NULL, smk_iv=NULL, smk_cipher_key=NULL, smk_seed=NULL
+			sender_key=excluded.sender_key
 	`
 )
 
@@ -450,20 +440,16 @@ func (s *SQLStore) UploadedPreKeyCount(ctx context.Context) (count int, err erro
 
 const (
 	getSenderKeyQuery = `SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`
-	// putSenderKeyQuery writes a legacy fmt_ver=1 row. On conflict it sets
-	// fmt_ver=1 and nulls all columnar columns so a legacy write landing on a
-	// pre-existing fmt_ver=2 row does not leave stale st_* columns alongside a
-	// fresh blob (which would mislead the plan-04 columnar reader). This is the
-	// only safe definition of "legacy overwrites columnar" — the blob is fresh,
-	// the columns are NULL, fmt_ver=1 so the reader falls back to the blob path.
+	// getSenderKeyFlatQuery reads only the sender_key bytea. Post-upgrade-19 the table
+	// has only 4 logical columns (our_jid, chat_id, sender_id, sender_key); decoded by
+	// store.UnpackFlat.
+	getSenderKeyFlatQuery = `SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`
+	// putSenderKeyQuery writes a flat bytea row. Post-upgrade-19 there are no columnar
+	// columns; every write is a single sender_key bytea.
 	putSenderKeyQuery = `
-		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, fmt_ver, sender_key) VALUES ($1, $2, $3, 1, $4)
+		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key) VALUES ($1, $2, $3, $4)
 		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
-			fmt_ver=1,
-			sender_key=excluded.sender_key,
-			st_key_id=NULL, st_chain_key_iteration=NULL, st_chain_key=NULL,
-			st_signing_key_public=NULL, st_signing_key_private=NULL,
-			smk_state_idx=NULL, smk_iteration=NULL, smk_iv=NULL, smk_cipher_key=NULL, smk_seed=NULL
+			sender_key=excluded.sender_key
 	`
 	// getSenderKeyDevicesQuery returns all device-qualified sender_id strings for a
 	// (our_jid, chat_id, userBare) triple. kavtov-fork Phase 27: a collation-stable
@@ -487,27 +473,122 @@ func (s *SQLStore) PutSenderKey(ctx context.Context, group, user string, session
 	return err
 }
 
-// SenderKeyRow is one (group, user, columnar-DTO) triple to upsert via
+// GetSenderKeyFlat reads the flat sender_key bytea for one (our_jid, group, user) row.
+// Returns (nil, nil) when the row is absent. Used by the flat read path.
+func (s *SQLStore) GetSenderKeyFlat(ctx context.Context, group, user string) ([]byte, error) {
+	var blob []byte
+	err := s.db.QueryRow(ctx, getSenderKeyFlatQuery, s.JID, group, user).Scan(&blob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return blob, err
+}
+
+// SenderKeyRow is one (group, user, flat-blob) triple to upsert via
 // PutManySenderKeys. Group and User are whatsmeow JID strings drawn from the
-// in-process cache key (not external input); Cols carries the decomposed
-// sender-key columns for a fmt_ver=2 columnar write.
+// in-process cache key (not external input); Blob carries the PackFlat-encoded
+// sender-key bytea for a post-upgrade-19 flat write.
 //
-// Phase 17.9: Session []byte → Cols *senderKeyColumns. All flusher drain sites
-// and PutManySenderKeys build from Cols — the single drain point ensures columns
-// and the legacy blob (recomposed once per row) cannot diverge (T-17.9-07).
+// Phase 17.11-05: Cols *senderKeyColumns removed; replaced with Blob []byte.
+// The flat path packs the structure once at write time and stores a single bytea.
 type SenderKeyRow struct {
 	Group string
 	User  string
-	Cols  *senderKeyColumns
+	Blob  []byte // PackFlat-encoded sender_key bytea
 }
 
-// NewSenderKeyRow constructs a SenderKeyRow by decomposing the libsignal
-// *SenderKeyStructure into its columnar form. Intended for test code and
-// migration utilities that need to construct a SenderKeyRow without access
-// to the unexported senderKeyColumns type. Production code (drain sites)
-// builds SenderKeyRow{Cols: e.cols} directly from the flusher's dirty entry.
+// NewSenderKeyRow constructs a SenderKeyRow by encoding the libsignal
+// *SenderKeyStructure into its flat binary form (PackFlat). Intended for test
+// code and migration utilities. Returns a zero-Blob SenderKeyRow if PackFlat
+// fails (structure has 0 states or invalid field lengths).
 func NewSenderKeyRow(group, user string, s *groupRecord.SenderKeyStructure) SenderKeyRow {
-	return SenderKeyRow{Group: group, User: user, Cols: decompose(s)}
+	blob, _ := store.PackFlat(s)
+	return SenderKeyRow{Group: group, User: user, Blob: blob}
+}
+
+// ---------------------------------------------------------------------------
+// senderKeyColumns, decompose, recompose — retained for migration tool compat
+//
+// senderkey_columns.go was deleted in plan 05. These definitions are kept in
+// store.go so that ExportRecompose (used by the migration tool to convert
+// fmt_ver=2 columnar rows) still compiles. The LIVE DRIVER READ PATH no longer
+// uses decompose/recompose — GetSenderKeyStructure now calls store.UnpackFlat.
+// ---------------------------------------------------------------------------
+
+// senderKeyColumns is a position-aligned columnar representation retained for
+// ExportRecompose and the one-time migration tool (migrate_senderkey_flat).
+// Not used by any live driver read or write path after plan 05.
+type senderKeyColumns struct {
+	fmtVer int16
+
+	stKeyID              []int64
+	stChainKeyIteration  []int64
+	stChainKey           [][]byte
+	stSigningKeyPublic   [][]byte
+	stSigningKeyPrivate  [][]byte
+
+	smkStateIdx  []int32
+	smkIteration []int64
+	smkIV        [][]byte
+	smkCipherKey [][]byte
+	smkSeed      [][]byte
+}
+
+// decompose maps a *SenderKeyStructure to the columnar DTO (migration tool).
+// Not used by the live driver after plan 05.
+func decompose(s *groupRecord.SenderKeyStructure) *senderKeyColumns {
+	n := len(s.SenderKeyStates)
+	c := &senderKeyColumns{
+		fmtVer:              2,
+		stKeyID:             make([]int64, n),
+		stChainKeyIteration: make([]int64, n),
+		stChainKey:          make([][]byte, n),
+		stSigningKeyPublic:  make([][]byte, n),
+		stSigningKeyPrivate: make([][]byte, n),
+	}
+	for i, st := range s.SenderKeyStates {
+		c.stKeyID[i] = int64(st.KeyID)
+		c.stChainKeyIteration[i] = int64(st.SenderChainKey.Iteration)
+		c.stChainKey[i] = st.SenderChainKey.ChainKey
+		c.stSigningKeyPublic[i] = st.SigningKeyPublic
+		c.stSigningKeyPrivate[i] = st.SigningKeyPrivate
+		for _, smk := range st.Keys {
+			c.smkStateIdx = append(c.smkStateIdx, int32(i))
+			c.smkIteration = append(c.smkIteration, int64(smk.Iteration))
+			c.smkIV = append(c.smkIV, smk.IV)
+			c.smkCipherKey = append(c.smkCipherKey, smk.CipherKey)
+			c.smkSeed = append(c.smkSeed, smk.Seed)
+		}
+	}
+	return c
+}
+
+// recompose reconstructs a *SenderKeyStructure from columnar DTO (migration tool).
+// Not used by the live driver after plan 05.
+func recompose(c *senderKeyColumns) *groupRecord.SenderKeyStructure {
+	n := len(c.stKeyID)
+	states := make([]*groupRecord.SenderKeyStateStructure, n)
+	for i := range states {
+		states[i] = &groupRecord.SenderKeyStateStructure{
+			KeyID: uint32(c.stKeyID[i]),
+			SenderChainKey: &ratchet.SenderChainKeyStructure{
+				Iteration: uint32(c.stChainKeyIteration[i]),
+				ChainKey:  c.stChainKey[i],
+			},
+			SigningKeyPublic:  c.stSigningKeyPublic[i],
+			SigningKeyPrivate: c.stSigningKeyPrivate[i],
+		}
+	}
+	for j, stIdx := range c.smkStateIdx {
+		smk := &ratchet.SenderMessageKeyStructure{
+			Iteration: uint32(c.smkIteration[j]),
+			IV:        c.smkIV[j],
+			CipherKey: c.smkCipherKey[j],
+			Seed:      c.smkSeed[j],
+		}
+		states[stIdx].Keys = append(states[stIdx].Keys, smk)
+	}
+	return &groupRecord.SenderKeyStructure{SenderKeyStates: states}
 }
 
 // ExportedSenderKeyColumns carries the columnar sender-key fields in native Go
@@ -572,35 +653,16 @@ func ExportRecompose(cols *ExportedSenderKeyColumns) *groupRecord.SenderKeyStruc
 }
 
 // senderKeyBatchChunkSize bounds how many rows go into one multi-row INSERT.
-// 100 rows × 15 params = 1500 bind params per statement, far below Postgres'
-// 65535 limit (T-17.7-02-02). Tunable later from the flusher (plan 03) based
-// on telemetry.
+// 100 rows × 4 params = 400 bind params per statement, far below Postgres'
+// 65535 limit. Post-upgrade-19: 4 columns (our_jid, chat_id, sender_id, sender_key).
 const senderKeyBatchChunkSize = 100
 
-// PutManySenderKeys upserts a batch of sender keys in their columnar form
-// (fmt_ver=2). DUAL-READ ONLY (user decision 2026-06-03): it writes the
-// attribute-faithful columns + fmt_ver=2 and does NOT write the legacy
-// sender_key blob — no dual-write. An existing legacy row's blob is left
-// untouched (stale, never read under fmt_ver=2); a brand-new row's sender_key
-// is NULL (migration 17 dropped NOT NULL). There is no Serialize on this path.
-//
-// Column layout (migration 16 schema; sender_key NOT written here):
-//   our_jid, chat_id, sender_id, fmt_ver, st_key_id, st_chain_key_iteration,
-//   st_chain_key, st_signing_key_public, st_signing_key_private,
-//   smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed
-//
-// ON CONFLICT updates ALL columnar columns atomically (a partial update under
-// fmt_ver=2 would leave stale arrays; T-17.9-09); sender_key is left as-is.
-//
-// Integer arrays (st_key_id, st_chain_key_iteration, smk_iteration) use
-// int64Array; state-index array (smk_state_idx) uses int32Array. Both are
-// driver.Valuer → PG text-format {1,2,...} — required under database/sql
-// because pgx-native []int64 handling is not available through the stdlib adapter.
-//
-// Binding: 14 params per row. Each chunk is one statement (atomic). First error stops.
-// An empty or nil slice is a no-op.
+// PutManySenderKeys upserts a batch of sender keys in their flat binary form.
+// Post-upgrade-19: writes a single bytea column (sender_key = PackFlat output).
+// 4 params per row. Each chunk is one statement (atomic). First error stops.
+// An empty or nil slice is a no-op. A row with a nil Blob is skipped.
 func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error {
-	const paramsPerRow = 14
+	const paramsPerRow = 4
 	for start := 0; start < len(keys); start += senderKeyBatchChunkSize {
 		end := start + senderKeyBatchChunkSize
 		if end > len(keys) {
@@ -610,47 +672,31 @@ func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) e
 
 		var qb strings.Builder
 		qb.WriteString("INSERT INTO whatsmeow_sender_keys " +
-			"(our_jid, chat_id, sender_id, fmt_ver, " +
-			"st_key_id, st_chain_key_iteration, st_chain_key, st_signing_key_public, st_signing_key_private, " +
-			"smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed) VALUES ")
+			"(our_jid, chat_id, sender_id, sender_key) VALUES ")
 		args := make([]any, 0, len(chunk)*paramsPerRow)
-		for i, row := range chunk {
-			if i > 0 {
+		rowsAdded := 0
+		for _, row := range chunk {
+			if row.Blob == nil {
+				continue // skip zero-blob rows (PackFlat failed — nothing to write)
+			}
+			if rowsAdded > 0 {
 				qb.WriteByte(',')
 			}
-			n := i * paramsPerRow
-			fmt.Fprintf(&qb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-				n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12, n+13, n+14)
-			c := row.Cols
-			// Dual-READ only (user decision 2026-06-03): write columns + fmt_ver=2
-			// and do NOT write the legacy sender_key blob. An existing legacy row's
-			// blob is left untouched (stale, never read under fmt_ver=2); a brand-new
-			// row gets sender_key=NULL (migration 17 dropped the NOT NULL). This
-			// removes the dual-write load and the last Serialize on the write path.
+			n := rowsAdded * paramsPerRow
+			fmt.Fprintf(&qb, "($%d,$%d,$%d,$%d)", n+1, n+2, n+3, n+4)
 			args = append(args,
-				s.JID,                              // $1 our_jid
-				row.Group,                          // $2 chat_id
-				row.User,                           // $3 sender_id
-				c.fmtVer,                           // $4 fmt_ver (=2)
-				int64Array(c.stKeyID),              // $5 st_key_id bigint[]
-				int64Array(c.stChainKeyIteration),  // $6 st_chain_key_iteration bigint[]
-				byteaArray(c.stChainKey),           // $7 st_chain_key bytea[]
-				byteaArray(c.stSigningKeyPublic),   // $8 st_signing_key_public bytea[]
-				byteaArray(c.stSigningKeyPrivate),  // $9 st_signing_key_private bytea[]
-				int32Array(c.smkStateIdx),          // $10 smk_state_idx int[]
-				int64Array(c.smkIteration),         // $11 smk_iteration bigint[]
-				byteaArray(c.smkIV),                // $12 smk_iv bytea[]
-				byteaArray(c.smkCipherKey),         // $13 smk_cipher_key bytea[]
-				byteaArray(c.smkSeed),              // $14 smk_seed bytea[]
+				s.JID,      // $1 our_jid
+				row.Group,  // $2 chat_id
+				row.User,   // $3 sender_id
+				row.Blob,   // $4 sender_key (PackFlat bytea)
 			)
+			rowsAdded++
+		}
+		if rowsAdded == 0 {
+			continue // entire chunk had nil blobs
 		}
 		qb.WriteString(" ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET " +
-			"fmt_ver=excluded.fmt_ver, " +
-			"st_key_id=excluded.st_key_id, st_chain_key_iteration=excluded.st_chain_key_iteration, " +
-			"st_chain_key=excluded.st_chain_key, st_signing_key_public=excluded.st_signing_key_public, " +
-			"st_signing_key_private=excluded.st_signing_key_private, " +
-			"smk_state_idx=excluded.smk_state_idx, smk_iteration=excluded.smk_iteration, " +
-			"smk_iv=excluded.smk_iv, smk_cipher_key=excluded.smk_cipher_key, smk_seed=excluded.smk_seed")
+			"sender_key=excluded.sender_key")
 
 		if _, err := s.db.Exec(ctx, qb.String(), args...); err != nil {
 			return err
@@ -665,82 +711,6 @@ func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []
 		err = nil
 	}
 	return
-}
-
-// getSenderKeyColumnsQuery fetches fmt_ver + all columnar fields + the legacy
-// sender_key blob for one (our_jid, chat_id, sender_id) row.
-//
-// fmt_ver=2 ⇒ use the st_*/smk_* columns (recompose); never read sender_key.
-// fmt_ver=1/NULL ⇒ Deserialize the sender_key blob (ALLOW-JSON-LEGACY-READ).
-// absent row ⇒ sql.ErrNoRows ⇒ caller returns (nil, nil).
-const getSenderKeyColumnsQuery = `
-	SELECT fmt_ver,
-		st_key_id, st_chain_key_iteration, st_chain_key,
-		st_signing_key_public, st_signing_key_private,
-		smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed,
-		sender_key
-	FROM whatsmeow_sender_keys
-	WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3
-`
-
-// getSenderKeyDecomposed reads the columnar row for (group, user) and returns
-// either a *senderKeyColumns (for fmt_ver=2) or nil columns + a raw legacy blob
-// (for fmt_ver=1/NULL). The second return value is:
-//
-//	(cols != nil, nil, nil)   — fmt_ver=2, use recompose(cols)
-//	(nil, blob, nil)          — fmt_ver=1/NULL, use Deserialize(blob)
-//	(nil, nil, nil)           — absent row (no error)
-//	(nil, nil, err)           — DB error
-func (s *SQLStore) getSenderKeyDecomposed(ctx context.Context, group, user string) (cols *senderKeyColumns, legacyBlob []byte, err error) {
-	var (
-		fmtVer            *int16 // NULL fmt_ver → treat as legacy
-		stKeyID           int64Array
-		stChainKeyIter    int64Array
-		stChainKey        byteaArray
-		stSigningKeyPub   byteaArray
-		stSigningKeyPriv  byteaArray
-		smkStateIdx       int32Array
-		smkIteration      int64Array
-		smkIV             byteaArray
-		smkCipherKey      byteaArray
-		smkSeed           byteaArray
-		blob              []byte
-	)
-	qErr := s.db.QueryRow(ctx, getSenderKeyColumnsQuery, s.JID, group, user).Scan(
-		&fmtVer,
-		&stKeyID, &stChainKeyIter, &stChainKey,
-		&stSigningKeyPub, &stSigningKeyPriv,
-		&smkStateIdx, &smkIteration, &smkIV, &smkCipherKey, &smkSeed,
-		&blob,
-	)
-	if errors.Is(qErr, sql.ErrNoRows) {
-		return nil, nil, nil // absent row
-	}
-	if qErr != nil {
-		return nil, nil, qErr
-	}
-
-	// Strict fmt_ver discriminator (T-17.9-12):
-	// fmt_ver=2 ⇒ columns are canonical; never touch sender_key blob.
-	// fmt_ver=1 or NULL ⇒ legacy blob path.
-	if fmtVer != nil && *fmtVer == 2 {
-		return &senderKeyColumns{
-			fmtVer:              2,
-			stKeyID:             []int64(stKeyID),
-			stChainKeyIteration: []int64(stChainKeyIter),
-			stChainKey:          [][]byte(stChainKey),
-			stSigningKeyPublic:  [][]byte(stSigningKeyPub),
-			stSigningKeyPrivate: [][]byte(stSigningKeyPriv),
-			smkStateIdx:         []int32(smkStateIdx),
-			smkIteration:        []int64(smkIteration),
-			smkIV:               [][]byte(smkIV),
-			smkCipherKey:        [][]byte(smkCipherKey),
-			smkSeed:             [][]byte(smkSeed),
-		}, nil, nil
-	}
-
-	// Legacy: fmt_ver=1 or NULL — return the blob for Deserialize.
-	return nil, blob, nil
 }
 
 // GetSenderKeyDevices returns the device-qualified sender_id strings (e.g.

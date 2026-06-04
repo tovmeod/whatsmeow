@@ -20,13 +20,13 @@ package sqlstore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"reflect"
 	"sync"
 	"testing"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	librecord "go.mau.fi/libsignal/state/record"
 	"go.mau.fi/libsignal/protocol"
@@ -136,72 +136,41 @@ func makeSignalAddress(name string) *protocol.SignalAddress {
 	return protocol.NewSignalAddress(name, 0)
 }
 
-// buildSenderKeyBlobKeyID builds a sender-key blob JSON with the given keyID
-// (all other fields identical to buildSenderKeyBlob(0)). Lets TR-03 and
-// TR-08 make an exact keyID assertion rather than just a non-nil check.
+// buildSenderKeyBlobKeyID builds a PackFlat-encoded sender-key blob with the given keyID.
+// Post-upgrade-19: GetSenderKeyStructure uses store.UnpackFlat, not JSON Deserialize.
+// Lets TR-03 and TR-08 make an exact keyID assertion rather than just a non-nil check.
 func buildSenderKeyBlobKeyID(keyID uint32) []byte {
-	// Field name MUST match libsignal: the chain key is
-	// SenderChainKeyStructure.ChainKey, not "Seed". Keys is nil here (no skipped
-	// keys), so senderMsgKeyStruct is unused, but the chain key must be a valid
-	// 32-byte value or the flat-cache length guard refuses the structure.
-	type senderMsgKeyStruct struct {
-		Iteration uint32
-		IV        []byte
-		CipherKey []byte
-		Seed      []byte
+	chainKey := make([]byte, 32)
+	for i := range chainKey {
+		chainKey[i] = byte(i + 3)
 	}
-	type chainKeyStruct struct {
-		Iteration uint32
-		ChainKey  []byte
+	sigPub := make([]byte, 33)
+	sigPub[0] = 0x05
+	for i := 1; i < 33; i++ {
+		sigPub[i] = byte(i)
 	}
-	type senderKeyRecordStruct struct {
-		SenderKeyStates []struct {
-			KeyID          uint32
-			SenderChainKey chainKeyStruct
-			Keys           []senderMsgKeyStruct
-			SigningKeyPublic  []byte
-			SigningKeyPrivate []byte
-		}
+	sigPriv := make([]byte, 32)
+	for i := range sigPriv {
+		sigPriv[i] = byte(i + 3)
 	}
-
-	key32 := func() []byte {
-		b := make([]byte, 32)
-		for i := range b {
-			b[i] = byte(i + 3)
-		}
-		return b
-	}
-	pub33 := func() []byte {
-		b := make([]byte, 33)
-		b[0] = 0x05
-		for i := 1; i < 33; i++ {
-			b[i] = byte(i)
-		}
-		return b
-	}
-
-	record := senderKeyRecordStruct{}
-	record.SenderKeyStates = []struct {
-		KeyID          uint32
-		SenderChainKey chainKeyStruct
-		Keys           []senderMsgKeyStruct
-		SigningKeyPublic  []byte
-		SigningKeyPrivate []byte
-	}{
-		{
-			KeyID:            keyID,
-			SenderChainKey:   chainKeyStruct{Iteration: 0, ChainKey: key32()},
-			Keys:             nil,
-			SigningKeyPublic:  pub33(),
-			SigningKeyPrivate: key32(),
+	s := &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+			{
+				KeyID: keyID,
+				SenderChainKey: &ratchet.SenderChainKeyStructure{
+					Iteration: 0,
+					ChainKey:  chainKey,
+				},
+				SigningKeyPublic:  sigPub,
+				SigningKeyPrivate: sigPriv,
+			},
 		},
 	}
-
-	b, err := json.Marshal(record)
-	if err != nil {
-		panic("buildSenderKeyBlobKeyID: " + err.Error())
+	blob, ok := store.PackFlat(s)
+	if !ok {
+		panic("buildSenderKeyBlobKeyID: PackFlat returned nil")
 	}
-	return b
+	return blob
 }
 
 // seedSKStructCache calls LoadSenderKey to populate the struct cache via the
@@ -232,6 +201,77 @@ func seedSKStructCache(t *testing.T, h *testDeviceHandles, group, senderName str
 		t.Fatalf("seedSKStructCache LoadSenderKey: %v", err)
 	}
 	return key
+}
+
+// fullParseSenderKeyFlat decodes a PackFlat blob to a *SenderKey. Used by CR
+// tests post-upgrade-19 (fullParseSenderKey in bench_test.go uses JSON).
+func fullParseSenderKeyFlat(blob []byte) (*groupRecord.SenderKey, error) {
+	s, err := store.UnpackFlat(blob)
+	if err != nil {
+		return nil, err
+	}
+	return groupRecord.NewSenderKeyFromStruct(s,
+		store.SignalProtobufSerializer.SenderKeyRecord,
+		store.SignalProtobufSerializer.SenderKeyState)
+}
+
+// buildFlatSenderKeyBlob returns a PackFlat-encoded sender-key blob with numKeys
+// skipped message keys. Post-upgrade-19: GetSenderKeyStructure uses store.UnpackFlat,
+// not JSON Deserialize. Used by decode-once CR tests as the cache-seeding blob.
+func buildFlatSenderKeyBlob(numKeys int) []byte {
+	chainKey := make([]byte, 32)
+	for i := range chainKey {
+		chainKey[i] = byte(i + 3)
+	}
+	sigPub := make([]byte, 33)
+	sigPub[0] = 0x05
+	for i := 1; i < 33; i++ {
+		sigPub[i] = byte(i)
+	}
+	sigPriv := make([]byte, 32)
+	for i := range sigPriv {
+		sigPriv[i] = byte(i + 3)
+	}
+	var smks []*ratchet.SenderMessageKeyStructure
+	for k := 0; k < numKeys; k++ {
+		iv := make([]byte, 16)
+		ck := make([]byte, 32)
+		sd := make([]byte, 32)
+		for i := range iv {
+			iv[i] = byte(k + i)
+		}
+		for i := range ck {
+			ck[i] = byte(k + i + 1)
+		}
+		for i := range sd {
+			sd[i] = byte(k + i + 2)
+		}
+		smks = append(smks, &ratchet.SenderMessageKeyStructure{
+			Iteration: uint32(k),
+			IV:        iv,
+			CipherKey: ck,
+			Seed:      sd,
+		})
+	}
+	s := &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+			{
+				KeyID: 0,
+				SenderChainKey: &ratchet.SenderChainKeyStructure{
+					Iteration: 0,
+					ChainKey:  chainKey,
+				},
+				SigningKeyPublic:  sigPub,
+				SigningKeyPrivate: sigPriv,
+				Keys:             smks,
+			},
+		},
+	}
+	blob, ok := store.PackFlat(s)
+	if !ok {
+		panic("buildFlatSenderKeyBlob: PackFlat returned nil")
+	}
+	return blob
 }
 
 // seedSessStructCache calls LoadSession to populate the session struct cache.
@@ -266,7 +306,7 @@ func TestDecodeOnce_CR_TR01(t *testing.T) {
 	ctx := context.Background()
 
 	group, sender := "group-TR01", "15550001001"
-	blob := buildSenderKeyBlob(0)
+	blob := buildFlatSenderKeyBlob(0)
 
 	// Pre-populate struct cache so subsequent hot Loads exercise the hit path.
 	seedSKStructCache(t, h, group, sender, blob)
@@ -279,11 +319,11 @@ func TestDecodeOnce_CR_TR01(t *testing.T) {
 	var storeErr error
 
 	// 1 writer: StoreSenderKey with a distinct blob.
-	blob2 := buildSenderKeyBlob(2)
+	blob2 := buildFlatSenderKeyBlob(2)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		k2, err := fullParseSenderKey(blob2)
+		k2, err := fullParseSenderKeyFlat(blob2)
 		if err != nil {
 			storeErr = err
 			return
@@ -343,16 +383,16 @@ func TestDecodeOnce_CR_TR02(t *testing.T) {
 	ctx := context.Background()
 
 	group, sender := "group-TR02", "15550001002"
-	blob1 := buildSenderKeyBlob(0)
-	blob2 := buildSenderKeyBlob(5)
+	blob1 := buildFlatSenderKeyBlob(0)
+	blob2 := buildFlatSenderKeyBlob(5)
 
 	skName := makeSenderKeyName(group, sender)
 
-	k1, err := fullParseSenderKey(blob1)
+	k1, err := fullParseSenderKeyFlat(blob1)
 	if err != nil {
 		t.Fatalf("TR-02: fullParseSenderKey blob1: %v", err)
 	}
-	k2, err := fullParseSenderKey(blob2)
+	k2, err := fullParseSenderKeyFlat(blob2)
 	if err != nil {
 		t.Fatalf("TR-02: fullParseSenderKey blob2: %v", err)
 	}
@@ -409,7 +449,7 @@ func TestDecodeOnce_CR_TR03(t *testing.T) {
 	blob42 := buildSenderKeyBlobKeyID(wantKeyID)
 	skName := makeSenderKeyName(group, sender)
 
-	k, err := fullParseSenderKey(blob42)
+	k, err := fullParseSenderKeyFlat(blob42)
 	if err != nil {
 		t.Fatalf("TR-03: fullParseSenderKey blob42: %v", err)
 	}
@@ -435,7 +475,7 @@ func TestDecodeOnce_CR_TR03(t *testing.T) {
 
 	// Verify keyID survives the struct-cache round-trip.
 	// Phase 17.9: extractSenderKeyMeta now takes *senderKeyColumns; decompose the structure.
-	gotKeyID, _ := extractSenderKeyMeta(decompose(got.Structure()))
+	gotKeyID, _ := extractStructMeta(got.Structure())
 	if gotKeyID != wantKeyID {
 		t.Errorf("TR-03: gotKeyID = %d, want %d "+
 			"(post-ratchet structure not preserved by struct cache)", gotKeyID, wantKeyID)
@@ -455,7 +495,7 @@ func TestDecodeOnce_CR_TR04(t *testing.T) {
 	ctx := context.Background()
 
 	group, sender := "group-TR04", "15550001004"
-	blob := buildSenderKeyBlob(0)
+	blob := buildFlatSenderKeyBlob(0)
 
 	// Pre-populate struct cache.
 	seedSKStructCache(t, h, group, sender, blob)
@@ -510,7 +550,7 @@ func TestDecodeOnce_CR_TR05(t *testing.T) {
 	ctx := context.Background()
 
 	group := "group-TR05"
-	blob := buildSenderKeyBlob(0)
+	blob := buildFlatSenderKeyBlob(0)
 
 	// Fill both slots in the struct-LRU.
 	seedSKStructCache(t, h, group, "sender-A", blob)
@@ -745,7 +785,7 @@ func TestDecodeOnce_CR_TR08(t *testing.T) {
 
 	// Verify the re-parsed result uses the new key (keyID=99).
 	// Phase 17.9: extractSenderKeyMeta now takes *senderKeyColumns; decompose the structure.
-	gotKeyID, _ := extractSenderKeyMeta(decompose(got.Structure()))
+	gotKeyID, _ := extractStructMeta(got.Structure())
 	if gotKeyID != newKeyID {
 		t.Errorf("TR-08: gotKeyID = %d, want %d "+
 			"(next Load must re-parse from blobNew after invalidation)", gotKeyID, newKeyID)

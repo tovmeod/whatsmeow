@@ -245,8 +245,9 @@ func TestBatchUpsertSenderKeysChunking(t *testing.T) {
 	}
 }
 
-// TestBatchUpsertColumnRoundTrip verifies that the columnar fields are stored
-// and that the legacy sender_key blob round-trips through recompose correctly.
+// TestBatchUpsertColumnRoundTrip verifies that PutManySenderKeys writes a valid
+// PackFlat blob and GetSenderKeyStructure reads it back correctly (flat round-trip).
+// Post-upgrade-19: no columnar columns; sender_key is the flat blob.
 // Requires a live DB (skips if unavailable).
 func TestBatchUpsertColumnRoundTrip(t *testing.T) {
 	store, db := newBatchTestStore(t)
@@ -255,25 +256,26 @@ func TestBatchUpsertColumnRoundTrip(t *testing.T) {
 	// Write a structure with known fields.
 	original := buildTestSenderKeyStructure(77)
 	row := sqlstore.NewSenderKeyRow("555@g.us", "777_1:0", original)
+	if row.Blob == nil {
+		t.Fatal("NewSenderKeyRow: PackFlat returned nil blob")
+	}
 	if err := store.PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{row}); err != nil {
 		t.Fatalf("PutManySenderKeys: %v", err)
 	}
 
-	// Verify fmt_ver=2 was written.
-	var fmtVer int
+	// Post-upgrade-19: verify the flat blob was written (sender_key NOT NULL).
+	var blob []byte
 	err := db.QueryRowContext(ctx,
-		`SELECT fmt_ver FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
-		testJID, "555@g.us", "777_1:0").Scan(&fmtVer)
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		testJID, "555@g.us", "777_1:0").Scan(&blob)
 	if err != nil {
-		t.Fatalf("QueryRow fmt_ver: %v", err)
+		t.Fatalf("QueryRow sender_key: %v", err)
 	}
-	if fmtVer != 2 {
-		t.Errorf("fmt_ver = %d, want 2", fmtVer)
+	if blob == nil {
+		t.Error("sender_key blob is NULL, want non-NULL PackFlat blob")
 	}
 
-	// Dual-READ only: no sender_key blob is written. Verify the round-trip
-	// through the columnar read path (GetSenderKeyStructure → recompose from
-	// the st_* / smk_* columns), which is the production read path.
+	// Verify round-trip through GetSenderKeyStructure → store.UnpackFlat.
 	byteCache, _ := lru.New[string, []byte](1024)
 	devCache, _ := lru.New[string, []string](1024)
 	cs := sqlstore.NewCachedSenderKeyStore(store, testJID, byteCache, devCache)
@@ -281,11 +283,8 @@ func TestBatchUpsertColumnRoundTrip(t *testing.T) {
 	if err != nil || structure == nil {
 		t.Fatalf("GetSenderKeyStructure: err=%v got=%v", err, structure)
 	}
-	// Normalize nil/empty-slice differences (the JSON serializer converts nil Keys
-	// to [] on serialization; reflect.DeepEqual sees them as different).
-	// Confirmed: the only diff in this fixture is nil vs [] on the Keys field.
 	if !reflect.DeepEqual(normalizeSenderKeyStructure(original), normalizeSenderKeyStructure(structure)) {
-		t.Errorf("round-trip mismatch:\n  original:    %+v\n  roundtripped: %+v", original, structure)
+		t.Errorf("flat round-trip mismatch:\n  original:    %+v\n  roundtripped: %+v", original, structure)
 	}
 }
 

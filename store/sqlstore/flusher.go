@@ -35,23 +35,16 @@ type flushSenderKeyBatch interface {
 
 // dirtyEntry tracks one pending sender-key write in the dirty-set.
 //
-// Phase 17.9: session []byte → cols *senderKeyColumns. The DTO carries all
-// decomposed fields; keyID and iter are sourced from the DTO by the producer
-// (PutSenderKeyStructure) and passed explicitly to Enqueue. The drain sites
-// build SenderKeyRow{Cols: e.cols} — no []byte anywhere in the dirty-set.
-//
-// Copy discipline: cols slice fields are references into the senderKeyColumns
-// produced by decompose; decompose allocates fresh slices from the libsignal
-// structure, so the DTO is already disjoint from the caller's structure. The
-// flusher holds the only reference to each dirtyEntry's cols; no defensive
-// copy of the DTO slice fields is required (the libsignal structure is
-// immutable in the context of a ratchet write).
+// Phase 17.11-05: cols *senderKeyColumns → blob []byte (PackFlat output).
+// The flat blob is produced once at PutSenderKeyStructure call time; the flusher
+// holds the only reference to each dirtyEntry's blob. keyID and iter are still
+// passed explicitly (derived from the structure before packing).
 type dirtyEntry struct {
 	group, user string
-	cols        *senderKeyColumns // latest columnar DTO — monotonic forward ratchet makes "last wins" safe
-	highIter    uint32            // highest iteration seen for this entry
-	lastFlushed uint32            // iteration at last successful DB write
-	keyID       uint32            // keyID (generation) of the most-recent state; new keyID resets dedup
+	blob        []byte // PackFlat-encoded sender_key — monotonic forward ratchet makes "last wins" safe
+	highIter    uint32 // highest iteration seen for this entry
+	lastFlushed uint32 // iteration at last successful DB write
+	keyID       uint32 // keyID (generation) of the most-recent state; new keyID resets dedup
 }
 
 // SenderKeyFlusher batches dirty sender-key entries and drains them
@@ -146,10 +139,9 @@ func (f *SenderKeyFlusher) crossesBoundary(iter, lastFlushed uint32) bool {
 //  4. If N-boundary crossed, signal the async flusher.
 //  5. If dirty-set > backpressureCap, perform an inline synchronous write.
 //
-// Phase 17.9: accepts *senderKeyColumns (not []byte). keyID and iter are
-// passed explicitly — the len==0 guard for 0-state structures lives in the
-// producer (PutSenderKeyStructure), not here.
-func (f *SenderKeyFlusher) Enqueue(group, user string, cols *senderKeyColumns, keyID, iter uint32, wasFailed bool) {
+// Phase 17.11-05: accepts []byte (PackFlat blob) instead of *senderKeyColumns.
+// keyID and iter are still passed explicitly by the producer (PutSenderKeyStructure).
+func (f *SenderKeyFlusher) Enqueue(group, user string, blob []byte, keyID, iter uint32, wasFailed bool) {
 	k := group + "|" + user
 
 	f.mu.Lock()
@@ -190,14 +182,14 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, cols *senderKeyColumns, k
 	var lastFlushed uint32
 	if exists {
 		lastFlushed = entry.lastFlushed
-		entry.cols = cols // DTO replaces previous; monotonic ratchet makes last-wins safe
+		entry.blob = blob // blob replaces previous; monotonic ratchet makes last-wins safe
 		entry.highIter = iter
 		entry.keyID = keyID
 	} else {
 		entry = &dirtyEntry{
 			group:    group,
 			user:     user,
-			cols:     cols,
+			blob:     blob,
 			highIter: iter,
 			keyID:    keyID,
 		}
@@ -221,17 +213,17 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, cols *senderKeyColumns, k
 	// Inline synchronous write on backpressure (valve fires when dirty-set > backpressureCap).
 	// This runs outside the lock — PutManySenderKeys must not be called under mu.
 	if needsInlineWrite {
-		f.flushOneSynchronous(group, user, cols, iter)
+		f.flushOneSynchronous(group, user, blob, iter)
 	}
 }
 
 // flushOneSynchronous performs a single-row synchronous write (inline backpressure path).
 // Removes the entry from the dirty-set on success. On failure, retains dirty state.
 // Must NOT be called while f.mu is held.
-func (f *SenderKeyFlusher) flushOneSynchronous(group, user string, cols *senderKeyColumns, iter uint32) {
+func (f *SenderKeyFlusher) flushOneSynchronous(group, user string, blob []byte, iter uint32) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err := f.store.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Cols: cols}})
+	err := f.store.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Blob: blob}})
 	if err != nil {
 		slog.Error(fmt.Sprintf("SenderKeyFlusher inline flush failed group=%s user=%s iter=%d: %v", group, user, iter, err))
 
@@ -280,7 +272,7 @@ func (f *SenderKeyFlusher) Drain() {
 		rows := make([]SenderKeyRow, 0, len(f.dirty))
 		keys := make([]string, 0, len(f.dirty))
 		for k, e := range f.dirty {
-			rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Cols: e.cols})
+			rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob})
 			keys = append(keys, k)
 		}
 		f.mu.Unlock()
@@ -321,7 +313,7 @@ func (f *SenderKeyFlusher) runFlush() {
 	rows := make([]SenderKeyRow, 0, len(f.dirty))
 	keys := make([]string, 0, len(f.dirty))
 	for k, e := range f.dirty {
-		rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Cols: e.cols})
+		rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob})
 		keys = append(keys, k)
 	}
 	f.mu.Unlock()

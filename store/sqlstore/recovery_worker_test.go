@@ -286,18 +286,24 @@ func TestRecoveryIterationGuard(t *testing.T) {
 	}
 
 	// Verify DB row is still at Iteration=100 (not overwritten by donor iter=50).
-	var iterDB sql.NullInt64
+	// Post-upgrade-19: read the flat blob and unpack to get the iteration.
+	var blobDB []byte
 	err = db.QueryRowContext(ctx,
-		`SELECT st_chain_key_iteration[1] FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
 		recoveryWorkerTestJIDB, group, targetSenderID,
-	).Scan(&iterDB)
+	).Scan(&blobDB)
 	if err != nil {
-		t.Fatalf("read B row iteration: %v", err)
+		t.Fatalf("read B row sender_key: %v", err)
 	}
-	if !iterDB.Valid || iterDB.Int64 != 100 {
-		t.Errorf("DB row iteration = %v, want 100 (must not be downgraded by donor iter=50)", iterDB)
+	unpackedB, uErr := store.UnpackFlat(blobDB)
+	if uErr != nil || unpackedB == nil || len(unpackedB.SenderKeyStates) == 0 {
+		t.Fatalf("UnpackFlat B row: err=%v got=%v", uErr, unpackedB)
 	}
-	t.Logf("PASS: iteration guard fired — RecoverSenderKey returned false, DB row preserved at iter=%d", iterDB.Int64)
+	iterFromBlob := unpackedB.SenderKeyStates[0].SenderChainKey.Iteration
+	if iterFromBlob != 100 {
+		t.Errorf("DB row iteration = %d, want 100 (must not be downgraded by donor iter=50)", iterFromBlob)
+	}
+	t.Logf("PASS: iteration guard fired — RecoverSenderKey returned false, DB row preserved at iter=%d", iterFromBlob)
 }
 
 // containsStrings is a helper to check if a string slice contains a target string.

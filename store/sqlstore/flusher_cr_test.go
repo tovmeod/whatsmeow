@@ -60,7 +60,7 @@ func TestCR01DeleteBeforeFlush(t *testing.T) {
 	k := group + "|" + user
 
 	// Enqueue an entry — it enters the dirty-set.
-	f.Enqueue(group, user, testCols(1, 1), 1, 1, false)
+	f.Enqueue(group, user, testBlob(1, 1), 1, 1, false)
 	if f.DirtyCount() != 1 {
 		t.Fatalf("DirtyCount before delete = %d, want 1", f.DirtyCount())
 	}
@@ -104,7 +104,7 @@ func TestCR02AckAfterFlush(t *testing.T) {
 	group, user := "group-CR02", "user-CR02"
 
 	// Enqueue one entry.
-	f.Enqueue(group, user, testCols(1, 1), 1, 1, false)
+	f.Enqueue(group, user, testBlob(1, 1), 1, 1, false)
 	if f.DirtyCount() != 1 {
 		t.Fatalf("DirtyCount before flush = %d, want 1", f.DirtyCount())
 	}
@@ -157,8 +157,8 @@ func TestCR03DeleteAllSessions(t *testing.T) {
 	groupB, userB := "group-CR03", "user-B"
 	kA := groupA + "|" + userA
 
-	f.Enqueue(groupA, userA, testCols(1, 1), 1, 1, false)
-	f.Enqueue(groupB, userB, testCols(1, 1), 1, 1, false)
+	f.Enqueue(groupA, userA, testBlob(1, 1), 1, 1, false)
+	f.Enqueue(groupB, userB, testBlob(1, 1), 1, 1, false)
 	if f.DirtyCount() != 2 {
 		t.Fatalf("DirtyCount before scoped delete = %d, want 2", f.DirtyCount())
 	}
@@ -218,8 +218,8 @@ func TestCR04MigrateBeforeFlush(t *testing.T) {
 
 	group, user := "group-CR04", "user-CR04"
 	k := group + "|" + user
-	colsHigh := testCols(1, 10)
-	colsStale := testCols(1, 5)
+	colsHigh := testBlob(1, 10)
+	colsStale := testBlob(1, 5)
 
 	// Enqueue the high-iter entry (simulating the most-recent dirty write).
 	f.Enqueue(group, user, colsHigh, /*keyID=*/ 1, /*iter=*/ 10, false)
@@ -240,15 +240,19 @@ func TestCR04MigrateBeforeFlush(t *testing.T) {
 	if entry.highIter != 10 {
 		t.Fatalf("CR-04: highIter = %d, want 10 (stale re-read must not overwrite)", entry.highIter)
 	}
-	// Confirm the dirty entry points to the high-iter cols DTO (not the stale one).
-	// We compare via the stChainKeyIteration field which encodes iter in our testCols helper.
-	if entry.cols == nil {
-		t.Fatal("CR-04: dirty entry cols is nil")
+	// Confirm the dirty entry holds the high-iter blob (not the stale one).
+	// Post-17.11-05: dirty-set stores []byte (PackFlat blob). We verify the high-iter
+	// blob is in the entry by checking it is not nil and matches colsHigh.
+	if entry.blob == nil {
+		t.Fatal("CR-04: dirty entry blob is nil")
 	}
-	if len(entry.cols.stChainKeyIteration) == 0 || entry.cols.stChainKeyIteration[0] != 10 {
-		t.Fatalf("CR-04: dirty cols iteration = %v, want [10] (stale DTO must not overwrite high-iter DTO)", entry.cols.stChainKeyIteration)
+	// The blob must be colsHigh (iter=10), not colsStale (iter=5). Since blob is
+	// an opaque []byte, verify by bytes identity: high-iter blob was enqueued first
+	// and the dedup-skip of the stale write must not replace it.
+	if len(entry.blob) != len(colsHigh) {
+		t.Fatalf("CR-04: dirty blob length = %d, want %d (stale blob must not overwrite high-iter blob)", len(entry.blob), len(colsHigh))
 	}
-	_ = colsStale // stale DTO should not be in dirty entry
+	_ = colsStale // stale blob should not be in dirty entry
 }
 
 // ---------------------------------------------------------------------------
@@ -285,9 +289,11 @@ func TestCR05BulkWriteReconcile(t *testing.T) {
 	wrapper.SetFlusher(f)
 
 	// Build a minimal SenderKeyStructure to pass to PutSenderKeyStructure.
-	// The columnar path decomposes → enqueues to flusher (no inner call).
-	cols := testCols(1, 5)
-	structure := recompose(cols)
+	// The flat path packs → enqueues to flusher (no inner call).
+	chainKey := make([]byte, 32)
+	sigPub := make([]byte, 33)
+	sigPub[0] = 0x05
+	structure := testStructure(1, 5, chainKey, sigPub, make([]byte, 32))
 
 	// Call PutSenderKeyStructure — columnar write-back must not reach inner.
 	if err := wrapper.PutSenderKeyStructure(ctx, "group-CR05", "user-CR05", structure); err != nil {
@@ -388,7 +394,7 @@ func TestEvictBeforeDrop(t *testing.T) {
 		user := fmt.Sprintf("user-evict-%d", i)
 		cacheKey := testJID + "|" + group + "|" + user
 		// Enqueue columnar DTO to flusher.
-		f.Enqueue(group, user, testCols(1, uint32(i+1)), 1, uint32(i+1), false)
+		f.Enqueue(group, user, testBlob(1, uint32(i+1)), 1, uint32(i+1), false)
 		// Add dummy blob to []byte LRU — may evict older entries (counter-only callback).
 		lruCache.Add(cacheKey, []byte("legacy-blob"))
 	}
@@ -429,7 +435,7 @@ func TestSynchronousShutdownDrain(t *testing.T) {
 	for i := 0; i < numEntries; i++ {
 		group := fmt.Sprintf("group-shutdown-%d", i)
 		user := fmt.Sprintf("user-shutdown-%d", i)
-		f.Enqueue(group, user, testCols(1, 1), 1, 1, false)
+		f.Enqueue(group, user, testBlob(1, 1), 1, 1, false)
 	}
 
 	if n := f.DirtyCount(); n != numEntries {

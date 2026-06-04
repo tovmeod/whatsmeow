@@ -70,107 +70,62 @@ type donorSenderKeyState struct {
 	SkippedKeys []*ratchet.SenderMessageKeyStructure
 }
 
-// recoveryScanQuery fetches all (chat_id, bare-user LIKE) rows across ALL accounts
-// (no our_jid filter — the whole point of recovery is to find another account's row).
+// recoveryScanQueryFast is the indexed fast-path donor query (R8).
+// Filters by chat_id + sk_keyid0 (STORED GENERATED column = state[0].KeyID in PackFlat)
+// + sender_id LIKE prefix, seeking the composite (chat_id, sk_keyid0) index.
+// Finds single-state donors (and multi-state donors where state[0].KeyID == targetKeyID).
+// Does NOT find multi-state donors where targetKeyID is only in state[1+]; those are
+// covered by the LIKE-only fallback (recoveryScanQuery).
 //
-// Returns fmt_ver + all columnar fields + the legacy sender_key blob.
-// The fmt_ver=2 rows carry the key_id and chain_key_iteration arrays that allow
-// SQL-side pre-filtering (commented in code below — we still fetch both format rows
-// and do final selection in Go so the logic stays simple and correct for both).
+// Device-tolerant: LIKE userBare||':%' ESCAPE '\' matches any device suffix.
+const recoveryScanQueryFast = `
+	SELECT our_jid, sender_key
+	FROM whatsmeow_sender_keys
+	WHERE chat_id=$1 AND sk_keyid0=$3 AND sender_id LIKE $2 || ':%' ESCAPE '\'
+`
+
+// recoveryScanQuery is the LIKE-only fallback donor scan, used when recoveryScanQueryFast
+// finds no qualifying donor (target KeyID is in state[1+] of some multi-state row).
+// Fetches all rows for (chat_id, LIKE sender_id prefix) across ALL accounts and lets
+// the Go loop scan all states for the matching KeyID.
 //
 // Device-tolerant: LIKE userBare||':%' ESCAPE '\' matches any device suffix.
 const recoveryScanQuery = `
-	SELECT
-		fmt_ver,
-		st_key_id, st_chain_key_iteration, st_chain_key,
-		st_signing_key_public, st_signing_key_private,
-		smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed,
-		sender_key
+	SELECT our_jid, sender_key
 	FROM whatsmeow_sender_keys
 	WHERE chat_id=$1 AND sender_id LIKE $2 || ':%' ESCAPE '\'
 `
 
-// findSenderKeyDonor scans all rows for (group, senderBare LIKE) across every
-// account (no our_jid filter) and returns the best donor state: the one with
-// KeyID == targetKeyID and the maximum chain_key_iteration <= targetIter.
-//
-// Returns (nil, nil) when no qualifying donor exists (the caller decides whether
-// to fall back to other recovery mechanisms or fail gracefully).
-//
-// Handles fmt_ver=2 (column) and fmt_ver=1/NULL (legacy blob) donors.
-// Blob Deserialize is allowed here — recovery is off the per-message hot path.
-func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare string, targetKeyID uint32, targetIter uint32) (*donorSenderKeyState, error) {
-	escapedBare := senderKeyLikeEscaper.Replace(senderBare)
-	rows, err := s.db.Query(ctx, recoveryScanQuery, group, escapedBare)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var best *donorSenderKeyState // best donor seen so far (max iter <= targetIter)
-
+// scanFlatRows scans a row cursor from either recoveryScanQueryFast or
+// recoveryScanQuery (both SELECT our_jid, sender_key) and updates best with the
+// best qualifying donor state found. Returns the updated best (may be unchanged).
+func scanFlatRows(rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}, targetKeyID, targetIter uint32, best *donorSenderKeyState) (*donorSenderKeyState, error) {
 	for rows.Next() {
 		var (
-			fmtVer           *int16
-			stKeyID          int64Array
-			stChainKeyIter   int64Array
-			stChainKey       byteaArray
-			stSigningKeyPub  byteaArray
-			stSigningKeyPriv byteaArray
-			smkStateIdx      int32Array
-			smkIteration     int64Array
-			smkIV            byteaArray
-			smkCipherKey     byteaArray
-			smkSeed          byteaArray
-			blob             []byte
+			ourJID string
+			blob   []byte
 		)
-		if err := rows.Scan(
-			&fmtVer,
-			&stKeyID, &stChainKeyIter, &stChainKey,
-			&stSigningKeyPub, &stSigningKeyPriv,
-			&smkStateIdx, &smkIteration, &smkIV, &smkCipherKey, &smkSeed,
-			&blob,
-		); err != nil {
-			return nil, err
+		if err := rows.Scan(&ourJID, &blob); err != nil {
+			return best, err
+		}
+		if blob == nil {
+			continue // NULL blob — skip (should not happen post-upgrade-19)
 		}
 
-		var structure *groupRecord.SenderKeyStructure
-		if fmtVer != nil && *fmtVer == 2 {
-			// fmt_ver=2: recompose from columns.
-			cols := &senderKeyColumns{
-				fmtVer:              2,
-				stKeyID:             []int64(stKeyID),
-				stChainKeyIteration: []int64(stChainKeyIter),
-				stChainKey:          [][]byte(stChainKey),
-				stSigningKeyPublic:  [][]byte(stSigningKeyPub),
-				stSigningKeyPrivate: [][]byte(stSigningKeyPriv),
-				smkStateIdx:         []int32(smkStateIdx),
-				smkIteration:        []int64(smkIteration),
-				smkIV:               [][]byte(smkIV),
-				smkCipherKey:        [][]byte(smkCipherKey),
-				smkSeed:             [][]byte(smkSeed),
-			}
-			structure = recompose(cols)
-		} else {
-			// fmt_ver=1 or NULL: Deserialize the legacy blob.
-			// Allowed here — recovery is off the hot path (outside the grep-gate).
-			if blob == nil {
-				continue // absent / NULL blob on a legacy row — skip
-			}
-			var dErr error
-			structure, dErr = store.SignalProtobufSerializer.SenderKeyRecord.Deserialize(blob)
-			if dErr != nil {
-				// Corrupt blob in a donor row — skip this row, try others.
-				continue
-			}
+		structure, err := store.UnpackFlat(blob)
+		if err != nil {
+			// Corrupt flat blob in a donor row — skip this row, try others.
+			continue
 		}
-
 		if structure == nil {
 			continue
 		}
 
-		// Scan each state in this donor structure for a matching key_id
-		// with chain_iter <= targetIter, keeping the maximum such iteration.
+		// Scan each state for a matching key_id with chain_iter <= targetIter.
 		for _, st := range structure.SenderKeyStates {
 			if st == nil || st.SenderChainKey == nil {
 				continue
@@ -185,7 +140,7 @@ func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare str
 			if best != nil && donorIter <= best.Iteration {
 				continue // not better than current best
 			}
-			// This state is a candidate — collect skipped keys for this state.
+			// This state is a candidate — collect skipped keys.
 			var skipped []*ratchet.SenderMessageKeyStructure
 			for _, smk := range st.Keys {
 				if smk != nil {
@@ -208,10 +163,51 @@ func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare str
 		}
 	}
 	if err := rows.Err(); err != nil {
+		return best, err
+	}
+	return best, nil
+}
+
+// findSenderKeyDonor scans all rows for (group, senderBare LIKE) across every
+// account (no our_jid filter) and returns the best donor state: the one with
+// KeyID == targetKeyID and the maximum chain_key_iteration <= targetIter.
+//
+// TWO-PATH SCAN (R8):
+//  1. Fast path (recoveryScanQueryFast): filters chat_id + sk_keyid0=targetKeyID + LIKE,
+//     seeking the composite (chat_id, sk_keyid0) index. Finds donors where
+//     state[0].KeyID == targetKeyID without scanning the full group row-set.
+//  2. Fallback path (recoveryScanQuery): runs ONLY when the fast path finds no qualifying
+//     donor. LIKE-only scan covers multi-state donors where targetKeyID is in state[1+].
+//
+// All donor rows are PackFlat-encoded. Decode with store.UnpackFlat.
+// Returns (nil, nil) when no qualifying donor exists.
+func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare string, targetKeyID uint32, targetIter uint32) (*donorSenderKeyState, error) {
+	escapedBare := senderKeyLikeEscaper.Replace(senderBare)
+
+	// Fast path: indexed scan on (chat_id, sk_keyid0).
+	// $3 = targetKeyID as int32 (sk_keyid0 is INT4).
+	fastRows, err := s.db.Query(ctx, recoveryScanQueryFast, group, escapedBare, int32(targetKeyID))
+	if err != nil {
+		return nil, err
+	}
+	best, err := scanFlatRows(fastRows, targetKeyID, targetIter, nil)
+	fastRows.Close()
+	if err != nil {
 		return nil, err
 	}
 
-	return best, nil
+	if best != nil {
+		// Fast path found a qualifying donor — skip the fallback scan.
+		return best, nil
+	}
+
+	// Fallback path: LIKE-only scan (covers multi-state donors, state[1+] KeyID match).
+	fbRows, err := s.db.Query(ctx, recoveryScanQuery, group, escapedBare)
+	if err != nil {
+		return nil, err
+	}
+	defer fbRows.Close()
+	return scanFlatRows(fbRows, targetKeyID, targetIter, nil)
 }
 
 // RecoverSenderKey is the cross-account recovery entry-point for
@@ -325,8 +321,7 @@ var _ store.SenderKeyStore = (*SQLStore)(nil)
 // falling back to (false, nil) via the type-assertion above.
 var _ senderKeyRecoveryReader = (*SQLStore)(nil)
 
-// fmtVerDiscriminator documents the critical invariant: recovery MUST consult
-// both fmt_ver=1 (legacy blob) and fmt_ver=2 (column) donors.
-// recoveryScanQuery returns ALL rows regardless of fmt_ver; the Go loop in
-// findSenderKeyDonor dispatches on fmtVer — no format is skipped.
-// T-17.9-20 mitigation: recovery works before any backfill (fmt_ver=1 dominant).
+// flatRecoveryNote: post-upgrade-19 all sender_key values are PackFlat format.
+// findSenderKeyDonor uses store.UnpackFlat for all rows. The fast path
+// (recoveryScanQueryFast + sk_keyid0 index) reduces per-scan cost for the common
+// single-state donor case. The LIKE-only fallback covers multi-state donors.

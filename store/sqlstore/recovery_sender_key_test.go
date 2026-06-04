@@ -131,32 +131,24 @@ func buildDonorStructure(keyID, iter uint32, tag byte) *groupRecord.SenderKeyStr
 	}
 }
 
-// insertLegacyBlobRow inserts a fmt_ver=1 sender-key row (legacy blob only) for
-// the given account. Simulates the common pre-backfill state.
-func insertLegacyBlobRow(t *testing.T, db *sql.DB, ourJID, group, senderID string, structure *groupRecord.SenderKeyStructure) {
+// insertFlatBlobRow inserts a PackFlat-encoded sender-key row for the given account.
+// Post-upgrade-19: all rows are flat (no columnar columns, no fmt_ver).
+// Previously called insertLegacyBlobRow; now encodes as PackFlat.
+func insertFlatBlobRow(t *testing.T, db *sql.DB, ourJID, group, senderID string, structure *groupRecord.SenderKeyStructure) {
 	t.Helper()
-	sk, err := groupRecord.NewSenderKeyFromStruct(structure,
-		pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
-	if err != nil {
-		t.Fatalf("NewSenderKeyFromStruct: %v", err)
+	blob, ok := store.PackFlat(structure)
+	if !ok {
+		t.Fatalf("PackFlat returned nil for %s", senderID)
 	}
-	blob := sk.Serialize()
-	if blob == nil {
-		t.Fatal("Serialize returned nil blob")
-	}
-	_, err = db.ExecContext(context.Background(),
-		`INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, fmt_ver, sender_key)
-		 VALUES ($1, $2, $3, 1, $4)
+	_, err := db.ExecContext(context.Background(),
+		`INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
+		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
-		   fmt_ver=1, sender_key=excluded.sender_key,
-		   st_key_id=NULL, st_chain_key_iteration=NULL, st_chain_key=NULL,
-		   st_signing_key_public=NULL, st_signing_key_private=NULL,
-		   smk_state_idx=NULL, smk_iteration=NULL, smk_iv=NULL,
-		   smk_cipher_key=NULL, smk_seed=NULL`,
+		   sender_key=excluded.sender_key`,
 		ourJID, group, senderID, blob,
 	)
 	if err != nil {
-		t.Fatalf("insertLegacyBlobRow: %v", err)
+		t.Fatalf("insertFlatBlobRow: %v", err)
 	}
 }
 
@@ -259,45 +251,25 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 			t.Fatal("RecoverSenderKey: expected true (donor found), got false")
 		}
 
-		// Verify the row under B: fmt_ver=2, iter=10.
-		var fmtVerDB, iterDB sql.NullInt64
-		err = db.QueryRowContext(ctx,
-			`SELECT fmt_ver, st_chain_key_iteration[1] FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
-			recoveryTestJIDB, group, targetSenderID,
-		).Scan(&fmtVerDB, &iterDB)
-		if err != nil {
-			t.Fatalf("read recovered row (fmt_ver=2 arm): %v", err)
-		}
-		if !fmtVerDB.Valid || fmtVerDB.Int64 != 2 {
-			t.Errorf("fmt_ver2 arm: want fmt_ver=2, got %v", fmtVerDB)
-		}
-		if !iterDB.Valid || iterDB.Int64 != 10 {
-			t.Errorf("fmt_ver2 arm: want iter=10, got %v", iterDB)
-		}
-
-		// Dual-READ only: the recovered row is column-only, so the legacy
-		// sender_key blob must be NULL (recovery writes columns, never the blob).
+		// Verify the recovered row via UnpackFlat (post-upgrade-19: no columnar columns).
 		var blob []byte
 		err = db.QueryRowContext(ctx,
 			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
 			recoveryTestJIDB, group, targetSenderID,
 		).Scan(&blob)
-		if err != nil {
-			t.Fatalf("read blob: %v", err)
+		if err != nil || blob == nil {
+			t.Fatalf("read recovered sender_key: err=%v blob=%v", err, blob)
 		}
-		if blob != nil {
-			t.Errorf("sender_key blob = %d bytes, want NULL (recovery must write columns only, not the legacy blob)", len(blob))
+		unpacked, uErr := store.UnpackFlat(blob)
+		if uErr != nil || unpacked == nil || len(unpacked.SenderKeyStates) == 0 {
+			t.Fatalf("UnpackFlat recovered row: err=%v got=%v", uErr, unpacked)
 		}
-		// Recompose from the columns and compare signing keys against the donor.
-		recovered, err := csB.GetSenderKeyStructure(ctx, group, targetSenderID)
-		if err != nil || recovered == nil {
-			t.Fatalf("GetSenderKeyStructure (recovered): err=%v got=%v", err, recovered)
+		recvState := unpacked.SenderKeyStates[0]
+		if recvState.SenderChainKey.Iteration != 10 {
+			t.Errorf("fmt_ver2 arm: want iter=10, got %d", recvState.SenderChainKey.Iteration)
 		}
-		if len(recovered.SenderKeyStates) == 0 {
-			t.Fatal("recovered structure has 0 states")
-		}
+
 		donorState := donorStruct.SenderKeyStates[0]
-		recvState := recovered.SenderKeyStates[0]
 		if !bytes.Equal(donorState.SigningKeyPublic, recvState.SigningKeyPublic) {
 			t.Errorf("fmt_ver2 arm: SigningKeyPublic mismatch:\n  donor: %x\n  recv:  %x",
 				donorState.SigningKeyPublic, recvState.SigningKeyPublic)
@@ -312,13 +284,13 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 			t.Errorf("fmt_ver2 arm: SigningKeyPrivate mismatch (nil-normalized):\n  donor: %x\n  recv:  %x",
 				normalDonor, normalRecv)
 		}
-		t.Logf("fmt_ver2 arm: PASS — donor iter=10, target=15, recovered iter=%d, fmt_ver=%d", iterDB.Int64, fmtVerDB.Int64)
+		t.Logf("fmt_ver2 arm: PASS — donor iter=10, target=15, recovered iter=%d", recvState.SenderChainKey.Iteration)
 	})
 
 	// -----------------------------------------------------------------------
-	// Arm 2: fmt_ver=1 legacy blob donor (T-17.9-20)
-	// Seed account A with a raw fmt_ver=1 legacy-blob row (iter=20, keyID=42).
-	// Recovery must parse the blob and find the donor.
+	// Arm 2: flat donor arm (previously fmt_ver=1 legacy blob)
+	// Post-upgrade-19: all rows are PackFlat. Seed A with a flat row (iter=20, keyID=42).
+	// Recovery must unpack the flat blob and find the donor.
 	// -----------------------------------------------------------------------
 	t.Run("fmt_ver1_legacy_donor", func(t *testing.T) {
 		ctx := context.Background()
@@ -329,58 +301,36 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 
 		csB := newRecoveryTestStoreB(t, db)
 
-		// Seed A: fmt_ver=1 legacy-blob row (iter=20, keyID=42, donor suffix :5).
+		// Seed A: flat PackFlat row (iter=20, keyID=42, donor suffix :5).
 		donorStruct := buildDonorStructure(targetKeyID, 20, 0xBB)
-		insertLegacyBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
-
-		// Sanity: verify the row is fmt_ver=1.
-		var seedFmtVer int
-		err := db.QueryRowContext(ctx,
-			`SELECT fmt_ver FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
-			recoveryTestJIDA, group, donorSenderID,
-		).Scan(&seedFmtVer)
-		if err != nil || seedFmtVer != 1 {
-			t.Fatalf("expected fmt_ver=1 for seeded legacy row, got %d (err=%v)", seedFmtVer, err)
-		}
+		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		// Recover into B with targetIter=25 (donor=20 ≤ 25 → accepted).
 		ok, err := csB.RecoverSenderKey(ctx, group, targetSenderID, bareUser, targetKeyID, 25)
 		if err != nil {
-			t.Fatalf("RecoverSenderKey (legacy arm): %v", err)
+			t.Fatalf("RecoverSenderKey (flat arm): %v", err)
 		}
 		if !ok {
-			t.Fatal("RecoverSenderKey (legacy arm): expected true (donor found via blob parse), got false")
+			t.Fatal("RecoverSenderKey (flat arm): expected true (donor found via UnpackFlat), got false")
 		}
 
-		// Verify: fmt_ver=2 written under B, iter=20.
-		var fmtVerDB, iterDB sql.NullInt64
-		err = db.QueryRowContext(ctx,
-			`SELECT fmt_ver, st_chain_key_iteration[1] FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
-			recoveryTestJIDB, group, targetSenderID,
-		).Scan(&fmtVerDB, &iterDB)
-		if err != nil {
-			t.Fatalf("read recovered row (legacy arm): %v", err)
-		}
-		if !fmtVerDB.Valid || fmtVerDB.Int64 != 2 {
-			t.Errorf("legacy arm: want fmt_ver=2 (upgraded on write), got %v", fmtVerDB)
-		}
-		if !iterDB.Valid || iterDB.Int64 != 20 {
-			t.Errorf("legacy arm: want iter=20, got %v", iterDB)
-		}
-		// Dual-READ only: even a legacy (fmt_ver=1) donor is recovered as a
-		// column-only fmt_ver=2 row, so the recovered blob must be NULL.
+		// Verify the recovered row via UnpackFlat.
 		var blob []byte
 		err = db.QueryRowContext(ctx,
 			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
 			recoveryTestJIDB, group, targetSenderID,
 		).Scan(&blob)
-		if err != nil {
-			t.Fatalf("legacy arm: read blob: %v", err)
+		if err != nil || blob == nil {
+			t.Fatalf("flat arm: read recovered sender_key: err=%v blob=%v", err, blob)
 		}
-		if blob != nil {
-			t.Errorf("legacy arm: sender_key blob = %d bytes, want NULL (recovery writes columns only)", len(blob))
+		unpacked, uErr := store.UnpackFlat(blob)
+		if uErr != nil || unpacked == nil || len(unpacked.SenderKeyStates) == 0 {
+			t.Fatalf("flat arm: UnpackFlat recovered row: err=%v got=%v", uErr, unpacked)
 		}
-		t.Logf("legacy arm: PASS — fmt_ver=1 donor iter=20, target=25, recovered iter=%d fmt_ver=%d", iterDB.Int64, fmtVerDB.Int64)
+		if unpacked.SenderKeyStates[0].SenderChainKey.Iteration != 20 {
+			t.Errorf("flat arm: want iter=20, got %d", unpacked.SenderKeyStates[0].SenderChainKey.Iteration)
+		}
+		t.Logf("flat arm: PASS — flat donor iter=20, target=25, recovered iter=%d", unpacked.SenderKeyStates[0].SenderChainKey.Iteration)
 	})
 
 	// -----------------------------------------------------------------------
@@ -464,34 +414,34 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 			t.Fatal("closest-iter arm: expected true (two donors), got false")
 		}
 
-		// The recovered iter must be 12 (the maximum ≤ 15).
-		var iterDB sql.NullInt64
+		// The recovered iter must be 12 (the maximum ≤ 15) — verify via UnpackFlat.
+		var blob []byte
 		err = db.QueryRowContext(ctx,
-			`SELECT st_chain_key_iteration[1] FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
 			recoveryTestJIDB, group, targetSenderID,
-		).Scan(&iterDB)
-		if err != nil {
-			t.Fatalf("read recovered row (closest-iter arm): %v", err)
+		).Scan(&blob)
+		if err != nil || blob == nil {
+			t.Fatalf("closest-iter arm: read recovered sender_key: err=%v blob=%v", err, blob)
 		}
-		if !iterDB.Valid || iterDB.Int64 != 12 {
-			t.Errorf("closest-iter arm: want iter=12 (max of {5,12} ≤ 15), got %v", iterDB)
+		unpacked, uErr := store.UnpackFlat(blob)
+		if uErr != nil || unpacked == nil || len(unpacked.SenderKeyStates) == 0 {
+			t.Fatalf("closest-iter arm: UnpackFlat: err=%v got=%v", uErr, unpacked)
+		}
+		recvSt := unpacked.SenderKeyStates[0]
+		if recvSt.SenderChainKey.Iteration != 12 {
+			t.Errorf("closest-iter arm: want iter=12 (max of {5,12} ≤ 15), got %d", recvSt.SenderChainKey.Iteration)
 		}
 
 		// Verify the chain key belongs to struct12 (tag=0xD2).
-		var chainKeyDB []byte
-		_ = db.QueryRowContext(ctx,
-			`SELECT st_chain_key[1] FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
-			recoveryTestJIDB, group, targetSenderID,
-		).Scan(&chainKeyDB)
 		expectedChainKey := make([]byte, 32)
 		for i := range expectedChainKey {
 			expectedChainKey[i] = 0xD2 + byte(i)
 		}
-		if !bytes.Equal(chainKeyDB, expectedChainKey) {
+		if !bytes.Equal(recvSt.SenderChainKey.ChainKey, expectedChainKey) {
 			t.Errorf("closest-iter arm: ChainKey mismatch — want tag=0xD2 (iter=12 donor):\n  got:  %x\n  want: %x",
-				chainKeyDB, expectedChainKey)
+				recvSt.SenderChainKey.ChainKey, expectedChainKey)
 		}
-		t.Logf("closest-iter arm: PASS — donors {iter=5, iter=12} for target=15; recovered iter=%d (max wins)", iterDB.Int64)
+		t.Logf("closest-iter arm: PASS — donors {iter=5, iter=12} for target=15; recovered iter=%d (max wins)", recvSt.SenderChainKey.Iteration)
 	})
 
 	// -----------------------------------------------------------------------
