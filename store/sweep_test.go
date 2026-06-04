@@ -65,6 +65,30 @@ func simulateGuardedUpdate(sessions map[string][]byte, key string, newBlob []byt
 	return 1
 }
 
+// simulateBatchedGuardedUpdate models the sweeper's single multi-row UPDATE:
+//
+//	UPDATE whatsmeow_sessions AS w SET session = v.flat
+//	FROM (VALUES ...) AS v(our_jid, their_id, flat)
+//	WHERE w.our_jid=v.our_jid AND w.their_id=v.their_id AND get_byte(w.session,0)=123
+//
+// Every candidate row is independently guarded by the same get_byte predicate, so
+// the batched form has identical safety to the per-row form: rows already flat are
+// excluded from the join and left untouched. Returns the total rows actually updated.
+func simulateBatchedGuardedUpdate(sessions map[string][]byte, updates map[string][]byte) (rowsAffected int) {
+	for key, newBlob := range updates {
+		current, ok := sessions[key]
+		if !ok {
+			continue // row no longer exists — not in the join result
+		}
+		if !byteZeroMatchesJSON(current) {
+			continue // guard: already flat, excluded by WHERE get_byte=123
+		}
+		sessions[key] = newBlob
+		rowsAffected++
+	}
+	return rowsAffected
+}
+
 // makeJSONBlob builds a JSON-encoded session blob from a SessionStructure
 // using the standard SignalProtobufSerializer's session Serialize method —
 // the same JSON path that the live driver's ALLOW-JSON-DRAIN-BLOB-SESSION
@@ -167,6 +191,34 @@ func TestSweeperGuard(t *testing.T) {
 	// The flat row must be unchanged.
 	if !bytes.Equal(sessions[flatKey], originalFlatBlob) {
 		t.Error("flat row was modified despite guard — predicate-based protection failed")
+	}
+
+	// Step 6: BATCHED guarded UPDATE — the sweeper applies one multi-row UPDATE per
+	// batch (UPDATE ... FROM (VALUES ...) WHERE get_byte=123). A batch mixing an
+	// already-flat row and a JSON row must convert ONLY the JSON row and leave the
+	// flat row byte-identical; rowsAffected must be exactly 1.
+	jsonToFlat, okB := PackFlatSession(flatStruct)
+	if !okB {
+		t.Fatal("PackFlatSession refused for batched-update blob")
+	}
+	batchSessions := map[string][]byte{
+		flatKey: append([]byte(nil), originalFlatBlob...),
+		jsonKey: makeJSONBlob(flatStruct),
+	}
+	batchUpdates := map[string][]byte{
+		flatKey: differentBlob, // would corrupt the flat row if the guard failed
+		jsonKey: jsonToFlat,    // legitimate JSON→flat conversion
+	}
+	batchAffected := simulateBatchedGuardedUpdate(batchSessions, batchUpdates)
+	if batchAffected != 1 {
+		t.Errorf("batched guarded UPDATE: rowsAffected=%d, want 1 (only the JSON row converts)", batchAffected)
+	}
+	if !bytes.Equal(batchSessions[flatKey], originalFlatBlob) {
+		t.Error("batched UPDATE modified the already-flat row despite the per-row guard")
+	}
+	if batchSessions[jsonKey][0] != flatSessionMagic {
+		t.Errorf("batched UPDATE: JSON row not converted (byte[0]=0x%02X, want flat magic 0x%02X)",
+			batchSessions[jsonKey][0], flatSessionMagic)
 	}
 
 	// D-02 invariant check: PackFlatSession MUST NOT emit 0x7B at byte[0] for any
