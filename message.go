@@ -533,6 +533,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 }
 
 func (cli *Client) clearUntrustedIdentity(ctx context.Context, target types.JID) error {
+	cli.Log.Warnf("IDENTITY_CLEAR target=%s account=%s", target.String(), cli.getOwnID().User)
 	err := cli.Store.Identities.DeleteIdentity(ctx, target.SignalAddress().String())
 	if err != nil {
 		return fmt.Errorf("failed to delete identity: %w", err)
@@ -824,7 +825,7 @@ func extractSenderKeyHave(ctx context.Context, senderKeyStore store.SenderKeySto
 // diagnostic. At 1-in-100, peak SENDERKEY_MISS volume (a few thousand/min at
 // peak) pays the deserialization cost ~tens of times per minute instead of
 // every time.
-const senderKeyMissHaveDefaultRate = 100
+const senderKeyMissHaveDefaultRate = 10
 
 // senderKeyMissHaveRate is the resolved sample rate (read once at init):
 //
@@ -846,6 +847,17 @@ var senderKeyMissHaveRate = func() int {
 
 // senderKeyMissCounter is the process-wide miss counter driving the sampler.
 var senderKeyMissCounter atomic.Uint64
+
+// D-14: placeholderResend counters track the empty-vs-ok rate for phone re-request responses.
+// placeholderResendEmpty counts items where GetPlaceholderMessageResendResponse() == nil.
+// placeholderResendOk counts items that successfully set UnavailableRequestID (message recovered).
+// Ratio: empty/(empty+ok) is the empty-rate; >20% indicates investigate sender decline or malformation.
+var (
+	placeholderResendEmpty atomic.Uint64
+	placeholderResendOk    atomic.Uint64
+)
+
+const placeholderLogEvery = 1000
 
 // senderKeyMissShouldSample returns true on 1-in-senderKeyMissHaveRate calls.
 // Always false when senderKeyMissHaveRate == 0 (and never touches the counter
@@ -1237,12 +1249,16 @@ func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationR
 		var webMsg waWeb.WebMessageInfo
 		if resp := part.GetPlaceholderMessageResendResponse(); resp == nil {
 			cli.Log.Warnf("Missing response in item #%d of response to %s", i+1, reqID)
+			if n := placeholderResendEmpty.Add(1); n%placeholderLogEvery == 0 {
+				cli.Log.Infof("PLACEHOLDER_RESEND empty=%d ok=%d", n, placeholderResendOk.Load())
+			}
 		} else if err := proto.Unmarshal(resp.GetWebMessageInfoBytes(), &webMsg); err != nil {
 			cli.Log.Warnf("Failed to unmarshal protobuf web message in item #%d of response to %s: %v", i+1, reqID, err)
 		} else if msgEvt, err := cli.ParseWebMessage(types.EmptyJID, &webMsg); err != nil {
 			cli.Log.Warnf("Failed to parse web message info in item #%d of response to %s: %v", i+1, reqID, err)
 		} else {
 			msgEvt.UnavailableRequestID = reqID
+			placeholderResendOk.Add(1)
 			ok = !cli.dispatchEvent(msgEvt) && ok
 		}
 	}
