@@ -23,6 +23,10 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
+// appStateSyncFailureThreshold is the number of consecutive ErrMismatchingLTHash errors
+// for the same app-state collection that triggers an automatic full resync.
+const appStateSyncFailureThreshold = 3
+
 func (cli *Client) handleEncryptNotification(ctx context.Context, node *waBinary.Node) {
 	from := node.AttrGetter().JID("from")
 	if from == types.ServerJID {
@@ -76,13 +80,36 @@ func (cli *Client) handleAppStateNotification(ctx context.Context, node *waBinar
 		name := appstate.WAPatchName(ag.String("name"))
 		version := ag.Uint64("version")
 		cli.Log.Debugf("Got server sync notification that app state %s has updated to version %d", name, version)
-		err := cli.FetchAppState(ctx, name, false, false)
+		err := cli.fetchAppStateFunc(ctx, name, false, false)
 		if errors.Is(err, ErrIQDisconnected) || errors.Is(err, ErrNotConnected) {
 			// There are some app state changes right before a remote logout, so stop syncing if we're disconnected.
 			cli.Log.Debugf("Failed to sync app state after notification: %v, not trying to sync other states", err)
 			return
+		} else if errors.Is(err, appstate.ErrMismatchingLTHash) {
+			cli.appStateSyncFailuresLock.Lock()
+			cli.appStateSyncFailures[name]++
+			count := cli.appStateSyncFailures[name]
+			cli.appStateSyncFailuresLock.Unlock()
+			cli.Log.Errorf("Failed to sync app state after notification: %v", err)
+			if count >= appStateSyncFailureThreshold {
+				cli.Log.Warnf("APP_STATE_AUTO_RESYNC: %d consecutive ErrMismatchingLTHash for %s — triggering fullSync", count, name)
+				err2 := cli.fetchAppStateFunc(ctx, name, true, false)
+				cli.appStateSyncFailuresLock.Lock()
+				if err2 == nil {
+					cli.appStateSyncFailures[name] = 0
+				}
+				cli.appStateSyncFailuresLock.Unlock()
+				if err2 != nil {
+					cli.Log.Errorf("APP_STATE_AUTO_RESYNC fullSync also failed for %s: %v", name, err2)
+				}
+			}
 		} else if err != nil {
 			cli.Log.Errorf("Failed to sync app state after notification: %v", err)
+		} else {
+			// Success: reset the failure counter for this collection.
+			cli.appStateSyncFailuresLock.Lock()
+			cli.appStateSyncFailures[name] = 0
+			cli.appStateSyncFailuresLock.Unlock()
 		}
 	}
 }

@@ -163,6 +163,17 @@ type Client struct {
 	failedSenderKeyTuplesPtr  int
 	failedSenderKeyTuplesLock sync.Mutex
 
+	// kavtov-fork (D-12): per-collection consecutive ErrMismatchingLTHash failure counter.
+	// When the same collection name fails N times in a row, handleAppStateNotification triggers
+	// FetchAppState(fullSync=true) to self-heal the divergence. Uses its own lock — NOT
+	// appStateSyncLock — so the counter is never held across the long FetchAppState fetch.
+	// Collection set is small (bounded by appstate.AllPatchNames, ~10 entries); no ring needed.
+	appStateSyncFailures     map[appstate.WAPatchName]int
+	appStateSyncFailuresLock sync.Mutex
+	// fetchAppStateFunc is the function used by handleAppStateNotification to call FetchAppState.
+	// Defaults to cli.FetchAppState in NewClient; tests override it with a spy.
+	fetchAppStateFunc func(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error
+
 	// kavtov-fork (perf 260602): SKDM redundancy dedup. WhatsApp re-bundles the SenderKeyDistribution
 	// message with normal group traffic; builder.Process then LoadSenderKey+AddSenderKeyState+
 	// StoreSenderKey unconditionally on each arrival, re-writing the row. The dedup is ITERATION-AWARE
@@ -302,6 +313,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
 		failedSenderKeyTuples:  make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
 		skdmInstalled:          make(map[skdmInstalledKey]uint32, skdmInstalledSize),
+		appStateSyncFailures:   make(map[appstate.WAPatchName]int),
 		sessionRecreateHistory: make(map[types.JID]time.Time),
 		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
@@ -313,6 +325,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 
 		BackgroundEventCtx: context.Background(),
 	}
+	cli.fetchAppStateFunc = cli.FetchAppState
 	cli.nodeHandlers = map[string]nodeHandler{
 		"message":      cli.handleEncryptedMessage,
 		"appdata":      cli.handleEncryptedMessage,
