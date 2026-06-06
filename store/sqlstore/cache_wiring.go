@@ -26,6 +26,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
+	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -352,6 +353,12 @@ type signalCaches struct {
 	Session   *lru.Cache[string, []byte]
 	Identity  *lru.Cache[string, *[32]byte]
 	SenderKey *lru.Cache[string, []byte]
+	// Phase 29 D-01: process-global singleflight.Group for findSenderKeyDonor.
+	// Coalesces concurrent cross-account donor queries for the same
+	// (group, senderBare, keyID) so N accounts missing the same key run exactly
+	// one donor DB scan. Zero value is ready — no New() call needed.
+	// Passed by pointer to each CachedSenderKeyStore so all accounts share one Group.
+	DonorSF singleflight.Group
 	// kavtov-fork: Phase 27 — device-set index for the device-tolerant group
 	// sender-key lookup. Keyed jid|group|userBare → the device-qualified
 	// sender_id list. Lets GetSenderKeyDevices be answered from cache (0 DB
@@ -559,7 +566,7 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	// re-wiring (same JID, same shared db; its dirty-set persists). Only the
 	// first attach for a JID constructs + Start()s it. Check+create under the
 	// mutex so concurrent saves for the same JID can't both create one.
-	senderKeyStore := NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices)
+	senderKeyStore := NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices, &c.caches.DonorSF)
 	c.caches.senderKeyFlushersMu.Lock()
 	flusher, exists := c.caches.senderKeyFlusherMap[jid]
 	if !exists {

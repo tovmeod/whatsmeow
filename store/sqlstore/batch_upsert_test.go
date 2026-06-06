@@ -156,7 +156,7 @@ func readBackAndVerify(t *testing.T, s *sqlstore.SQLStore, group, user string, w
 	// the production read path.
 	byteCache, _ := lru.New[string, []byte](1024)
 	devCache, _ := lru.New[string, []string](1024)
-	cs := sqlstore.NewCachedSenderKeyStore(s, testJID, byteCache, devCache)
+	cs := sqlstore.NewCachedSenderKeyStore(s, testJID, byteCache, devCache, nil)
 	structure, err := cs.GetSenderKeyStructure(ctx, group, user)
 	if err != nil {
 		t.Fatalf("GetSenderKeyStructure(%s,%s): %v", group, user, err)
@@ -278,7 +278,7 @@ func TestBatchUpsertColumnRoundTrip(t *testing.T) {
 	// Verify round-trip through GetSenderKeyStructure → store.UnpackFlat.
 	byteCache, _ := lru.New[string, []byte](1024)
 	devCache, _ := lru.New[string, []string](1024)
-	cs := sqlstore.NewCachedSenderKeyStore(store, testJID, byteCache, devCache)
+	cs := sqlstore.NewCachedSenderKeyStore(store, testJID, byteCache, devCache, nil)
 	structure, err := cs.GetSenderKeyStructure(ctx, "555@g.us", "777_1:0")
 	if err != nil || structure == nil {
 		t.Fatalf("GetSenderKeyStructure: err=%v got=%v", err, structure)

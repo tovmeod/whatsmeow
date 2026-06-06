@@ -282,7 +282,7 @@ func TestCR05BulkWriteReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lru.New deviceCache: %v", err)
 	}
-	wrapper := NewCachedSenderKeyStore(inner, "test-jid-CR05", cache, deviceCache)
+	wrapper := NewCachedSenderKeyStore(inner, "test-jid-CR05", cache, deviceCache, nil)
 
 	flusherStore := &mockFlushStore{}
 	f := NewSenderKeyFlusher(flusherStore, waLog.Noop, 1000)

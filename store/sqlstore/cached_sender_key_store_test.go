@@ -50,7 +50,7 @@ func newTestCachedSenderKeyStore(t *testing.T, capSize int) (*CachedSenderKeySto
 	}
 	// "test-jid" with no trailing pipe — wrapper's key() prepends the
 	// separator. Matches production format used by Container.initializeDevice.
-	wrapper := NewCachedSenderKeyStore(inner, "test-jid", cache, deviceCache)
+	wrapper := NewCachedSenderKeyStore(inner, "test-jid", cache, deviceCache, nil)
 	return wrapper, inner
 }
 

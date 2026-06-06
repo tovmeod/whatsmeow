@@ -708,7 +708,7 @@ func benchmarkSenderKeyRecovery(b *testing.B, nDonors int) {
 	storeB := NewSQLStore(containerB, jidB)
 	byteCache, _ := lru.New[string, []byte](256)
 	devCache, _ := lru.New[string, []string](256)
-	csB := NewCachedSenderKeyStore(storeB, recovBenchJIDB, byteCache, devCache)
+	csB := NewCachedSenderKeyStore(storeB, recovBenchJIDB, byteCache, devCache, nil)
 
 	// targetSenderID and targetIter: recover the best donor (max iter <= target).
 	targetSenderID := recovBenchSender + ":0"

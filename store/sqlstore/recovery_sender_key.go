@@ -40,11 +40,25 @@ package sqlstore
 
 import (
 	"context"
+	"strconv"
+	"sync/atomic"
 
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
 
 	"go.mau.fi/whatsmeow/store"
+)
+
+// D-05 fallback-scan instrumentation counters.
+// fallbackScanEntered counts how often recoveryScanQuery (the LIKE-only fallback
+// path) is entered. fallbackScanDonorFound counts how often it returns a non-nil
+// donor. The ratio fallbackScanDonorFound/fallbackScanEntered is the hit rate of
+// the LIKE-only fallback; a low ratio means the fallback rarely succeeds (most
+// misses are fleet-correlated no-donor cases). Both counters are logged every 500
+// fallback entries so the operator can measure without a prod restart.
+var (
+	fallbackScanEntered    atomic.Uint64
+	fallbackScanDonorFound atomic.Uint64
 )
 
 // senderKeyRecoveryReader is the local interface that *SQLStore satisfies to
@@ -208,12 +222,24 @@ func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare str
 	}
 
 	// Fallback path: LIKE-only scan (covers multi-state donors, state[1+] KeyID match).
+	// D-05: count entries and donor hits so the operator can measure hit-rate post-deploy.
+	if n := fallbackScanEntered.Add(1); n%500 == 0 {
+		s.log.Infof("D05_FALLBACK_SCAN entered=%d donorFound=%d group=%s",
+			n, fallbackScanDonorFound.Load(), group)
+	}
 	fbRows, err := s.db.Query(ctx, recoveryScanQuery, group, escapedBare)
 	if err != nil {
 		return nil, err
 	}
 	defer fbRows.Close()
-	return scanFlatRows(fbRows, targetKeyID, targetIter, nil)
+	fbBest, err := scanFlatRows(fbRows, targetKeyID, targetIter, nil)
+	if err != nil {
+		return nil, err
+	}
+	if fbBest != nil {
+		fallbackScanDonorFound.Add(1)
+	}
+	return fbBest, nil
 }
 
 // TryInlineRecovery is the cross-account recovery entry-point for
@@ -237,9 +263,35 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 		return "", false, nil
 	}
 
-	donor, err := r.findSenderKeyDonor(ctx, group, senderBare, targetKeyID, targetIter)
-	if err != nil {
-		return "", false, err
+	// D-01: coalesce concurrent findSenderKeyDonor calls for the same
+	// (group, senderBare, keyID) via the process-global singleflight.Group.
+	// N accounts missing the same key will share ONE donor DB scan; each
+	// account then independently runs the downgrade guard + install below.
+	// targetIter is excluded from the key (RESEARCH Open Q1): the per-account
+	// iteration-downgrade guard already handles the case where a shared donor
+	// is inapplicable at a lower target iteration.
+	// The "|" separator prevents key collisions between distinct tuples that
+	// share a prefix (T-29-01-01 mitigation).
+	sfKey := group + "|" + senderBare + "|" + strconv.FormatUint(uint64(targetKeyID), 10)
+
+	var donor *donorSenderKeyState
+	if c.sf != nil {
+		v, sfErr, _ := c.sf.Do(sfKey, func() (any, error) {
+			return r.findSenderKeyDonor(ctx, group, senderBare, targetKeyID, targetIter)
+		})
+		if sfErr != nil {
+			return "", false, sfErr
+		}
+		if v != nil {
+			donor = v.(*donorSenderKeyState)
+		}
+	} else {
+		// No singleflight wired (test context); call directly.
+		var findErr error
+		donor, findErr = r.findSenderKeyDonor(ctx, group, senderBare, targetKeyID, targetIter)
+		if findErr != nil {
+			return "", false, findErr
+		}
 	}
 	if donor == nil {
 		return "", false, nil // no qualifying donor

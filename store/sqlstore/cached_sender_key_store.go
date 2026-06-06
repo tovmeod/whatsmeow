@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
+	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
 )
@@ -53,6 +53,13 @@ type CachedSenderKeyStore struct {
 	// by PutSenderKey only when a genuinely new device appears (see PutSenderKey).
 	deviceCache *lru.Cache[string, []string]
 
+	// Phase 29 D-01: pointer to the process-global singleflight.Group for
+	// findSenderKeyDonor coalescing. Shared by all CachedSenderKeyStore instances
+	// (passed from signalCaches.DonorSF). May be nil in unit-test contexts that
+	// construct the store without a Container — the nil path calls findSenderKeyDonor
+	// directly (no coalescing but correct behaviour).
+	sf *singleflight.Group
+
 	// Phase 17.7-03: write-back flusher. May be nil before Start() wiring
 	// (will fall back to write-through when nil, preserving backward compat).
 	flusher *SenderKeyFlusher
@@ -86,13 +93,16 @@ var _ store.SenderKeyColumnarStore = (*CachedSenderKeyStore)(nil)
 
 // NewCachedSenderKeyStore constructs a wrapper over inner. jid is the device
 // JID (used as cache-key prefix). cache is a shared LRU constructed by the
-// Container.
-func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte], deviceCache *lru.Cache[string, []string]) *CachedSenderKeyStore {
+// Container. sf is a pointer to the process-global singleflight.Group for
+// findSenderKeyDonor coalescing (passed from signalCaches.DonorSF); nil is
+// accepted for test contexts that do not wire a Container.
+func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte], deviceCache *lru.Cache[string, []string], sf *singleflight.Group) *CachedSenderKeyStore {
 	return &CachedSenderKeyStore{
 		inner:       inner,
 		jid:         jid,
 		cache:       cache,
 		deviceCache: deviceCache,
+		sf:          sf,
 	}
 }
 

@@ -86,7 +86,7 @@ func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles
 	// Build the CachedSenderKeyStore. jid string must match device.ID.String()
 	// so that c.key(group,user) == the device struct-cache cacheKey (TR-08).
 	jidStr := jid.String()
-	skStore := NewCachedSenderKeyStore(fakeSK, jidStr, skCache, devCache)
+	skStore := NewCachedSenderKeyStore(fakeSK, jidStr, skCache, devCache, nil)
 
 	// Attach a non-Started flusher so the wasFailed path executes the
 	// parsedInvalidate callback (TR-08) without spawning a background goroutine.

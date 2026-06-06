@@ -520,7 +520,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	innerB := sqlstore.NewSQLStore(containerB, jidBParsed)
 	byteB, _ := lru.New[string, []byte](256)
 	devB, _ := lru.New[string, []string](256)
-	csBStore := sqlstore.NewCachedSenderKeyStore(innerB, inlineTestJIDB, byteB, devB)
+	csBStore := sqlstore.NewCachedSenderKeyStore(innerB, inlineTestJIDB, byteB, devB, nil)
 
 	// Wire parsedReplace on B's store (needed by PutSenderKeyStructure coherence
 	// path, but the parsed cache object itself doesn't matter for B — only C
@@ -570,7 +570,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	innerC := sqlstore.NewSQLStore(containerC, jidCParsed)
 	byteC, _ := lru.New[string, []byte](256)
 	devC, _ := lru.New[string, []string](256)
-	csC := sqlstore.NewCachedSenderKeyStore(innerC, inlineTestJIDC, byteC, devC)
+	csC := sqlstore.NewCachedSenderKeyStore(innerC, inlineTestJIDC, byteC, devC, nil)
 
 	skLRUC, _ := store.NewSKParsedLRU(256)
 	parsedC := store.NewParsedSKCache(skLRUC)

@@ -96,7 +96,7 @@ func newRecoveryTestStoreB(t *testing.T, db *sql.DB) *sqlstore.CachedSenderKeySt
 
 	byteCache, _ := lru.New[string, []byte](256)
 	devCache, _ := lru.New[string, []string](256)
-	return sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache)
+	return sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 }
 
 // buildDonorStructure builds a SenderKeyStructure with one state: the given
@@ -639,7 +639,7 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		innerB := sqlstore.NewSQLStore(containerB, flatJIDB)
 		byteCache, _ := lru.New[string, []byte](256)
 		devCache, _ := lru.New[string, []string](256)
-		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache)
+		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache, nil)
 
 		targetSenderID := flatBareUser + ":0"
 		_, ok, err := csB.TryInlineRecovery(ctx, flatGroup, targetSenderID, flatBareUser, fastTargetKeyID, fastTargetIter)
@@ -712,7 +712,7 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		innerB := sqlstore.NewSQLStore(containerB, flatJIDB)
 		byteCache, _ := lru.New[string, []byte](256)
 		devCache, _ := lru.New[string, []string](256)
-		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache)
+		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache, nil)
 
 		targetSenderID := flatBareUser + ":0"
 		_, ok, err := csB.TryInlineRecovery(ctx, flatGroup, targetSenderID, flatBareUser, fallbackTarget, fallbackTargetIter)
