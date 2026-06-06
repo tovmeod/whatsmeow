@@ -27,6 +27,15 @@ import (
 // for the same app-state collection that triggers an automatic full resync.
 const appStateSyncFailureThreshold = 3
 
+// maxAppStateFullSyncFailures bounds how many times a fullSync may itself fail with
+// ErrMismatchingLTHash before we give up on auto-healing a collection. A permanently
+// diverged collection (server snapshot itself fails LTHash verification, e.g. a stuck
+// patch version) cannot be healed by re-fetching, so without a cap the auto-resync
+// degenerates into an unbounded fullSync loop hammering the server (D-12 prod loop on
+// 972527147052, patch v67292). After this many failed fullSyncs we stop triggering and
+// leave the collection diverged; any later successful sync re-arms auto-heal.
+const maxAppStateFullSyncFailures = 3
+
 func (cli *Client) handleEncryptNotification(ctx context.Context, node *waBinary.Node) {
 	from := node.AttrGetter().JID("from")
 	if from == types.ServerJID {
@@ -89,26 +98,38 @@ func (cli *Client) handleAppStateNotification(ctx context.Context, node *waBinar
 			cli.appStateSyncFailuresLock.Lock()
 			cli.appStateSyncFailures[name]++
 			count := cli.appStateSyncFailures[name]
+			gaveUp := cli.appStateFullSyncFailures[name] >= maxAppStateFullSyncFailures
 			cli.appStateSyncFailuresLock.Unlock()
 			cli.Log.Errorf("Failed to sync app state after notification: %v", err)
-			if count >= appStateSyncFailureThreshold {
+			if count >= appStateSyncFailureThreshold && !gaveUp {
 				cli.Log.Warnf("APP_STATE_AUTO_RESYNC: %d consecutive ErrMismatchingLTHash for %s — triggering fullSync", count, name)
 				err2 := cli.fetchAppStateFunc(ctx, name, true, false)
 				cli.appStateSyncFailuresLock.Lock()
+				// Reset the consecutive-error counter after EVERY fullSync attempt so a
+				// failed fullSync backs off to one attempt per appStateSyncFailureThreshold
+				// errors instead of re-firing on every subsequent notification (D-12 loop fix).
+				cli.appStateSyncFailures[name] = 0
 				if err2 == nil {
-					cli.appStateSyncFailures[name] = 0
+					cli.appStateFullSyncFailures[name] = 0
+				} else {
+					cli.appStateFullSyncFailures[name]++
 				}
+				fullSyncFails := cli.appStateFullSyncFailures[name]
 				cli.appStateSyncFailuresLock.Unlock()
 				if err2 != nil {
-					cli.Log.Errorf("APP_STATE_AUTO_RESYNC fullSync also failed for %s: %v", name, err2)
+					cli.Log.Errorf("APP_STATE_AUTO_RESYNC fullSync also failed for %s (attempt %d/%d): %v", name, fullSyncFails, maxAppStateFullSyncFailures, err2)
+					if fullSyncFails >= maxAppStateFullSyncFailures {
+						cli.Log.Errorf("APP_STATE_AUTO_RESYNC giving up on %s after %d failed fullSync attempts — collection left diverged; manual intervention required", name, fullSyncFails)
+					}
 				}
 			}
 		} else if err != nil {
 			cli.Log.Errorf("Failed to sync app state after notification: %v", err)
 		} else {
-			// Success: reset the failure counter for this collection.
+			// Success: reset both failure counters for this collection (re-arms auto-heal).
 			cli.appStateSyncFailuresLock.Lock()
 			cli.appStateSyncFailures[name] = 0
+			cli.appStateFullSyncFailures[name] = 0
 			cli.appStateSyncFailuresLock.Unlock()
 		}
 	}

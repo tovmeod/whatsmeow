@@ -37,9 +37,10 @@ func makeAppStateNode(name appstate.WAPatchName) *waBinary.Node {
 // It seeds appStateSyncFailures so the map is non-nil (matching NewClient behaviour).
 func newAppStateTestClient() *Client {
 	return &Client{
-		Store: &store.Device{Log: waLog.Noop},
-		Log:   waLog.Noop,
-		appStateSyncFailures: make(map[appstate.WAPatchName]int),
+		Store:                    &store.Device{Log: waLog.Noop},
+		Log:                      waLog.Noop,
+		appStateSyncFailures:     make(map[appstate.WAPatchName]int),
+		appStateFullSyncFailures: make(map[appstate.WAPatchName]int),
 	}
 }
 
@@ -242,5 +243,62 @@ func TestAppStateCounterPerCollection(t *testing.T) {
 	}
 	if countB != 1 {
 		t.Fatalf("collB counter = %d, want 1 (cross-collection contamination)", countB)
+	}
+}
+
+// TestAppStateFullSyncGivesUpAfterMaxFailures verifies the D-12 loop fix: when fullSync
+// itself keeps failing with ErrMismatchingLTHash (a permanently diverged collection like
+// 972527147052/patch-v67292), the consecutive counter resets after each fullSync attempt
+// (back-off to one fullSync per appStateSyncFailureThreshold errors) and fullSync stops
+// being triggered entirely after maxAppStateFullSyncFailures attempts.
+func TestAppStateFullSyncGivesUpAfterMaxFailures(t *testing.T) {
+	const collection appstate.WAPatchName = "regular_high"
+	ctx := context.Background()
+	node := makeAppStateNode(collection)
+
+	var mu sync.Mutex
+	var fullSyncCalls int
+	cli := newAppStateTestClient()
+	cli.fetchAppStateFunc = func(_ context.Context, _ appstate.WAPatchName, fullSync, _ bool) error {
+		// Everything fails — the collection cannot be healed by re-fetching.
+		if fullSync {
+			mu.Lock()
+			fullSyncCalls++
+			mu.Unlock()
+		}
+		return appstate.ErrMismatchingLTHash
+	}
+
+	// Drive far more notifications than could ever be needed. Without the cap this would
+	// fire fullSync on most of them (the original unbounded loop).
+	for i := 0; i < 60; i++ {
+		cli.handleAppStateNotification(ctx, node)
+	}
+
+	mu.Lock()
+	gotFullSync := fullSyncCalls
+	mu.Unlock()
+	if gotFullSync != maxAppStateFullSyncFailures {
+		t.Fatalf("fullSync triggered %d times, want %d (must give up after the cap)", gotFullSync, maxAppStateFullSyncFailures)
+	}
+
+	cli.appStateSyncFailuresLock.Lock()
+	fullSyncFails := cli.appStateFullSyncFailures[collection]
+	cli.appStateSyncFailuresLock.Unlock()
+	if fullSyncFails != maxAppStateFullSyncFailures {
+		t.Fatalf("appStateFullSyncFailures = %d, want %d", fullSyncFails, maxAppStateFullSyncFailures)
+	}
+
+	// A later successful sync must re-arm auto-heal (clears the give-up state).
+	cli.fetchAppStateFunc = func(_ context.Context, _ appstate.WAPatchName, _, _ bool) error {
+		return nil
+	}
+	cli.handleAppStateNotification(ctx, node)
+	cli.appStateSyncFailuresLock.Lock()
+	rearmed := cli.appStateFullSyncFailures[collection]
+	count := cli.appStateSyncFailures[collection]
+	cli.appStateSyncFailuresLock.Unlock()
+	if rearmed != 0 || count != 0 {
+		t.Fatalf("after a successful sync: fullSyncFails=%d count=%d, want both 0 (auto-heal must re-arm)", rearmed, count)
 	}
 }

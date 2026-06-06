@@ -170,6 +170,10 @@ type Client struct {
 	// Collection set is small (bounded by appstate.AllPatchNames, ~10 entries); no ring needed.
 	appStateSyncFailures     map[appstate.WAPatchName]int
 	appStateSyncFailuresLock sync.Mutex
+	// kavtov-fork (D-12 loop fix): per-collection count of fullSync attempts that themselves
+	// failed with ErrMismatchingLTHash. Capped by maxAppStateFullSyncFailures so a permanently
+	// diverged collection stops re-triggering fullSync. Guarded by appStateSyncFailuresLock.
+	appStateFullSyncFailures map[appstate.WAPatchName]int
 	// fetchAppStateFunc is the function used by handleAppStateNotification to call FetchAppState.
 	// Defaults to cli.FetchAppState in NewClient; tests override it with a spy.
 	fetchAppStateFunc func(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error
@@ -313,7 +317,8 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
 		failedSenderKeyTuples:  make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
 		skdmInstalled:          make(map[skdmInstalledKey]uint32, skdmInstalledSize),
-		appStateSyncFailures:   make(map[appstate.WAPatchName]int),
+		appStateSyncFailures:     make(map[appstate.WAPatchName]int),
+		appStateFullSyncFailures: make(map[appstate.WAPatchName]int),
 		sessionRecreateHistory: make(map[types.JID]time.Time),
 		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
