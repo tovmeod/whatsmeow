@@ -143,6 +143,8 @@ func (cli *Client) getMessageForRetry(ctx context.Context, receipt *events.Recei
 				return nil, fmt.Errorf("failed to get message from retry store by id: %w", errByID)
 			}
 		}
+		cli.Log.Warnf("RETRY_STORE_MISS msgID=%s chat=%s altChat=%s account=%s altEmpty=%v err=%v",
+			messageID, receipt.Chat, altChat, cli.getOwnID().User, altChat.IsEmpty(), err)
 		return nil, fmt.Errorf("failed to get message from retry store: %w", err)
 	}
 	waMsg := cli.GetMessageForRetry(receipt.Sender, receipt.Chat, messageID)
