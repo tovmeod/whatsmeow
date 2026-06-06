@@ -932,6 +932,69 @@ func (cli *Client) isFailedSenderKeyTuple(sender, group string) bool {
 	return exists
 }
 
+// kavtov-fork (perf 260602): SKDM dedup sizing. The installed working set is roughly
+// groups×senders×active-keyID per account; 16384 holds the hot set so the frequently re-bundled
+// SKDMs dedup reliably, while a cold tuple that ring-evicts simply re-processes once (a write we
+// would have done anyway — safe, never a correctness loss). Dedup on add; ring-evict oldest when full.
+const skdmInstalledSize = 16384
+
+// skdmDedupLogEvery samples the periodic SKDM_DEDUP stat line (every Nth skip) so the redundant-write
+// slice can be sized from journald without a DB query.
+const skdmDedupLogEvery = 1000
+
+// skdmInstalledKey keys the dedup set by the INBOUND sender's device-qualified signal address (same
+// keying as the failed-set), the group, and the SKDM's keyID (the per-generation identifier).
+type skdmInstalledKey struct {
+	Sender string // from.SignalAddress().String()
+	Group  string // chat.String()
+	KeyID  uint32 // sdkMsg.ID()
+}
+
+// skdmDedupSkipped / skdmDedupProcessed are process-wide counters: redundant re-broadcasts skipped vs
+// SKDMs actually processed (first installs + forward checkpoints + forced re-processes for failing
+// tuples). skip_pct sizes the redundant-write slice this dedup eliminates.
+var skdmDedupSkipped, skdmDedupProcessed atomic.Uint64
+
+// skdmProcessedIteration returns the highest SKDM iteration already processed for (sender,group,keyID)
+// and whether any has been processed. Read-only; guarded by skdmInstalledLock, safe under the
+// concurrent receive path.
+func (cli *Client) skdmProcessedIteration(sender, group string, keyID uint32) (uint32, bool) {
+	key := skdmInstalledKey{Sender: sender, Group: group, KeyID: keyID}
+	cli.skdmInstalledLock.Lock()
+	defer cli.skdmInstalledLock.Unlock()
+	iter, ok := cli.skdmInstalled[key]
+	return iter, ok
+}
+
+// markSKDMProcessed records that an SKDM at iteration `iter` was processed for (sender,group,keyID),
+// keeping the MAX iteration seen (a later forward checkpoint raises the bar; a stale one never lowers
+// it). A first observation consumes a ring slot and evicts the oldest when full; updating an existing
+// key consumes no slot (dedup-on-add). Guarded by skdmInstalledLock.
+func (cli *Client) markSKDMProcessed(sender, group string, keyID, iter uint32) {
+	key := skdmInstalledKey{Sender: sender, Group: group, KeyID: keyID}
+	cli.skdmInstalledLock.Lock()
+	defer cli.skdmInstalledLock.Unlock()
+	if cli.skdmInstalled == nil {
+		// Lazy init: a bare &Client{} (tests / direct construction) must not nil-panic on receive.
+		cli.skdmInstalled = make(map[skdmInstalledKey]uint32, skdmInstalledSize)
+	}
+	if prev, exists := cli.skdmInstalled[key]; exists {
+		if iter > prev {
+			cli.skdmInstalled[key] = iter
+		}
+		return
+	}
+	if old := cli.skdmInstalledList[cli.skdmInstalledPtr]; old.Sender != "" {
+		delete(cli.skdmInstalled, old)
+	}
+	cli.skdmInstalled[key] = iter
+	cli.skdmInstalledList[cli.skdmInstalledPtr] = key
+	cli.skdmInstalledPtr++
+	if cli.skdmInstalledPtr >= len(cli.skdmInstalledList) {
+		cli.skdmInstalledPtr = 0
+	}
+}
+
 const checkPadding = true
 
 func isValidPadding(plaintext []byte) bool {
@@ -963,7 +1026,6 @@ func padMessage(plaintext []byte) []byte {
 }
 
 func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat, from types.JID, axolotlSKDM []byte) {
-	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
 	// kavtov-fork: Phase 27 — device-qualified store; the message keyID disambiguates devices; device-tolerant lookup (27-01) finds the record regardless of which device the skmsg is labeled with.
 	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
 	// kavtov-fork (STEP 1 instrument): is this arriving SKDM for a tuple that is CURRENTLY stuck (a
@@ -983,6 +1045,25 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 		}
 		return
 	}
+	// kavtov-fork (perf 260602): skip the redundant re-process of an SKDM we have already seen at an
+	// equal-or-higher iteration. builder.Process is LoadSenderKey+AddSenderKeyState+StoreSenderKey
+	// unconditionally; for a re-bundled SKDM that is a duplicate write. The skip is ITERATION-AWARE: a
+	// HIGHER-iteration SKDM (SKDM.Create emits the sender's live chain position) is a forward checkpoint
+	// that rescues a recipient who fell >2000 behind, so it MUST process — only an at-or-below iteration
+	// is a true redundant/stale re-broadcast. The failed-set bypass guarantees recovery is never blocked:
+	// a tuple currently failing to decrypt always re-processes, so a deleted/lost key re-installs.
+	senderStr := from.SignalAddress().String()
+	keyID := sdkMsg.ID()
+	skdmIter := sdkMsg.Iteration()
+	if !wasFailed {
+		if seenIter, ok := cli.skdmProcessedIteration(senderStr, chat.String(), keyID); ok && skdmIter <= seenIter {
+			if n := skdmDedupSkipped.Add(1); n%skdmDedupLogEvery == 0 {
+				cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d group=%s keyid=%d iter=%d seen=%d", skdmDedupProcessed.Load(), n, chat.String(), keyID, skdmIter, seenIter)
+			}
+			return
+		}
+	}
+	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
 	err = builder.Process(ctx, senderKeyName, sdkMsg)
 	if err != nil {
 		cli.Log.Errorf("Failed to process sender key distribution message from %s for %s: %v", from, chat, err)
@@ -991,6 +1072,8 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 		}
 		return
 	}
+	cli.markSKDMProcessed(senderStr, chat.String(), keyID, skdmIter)
+	skdmDedupProcessed.Add(1)
 	if wasFailed {
 		cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=y", from.SignalAddressUser(), from.Device, chat.String())
 	}

@@ -163,6 +163,21 @@ type Client struct {
 	failedSenderKeyTuplesPtr  int
 	failedSenderKeyTuplesLock sync.Mutex
 
+	// kavtov-fork (perf 260602): SKDM redundancy dedup. WhatsApp re-bundles the SenderKeyDistribution
+	// message with normal group traffic; builder.Process then LoadSenderKey+AddSenderKeyState+
+	// StoreSenderKey unconditionally on each arrival, re-writing the row. The dedup is ITERATION-AWARE
+	// (not keyID-only): SKDM.Create emits the sender's LIVE SenderChainKey iteration, so a re-bundled
+	// SKDM from an active sender can carry a HIGHER iteration — a forward checkpoint that rescues a
+	// recipient who fell >2000 behind (ErrTooFarIntoFuture). This map records, per (sender,group,keyID),
+	// the highest SKDM iteration we have already processed; an arriving SKDM is skipped ONLY when it is
+	// at-or-below that (a true redundant/stale re-broadcast). A higher-iteration SKDM always processes
+	// (never drop a rescue). Bypassed entirely when the tuple is in failedSenderKeyTuples, so a deleted/
+	// lost key re-installs. Restart empties it (first SKDM per keyID re-confirms). Bounded ring idiom.
+	skdmInstalled     map[skdmInstalledKey]uint32
+	skdmInstalledList [skdmInstalledSize]skdmInstalledKey
+	skdmInstalledPtr  int
+	skdmInstalledLock sync.Mutex
+
 	sessionRecreateHistory     map[types.JID]time.Time
 	sessionRecreateHistoryLock sync.Mutex
 	// GetMessageForRetry is used to find the source message for handling retry receipts
@@ -286,6 +301,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 
 		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
 		failedSenderKeyTuples:  make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
+		skdmInstalled:          make(map[skdmInstalledKey]uint32, skdmInstalledSize),
 		sessionRecreateHistory: make(map[types.JID]time.Time),
 		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
