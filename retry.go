@@ -153,8 +153,8 @@ func (cli *Client) getMessageForRetry(ctx context.Context, receipt *events.Recei
 		if !msgTimestamp.IsZero() {
 			age = time.Since(msgTimestamp).Round(time.Second).String()
 		}
-		cli.Log.Warnf("RETRY_STORE_MISS msgID=%s chat=%s altChat=%s account=%s altEmpty=%v age=%s retrySender=%s senderIsOwn=%v isGroup=%v isFromMe=%v err=%v",
-			messageID, receipt.Chat, altChat, cli.getOwnID().User, altChat.IsEmpty(), age, receipt.Sender, receipt.Sender.User == cli.getOwnID().User, receipt.IsGroup, receipt.IsFromMe, err)
+		cli.Log.Warnf("RETRY_STORE_MISS msgID=%s chat=%s altChat=%s account=%s altEmpty=%v age=%s retrySender=%s senderDevice=%d senderAgent=%d senderIsOwn=%v isGroup=%v isFromMe=%v err=%v",
+			messageID, receipt.Chat, altChat, cli.getOwnID().User, altChat.IsEmpty(), age, receipt.Sender, receipt.Sender.Device, receipt.Sender.RawAgent, receipt.Sender.User == cli.getOwnID().User, receipt.IsGroup, receipt.IsFromMe, err)
 		return nil, fmt.Errorf("failed to get message from retry store: %w", err)
 	}
 	waMsg := cli.GetMessageForRetry(receipt.Sender, receipt.Chat, messageID)
