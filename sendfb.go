@@ -137,11 +137,10 @@ func (cli *Client) SendFBMessage(
 	resp.DebugTimings.Queue = time.Since(start)
 	defer cli.messageSendLock.Unlock()
 
-	if !req.Peer {
-		err = cli.addRecentMessage(ctx, to, req.ID, nil, messageAppProto)
-		if err != nil {
-			return
-		}
+	// kavtov: always store for retry; addRecentMessage skips the DB write for peer messages.
+	err = cli.addRecentMessage(ctx, to, req.ID, nil, messageAppProto, req.Peer)
+	if err != nil {
+		return
 	}
 	respChan := cli.waitResponse(req.ID)
 	var phash string

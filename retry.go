@@ -46,14 +46,23 @@ type recentMessageKey struct {
 type RecentMessage struct {
 	wa *waE2E.Message
 	fb *waMsgApplication.MessageApplication
+	// isPeer marks a message sent via SendPeerMessage (category=peer). kavtov: peer
+	// messages are kept in the in-memory ring only (never the DB retry buffer) so they
+	// can be re-served on a retry receipt with PEER framing instead of the malformed
+	// DeviceSentMessage wrap. See debug session retry-store-miss-never-stored.
+	isPeer bool
 }
 
 func (rm RecentMessage) IsEmpty() bool {
 	return rm.wa == nil && rm.fb == nil
 }
 
-func (cli *Client) addRecentMessage(ctx context.Context, to types.JID, id types.MessageID, wa *waE2E.Message, fb *waMsgApplication.MessageApplication) error {
-	if cli.UseRetryMessageStore {
+func (cli *Client) addRecentMessage(ctx context.Context, to types.JID, id types.MessageID, wa *waE2E.Message, fb *waMsgApplication.MessageApplication, isPeer bool) error {
+	// kavtov: peer messages (req.Peer) are NOT written to the DB retry buffer — the DB
+	// is write-bound and peer retries only need to be servable for the brief window the
+	// requesting device retries (~seconds). They are always kept in the in-memory ring
+	// below so a retry receipt can be served from getRecentMessage (retry.go:109).
+	if cli.UseRetryMessageStore && !isPeer {
 		var buf []byte
 		var format string
 		var err error
@@ -85,7 +94,7 @@ func (cli *Client) addRecentMessage(ctx context.Context, to types.JID, id types.
 	if cli.recentMessagesList[cli.recentMessagesPtr].ID != "" {
 		delete(cli.recentMessagesMap, cli.recentMessagesList[cli.recentMessagesPtr])
 	}
-	cli.recentMessagesMap[key] = RecentMessage{wa: wa, fb: fb}
+	cli.recentMessagesMap[key] = RecentMessage{wa: wa, fb: fb, isPeer: isPeer}
 	cli.recentMessagesList[cli.recentMessagesPtr] = key
 	cli.recentMessagesPtr++
 	if cli.recentMessagesPtr >= len(cli.recentMessagesList) {
@@ -99,6 +108,31 @@ func (cli *Client) getRecentMessage(to types.JID, id types.MessageID) RecentMess
 	cli.recentMessagesLock.RLock()
 	defer cli.recentMessagesLock.RUnlock()
 	return cli.recentMessagesMap[recentMessageKey{to, id}]
+}
+
+// shouldWrapDeviceSentRetry reports whether an outgoing-message retry should be re-wrapped
+// as a DeviceSentMessage. This is true for own-account (IsFromMe) DM retries, but NOT for
+// peer messages (msg.isPeer): peer messages must be re-sent with PEER framing instead
+// (see applyPeerRetryAttrs and the peer content shape in handleRetryReceipt). Wrapping a
+// peer message as DeviceSentMessage produces the malformed resend upstream deferred.
+func shouldWrapDeviceSentRetry(receipt *events.Receipt, msg *RecentMessage) bool {
+	return receipt.IsFromMe && !msg.isPeer
+}
+
+// applyPeerRetryAttrs mutates a retry message node's attrs to use PEER framing, mirroring
+// preparePeerMessageNode (send.go): type=text, category=peer, and push_priority for the
+// app-state-sync-key-request / history-sync-on-demand peer request types. The dominant
+// PLACEHOLDER_MESSAGE_RESEND request (PEER_DATA_OPERATION_REQUEST_MESSAGE) gets neither.
+// It deliberately does NOT set device_fanout (peer sends never do).
+func applyPeerRetryAttrs(attrs waBinary.Attrs, wa *waE2E.Message) {
+	attrs["type"] = "text"
+	attrs["category"] = "peer"
+	if wa.GetProtocolMessage().GetType() == waE2E.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST {
+		attrs["push_priority"] = "high"
+	} else if wa.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetPeerDataOperationRequestType() == waE2E.PeerDataOperationRequestType_HISTORY_SYNC_ON_DEMAND {
+		attrs["push_priority"] = "high_force"
+		attrs["privacy_sensitive"] = "1"
+	}
 }
 
 // getMessageForRetry looks up the outgoing message for a retry receipt by messageID.
@@ -326,7 +360,13 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 				AxolotlSenderKeyDistributionMessage: signalSKDMessage.Serialize(),
 			}
 		}
-	} else if receipt.IsFromMe {
+	} else if shouldWrapDeviceSentRetry(receipt, msg) {
+		// kavtov: a normal own-device (DeviceSent fan-out) message is re-wrapped as
+		// DeviceSentMessage. A PEER message (msg.isPeer) must NOT be wrapped — it is
+		// re-sent with peer framing below (category=peer, meta node, no DeviceSent wrap),
+		// matching the original preparePeerMessageNode send. Wrapping a peer message would
+		// produce the malformed resend upstream deferred ("Peer message retries aren't
+		// implemented yet"). See debug session retry-store-miss-never-stored.
 		if msg.wa != nil {
 			msg.wa = &waE2E.Message{
 				DeviceSentMessage: &waE2E.DeviceSentMessage{
@@ -339,6 +379,11 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 				DestinationJID: proto.String(receipt.Chat.String()),
 			}
 		}
+	}
+	if msg.isPeer && msg.fb != nil {
+		// Both peer callers (immediateRequestMessageFromPhone, appstate recovery) build
+		// waE2E ProtocolMessages; an fb peer message is not a path we can frame. Fail safe.
+		return fmt.Errorf("cannot retry fb peer message %s: peer fb retries are unsupported", messageID)
 	}
 
 	// TODO pre-retry callback for fb
@@ -430,7 +475,13 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 		"id":   messageID,
 		"t":    timestamp.Unix(),
 	}
-	if !receipt.IsGroup {
+	if msg.isPeer {
+		// kavtov: re-send a peer message with PEER framing, mirroring
+		// preparePeerMessageNode (send.go) but reusing the SAME messageID through the
+		// retry-node path (a fresh SendPeerMessage would mint a new ID and escape the
+		// internalCounter >= 10 loop guard above). category=peer, no device_fanout.
+		applyPeerRetryAttrs(attrs, msg.wa)
+	} else if !receipt.IsGroup {
 		attrs["device_fanout"] = false
 	}
 	if participant, ok := node.Attrs["participant"]; ok {
@@ -443,7 +494,18 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 		attrs["edit"] = edit
 	}
 	var content []waBinary.Node
-	if msg.wa != nil {
+	if msg.isPeer {
+		// kavtov: peer content shape mirrors preparePeerMessageNode (send.go): a meta
+		// node (appdata=default) followed by the encrypted node, plus the device identity
+		// node when a prekey message was produced (includeDeviceIdentity == isPreKey).
+		content = []waBinary.Node{{
+			Tag:   "meta",
+			Attrs: waBinary.Attrs{"appdata": "default"},
+		}, *encrypted}
+		if includeDeviceIdentity {
+			content = append(content, cli.makeDeviceIdentityNode())
+		}
+	} else if msg.wa != nil {
 		content = cli.getMessageContent(
 			*encrypted, msg.wa, attrs, includeDeviceIdentity, nodeExtraParams{},
 		)

@@ -600,7 +600,7 @@ func (int *DangerousInternalClient) RetryFrame(ctx context.Context, reqType, id 
 }
 
 func (int *DangerousInternalClient) AddRecentMessage(ctx context.Context, to types.JID, id types.MessageID, wa *waE2E.Message, fb *waMsgApplication.MessageApplication) error {
-	return int.c.addRecentMessage(ctx, to, id, wa, fb)
+	return int.c.addRecentMessage(ctx, to, id, wa, fb, false)
 }
 
 func (int *DangerousInternalClient) GetRecentMessage(to types.JID, id types.MessageID) RecentMessage {

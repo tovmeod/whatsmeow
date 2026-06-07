@@ -373,12 +373,12 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	resp.DebugTimings.Queue = time.Since(start)
 	defer cli.messageSendLock.Unlock()
 
-	// Peer message retries aren't implemented yet
-	if !req.Peer {
-		err = cli.addRecentMessage(ctx, to, req.ID, message, nil)
-		if err != nil {
-			return
-		}
+	// kavtov: always store outgoing messages for retry. Peer messages (req.Peer) are
+	// kept in the in-memory ring only (addRecentMessage skips the DB write when isPeer)
+	// and re-served with PEER framing on a retry receipt — see retry.go handleRetryReceipt.
+	err = cli.addRecentMessage(ctx, to, req.ID, message, nil, req.Peer)
+	if err != nil {
+		return
 	}
 
 	if message.GetMessageContextInfo().GetMessageSecret() != nil {
