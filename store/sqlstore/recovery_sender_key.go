@@ -47,6 +47,7 @@ import (
 	"go.mau.fi/libsignal/groups/ratchet"
 
 	"go.mau.fi/whatsmeow/store"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 // D-05 fallback-scan instrumentation counters.
@@ -60,6 +61,23 @@ var (
 	fallbackScanEntered    atomic.Uint64
 	fallbackScanDonorFound atomic.Uint64
 )
+
+// D-01 singleflight coalescing counters (Gap 1 / 29-08).
+// donorSFTotal counts every TryInlineRecovery singleflight attempt (each account that
+// enters the sf.Do call, whether or not the call was coalesced). donorSFShared counts
+// the subset where shared=true (the call returned a cached result from a concurrent
+// goroutine — the coalescing benefit). The ratio donorSFShared/donorSFTotal is the
+// coalescing rate; a low ratio means the singleflight coalesces rarely (have=none
+// dominant, no donor to share). Logged every donorSFLogEvery total attempts so the
+// operator can measure collapse magnitude without a prod restart.
+var (
+	donorSFTotal  atomic.Uint64
+	donorSFShared atomic.Uint64
+)
+
+// donorSFLogEvery is the sampling period for the DONOR_SF_COALESCED log line.
+// 100 yields observable lines within minutes given the ~10/min donor-attempt rate.
+const donorSFLogEvery = 100
 
 // senderKeyRecoveryReader is the local interface that *SQLStore satisfies to
 // expose the cross-account donor scan. Using a local interface avoids exposing
@@ -276,9 +294,28 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 
 	var donor *donorSenderKeyState
 	if c.sf != nil {
-		v, sfErr, _ := c.sf.Do(sfKey, func() (any, error) {
+		v, sfErr, shared := c.sf.Do(sfKey, func() (any, error) {
 			return r.findSenderKeyDonor(ctx, group, senderBare, targetKeyID, targetIter)
 		})
+		// D-01: count total attempts and coalesced followers; emit every donorSFLogEvery
+		// total attempts so the coalescing rate is observable even when shared=0 (have=none
+		// dominant). Keyed on total (not shared) so lines appear regardless of coalescing.
+		n := donorSFTotal.Add(1)
+		if shared {
+			donorSFShared.Add(1)
+		}
+		if n%donorSFLogEvery == 0 {
+			// Obtain a logger via the inner SQLStore; guard nil so test contexts without
+			// a Container do not panic. The type assertion is intra-package (both types
+			// live in package sqlstore) so accessing Container.log (unexported) is legal.
+			var sfLog waLog.Logger
+			if sq, ok := c.inner.(*SQLStore); ok {
+				sfLog = sq.log
+			}
+			if sfLog != nil {
+				sfLog.Infof("DONOR_SF_COALESCED total=%d shared=%d", n, donorSFShared.Load())
+			}
+		}
 		if sfErr != nil {
 			return "", false, sfErr
 		}
