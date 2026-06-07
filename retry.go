@@ -101,7 +101,11 @@ func (cli *Client) getRecentMessage(to types.JID, id types.MessageID) RecentMess
 	return cli.recentMessagesMap[recentMessageKey{to, id}]
 }
 
-func (cli *Client) getMessageForRetry(ctx context.Context, receipt *events.Receipt, messageID types.MessageID) (*RecentMessage, error) {
+// getMessageForRetry looks up the outgoing message for a retry receipt by messageID.
+// msgTimestamp is the original message send-time from the retry node's "t" attribute
+// (retry.go:231); used to add age= to RETRY_STORE_MISS for age-expiry vs never-stored
+// classification. Pass time.Time{} (zero) when the timestamp is unavailable.
+func (cli *Client) getMessageForRetry(ctx context.Context, receipt *events.Receipt, messageID types.MessageID, msgTimestamp time.Time) (*RecentMessage, error) {
 	msg := cli.getRecentMessage(receipt.Chat, messageID)
 	if !msg.IsEmpty() {
 		cli.Log.Debugf("Found message in local cache to accept retry receipt for %s/%s from %s", receipt.Chat, messageID, receipt.Sender)
@@ -143,8 +147,14 @@ func (cli *Client) getMessageForRetry(ctx context.Context, receipt *events.Recei
 				return nil, fmt.Errorf("failed to get message from retry store by id: %w", errByID)
 			}
 		}
-		cli.Log.Warnf("RETRY_STORE_MISS msgID=%s chat=%s altChat=%s account=%s altEmpty=%v err=%v",
-			messageID, receipt.Chat, altChat, cli.getOwnID().User, altChat.IsEmpty(), err)
+		// kavtov-fork (29-08 gap-closure): add age= to split age-expiry (benign,
+		// age>48h eviction by store.go:1439 DELETE) from never-stored (structural, age<48h).
+		age := "unknown"
+		if !msgTimestamp.IsZero() {
+			age = time.Since(msgTimestamp).Round(time.Second).String()
+		}
+		cli.Log.Warnf("RETRY_STORE_MISS msgID=%s chat=%s altChat=%s account=%s altEmpty=%v age=%s err=%v",
+			messageID, receipt.Chat, altChat, cli.getOwnID().User, altChat.IsEmpty(), age, err)
 		return nil, fmt.Errorf("failed to get message from retry store: %w", err)
 	}
 	waMsg := cli.GetMessageForRetry(receipt.Sender, receipt.Chat, messageID)
@@ -270,7 +280,7 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 		}
 	}
 
-	msg, err := cli.getMessageForRetry(ctx, receipt, messageID)
+	msg, err := cli.getMessageForRetry(ctx, receipt, messageID, timestamp)
 	if err != nil {
 		return err
 	} else if msg == nil {

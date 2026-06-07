@@ -608,7 +608,9 @@ func (int *DangerousInternalClient) GetRecentMessage(to types.JID, id types.Mess
 }
 
 func (int *DangerousInternalClient) GetMessageForRetry(ctx context.Context, receipt *events.Receipt, messageID types.MessageID) (*RecentMessage, error) {
-	return int.c.getMessageForRetry(ctx, receipt, messageID)
+	// Pass receipt.Timestamp as msgTimestamp; this bridge is used internally/tests,
+	// not the prod hot path. receipt.Timestamp is the closest available timestamp here.
+	return int.c.getMessageForRetry(ctx, receipt, messageID, receipt.Timestamp)
 }
 
 func (int *DangerousInternalClient) ShouldRecreateSession(ctx context.Context, retryCount int, jid types.JID) (reason string, recreate bool) {
