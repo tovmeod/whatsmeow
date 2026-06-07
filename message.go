@@ -950,9 +950,10 @@ func (cli *Client) isFailedSenderKeyTuple(sender, group string) bool {
 // would have done anyway — safe, never a correctness loss). Dedup on add; ring-evict oldest when full.
 const skdmInstalledSize = 16384
 
-// skdmDedupLogEvery samples the periodic SKDM_DEDUP stat line (every Nth skip) so the redundant-write
-// slice can be sized from journald without a DB query.
-const skdmDedupLogEvery = 1000
+// skdmDedupLogEvery samples the periodic SKDM_DEDUP stat line (every Nth event on either the skip or
+// processed path) so the redundant-write slice can be sized from journald without a DB query. Lowered
+// from 1000 to 100 (29-08 gap-closure) so lines appear within minutes even at low skip rates.
+const skdmDedupLogEvery = 100
 
 // skdmInstalledKey keys the dedup set by the INBOUND sender's device-qualified signal address (same
 // keying as the failed-set), the group, and the SKDM's keyID (the per-generation identifier).
@@ -1085,7 +1086,13 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 		return
 	}
 	cli.markSKDMProcessed(senderStr, chat.String(), keyID, skdmIter)
-	skdmDedupProcessed.Add(1)
+	// kavtov-fork (29-08 gap-closure): emit SKDM_DEDUP on the processed path every
+	// skdmDedupLogEvery installs so the stat line appears even at near-zero skip rates.
+	// The skip-path line (below wasFailed block) carries group/keyid/iter; this line
+	// records totals only (processed/skipped magnitude without per-event detail).
+	if p := skdmDedupProcessed.Add(1); p%skdmDedupLogEvery == 0 {
+		cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d", p, skdmDedupSkipped.Load())
+	}
 	if wasFailed {
 		cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=y", from.SignalAddressUser(), from.Device, chat.String())
 	}
