@@ -707,10 +707,25 @@ func (cli *Client) registerRetryAttempt(msgID string, senderUser string, group s
 		if cap <= 0 {
 			cap = 3
 		}
-		// STUB (35.2-02 Task 2 RED): no short-circuit, no terminal log — tests will fail on
-		// the short-circuit behavior, terminal-once, and contentRecovered assertions.
-		// Real implementation lands in the GREEN commit.
+		// D-06 short-circuit: for attempt #2+ (count >= 2), check if content was already
+		// recovered via phone-fetch. Attempt #1 is NEVER short-circuited (phone-fetch rides
+		// attempt #1 per D-06; it also triggers the immediateRequestMessageFromPhone below).
+		if count >= 2 && cli.isRecoveredMsgID(msgID) {
+			// Content already arrived; no more receipts needed.
+			if !e.Terminal {
+				e.Terminal = true
+				logTerminal = true // caller emits SENDERKEY_TERMINAL with contentRecovered=true
+			}
+			cli.retryAttempts[k] = e
+			proceed = false
+			return
+		}
 		proceed = count <= cap
+		if !proceed && !e.Terminal {
+			// First give-up for this (msgID, sender): emit exactly one terminal log.
+			e.Terminal = true
+			logTerminal = true // caller emits SENDERKEY_TERMINAL with contentRecovered=false
+		}
 	} else {
 		// Session-class: preserve existing upstream behavior (D-08).
 		proceed = count < 5
@@ -719,16 +734,51 @@ func (cli *Client) registerRetryAttempt(msgID string, senderUser string, group s
 	return
 }
 
-// recordRecoveredMsgID is a STUB (35.2-02 Task 2 RED): no-op so that the recovered-set
-// tests fail. Real implementation lands in the GREEN commit.
+// recordRecoveredMsgID records a message ID as content-recovered (phone-fetch success).
+// Called from handlePlaceholderResendResponse's success branch (same branch as
+// placeholderResendOk.Add, so the two always agree).
+// Lazy-init under recoveredMsgIDsLock; safe from bare &Client{}.
 func (cli *Client) recordRecoveredMsgID(msgID string) {
-	// STUB: no-op — tests will fail on "isRecoveredMsgID returns false after record" assertion
+	cli.recoveredMsgIDsLock.Lock()
+	defer cli.recoveredMsgIDsLock.Unlock()
+
+	if cli.recoveredMsgIDs == nil {
+		// Lazy init: the production constructor does not pre-allocate this map; a bare
+		// &Client{} (tests / direct construction) must not nil-panic.
+		cli.recoveredMsgIDs = make(map[string]struct{}, recoveredMsgIDsSize)
+	}
+
+	if _, exists := cli.recoveredMsgIDs[msgID]; exists {
+		return // already recorded; dedup without consuming a ring slot
+	}
+
+	ringSize := recoveredMsgIDsSize
+	if ringSize <= 0 || ringSize > recoveredMsgIDsListSize {
+		ringSize = recoveredMsgIDsListSize
+	}
+	// Evict the slot we are about to overwrite (ring-map idiom, same as retryAttempts).
+	old := cli.recoveredMsgIDsList[cli.recoveredMsgIDsPtr]
+	if old != "" {
+		delete(cli.recoveredMsgIDs, old)
+	}
+	cli.recoveredMsgIDs[msgID] = struct{}{}
+	cli.recoveredMsgIDsList[cli.recoveredMsgIDsPtr] = msgID
+	cli.recoveredMsgIDsPtr++
+	if cli.recoveredMsgIDsPtr >= ringSize {
+		cli.recoveredMsgIDsPtr = 0
+	}
 }
 
-// isRecoveredMsgID is a STUB (35.2-02 Task 2 RED): always returns false.
-// Real implementation lands in the GREEN commit.
+// isRecoveredMsgID reports whether the message ID is in the recovered set.
+// Read-only (does not evict); guarded by recoveredMsgIDsLock.
 func (cli *Client) isRecoveredMsgID(msgID string) bool {
-	return false // STUB: always false — tests will fail
+	cli.recoveredMsgIDsLock.Lock()
+	defer cli.recoveredMsgIDsLock.Unlock()
+	if cli.recoveredMsgIDs == nil {
+		return false
+	}
+	_, ok := cli.recoveredMsgIDs[msgID]
+	return ok
 }
 
 // clearMessageRetrySender removes the retry-attempt entry for (msgID, senderUser).
