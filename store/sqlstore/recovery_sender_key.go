@@ -364,20 +364,51 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 			Seed:      smk.Seed,
 		}
 	}
-	structure := &groupRecord.SenderKeyStructure{
-		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
-			{
-				KeyID: donor.KeyID,
-				SenderChainKey: &ratchet.SenderChainKeyStructure{
-					Iteration: donor.Iteration,
-					ChainKey:  donor.ChainKey,
-				},
-				SigningKeyPublic:  donor.SigningKeyPublic,
-				SigningKeyPrivate: donor.SigningKeyPrivate,
-				Keys:              skippedKeys,
-			},
+	donorState := &groupRecord.SenderKeyStateStructure{
+		KeyID: donor.KeyID,
+		SenderChainKey: &ratchet.SenderChainKeyStructure{
+			Iteration: donor.Iteration,
+			ChainKey:  donor.ChainKey,
 		},
+		SigningKeyPublic:  donor.SigningKeyPublic,
+		SigningKeyPrivate: donor.SigningKeyPrivate,
+		Keys:              skippedKeys,
 	}
+
+	// D-12: merge the donor state into the existing structure rather than
+	// full-replacing it. Start from existing.SenderKeyStates (the guard read at
+	// :342 already holds it), replace or add only the donor's KeyID state, and
+	// preserve all foreign-KeyID states unchanged.
+	//
+	// If there is no existing structure, install as a single-state structure
+	// (same behaviour as before D-12 for the nil-existing case).
+	var mergedStates []*groupRecord.SenderKeyStateStructure
+	if existing != nil {
+		donorKeyIDReplaced := false
+		for _, st := range existing.SenderKeyStates {
+			if st == nil || st.SenderChainKey == nil {
+				// Defensive skip (malformed state from prior versions).
+				continue
+			}
+			if st.KeyID == donor.KeyID {
+				// Replace with the donor's strictly-fresher state.
+				mergedStates = append(mergedStates, donorState)
+				donorKeyIDReplaced = true
+			} else {
+				// Preserve foreign-KeyID state unchanged.
+				mergedStates = append(mergedStates, st)
+			}
+		}
+		if !donorKeyIDReplaced {
+			// Donor's KeyID is not in existing — append it.
+			mergedStates = append(mergedStates, donorState)
+		}
+	} else {
+		// No existing structure: single-state install (nil-existing case).
+		mergedStates = []*groupRecord.SenderKeyStateStructure{donorState}
+	}
+
+	structure := &groupRecord.SenderKeyStructure{SenderKeyStates: mergedStates}
 
 	// Install via PutSenderKeyStructureRecovery (fires parsedReplace with the donor
 	// KeyID so the iteration gate applies the recovery rule: reject unless donor
