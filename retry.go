@@ -14,7 +14,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"runtime/debug"
+	"strconv"
 	"time"
 
 	"go.mau.fi/libsignal/ecc"
@@ -590,10 +592,103 @@ func (cli *Client) clearDelayedMessageRequests() {
 	}
 }
 
+// kavtov-fork (35.2-02 D-05/D-08/D-09): bounded retry-attempt store types.
+
+// retryAttemptKey identifies a retry by both message ID AND bare sender user (device-agnostic)
+// so different senders for the same message get independent counts.
+type retryAttemptKey struct {
+	MsgID  string
+	Sender string // info.Sender.User — bare JID user (no device suffix)
+}
+
+// retryAttemptEntry holds the per-(msgID,sender) state for the retry cap.
+// Value-typed (no pointers) to stay GC-friendly per the 35.1 lesson.
+// Terminal is set once to prevent duplicate SENDERKEY_TERMINAL logs (Task 2).
+type retryAttemptEntry struct {
+	Count    int
+	Terminal bool
+}
+
+// retryAttemptsListSize is the ring-buffer capacity for the retry-attempt store.
+// Must equal retryStoreSKMsgSize at runtime; both are in this file.
+// At ~6000 skmsg failures/hr and 3 retries per message the working set is
+// ~6000 distinct (msgID,sender) keys/hr; 4096 covers ~40 minutes of the peak
+// failure rate without evicting active entries mid-flight.
+const retryAttemptsListSize = 4096
+
+// retryStoreSKMsgSize is the ring capacity exposed as a var so tests can override it.
+// Tests that want a smaller cap should save/restore this value.
+var retryStoreSKMsgSize = retryAttemptsListSize
+
+// retryCapSKMsgDefault is the number of retry receipts sent for group/sender-key class
+// messages before giving up. Overridable via env KAVTOV_RETRY_CAP_SKMSG.
+// Declared as a var (not const) so tests can override it.
+var retryCapSKMsg = func() int {
+	s := os.Getenv("KAVTOV_RETRY_CAP_SKMSG")
+	if s == "0" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil && n > 0 {
+		return n
+	}
+	return 3 // default: 3 receipts per (msgID, sender) for skmsg class
+}()
+
+// registerRetryAttempt records one retry attempt for (msgID, senderUser) and returns
+// (count, proceed). proceed=false means the cap has been reached and no receipt should be sent.
+// isSKMsg=true applies the skmsg cap (retryCapSKMsg); false applies the session-class cap (>=5).
+// retryCountInMsg>0 on the first observation seeds the count to retryCountInMsg+1 (restart after
+// driver restart, Pitfall 6). Lazy-init under messageRetriesLock; bare &Client{} is safe.
+//
+// STUB (35.2-02 RED): preserves current msgID-only keying and >=5 cap so existing behavior
+// is unchanged. Tests will fail on the skmsg cap, (msgID,sender) isolation, and bound.
+// The real implementation lands in the GREEN commit.
+func (cli *Client) registerRetryAttempt(msgID string, senderUser string, retryCountInMsg int, isSKMsg bool) (count int, proceed bool) {
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+
+	// STUB: use msgID-only key (not (msgID,sender)) — fails the two-sender test.
+	// STUB: use >=5 cap for all classes — fails the skmsg-cap-3 test.
+	// STUB: unbounded map — fails the eviction-bound test.
+	if cli.retryAttempts == nil {
+		cli.retryAttempts = make(map[retryAttemptKey]retryAttemptEntry, retryStoreSKMsgSize)
+	}
+	k := retryAttemptKey{MsgID: msgID, Sender: ""} // STUB: always empty sender
+	e := cli.retryAttempts[k]
+	e.Count++
+	if e.Count == 1 && retryCountInMsg > 0 {
+		e.Count = retryCountInMsg + 1
+	}
+	cli.retryAttempts[k] = e
+	count = e.Count
+	proceed = count < 5 // STUB: always >=5 cap (not class-split)
+	return
+}
+
+// clearMessageRetrySender removes the retry-attempt entry for (msgID, senderUser).
+// Called on successful decrypt to allow a fresh retry loop if needed.
+// The senderUser must be the bare JID user (info.Sender.User).
+func (cli *Client) clearMessageRetrySender(msgID string, senderUser string) {
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+	if cli.retryAttempts == nil {
+		return
+	}
+	delete(cli.retryAttempts, retryAttemptKey{MsgID: msgID, Sender: senderUser})
+}
+
+// clearMessageRetry removes retry state for the given message ID.
+// Kept for compatibility with message.go:474 which passes only info.ID.
+// In the GREEN commit this will delegate to clearMessageRetrySender with info.Sender.User;
+// for the stub phase it clears the msgID-only key used by the stub registerRetryAttempt.
 func (cli *Client) clearMessageRetry(msgID types.MessageID) {
 	cli.messageRetriesLock.Lock()
 	defer cli.messageRetriesLock.Unlock()
-	delete(cli.messageRetries, string(msgID))
+	if cli.retryAttempts == nil {
+		return
+	}
+	// STUB: clear with empty sender to match the stub's empty-sender keying.
+	delete(cli.retryAttempts, retryAttemptKey{MsgID: string(msgID), Sender: ""})
 }
 
 // sendRetryReceipt sends a retry receipt for an incoming message.
@@ -601,21 +696,20 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 	id, _ := node.Attrs["id"].(string)
 	children := node.GetChildren()
 	var retryCountInMsg int
+	var isSKMsg bool
 	if len(children) == 1 && children[0].Tag == "enc" {
-		retryCountInMsg = children[0].AttrGetter().OptionalInt("count")
+		ag := children[0].AttrGetter()
+		retryCountInMsg = ag.OptionalInt("count")
+		isSKMsg = ag.OptionalString("type") == "skmsg"
 	}
 
-	cli.messageRetriesLock.Lock()
-	cli.messageRetries[id]++
-	retryCount := cli.messageRetries[id]
-	// In case the message is a retry response, and we restarted in between, find the count from the message
-	if retryCount == 1 && retryCountInMsg > 0 {
-		retryCount = retryCountInMsg + 1
-		cli.messageRetries[id] = retryCount
-	}
-	cli.messageRetriesLock.Unlock()
-	if retryCount >= 5 {
-		cli.Log.Warnf("Not sending any more retry receipts for %s", id)
+	retryCount, proceed := cli.registerRetryAttempt(id, info.Sender.User, retryCountInMsg, isSKMsg)
+	if !proceed {
+		if isSKMsg {
+			cli.Log.Warnf("Not sending any more retry receipts for %s (skmsg cap reached, count=%d)", id, retryCount)
+		} else {
+			cli.Log.Warnf("Not sending any more retry receipts for %s", id)
+		}
 		return
 	}
 	if retryCount == 1 {

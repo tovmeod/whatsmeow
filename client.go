@@ -119,7 +119,14 @@ type Client struct {
 	eventHandlers     []wrappedEventHandler
 	eventHandlersLock sync.RWMutex
 
-	messageRetries     map[string]int
+	// kavtov-fork (35.2-02 D-05/D-08/D-09): bounded (msgID,sender)-keyed retry-attempt store.
+	// Replaces the unbounded messageRetries map[string]int. Keyed by retryAttemptKey so different
+	// senders for the same msgID get independent counts. Bounded by a ring of size retryStoreSKMsgSize
+	// to cap memory growth at ~6000 failures/hr. Value-typed entries (no pointers) per 35.1 GC lesson.
+	// Lazy-init under messageRetriesLock so a bare &Client{} never nil-panics.
+	retryAttempts     map[retryAttemptKey]retryAttemptEntry
+	retryAttemptsList [retryAttemptsListSize]retryAttemptKey
+	retryAttemptsPtr  int
 	messageRetriesLock sync.Mutex
 	retrySema          *semaphore.Weighted
 
@@ -300,7 +307,6 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		uniqueID:           fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
 		responseWaiters:    make(map[string]chan<- *waBinary.Node),
 		eventHandlers:      make([]wrappedEventHandler, 0, 1),
-		messageRetries:     make(map[string]int),
 		handlerQueue:       make(chan *waBinary.Node, handlerQueueSize),
 		appStateProc:       appstate.NewProcessor(deviceStore, log.Sub("AppState")),
 		socketWait:         make(chan struct{}),
