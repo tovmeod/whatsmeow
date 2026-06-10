@@ -128,6 +128,17 @@ type Client struct {
 	retryAttemptsList [retryAttemptsListSize]retryAttemptKey
 	retryAttemptsPtr  int
 	messageRetriesLock sync.Mutex
+
+	// kavtov-fork (35.2-02 D-06): bounded set of message IDs whose content was already
+	// recovered via phone-fetch (handlePlaceholderResendResponse success branch). Used by
+	// registerRetryAttempt to short-circuit retry receipts for attempts #2+ after content
+	// arrives (D-06 short-circuit). Value-typed, lazy-init, bounded ring — same idiom as
+	// retryAttempts above. Guarded by recoveredMsgIDsLock.
+	recoveredMsgIDs     map[string]struct{}
+	recoveredMsgIDsList [recoveredMsgIDsListSize]string
+	recoveredMsgIDsPtr  int
+	recoveredMsgIDsLock sync.Mutex
+
 	retrySema          *semaphore.Weighted
 
 	incomingRetryRequestCounter     map[incomingRetryKey]int

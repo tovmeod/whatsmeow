@@ -1266,6 +1266,12 @@ func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationR
 		} else {
 			msgEvt.UnavailableRequestID = reqID
 			placeholderResendOk.Add(1)
+			// D-06: record the original message ID as recovered so sendRetryReceipt can
+			// short-circuit further retry receipts for this message (attempts #2+). The ID
+			// is the ORIGINAL failed message's ID (set by ParseWebMessage from the resent
+			// web message protobuf). This insert sits in the same success branch as
+			// placeholderResendOk.Add so the two always agree.
+			cli.recordRecoveredMsgID(msgEvt.Info.ID)
 			ok = !cli.dispatchEvent(msgEvt) && ok
 		}
 	}

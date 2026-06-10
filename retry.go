@@ -620,6 +620,15 @@ const retryAttemptsListSize = 4096
 // Tests that want a smaller cap should save/restore this value.
 var retryStoreSKMsgSize = retryAttemptsListSize
 
+// recoveredMsgIDsListSize is the ring capacity for the recovered-msgID set.
+// 4096 matches retryAttemptsListSize — the set tracks at most as many IDs
+// as the retry-attempt store can hold at once.
+const recoveredMsgIDsListSize = 4096
+
+// recoveredMsgIDsSize is the effective ring capacity exposed as a var so tests can
+// override it. Save/restore around the test when changing from the default.
+var recoveredMsgIDsSize = recoveredMsgIDsListSize
+
 // retryCapSKMsgDefault is the number of retry receipts sent for group/sender-key class
 // messages before giving up. Overridable via env KAVTOV_RETRY_CAP_SKMSG.
 // Declared as a var (not const) so tests can override it.
@@ -635,12 +644,23 @@ var retryCapSKMsg = func() int {
 }()
 
 // registerRetryAttempt records one retry attempt for (msgID, senderUser) and returns
-// (count, proceed). proceed=false means the cap has been reached and no receipt should be sent.
+// (count, proceed, logTerminal).
+//   - proceed=false means the cap has been reached or content was already recovered
+//     (short-circuit); no retry receipt should be sent.
+//   - logTerminal=true means this is the first give-up for this (msgID, sender) and the
+//     caller must emit SENDERKEY_TERMINAL. The Terminal flag is set in the entry so
+//     subsequent calls return logTerminal=false (exactly-once guarantee, D-07).
+//
 // isSKMsg=true applies the skmsg cap (retryCapSKMsg, default 3); false applies the
 // session-class cap (>=5, preserving upstream behavior — D-08).
+// group is used only in the SENDERKEY_TERMINAL log (passed to caller via logTerminal).
 // retryCountInMsg>0 on the first observation seeds the count to retryCountInMsg+1 (restart after
 // driver restart, Pitfall 6). Lazy-init under messageRetriesLock; bare &Client{} is safe.
-func (cli *Client) registerRetryAttempt(msgID string, senderUser string, retryCountInMsg int, isSKMsg bool) (count int, proceed bool) {
+//
+// D-06 short-circuit: for attempt #2+ (count >= 2), if the msgID is in the recovered set,
+// proceed=false and logTerminal=true (contentRecovered=true for the terminal log).
+// Attempt #1 is NEVER short-circuited (phone-fetch rides attempt #1 per D-06).
+func (cli *Client) registerRetryAttempt(msgID string, senderUser string, group string, retryCountInMsg int, isSKMsg bool) (count int, proceed bool, logTerminal bool) {
 	cli.messageRetriesLock.Lock()
 	defer cli.messageRetriesLock.Unlock()
 
@@ -680,7 +700,6 @@ func (cli *Client) registerRetryAttempt(msgID string, senderUser string, retryCo
 	if e.Count == 1 && retryCountInMsg > 0 {
 		e.Count = retryCountInMsg + 1
 	}
-	cli.retryAttempts[k] = e
 	count = e.Count
 
 	if isSKMsg {
@@ -688,12 +707,28 @@ func (cli *Client) registerRetryAttempt(msgID string, senderUser string, retryCo
 		if cap <= 0 {
 			cap = 3
 		}
+		// STUB (35.2-02 Task 2 RED): no short-circuit, no terminal log — tests will fail on
+		// the short-circuit behavior, terminal-once, and contentRecovered assertions.
+		// Real implementation lands in the GREEN commit.
 		proceed = count <= cap
 	} else {
 		// Session-class: preserve existing upstream behavior (D-08).
 		proceed = count < 5
 	}
+	cli.retryAttempts[k] = e
 	return
+}
+
+// recordRecoveredMsgID is a STUB (35.2-02 Task 2 RED): no-op so that the recovered-set
+// tests fail. Real implementation lands in the GREEN commit.
+func (cli *Client) recordRecoveredMsgID(msgID string) {
+	// STUB: no-op — tests will fail on "isRecoveredMsgID returns false after record" assertion
+}
+
+// isRecoveredMsgID is a STUB (35.2-02 Task 2 RED): always returns false.
+// Real implementation lands in the GREEN commit.
+func (cli *Client) isRecoveredMsgID(msgID string) bool {
+	return false // STUB: always false — tests will fail
 }
 
 // clearMessageRetrySender removes the retry-attempt entry for (msgID, senderUser).
@@ -732,11 +767,19 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 		isSKMsg = ag.OptionalString("type") == "skmsg"
 	}
 
-	retryCount, proceed := cli.registerRetryAttempt(id, info.Sender.User, retryCountInMsg, isSKMsg)
+	retryCount, proceed, logTerminal := cli.registerRetryAttempt(id, info.Sender.User, info.Chat.String(), retryCountInMsg, isSKMsg)
 	if !proceed {
-		if isSKMsg {
-			cli.Log.Warnf("Not sending any more retry receipts for %s (skmsg cap reached, count=%d)", id, retryCount)
-		} else {
+		if logTerminal && isSKMsg {
+			// D-07: SENDERKEY_TERMINAL is the permanent-loss numerator for D-04 measurement.
+			// Tag string and key names are load-bearing for the journalctl grep in plan 35.2-07;
+			// do not rename them.
+			// Known accepted gap (RESEARCH Open Question 2): a message whose sender never re-sends
+			// produces no attempt #2+ and therefore no terminal line; the D-04 journalctl
+			// decrypt-fail leg catches those. A timer sweep is intentionally NOT added.
+			contentRecovered := cli.isRecoveredMsgID(id)
+			cli.Log.Warnf("SENDERKEY_TERMINAL msgID=%s sender=%s group=%s retries=%d contentRecovered=%t",
+				id, info.Sender.User, info.Chat.String(), retryCount, contentRecovered)
+		} else if !isSKMsg {
 			cli.Log.Warnf("Not sending any more retry receipts for %s", id)
 		}
 		return
