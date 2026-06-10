@@ -997,7 +997,9 @@ func TestInlineRecoveryIterationGuard(t *testing.T) {
 	// Needed because TryInlineRecovery calls c.GetSenderKeyStructure (which reads
 	// the struct cache if warm) and must correctly see the existing B row.
 	// The parsedReplace callback here is a no-op (just wires the field).
-	csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
+	csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
+		return store.StoreAccepted
+	})
 
 	// Attempt inline recovery with donor at iter=50, existing at iter=100.
 	// targetIter=60 (donor=50 <= 60 so donor qualifies by forward-only filter),
@@ -1253,7 +1255,9 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
+			return store.StoreAccepted
+		})
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 15)
 		if err != nil {
@@ -1326,7 +1330,9 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
+			return store.StoreAccepted
+		})
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k3, 10)
 		if err != nil {
@@ -1374,7 +1380,9 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
+			return store.StoreAccepted
+		})
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 10)
 		if err != nil {
@@ -1399,7 +1407,9 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
+			return store.StoreAccepted
+		})
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k1, 20)
 		if err != nil {
