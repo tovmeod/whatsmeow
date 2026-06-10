@@ -1025,3 +1025,411 @@ func TestInlineRecoveryIterationGuard(t *testing.T) {
 	}
 	t.Logf("PASS: iteration guard fired — TryInlineRecovery returned (empty, false, nil), DB row preserved at iter=%d", iterFromBlob)
 }
+
+// buildMultiStateStructure builds a SenderKeyStructure with two states:
+//   state[0]: keyID=k1, iter=iter1
+//   state[1]: keyID=k2, iter=iter2
+func buildMultiStateStructure(k1, iter1, k2, iter2 uint32, tag1, tag2 byte) *groupRecord.SenderKeyStructure {
+	makeChainKey := func(base byte) []byte {
+		ck := make([]byte, 32)
+		for i := range ck {
+			ck[i] = base + byte(i)
+		}
+		return ck
+	}
+	makePub := func(base byte) []byte {
+		p := make([]byte, 33)
+		p[0] = 0x05
+		for i := 1; i < 33; i++ {
+			p[i] = base + byte(i)
+		}
+		return p
+	}
+	makePriv := func(base byte) []byte {
+		p := make([]byte, 32)
+		for i := range p {
+			p[i] = base + 0x80 + byte(i)
+		}
+		return p
+	}
+	return &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+			{
+				KeyID: k1,
+				SenderChainKey: &ratchet.SenderChainKeyStructure{
+					Iteration: iter1,
+					ChainKey:  makeChainKey(tag1),
+				},
+				SigningKeyPublic:  makePub(tag1),
+				SigningKeyPrivate: makePriv(tag1),
+			},
+			{
+				KeyID: k2,
+				SenderChainKey: &ratchet.SenderChainKeyStructure{
+					Iteration: iter2,
+					ChainKey:  makeChainKey(tag2),
+				},
+				SigningKeyPublic:  makePub(tag2),
+				SigningKeyPrivate: makePriv(tag2),
+			},
+		},
+	}
+}
+
+// findStateByKeyID returns the state with the matching KeyID, or nil.
+func findStateByKeyID(s *groupRecord.SenderKeyStructure, keyID uint32) *groupRecord.SenderKeyStateStructure {
+	for _, st := range s.SenderKeyStates {
+		if st != nil && st.KeyID == keyID {
+			return st
+		}
+	}
+	return nil
+}
+
+// TestInlineRecoveryDonorMerge exercises D-12: the donor state is MERGED into the
+// existing structure rather than full-replacing it. Foreign-KeyID states are
+// preserved in the merged result.
+//
+// Arms:
+//  1. replace arm: existing [K1@20, K2@5]; donor K2@9 → merged has K1@20 + K2@9.
+//     Against current full-replace code K1 is DROPPED — this arm MUST fail (red).
+//  2. add arm: donor provides K3@4 (new KeyID) → merged has K1, K2, K3.
+//  3. equal arm: donor provides K2@5 (equal, not strictly fresher) → guard fires, no write.
+//  4. nil-existing arm: no existing structure for B → donor installs as single-state.
+//  5. warm-cache arm (checker-required D-12 interaction): K1@20 consistent in
+//     cache AND DB (write-through, no flusher); donor K2@9; TryInlineRecovery;
+//     LoadStruct serves K1@20 AND K2@9 (gate must NOT reject on equal K1 in cache).
+func TestInlineRecoveryDonorMerge(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		group        = "recovmerge_group@g.us"
+		bareUser     = "55512340099_1"
+		donorSuffix  = ":5"
+		targetSuffix = ":0"
+		k1           = uint32(10)
+		k2           = uint32(20)
+		k3           = uint32(30)
+	)
+	donorSenderID  := bareUser + donorSuffix
+	targetSenderID := bareUser + targetSuffix
+
+	ctx := context.Background()
+
+	// -----------------------------------------------------------------------
+	// Arm 1: replace — existing [K1@20, K2@5]; donor K2@9 → merged has K1@20 + K2@9.
+	// Against current full-replace this FAILS because K1 is dropped.
+	// -----------------------------------------------------------------------
+	t.Run("replace_preserves_foreign_key", func(t *testing.T) {
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+			recoveryTestJIDA, recoveryTestJIDB, group)
+
+		// Seed B's existing multi-state row: [K1@20, K2@5].
+		existingStruct := buildMultiStateStructure(k1, 20, k2, 5, 0xA1, 0xA2)
+		insertFlatBlobRow(t, db, recoveryTestJIDB, group, targetSenderID, existingStruct)
+
+		// Seed A's donor row: K2@9 (strictly fresher than K2@5 in B's existing).
+		donorStruct := buildDonorStructure(k2, 9, 0xB1)
+		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+		csB := newRecoveryTestStoreB(t, db)
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 15)
+		if err != nil {
+			t.Fatalf("TryInlineRecovery: %v", err)
+		}
+		if !ok {
+			t.Fatal("TryInlineRecovery: expected true (donor found), got false")
+		}
+
+		// Read the recovered row and verify it contains BOTH K1@20 and K2@9.
+		var blob []byte
+		err = db.QueryRowContext(ctx,
+			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			recoveryTestJIDB, group, targetSenderID,
+		).Scan(&blob)
+		if err != nil || blob == nil {
+			t.Fatalf("read recovered row: err=%v blob=%v", err, blob)
+		}
+		merged, uErr := store.UnpackFlat(blob)
+		if uErr != nil || merged == nil {
+			t.Fatalf("UnpackFlat: err=%v", uErr)
+		}
+
+		k1State := findStateByKeyID(merged, k1)
+		k2State := findStateByKeyID(merged, k2)
+
+		// K1 must be preserved at Iteration=20 (foreign-KeyID — not the donor's).
+		// Against current full-replace code K1 is DROPPED → this fails (red proof).
+		if k1State == nil {
+			t.Errorf("D-12 FAIL: K1 (foreign-KeyID) was dropped from merged result (full-replace bug)")
+		} else if k1State.SenderChainKey.Iteration != 20 {
+			t.Errorf("D-12: K1 iteration = %d, want 20", k1State.SenderChainKey.Iteration)
+		}
+
+		// K2 must be updated to Iteration=9 (the donor's strictly fresher state).
+		if k2State == nil {
+			t.Errorf("D-12: K2 (donor KeyID) missing from merged result")
+		} else if k2State.SenderChainKey.Iteration != 9 {
+			t.Errorf("D-12: K2 iteration = %d, want 9 (donor)", k2State.SenderChainKey.Iteration)
+		}
+		t.Logf("replace arm: K1=%v iter=%v, K2=%v iter=%v",
+			k1State != nil, func() uint32 {
+				if k1State != nil {
+					return k1State.SenderChainKey.Iteration
+				}
+				return 0
+			}(),
+			k2State != nil, func() uint32 {
+				if k2State != nil {
+					return k2State.SenderChainKey.Iteration
+				}
+				return 0
+			}())
+	})
+
+	// -----------------------------------------------------------------------
+	// Arm 2: add — donor provides K3@4 (new KeyID absent from existing).
+	// Merged result must have K1, K2, AND K3.
+	// -----------------------------------------------------------------------
+	t.Run("add_new_keyid", func(t *testing.T) {
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+			recoveryTestJIDA, recoveryTestJIDB, group)
+
+		existingStruct := buildMultiStateStructure(k1, 20, k2, 5, 0xC1, 0xC2)
+		insertFlatBlobRow(t, db, recoveryTestJIDB, group, targetSenderID, existingStruct)
+
+		// K3 is new — not in existing.
+		donorStruct := buildDonorStructure(k3, 4, 0xD1)
+		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+		csB := newRecoveryTestStoreB(t, db)
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k3, 10)
+		if err != nil {
+			t.Fatalf("TryInlineRecovery: %v", err)
+		}
+		if !ok {
+			t.Fatal("add arm: expected true, got false")
+		}
+
+		var blob []byte
+		_ = db.QueryRowContext(ctx,
+			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			recoveryTestJIDB, group, targetSenderID,
+		).Scan(&blob)
+		merged, _ := store.UnpackFlat(blob)
+		if merged == nil {
+			t.Fatal("add arm: UnpackFlat returned nil")
+		}
+		if findStateByKeyID(merged, k1) == nil {
+			t.Error("add arm: K1 missing from merged result")
+		}
+		if findStateByKeyID(merged, k2) == nil {
+			t.Error("add arm: K2 missing from merged result")
+		}
+		if findStateByKeyID(merged, k3) == nil {
+			t.Error("add arm: K3 (new) missing from merged result")
+		}
+		t.Logf("add arm: merged has %d states (want K1+K2+K3)", len(merged.SenderKeyStates))
+	})
+
+	// -----------------------------------------------------------------------
+	// Arm 3: equal — donor provides K2@5 (equal to existing K2@5, not strictly fresher).
+	// The guard at :342-355 fires and returns false without writing.
+	// -----------------------------------------------------------------------
+	t.Run("equal_not_fresher_no_write", func(t *testing.T) {
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+			recoveryTestJIDA, recoveryTestJIDB, group)
+
+		existingStruct := buildMultiStateStructure(k1, 20, k2, 5, 0xE1, 0xE2)
+		insertFlatBlobRow(t, db, recoveryTestJIDB, group, targetSenderID, existingStruct)
+
+		// Donor at K2@5 (equal — not strictly fresher, guard fires).
+		donorStruct := buildDonorStructure(k2, 5, 0xF1)
+		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+		csB := newRecoveryTestStoreB(t, db)
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 10)
+		if err != nil {
+			t.Fatalf("TryInlineRecovery: %v", err)
+		}
+		if ok {
+			t.Error("equal arm: expected false (equal iter guard), got true")
+		}
+		t.Logf("equal arm: PASS — donor K2@5 == existing K2@5, no write")
+	})
+
+	// -----------------------------------------------------------------------
+	// Arm 4: nil-existing — no existing structure for B.
+	// Donor installs as a single-state structure (no merge needed).
+	// -----------------------------------------------------------------------
+	t.Run("no_existing_installs_single_state", func(t *testing.T) {
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+			recoveryTestJIDA, recoveryTestJIDB, group)
+
+		donorStruct := buildDonorStructure(k1, 15, 0x11)
+		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+		csB := newRecoveryTestStoreB(t, db)
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+
+		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k1, 20)
+		if err != nil {
+			t.Fatalf("TryInlineRecovery: %v", err)
+		}
+		if !ok {
+			t.Fatal("nil-existing arm: expected true (donor found), got false")
+		}
+
+		var blob []byte
+		_ = db.QueryRowContext(ctx,
+			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			recoveryTestJIDB, group, targetSenderID,
+		).Scan(&blob)
+		merged, _ := store.UnpackFlat(blob)
+		if merged == nil || len(merged.SenderKeyStates) == 0 {
+			t.Fatal("nil-existing arm: no recovered row")
+		}
+		if merged.SenderKeyStates[0].SenderChainKey.Iteration != 15 {
+			t.Errorf("nil-existing arm: iter = %d, want 15", merged.SenderKeyStates[0].SenderChainKey.Iteration)
+		}
+		t.Logf("nil-existing arm: PASS — single-state install at iter=15")
+	})
+
+	// -----------------------------------------------------------------------
+	// Arm 5: warm-cache (checker-required D-11/D-12 interaction).
+	//
+	// Seed K1@20 consistently in cache AND DB using the WRITE-THROUGH path
+	// (no flusher attached on seeding store — parsedReplace fires synchronously,
+	// DB row also written). Then seed K2@9 for account A. Call TryInlineRecovery.
+	// Assert LoadStruct serves BOTH K1@20 AND K2@9.
+	//
+	// The critical gate test: the merged union carries K1 at EQUAL iteration to
+	// its cache-resident counterpart. The iteration gate must accept this as a
+	// preserved foreign state (non-donor KeyID). If the gate incorrectly applies
+	// the cipher rule (reject on ANY equal iter) or the naive recovery rule
+	// (reject if ANY matching state cached >= new), the merged install is rejected
+	// and LoadStruct returns only K2@9 or a miss — proving the gate is wrong.
+	// -----------------------------------------------------------------------
+	t.Run("warm_cache_merge_accepted", func(t *testing.T) {
+		_, _ = db.ExecContext(ctx,
+			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+			recoveryTestJIDA, recoveryTestJIDB, group)
+
+		// Build a write-through store (NO flusher) for seeding K1@20 into B.
+		// This ensures the parsed cache AND DB are both warm at K1@20.
+		jidB, err := types.ParseJID(recoveryTestJIDB)
+		if err != nil {
+			t.Fatalf("ParseJID B: %v", err)
+		}
+		containerB := sqlstore.NewWithDB(db, "postgres", nil)
+		innerBSeed := sqlstore.NewSQLStore(containerB, jidB)
+		byteCache, _ := lru.New[string, []byte](256)
+		devCache, _ := lru.New[string, []string](256)
+		csBSeed := sqlstore.NewCachedSenderKeyStore(innerBSeed, recoveryTestJIDB, byteCache, devCache, nil)
+		// No flusher → write-through mode.
+
+		skLRU, _ := store.NewSKParsedLRU(256)
+		parsedCache := store.NewParsedSKCache(skLRU)
+		csBSeed.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+			return parsedCache.StoreStruct(key, s, donorKeyID)
+		})
+
+		// Seed K1@20 via PutSenderKeyStructure (write-through: writes DB + warms cache).
+		seedStruct := buildDonorStructure(k1, 20, 0x31)
+		if err := csBSeed.PutSenderKeyStructure(ctx, group, targetSenderID, seedStruct); err != nil {
+			t.Fatalf("seed K1@20 write-through: %v", err)
+		}
+
+		// Verify cache is warm at K1@20.
+		cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
+		warmSt, warmOK := parsedCache.LoadStruct(cacheKey)
+		if !warmOK || findStateByKeyID(warmSt, k1) == nil ||
+			findStateByKeyID(warmSt, k1).SenderChainKey.Iteration != 20 {
+			t.Fatalf("pre-condition: cache not warm at K1@20")
+		}
+
+		// Verify DB is also warm at K1@20.
+		var dbBlob []byte
+		_ = db.QueryRowContext(ctx,
+			`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+			recoveryTestJIDB, group, targetSenderID,
+		).Scan(&dbBlob)
+		if dbBlob == nil {
+			t.Fatal("pre-condition: DB row absent after write-through seed")
+		}
+
+		// Seed K2@9 for account A (the donor).
+		donorStruct := buildDonorStructure(k2, 9, 0x32)
+		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+		// Now call TryInlineRecovery using the SAME store (csBSeed) that holds the warm cache.
+		// TryInlineRecovery's GetSenderKeyStructure reads from DB (DB is consistent),
+		// finds K1@20 in existing, checks guard: K2 (donor) not in existing → proceeds.
+		// The merged install carries K1@20 (foreign, preserved) + K2@9 (donor).
+		// The iteration gate sees K1 at EQUAL iter in cache (cached=20, new=20) —
+		// this must be ACCEPTED as a preserved foreign state (D-12 interaction rule).
+		_, ok, err := csBSeed.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 15)
+		if err != nil {
+			t.Fatalf("TryInlineRecovery: %v", err)
+		}
+		if !ok {
+			t.Fatal("warm-cache arm: expected true (donor found), got false")
+		}
+
+		// Assert LoadStruct serves BOTH K1@20 AND K2@9.
+		afterSt, afterOK := parsedCache.LoadStruct(cacheKey)
+		if !afterOK || afterSt == nil {
+			t.Fatal("warm-cache arm: LoadStruct miss after TryInlineRecovery")
+		}
+		k1AfterState := findStateByKeyID(afterSt, k1)
+		k2AfterState := findStateByKeyID(afterSt, k2)
+		if k1AfterState == nil {
+			t.Error("warm-cache arm: K1 missing from cache after merge (D-12 interaction gate rejected preserved foreign state)")
+		} else if k1AfterState.SenderChainKey.Iteration != 20 {
+			t.Errorf("warm-cache arm: K1 cache iter = %d, want 20", k1AfterState.SenderChainKey.Iteration)
+		}
+		if k2AfterState == nil {
+			t.Error("warm-cache arm: K2 (donor) missing from cache")
+		} else if k2AfterState.SenderChainKey.Iteration != 9 {
+			t.Errorf("warm-cache arm: K2 cache iter = %d, want 9", k2AfterState.SenderChainKey.Iteration)
+		}
+		t.Logf("warm-cache arm: K1=%v iter=%v, K2=%v iter=%v",
+			k1AfterState != nil, func() uint32 {
+				if k1AfterState != nil {
+					return k1AfterState.SenderChainKey.Iteration
+				}
+				return 0
+			}(),
+			k2AfterState != nil, func() uint32 {
+				if k2AfterState != nil {
+					return k2AfterState.SenderChainKey.Iteration
+				}
+				return 0
+			}())
+	})
+}
