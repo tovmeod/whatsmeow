@@ -716,3 +716,41 @@ func formatCacheMetrics(c *Container) string {
 		walltime.DecryptHistogram.Count(),
 	)
 }
+
+// CacheLens returns live entry counts for all six signal caches.
+// A -1 value means the cache is not wired (nil pointer) — distinguishable from
+// an empty (0-entry) warm cache. Used by manager.go DebugStats to expose cache
+// sizes without requiring a pprof.
+//
+// Nil-guard discipline follows the existing msgSecBlock pattern in
+// formatCacheMetrics (lines 696-706 above): each field checked independently
+// so a partially-constructed Container never panics.
+func (c *Container) CacheLens() map[string]int {
+	lens := map[string]int{
+		"sk_bytes":   -1,
+		"session":    -1,
+		"identity":   -1,
+		"sk_devices": -1,
+		"msg_secret": -1,
+		"sk_parsed":  -1,
+	}
+	if c.caches.SenderKey != nil {
+		lens["sk_bytes"] = c.caches.SenderKey.Len()
+	}
+	if c.caches.Session != nil {
+		lens["session"] = c.caches.Session.Len()
+	}
+	if c.caches.Identity != nil {
+		lens["identity"] = c.caches.Identity.Len()
+	}
+	if c.caches.SenderKeyDevices != nil {
+		lens["sk_devices"] = c.caches.SenderKeyDevices.Len()
+	}
+	if c.caches.MsgSecret != nil {
+		lens["msg_secret"] = c.caches.MsgSecret.Len()
+	}
+	if c.caches.SKParsed != nil {
+		lens["sk_parsed"] = c.caches.SKParsed.Len()
+	}
+	return lens
+}
