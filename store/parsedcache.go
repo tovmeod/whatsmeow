@@ -92,10 +92,11 @@ func SenderKeyParsedCacheStats() (hits, misses uint64) {
 // Callers call NewSenderKeyFromStruct on the returned pointer to obtain a
 // fresh, independent *SenderKey record for each decrypt.
 //
-// mu guards only the lru.Add / lru.Remove calls in StoreStruct and Invalidate.
-// It is NOT held during NewSenderKeyFromStruct / NewSessionFromStructure calls
-// or any other libsignal operation. LoadStruct holds no lock at all because
-// lru.Cache is goroutine-safe.
+// mu guards the ENTIRE read-compare-add sequence in StoreStruct (the iteration
+// gate is check-then-act; see StoreStruct, CR-02 2026-06-10) and the lru.Remove
+// in Invalidate. It is NOT held during NewSenderKeyFromStruct /
+// NewSessionFromStructure calls or any other libsignal operation. LoadStruct
+// holds no lock at all because lru.Cache is goroutine-safe.
 type parsedSKCache struct {
 	lru *SKParsedLRU
 	mu  sync.Mutex
@@ -167,7 +168,17 @@ func (c *parsedSKCache) LoadStruct(key string) (*groupRecord.SenderKeyStructure,
 //
 // All comparisons are per-matching-KeyID across ALL states, never state[0] only.
 // Returns true if the entry was accepted and written to the LRU, false if rejected.
-// Holds c.mu only for the lru.Add call (not across the conversion or gate reads).
+//
+// Locking (CR-02, 2026-06-10): c.mu is held across the ENTIRE read-compare-add
+// sequence (lru.Get, gate evaluation, lru.Add). The gate is check-then-act —
+// evaluating it against an unlocked snapshot would let two concurrent writers
+// for the same key both pass against the same cached state and then Add in
+// arbitrary order, so a stale recovery write could land after (and regress) a
+// fresher cipher write — the exact ratchet-downgrade the gate exists to prevent
+// (999.17 / T-1712-01). lru.Get/Add are cheap map+list operations; holding the
+// lock across them adds no meaningful contention. Only the flatFromStructure
+// conversion runs outside the lock (pure function of s).
+//
 // The passed-in pointer s must have been produced by record.Structure() on the
 // post-ratchet record.
 //
@@ -179,7 +190,11 @@ func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructur
 		return false // refuse-to-cache: leave uncached, read path stays correct
 	}
 
-	// Read the cached entry for comparison (lru.Cache.Get is goroutine-safe, no lock needed).
+	// Hold the lock across read-compare-add: the gate below is check-then-act
+	// and must be atomic with respect to concurrent StoreStruct calls (CR-02).
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if cached, hit := c.lru.Get(key); hit {
 		// Compare per matching KeyID across ALL incoming states.
 		for _, inSt := range s.SenderKeyStates {
@@ -216,9 +231,7 @@ func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructur
 	}
 	// No cached entry (absent or malformed) — write proceeds.
 
-	c.mu.Lock()
 	c.lru.Add(key, f)
-	c.mu.Unlock()
 	return true
 }
 
