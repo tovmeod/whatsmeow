@@ -55,20 +55,21 @@ func parsedCacheEnvCapOrDefault(key string, fallback int) int {
 	return n
 }
 
-// Package-level LRU capacity defaults for the decoded-struct caches.
-// Sized to match the []byte LRU caps (KAVTOV_CACHE_SENDERKEY_CAP /
-// KAVTOV_CACHE_SESSION_CAP) so that struct-cache evictions and []byte-cache
-// evictions occur at the same working-set boundary.
+// Package-level LRU capacity default for the decoded SKParsed cache.
 //
-// KAVTOV_CACHE_SENDERKEY_DECODED_CAP = 1_500_000. Phase 17.9 briefly lowered
-// this to 500_000 to keep warmed heap under GOMEMLIMIT, but the flat
-// value-struct already makes a large cache GC-cheap, so the cap reduction only
-// cost cache hits (~72% warmed vs ~90% for the right-sized session cache).
-// Restored to 1_500_000 (2026-06-03), paired with GOMEMLIMIT=2500MiB. The
-// AUTHORITATIVE prod cap is sqlstore's signalSKParsedCacheCap (cache_wiring.go);
+// 2026-06-10 GC-storm: caee645 raised this from 500k to 1.5M. At 1.5M entries
+// the warmed heap reached 2.85 GB against GOMEMLIMIT=3200 MiB (11% headroom),
+// driving 40 GC cycles/min consuming ~4.5 of 8 cores (84% CPU in mark-scan).
+// Root cause: GC headroom is controlled by cap defaults (this var +
+// sqlstore.signalSKParsedCacheCap in cache_wiring.go), NOT by GOMEMLIMIT.
+// Validated by TestCacheMemoryBudget (Phase 35.1-01): measured 903 B/entry;
+// 500k cap = 430 MB, giving 50.7% GC headroom (>= 30% threshold). The host-only
+// drop-in (KAVTOV_CACHE_SENDERKEY_DECODED_CAP=500000) was removed in Phase
+// 35.1-02 because the durable fix is this default, not a host-only override.
+// The AUTHORITATIVE prod cap is sqlstore's signalSKParsedCacheCap (cache_wiring.go);
 // this package-level var is the store-package default for tests/standalone
-// wiring. Env-overridable.
-var signalSKParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
+// wiring. MUST match cache_wiring.go's signalSKParsedCacheCap default. Env-overridable.
+var signalSKParsedCacheCap = parsedCacheEnvCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
 
 // Process-global parsed-cache hit/miss counters. The parsed cache is a shared
 // process-level LRU wrapped per-device, so global atomics (not per-wrapper

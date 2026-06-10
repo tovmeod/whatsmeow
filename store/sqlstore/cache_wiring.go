@@ -54,51 +54,58 @@ func envCapOrDefault(key string, fallback int) int {
 // The original const names are kept as vars so wireSignalCaches /
 // formatCacheMetrics references stay identical.
 //
-// Memory budget at proposed cap defaults (box: 16 GB, PG shared_buffers=4 GB,
-// RSS base~1 GB). Blob sizes measured via ~1-2% TABLESAMPLE on prod (avg / p95
-// / max):
+// 2026-06-10 GC-storm incident: caee645 raised SKParsed cap from 500k to 1.5M.
+// At 1.5M entries the warmed heap reached 2.85 GB against GOMEMLIMIT=3200 MiB
+// (only 11% headroom), driving 40 GC cycles/min consuming ~4.5 of 8 cores
+// (84% CPU in mark-scan). Root cause: GC headroom is set by the cap defaults
+// in this file (cache_wiring.go), NOT by GOMEMLIMIT. Mitigated 2026-06-10 via
+// host-only drop-in (KAVTOV_CACHE_SENDERKEY_DECODED_CAP=500000). This phase
+// lands the validated 500k default and removes the drop-in.
+//
+// Per-entry heap bytes measured by TestCacheMemoryBudget (Phase 35.1-01) using
+// ReadMemStats-delta at N=10,000 entries. Values are ground-truth from the test,
+// not pprof estimates. Blob sizes from ~1-2% TABLESAMPLE on prod (avg / p95 / max):
 //
 //	sender_key: avg=720 B, p95=1301 B, max=282966 B (rare fat tail)
 //	session:    avg=2620 B, p95=5185 B, max=653645 B (rare fat tail)
-//	message_secret key: 32 B fixed; ~150 B map/LRU overhead per entry
 //
-//	Cache            | Value size (avg) | Cap       | Budget at avg size
-//	-----------------|------------------|-----------|--------------------
-//	SenderKey blobs  | 720 B avg        | 1,500,000 | ~1,080 MB + ~200 MB overhead = ~1,280 MB
-//	Sessions         | 2620 B avg       |   250,000 |   ~655 MB + ~100 MB overhead =   ~755 MB
-//	MsgSecret pairs  | ~182 B (32+150)  |   500,000 |    ~91 MB
-//	SKDevices ([]str)| ~200 B           |   500,000 |   ~100 MB
-//	Identities       | 32 B             |   250,000 |     ~8 MB + ~50 MB overhead  =    ~58 MB
-//	Total at avg                                    | ~2,284 MB (~2.3 GB)
+//	Cache            | Measured B/entry | Cap     | Budget MB
+//	-----------------|------------------|---------|----------
+//	SKParsed         |   903 B          | 500,000 |   430 MB
+//	SenderKey bytes  |   992 B          | 500,000 |   473 MB
+//	Session bytes    |  2874 B          | 100,000 |   274 MB
+//	Identity         |   179 B          | 150,000 |    26 MB
+//	SKDevices        |   215 B          | 300,000 |    62 MB
+//	MsgSecret        |   294 B          | 300,000 |    84 MB
+//	Total caches                                  | 1,349 MB
+//	Base RSS (non-cache)                          |   228 MB
+//	Grand total                                   | 1,577 MB
+//	GOMEMLIMIT                                    | 3,200 MB
+//	GC headroom                                   |  50.7%  (>= 30% threshold)
 //
-//	Fat-tail blobs (p95) are already factored into the avg-based budget via their rarity.
-//	Target RSS sum of caches: ~2.5 GB. OOMKill ceiling: 6 GB (matches systemd MemoryMax).
-//	Headroom: 6 GB - 1 GB base - 2.5 GB caches - 4 GB PG shared_buffers = well within box.
-//	Sessions cap is headroom: peak today showed len=88726, capacity_evictions=0
-//	(not yet saturated). Sender_keys IS saturated (len=100000, 512705 evictions).
+//	30% GC headroom constraint: available for caches <= GOMEMLIMIT*0.70 - baseRSS
+//	= 3200*0.70 - 228 = 2012 MB. Total caches 1349 MB << 2012 MB. Validated by
+//	TestCacheMemoryBudget in cache_sizing_test.go.
 //	Override env vars to reduce caps without a fork rebuild.
 var (
-	signalSessionCacheCap   = envCapOrDefault("KAVTOV_CACHE_SESSION_CAP", 250_000)
-	signalIdentityCacheCap  = envCapOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 250_000)
-	signalSenderKeyCacheCap = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 1_500_000)
+	signalSessionCacheCap   = envCapOrDefault("KAVTOV_CACHE_SESSION_CAP", 100_000)
+	signalIdentityCacheCap  = envCapOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 150_000)
+	signalSenderKeyCacheCap = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 500_000)
 	// kavtov-fork: Phase 27 — device-set index (one small []string per
 	// jid|group|userBare).
-	signalSenderKeyDevicesCacheCap = envCapOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 500_000)
+	signalSenderKeyDevicesCacheCap = envCapOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 300_000)
 	// perf 260601-uuy: message-secret pair cache (secret + realSender).
-	signalMsgSecretCacheCap = envCapOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 500_000)
-	// Phase 17.8: decoded struct-LRU caches. Sized to match the []byte LRU caps
-	// so evictions occur at the same working-set boundary (eviction of a parsed
-	// entry is silent — next Load re-populates from the []byte LRU).
+	signalMsgSecretCacheCap = envCapOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 300_000)
+	// Phase 17.8: decoded struct-LRU for flat sender-key values.
 	//
-	// DECODED cap = 1_500_000. Phase 17.9 briefly lowered this to 500_000 as a
-	// "companion lever" to keep warmed heap under GOMEMLIMIT=1200MiB, but that
-	// was unnecessary once the flat value-struct cache made a large cache
-	// GC-cheap (cheap scans regardless of count), and it cost ~25% of sender-key
-	// reads as cache misses (warmed hit rate ~72% at 500k vs sessions' ~90% at
-	// their right-sized cap). Restored to 1_500_000 (2026-06-03), paired with
-	// GOMEMLIMIT raised to 2500MiB (systemd unit). This is the AUTHORITATIVE prod
+	// 2026-06-10 GC-storm: caee645 raised this from 500k to 1.5M; the resulting
+	// warmed heap (2.85 GB) left only 11% GC headroom against GOMEMLIMIT=3200 MiB
+	// and drove 40 GC cycles/min. Fixed by TestCacheMemoryBudget (Phase 35.1-01):
+	// measured 903 B/entry; 500k * 903 B = 430 MB, preserving >= 30% headroom.
+	// Host-only drop-in (KAVTOV_CACHE_SENDERKEY_DECODED_CAP=500000) removed in
+	// Phase 35.1-02 after this default is deployed. This is the AUTHORITATIVE prod
 	// cap (wireSignalCaches builds the prod LRU from it); env-overridable.
-	signalSKParsedCacheCap = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 1_500_000)
+	signalSKParsedCacheCap = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
 )
 
 // ---------------------------------------------------------------------------
