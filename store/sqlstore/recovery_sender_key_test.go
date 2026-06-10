@@ -802,6 +802,136 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 	})
 }
 
+// TestInlineRecoveryCacheResidentRace is the D-13 failing-first test (CR-01).
+//
+// It reproduces the cache-resident ratchet-downgrade race: account B has an
+// ADVANCED sender-key state (KeyID K, Iteration 50) that is cache-resident in the
+// parsed cache AND in the flusher dirty-set, but the DB row for B is ABSENT (the
+// ~1s flusher window held open deterministically by attaching a flusher that is
+// never started). Account A has a STALE donor row (KeyID K, Iteration 10) in the
+// DB. TryInlineRecovery calls GetSenderKeyStructure (DB-only — it does NOT read
+// the parsed cache), finds no matching guard entry (B's row is absent from DB),
+// then installs the donor via PutSenderKeyStructure → parsedReplace which blindly
+// overwrites the cache with Iteration 10, downgrading the live ratchet position.
+//
+// Against current code (no iteration gate) the assertion MUST fail.
+// After Task 2 lands the iteration gate the assertion passes (green).
+func TestInlineRecoveryCacheResidentRace(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		group        = "recovcache_race_group@g.us"
+		bareUser     = "55512349900_1"
+		donorSuffix  = ":5"
+		targetSuffix = ":0"
+		targetKeyID  = uint32(7)
+		advancedIter = uint32(50)
+		staleIter    = uint32(10)
+	)
+	donorSenderID  := bareUser + donorSuffix
+	targetSenderID := bareUser + targetSuffix
+
+	ctx := context.Background()
+
+	// Clean up any leftover rows from previous runs.
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		recoveryTestJIDA, recoveryTestJIDB, group)
+
+	// Build account B's CachedSenderKeyStore.
+	jidB, err := types.ParseJID(recoveryTestJIDB)
+	if err != nil {
+		t.Fatalf("ParseJID B: %v", err)
+	}
+	containerB := sqlstore.NewWithDB(db, "postgres", nil)
+	innerB := sqlstore.NewSQLStore(containerB, jidB)
+
+	byteCache, _ := lru.New[string, []byte](256)
+	devCache, _ := lru.New[string, []string](256)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+
+	// Wire a real parsed cache (mirrors attachCachedStores).
+	skLRU, _ := store.NewSKParsedLRU(256)
+	parsedCache := store.NewParsedSKCache(skLRU)
+
+	// Wire parsedReplace -> parsedCache.StoreStruct.
+	// The closure signature must match what Task 2 changes it to; for Task 1
+	// (red test against CURRENT code) the existing signature is fine.
+	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
+		parsedCache.StoreStruct(key, s)
+	})
+
+	// Wire a flusher that is NOT started (attached-not-drained = stale DB window).
+	flusher := sqlstore.NewSenderKeyFlusher(innerB, nil, 0)
+	csB.SetFlusher(flusher)
+	// flusher.Start() intentionally NOT called — no goroutine, DB stays absent.
+
+	// Step 1: Warm the parsed cache with the ADVANCED state via PutSenderKeyStructure.
+	// This lands in the parsed cache + flusher dirty-set; the DB row for B stays absent.
+	advancedStruct := buildDonorStructure(targetKeyID, advancedIter, 0x11)
+	if err := csB.PutSenderKeyStructure(ctx, group, targetSenderID, advancedStruct); err != nil {
+		t.Fatalf("PutSenderKeyStructure (advanced seed): %v", err)
+	}
+
+	// Verify the cache is warm at Iteration=50 before the recovery attempt.
+	// Compute the cache key the same way CachedSenderKeyStore does: jid|group|user.
+	cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
+	warmStruct, warmOK := parsedCache.LoadStruct(cacheKey)
+	if !warmOK || warmStruct == nil || len(warmStruct.SenderKeyStates) == 0 {
+		t.Fatalf("pre-condition: parsed cache is not warm for %s (LoadStruct miss)", cacheKey)
+	}
+	if warmStruct.SenderKeyStates[0].SenderChainKey.Iteration != advancedIter {
+		t.Fatalf("pre-condition: cache iteration = %d, want %d",
+			warmStruct.SenderKeyStates[0].SenderChainKey.Iteration, advancedIter)
+	}
+
+	// Step 2: Seed account A with a STALE donor row (same KeyID K, Iteration 10).
+	staleStruct := buildDonorStructure(targetKeyID, staleIter, 0x22)
+	insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, staleStruct)
+
+	// Step 3: Call TryInlineRecovery for B's (group, targetSenderID).
+	// GetSenderKeyStructure inside TryInlineRecovery reads from DB only (the guard
+	// read) — it does NOT consult the parsed cache. B's DB row is absent (flusher
+	// not drained), so the guard passes, and the stale donor installs via
+	// PutSenderKeyStructure → parsedReplace.
+	_, _, recErr := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, advancedIter+5)
+	if recErr != nil {
+		t.Fatalf("TryInlineRecovery: %v", recErr)
+	}
+
+	// Step 4: Assert the parsed cache still serves Iteration=50.
+	// Against current code (no gate) the stale donor clobbers the cache with
+	// Iteration=10 and this assertion FAILS — proving the race is exercised.
+	afterStruct, afterOK := parsedCache.LoadStruct(cacheKey)
+	if !afterOK || afterStruct == nil || len(afterStruct.SenderKeyStates) == 0 {
+		t.Fatalf("D-13 FAIL: parsed cache evicted after recovery install (want Iter=%d, got miss)", advancedIter)
+	}
+	gotIter := afterStruct.SenderKeyStates[0].SenderChainKey.Iteration
+	if gotIter != advancedIter {
+		// This is the expected failure against pre-fix code: stale donor clobbered
+		// the cache with Iteration=10 instead of preserving Iteration=50.
+		t.Errorf("D-13 FAIL (CR-01): parsed cache degraded — got Iter=%d, want Iter=%d "+
+			"(stale donor Iter=%d overwrote cache-resident advanced state — ratchet downgraded)",
+			gotIter, advancedIter, staleIter)
+	}
+	t.Logf("D-13: parsed cache after recovery = Iter=%d (want %d)", gotIter, advancedIter)
+}
+
 // TestInlineRecoveryIterationGuard asserts the iteration-downgrade protection
 // for TryInlineRecovery (the inline path added in Phase 17.12).
 //
