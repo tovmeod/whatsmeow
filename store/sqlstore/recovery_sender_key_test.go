@@ -1026,6 +1026,103 @@ func TestInlineRecoveryIterationGuard(t *testing.T) {
 	t.Logf("PASS: iteration guard fired — TryInlineRecovery returned (empty, false, nil), DB row preserved at iter=%d", iterFromBlob)
 }
 
+// TestSenderKeySubclass verifies the D-03/999.19 classifyNoDonor helper (the
+// SENDERKEY_SUBCLASS classifier). It seeds a sender-key row for the recovering
+// account (B) in a DIFFERENT group than the failing one, then calls ClassifyNoDonor
+// and asserts keys_elsewhere=true (the "sender-alive-never-distributed" signature).
+//
+// Also verifies the nothing-anywhere case: no rows for B at all → keys_elsewhere=false.
+//
+// The test does NOT assert the log emission — it exercises only the classifier
+// helper that feeds the log (per plan: factor the classification into a testable
+// unexported function, keep the log emission at the call site).
+func TestSenderKeySubclass(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	const (
+		subclassJIDB  = "17799990020@s.whatsapp.net" // account under test
+		failGroup     = "subclass_fail_group@g.us"   // the group where the key is missing
+		otherGroup    = "subclass_other_group@g.us"  // a different group for keys_elsewhere
+		senderBare    = "55512340099_sub"
+		senderID      = senderBare + ":0"
+	)
+
+	cleanupB := insertRecoveryTestDevice(t, db, subclassJIDB)
+	t.Cleanup(func() {
+		cleanupB()
+		db.Close()
+	})
+
+	// Build the SQLStore for account B directly (classifyNoDonor takes *SQLStore).
+	jidB, err := types.ParseJID(subclassJIDB)
+	if err != nil {
+		t.Fatalf("ParseJID B: %v", err)
+	}
+	containerB := sqlstore.NewWithDB(db, "postgres", nil)
+	innerB := sqlstore.NewSQLStore(containerB, jidB)
+
+	ctx := context.Background()
+
+	// Clean up any leftover rows.
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id IN ($2,$3)`,
+		subclassJIDB, failGroup, otherGroup)
+
+	// Arm 1: nothing-anywhere — no rows for B anywhere.
+	// Expected: keys_elsewhere=false.
+	t.Run("nothing_anywhere", func(t *testing.T) {
+		fields := sqlstore.ClassifyNoDonor(ctx, innerB, subclassJIDB, failGroup, senderBare)
+		if fields.KeysElsewhere {
+			t.Error("nothing-anywhere arm: expected keys_elsewhere=false, got true")
+		}
+		t.Logf("nothing-anywhere arm: PASS — lidmap=%s keys_elsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
+	})
+
+	// Arm 2: keys_elsewhere=true — B has a sender-key row for senderBare in
+	// otherGroup (a different chat) but NOT in failGroup.
+	t.Run("keys_elsewhere_true", func(t *testing.T) {
+		// Seed B's row in otherGroup.
+		keysElsewhereStruct := buildDonorStructure(99, 1, 0xAB)
+		insertFlatBlobRow(t, db, subclassJIDB, otherGroup, senderID, keysElsewhereStruct)
+		t.Cleanup(func() {
+			_, _ = db.ExecContext(ctx,
+				`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2`,
+				subclassJIDB, otherGroup)
+		})
+
+		fields := sqlstore.ClassifyNoDonor(ctx, innerB, subclassJIDB, failGroup, senderBare)
+		if !fields.KeysElsewhere {
+			t.Error("keys-elsewhere arm: expected keys_elsewhere=true (row in otherGroup), got false")
+		}
+		t.Logf("keys-elsewhere arm: PASS — lidmap=%s keys_elsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
+	})
+
+	// Arm 3: row in the SAME failGroup does NOT set keys_elsewhere=true.
+	// (keys_elsewhere is for OTHER chats only.)
+	t.Run("same_group_no_keys_elsewhere", func(t *testing.T) {
+		sameGroupStruct := buildDonorStructure(88, 2, 0xCD)
+		insertFlatBlobRow(t, db, subclassJIDB, failGroup, senderID, sameGroupStruct)
+		t.Cleanup(func() {
+			_, _ = db.ExecContext(ctx,
+				`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2`,
+				subclassJIDB, failGroup)
+		})
+
+		fields := sqlstore.ClassifyNoDonor(ctx, innerB, subclassJIDB, failGroup, senderBare)
+		if fields.KeysElsewhere {
+			t.Error("same-group arm: expected keys_elsewhere=false (only row is in failGroup), got true")
+		}
+		t.Logf("same-group arm: PASS — lidmap=%s keys_elsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
+	})
+}
+
 // buildMultiStateStructure builds a SenderKeyStructure with two states:
 //   state[0]: keyID=k1, iter=iter1
 //   state[1]: keyID=k2, iter=iter2

@@ -40,6 +40,9 @@ package sqlstore
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"os"
 	"strconv"
 	"sync/atomic"
 
@@ -105,6 +108,111 @@ type donorSenderKeyState struct {
 	SigningKeyPrivate []byte // nil on received (non-own) keys — preserved
 	// Skipped message keys for this state, if any (forwarded for completeness).
 	SkippedKeys []*ratchet.SenderMessageKeyStructure
+}
+
+// D-03 / 999.19: SENDERKEY_SUBCLASS sampler — classifies why no donor was found.
+// Default rate 10 (1-in-10 no-donor events); 0 disables. Declared as a var (not
+// const) so internal tests can override the rate without restarting the process.
+// Configured via env KAVTOV_SENDERKEY_SUBCLASS.
+const senderKeySubclassDefaultRate = 10
+
+var senderKeySubclassRate = func() int {
+	s := os.Getenv("KAVTOV_SENDERKEY_SUBCLASS")
+	if s == "0" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil && n > 0 {
+		return n
+	}
+	return senderKeySubclassDefaultRate
+}()
+
+// senderKeySubclassCounter is the per-process counter driving the subclass sampler.
+var senderKeySubclassCounter atomic.Uint64
+
+// senderKeySubclassShouldSample returns true on 1-in-senderKeySubclassRate calls.
+// Always false when rate == 0 (disabled path never touches the counter).
+func senderKeySubclassShouldSample() bool {
+	rate := senderKeySubclassRate
+	if rate == 0 {
+		return false
+	}
+	n := senderKeySubclassCounter.Add(1)
+	return n%uint64(rate) == 0
+}
+
+// subclassLIDMapQuery checks whatsmeow_lid_map for the sender's identifier.
+// Returns one of: "pn-mapped" (sender resolves as a PN→LID pair),
+// "lid-mapped" (sender resolves as a LID→PN pair), "unmapped" (no entry),
+// or "err" if the query fails (errors are swallowed — diagnostic only).
+//
+// The sender identifier from the Signal address is the user part of a
+// @s.whatsapp.net JID (a phone number string) or a LID user.
+// getLIDForPNQuery / getPNForLIDQuery cover both directions; the first hit wins.
+const subclassLIDMapQuery = `
+	SELECT 'pn-mapped' AS kind FROM whatsmeow_lid_map WHERE pn=$1
+	UNION ALL
+	SELECT 'lid-mapped' AS kind FROM whatsmeow_lid_map WHERE lid=$1
+	LIMIT 1
+`
+
+// subclassKeysElsewhereQuery checks if ANY whatsmeow_sender_keys row exists for
+// (our_jid, sender LIKE prefix) in a DIFFERENT chat. This is the
+// "sender-alive-never-distributed" signature: the sender has shared keys with us
+// elsewhere, but not in this specific group.
+//
+// Uses the same LIKE device-tolerance as the donor scan (sender_id LIKE senderBare||':%').
+// Single indexed EXISTS/LIMIT 1 — read-only, no write.
+const subclassKeysElsewhereQuery = `
+	SELECT EXISTS(
+		SELECT 1 FROM whatsmeow_sender_keys
+		WHERE our_jid=$1
+		  AND chat_id <> $2
+		  AND sender_id LIKE $3 || ':%' ESCAPE '\'
+		LIMIT 1
+	)
+`
+
+// noDonorFields is the result of classifyNoDonor — factored out so tests can
+// assert the field values without triggering the log emission.
+type noDonorFields struct {
+	LIDMap       string // "pn-mapped", "lid-mapped", "unmapped", or "err"
+	KeysElsewhere bool   // true = sender has keys with us in at least one other group
+}
+
+// classifyNoDonor runs the two sampled read-only queries against s to produce
+// the SENDERKEY_SUBCLASS field values. Errors are swallowed with fallback field
+// values so the fail path never gets slower or fails because of diagnostics.
+//
+//   - ourJID:     the recovering account's own JID string (our_jid in the table)
+//   - group:      the group chat ID (chat_id of the failing decrypt)
+//   - senderBare: the bare Signal-address user (no device suffix, no @server)
+//
+// This function is called only when the sampler fires; it is NOT on the hot path.
+func classifyNoDonor(ctx context.Context, s *SQLStore, ourJID, group, senderBare string) noDonorFields {
+	fields := noDonorFields{LIDMap: "err", KeysElsewhere: false}
+
+	// (a) LID-map state: does senderBare appear in whatsmeow_lid_map as either
+	// a PN or a LID?
+	var lidKind string
+	err := s.db.QueryRow(ctx, subclassLIDMapQuery, senderBare).Scan(&lidKind)
+	if errors.Is(err, sql.ErrNoRows) {
+		fields.LIDMap = "unmapped"
+	} else if err == nil {
+		fields.LIDMap = lidKind
+	}
+	// else: fields.LIDMap stays "err"
+
+	// (b) Keys-elsewhere: does this our_jid have ANY sender-key row for senderBare
+	// in a chat_id != group?
+	escapedBare := senderKeyLikeEscaper.Replace(senderBare)
+	err = s.db.QueryRow(ctx, subclassKeysElsewhereQuery, ourJID, group, escapedBare).Scan(&fields.KeysElsewhere)
+	if err != nil {
+		// swallow error; KeysElsewhere stays false (safe conservative default)
+		fields.KeysElsewhere = false
+	}
+
+	return fields
 }
 
 // recoveryScanQueryFast is the indexed fast-path donor query (R8).
@@ -331,6 +439,21 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 		}
 	}
 	if donor == nil {
+		// D-03 / 999.19: sampled SENDERKEY_SUBCLASS classifier.
+		// Runs only when the sampler fires (default 1-in-10); reads whatsmeow_lid_map
+		// and whatsmeow_sender_keys (read-only, no writes). Errors are swallowed
+		// inside classifyNoDonor — the fail path must never get slower because of
+		// diagnostics.
+		if senderKeySubclassShouldSample() {
+			if sq, ok := c.inner.(*SQLStore); ok {
+				fields := classifyNoDonor(ctx, sq, c.jid, group, senderBare)
+				if sq.log != nil {
+					n := senderKeySubclassCounter.Load()
+					sq.log.Infof("SENDERKEY_SUBCLASS sender=%s group=%s lidmap=%s keys_elsewhere=%t sampled_n=%d",
+						senderBare, group, fields.LIDMap, fields.KeysElsewhere, n)
+				}
+			}
+		}
 		return "", false, nil // no qualifying donor
 	}
 
