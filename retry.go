@@ -604,9 +604,15 @@ type retryAttemptKey struct {
 // retryAttemptEntry holds the per-(msgID,sender) state for the retry cap.
 // Value-typed (no pointers) to stay GC-friendly per the 35.1 lesson.
 // Terminal is set once to prevent duplicate SENDERKEY_TERMINAL logs (Task 2).
+// slot is the entry's index in retryAttemptsList (WR-03 lockstep invariant:
+// every map entry owns exactly one ring slot, and clearMessageRetrySender
+// zeroes that slot when it deletes the map entry — so a cleared-then-re-added
+// key can never occupy two slots, and ring eviction can never delete a LIVE
+// entry through a stale slot).
 type retryAttemptEntry struct {
 	Count    int
 	Terminal bool
+	slot     int
 }
 
 // retryAttemptsListSize is the ring-buffer capacity for the retry-attempt store.
@@ -681,12 +687,19 @@ func (cli *Client) registerRetryAttempt(msgID string, senderUser string, group s
 		if ringSize <= 0 || ringSize > retryAttemptsListSize {
 			ringSize = retryAttemptsListSize
 		}
-		// Unconditionally evict the ring slot we are about to overwrite — after the ring
-		// has wrapped once every slot holds a live key and the eviction is always needed.
+		// Evict the ring slot we are about to overwrite — after the ring has
+		// wrapped once every non-sentinel slot holds a live key. WR-03: a slot
+		// zeroed by clearMessageRetrySender (MsgID == "") is an empty sentinel,
+		// not an occupant; and the map delete only fires when the map entry
+		// actually OWNS this slot (entry.slot == ptr), so a stale slot can never
+		// evict a live entry that has since moved to a different slot.
 		old := cli.retryAttemptsList[cli.retryAttemptsPtr]
 		if old.MsgID != "" {
-			delete(cli.retryAttempts, old)
+			if oldEntry, ok := cli.retryAttempts[old]; ok && oldEntry.slot == cli.retryAttemptsPtr {
+				delete(cli.retryAttempts, old)
+			}
 		}
+		e.slot = cli.retryAttemptsPtr
 		cli.retryAttemptsList[cli.retryAttemptsPtr] = k
 		cli.retryAttemptsPtr++
 		if cli.retryAttemptsPtr >= ringSize {
@@ -784,13 +797,32 @@ func (cli *Client) isRecoveredMsgID(msgID string) bool {
 // clearMessageRetrySender removes the retry-attempt entry for (msgID, senderUser).
 // Called on successful decrypt to allow a fresh retry loop if needed.
 // The senderUser must be the bare JID user (info.Sender.User).
+//
+// WR-03 (2026-06-10): the map delete alone left the key in retryAttemptsList;
+// a later re-entry for the same key inserted a SECOND ring slot, and when the
+// ring pointer reached the stale first slot, delete(retryAttempts, old)
+// evicted the LIVE entry — resetting the cap (up to 3 extra receipts) and
+// losing the Terminal flag, so SENDERKEY_TERMINAL could double-fire for the
+// same (msgID, sender) (D-07 exactly-once violation, D-04 numerator
+// double-count). The ring wraps every ~40 min at peak failure rates, so this
+// was live. Fix: zero the entry's ring slot (empty-key sentinel) in lockstep
+// with the map delete; eviction skips sentinel slots and only deletes when the
+// map entry owns the slot being recycled.
 func (cli *Client) clearMessageRetrySender(msgID string, senderUser string) {
 	cli.messageRetriesLock.Lock()
 	defer cli.messageRetriesLock.Unlock()
 	if cli.retryAttempts == nil {
 		return
 	}
-	delete(cli.retryAttempts, retryAttemptKey{MsgID: msgID, Sender: senderUser})
+	k := retryAttemptKey{MsgID: msgID, Sender: senderUser}
+	e, ok := cli.retryAttempts[k]
+	if !ok {
+		return
+	}
+	if e.slot >= 0 && e.slot < len(cli.retryAttemptsList) && cli.retryAttemptsList[e.slot] == k {
+		cli.retryAttemptsList[e.slot] = retryAttemptKey{}
+	}
+	delete(cli.retryAttempts, k)
 }
 
 // clearMessageRetry removes retry state for the given message ID.

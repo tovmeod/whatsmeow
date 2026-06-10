@@ -312,6 +312,68 @@ func TestSenderKeyTerminal_RecoveredSetBounded(t *testing.T) {
 	}
 }
 
+// --- WR-03 test: cleared-then-re-added keys must not occupy two ring slots ---
+
+// TestRetryCap_ClearThenReAddSurvivesRingWrap asserts the WR-03 lockstep
+// invariant: after clear + re-register, the old ring slot is a zeroed sentinel,
+// so a ring wrap over it does NOT evict the live re-registered entry — the cap
+// does not reset and SENDERKEY_TERMINAL fires exactly once.
+//
+// Against the pre-fix code (map delete only, stale slot left in the ring), the
+// re-registration inserts a SECOND slot; the wrap reaches the stale first slot
+// and delete(retryAttempts, old) evicts the LIVE entry — count restarts at 1
+// and the terminal can fire a second time.
+func TestRetryCap_ClearThenReAddSurvivesRingWrap(t *testing.T) {
+	cli := newRetryCap()
+
+	origCap := retryStoreSKMsgSize
+	retryStoreSKMsgSize = 4
+	defer func() { retryStoreSKMsgSize = origCap }()
+
+	const msgA = "msg-wr03-a"
+	const sender = "15550003002"
+	const group = "120363000000000021@g.us"
+
+	// Register A (occupies slot 0) and advance its count to 3.
+	for i := 0; i < 3; i++ {
+		cli.registerRetryAttempt(msgA, sender, group, 0, true)
+	}
+
+	// Decrypt success: clear A. Slot 0 must become a zeroed sentinel.
+	cli.clearMessageRetrySender(msgA, sender)
+
+	// A re-enters (late duplicate retry): fresh entry at slot 1, count back to 3.
+	for i := 0; i < 3; i++ {
+		_, proceed, _ := cli.registerRetryAttempt(msgA, sender, group, 0, true)
+		if !proceed {
+			t.Fatalf("re-registered A attempt %d: want proceed=true", i+1)
+		}
+	}
+
+	// Fill the remaining slots (2, 3) and wrap the pointer over the old
+	// (now-zeroed) slot 0. Pre-fix: slot 0 still held A → live A evicted here.
+	cli.registerRetryAttempt("msg-wr03-b", sender, group, 0, true) // slot 2
+	cli.registerRetryAttempt("msg-wr03-c", sender, group, 0, true) // slot 3
+	cli.registerRetryAttempt("msg-wr03-d", sender, group, 0, true) // wraps to slot 0
+
+	// A's live entry must have survived the wrap: 4th attempt is past the cap
+	// and fires the terminal exactly once.
+	_, proceed, logTerminal := cli.registerRetryAttempt(msgA, sender, group, 0, true)
+	if proceed {
+		t.Error("A attempt 4 after ring wrap: want proceed=false (cap intact); " +
+			"proceed=true means the live entry was evicted via the stale slot (WR-03)")
+	}
+	if !logTerminal {
+		t.Error("A attempt 4 after ring wrap: want logTerminal=true (first give-up)")
+	}
+
+	// 5th attempt: terminal already fired — must not re-log (D-07 exactly-once).
+	_, _, secondTerminal := cli.registerRetryAttempt(msgA, sender, group, 0, true)
+	if secondTerminal {
+		t.Error("A attempt 5: want logTerminal=false (terminal must fire exactly once)")
+	}
+}
+
 // --- WR-01 tests: enc-node classification on multi-child message nodes ---
 
 // TestClassifyRetryEnc_MetaPlusSKMsg asserts that a full message node carrying a
