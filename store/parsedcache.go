@@ -175,3 +175,17 @@ func (c *parsedSKCache) Invalidate(key string) {
 	c.mu.Unlock()
 }
 
+// AddFlatToLRU converts s to its flat form and adds it to lru.
+// Returns false if flatFromStructure refuses the structure (wrong field
+// lengths, 0 states, or > flatMaxStates). Used by cache_sizing_test.go
+// (package sqlstore) to fill SKParsedLRU entries without naming the
+// unexported flatSenderKey type across the package boundary.
+func AddFlatToLRU(lru *SKParsedLRU, key string, s *groupRecord.SenderKeyStructure) bool {
+	f, ok := flatFromStructure(s)
+	if !ok {
+		return false
+	}
+	lru.Add(key, f)
+	return true
+}
+
