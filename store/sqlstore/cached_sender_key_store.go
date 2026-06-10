@@ -383,7 +383,20 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 		return c.inner.PutSenderKey(ctx, group, user, legacyBlob)
 	}
 
+	// Derive the flusher Enqueue meta from the DONOR state, not blindly from
+	// state[0] (CR-04 belt-and-braces). After the donor-prepend fix in
+	// TryInlineRecovery's merge, state[0] IS the donor so the two coincide —
+	// but deriving from the donor KeyID explicitly guarantees the recovery
+	// enqueue can never carry a foreign generation's (keyID, iter), which would
+	// let the flusher's same-generation dedup silently skip the recovery blob
+	// (donor never reaching DB; re-lost on LRU eviction or restart).
 	keyID, iter := extractStructMeta(s)
+	for _, st := range s.SenderKeyStates {
+		if st != nil && st.KeyID == donorKeyID && st.SenderChainKey != nil {
+			keyID, iter = st.KeyID, st.SenderChainKey.Iteration
+			break
+		}
+	}
 
 	// ORDERING: evaluate the parsed-cache gate BEFORE flusher.Enqueue for recovery.
 	// A rejected stale install must not enter the dirty-set (prevents last-wins drain

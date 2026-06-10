@@ -49,6 +49,7 @@ import (
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 // recovery test JIDs — two separate accounts
@@ -1529,4 +1530,173 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 				return 0
 			}())
 	})
+}
+
+// TestInlineRecoveryDonorPrependedAndFlushed is the CR-04 regression test.
+//
+// Invariant under test: the D-12 merge must place the DONOR state at index 0
+// (libsignal's states[0]-most-recent invariant, relied on by extractStructMeta,
+// the sk_keyid0 generated column, and the flusher's same-generation dedup), and
+// the recovery enqueue must carry the donor's (keyID, iter) meta so a
+// pre-existing dirty entry at a FOREIGN generation cannot dedup-skip the
+// recovery blob.
+//
+// Setup: B's existing row [K1@20, K2@5] is in the DB AND enqueued as a dirty
+// flusher entry with meta (K1, 20) (the flusher is attached but never started,
+// holding the write-back window open). Donor K2@9 is then recovered.
+//
+// Pre-fix behaviour: the merge kept K1 at state[0], the recovery enqueue meta
+// was (K1, 20) from the stale state[0], sameGeneration was true with
+// iter 20 <= highIter 20, and the dedup SKIPPED the enqueue — the merged blob
+// (with the donor) never replaced the dirty blob, so the drained DB row lacked
+// the donor state. Post-fix the merged state[0] is the donor and the enqueue
+// meta is (K2, 9): sameGeneration is false, the dirty blob is replaced, and the
+// drain persists the donor at state[0].
+func TestInlineRecoveryDonorPrependedAndFlushed(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		group        = "recovprepend_group@g.us"
+		bareUser     = "55512340777_1"
+		donorSuffix  = ":5"
+		targetSuffix = ":0"
+		k1           = uint32(10) // foreign generation (pre-existing dirty entry meta)
+		k2           = uint32(20) // donor generation
+	)
+	donorSenderID := bareUser + donorSuffix
+	targetSenderID := bareUser + targetSuffix
+
+	ctx := context.Background()
+
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		recoveryTestJIDA, recoveryTestJIDB, group)
+
+	// Seed B's existing multi-state row in the DB: [K1@20, K2@5].
+	existingStruct := buildMultiStateStructure(k1, 20, k2, 5, 0x41, 0x42)
+	insertFlatBlobRow(t, db, recoveryTestJIDB, group, targetSenderID, existingStruct)
+
+	// Seed A's donor row: K2@9 (strictly fresher than B's K2@5).
+	donorStruct := buildDonorStructure(k2, 9, 0x51)
+	insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+	// Build B's store with a REAL parsed cache and a flusher that is attached
+	// but never started (write-back window held open deterministically).
+	jidB, err := types.ParseJID(recoveryTestJIDB)
+	if err != nil {
+		t.Fatalf("ParseJID B: %v", err)
+	}
+	containerB := sqlstore.NewWithDB(db, "postgres", nil)
+	innerB := sqlstore.NewSQLStore(containerB, jidB)
+	byteCache, _ := lru.New[string, []byte](256)
+	devCache, _ := lru.New[string, []string](256)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+
+	skLRU, _ := store.NewSKParsedLRU(256)
+	parsedCache := store.NewParsedSKCache(skLRU)
+	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+		return parsedCache.StoreStruct(key, s, donorKeyID)
+	})
+
+	flusher := sqlstore.NewSenderKeyFlusher(innerB, waLog.Noop, 0)
+	csB.SetFlusher(flusher)
+	// flusher.Start() intentionally NOT called — dirty-set drains only via Drain().
+
+	// Pre-seed a dirty entry at the FOREIGN generation: PutSenderKeyStructure
+	// derives meta from state[0] = (K1, 20), so the dirty entry's keyID is K1.
+	if err := csB.PutSenderKeyStructure(ctx, group, targetSenderID, existingStruct); err != nil {
+		t.Fatalf("PutSenderKeyStructure (dirty pre-seed): %v", err)
+	}
+	if got := flusher.DirtyCount(); got != 1 {
+		t.Fatalf("pre-condition: dirty count = %d, want 1", got)
+	}
+
+	// Recover donor K2@9 (targetIter=15: donor 9 <= 15 qualifies).
+	_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 15)
+	if err != nil {
+		t.Fatalf("TryInlineRecovery: %v", err)
+	}
+	if !ok {
+		t.Fatal("TryInlineRecovery: expected true (donor found), got false")
+	}
+
+	// Assert 1 (cache): the merged cached structure has the DONOR at state[0].
+	cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
+	cachedSt, cacheOK := parsedCache.LoadStruct(cacheKey)
+	if !cacheOK || cachedSt == nil || len(cachedSt.SenderKeyStates) == 0 {
+		t.Fatal("CR-04: parsed cache miss after recovery install")
+	}
+	if got := cachedSt.SenderKeyStates[0].KeyID; got != k2 {
+		t.Errorf("CR-04: cached state[0].KeyID = %d, want %d (donor must be most-recent)", got, k2)
+	}
+	if got := cachedSt.SenderKeyStates[0].SenderChainKey.Iteration; got != 9 {
+		t.Errorf("CR-04: cached state[0] iteration = %d, want 9 (donor)", got)
+	}
+	if k1Cached := findStateByKeyID(cachedSt, k1); k1Cached == nil {
+		t.Error("CR-04: foreign K1 dropped from cached merge")
+	} else if k1Cached.SenderChainKey.Iteration != 20 {
+		t.Errorf("CR-04: cached K1 iteration = %d, want 20", k1Cached.SenderChainKey.Iteration)
+	}
+
+	// Assert 2 (flusher dedup): the recovery enqueue replaced the dirty blob —
+	// drain it and verify the DB row carries the donor at state[0].
+	flusher.Drain()
+	if got := flusher.DirtyCount(); got != 0 {
+		t.Fatalf("Drain left %d dirty entries, want 0", got)
+	}
+
+	var blob []byte
+	err = db.QueryRowContext(ctx,
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		recoveryTestJIDB, group, targetSenderID,
+	).Scan(&blob)
+	if err != nil || blob == nil {
+		t.Fatalf("read drained row: err=%v blob=%v", err, blob)
+	}
+	drained, uErr := store.UnpackFlat(blob)
+	if uErr != nil || drained == nil || len(drained.SenderKeyStates) == 0 {
+		t.Fatalf("UnpackFlat drained row: err=%v got=%v", uErr, drained)
+	}
+	if got := drained.SenderKeyStates[0].KeyID; got != k2 {
+		t.Errorf("CR-04: drained DB state[0].KeyID = %d, want %d (recovery blob dedup-skipped?)", got, k2)
+	}
+	if got := drained.SenderKeyStates[0].SenderChainKey.Iteration; got != 9 {
+		t.Errorf("CR-04: drained DB state[0] iteration = %d, want 9 (donor)", got)
+	}
+	if k1DB := findStateByKeyID(drained, k1); k1DB == nil {
+		t.Error("CR-04: foreign K1 dropped from drained DB blob")
+	} else if k1DB.SenderChainKey.Iteration != 20 {
+		t.Errorf("CR-04: drained K1 iteration = %d, want 20", k1DB.SenderChainKey.Iteration)
+	}
+
+	// Assert 3 (sk_keyid0): the generated column indexes the donor generation,
+	// so recoveryScanQueryFast can find this row when K2 is the target.
+	var keyid0 int32
+	err = db.QueryRowContext(ctx,
+		`SELECT sk_keyid0 FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		recoveryTestJIDB, group, targetSenderID,
+	).Scan(&keyid0)
+	if err != nil {
+		t.Fatalf("read sk_keyid0: %v", err)
+	}
+	if uint32(keyid0) != k2 {
+		t.Errorf("CR-04: sk_keyid0 = %d, want %d (donor generation must be indexable)", keyid0, k2)
+	}
+	t.Logf("CR-04: drained state[0]=(keyID=%d iter=%d), sk_keyid0=%d (want donor K2@9)",
+		drained.SenderKeyStates[0].KeyID, drained.SenderKeyStates[0].SenderChainKey.Iteration, keyid0)
 }

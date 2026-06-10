@@ -499,36 +499,35 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	}
 
 	// D-12: merge the donor state into the existing structure rather than
-	// full-replacing it. Start from existing.SenderKeyStates (the guard read at
-	// :342 already holds it), replace or add only the donor's KeyID state, and
-	// preserve all foreign-KeyID states unchanged.
+	// full-replacing it. The guard read above already holds existing.
 	//
-	// If there is no existing structure, install as a single-state structure
-	// (same behaviour as before D-12 for the nil-existing case).
-	var mergedStates []*groupRecord.SenderKeyStateStructure
+	// CR-04 (2026-06-10): the donor state is PREPENDED at index 0. libsignal's
+	// invariant is that SenderKeyStates[0] is the most-recent/active state —
+	// relied on by extractStructMeta (flusher Enqueue meta), the sk_keyid0
+	// generated column (recoveryScanQueryFast index), and the flusher's
+	// same-generation dedup. Appending the donor at the end (or replacing it
+	// in place) left a stale foreign state at index 0, so the recovery enqueue
+	// carried the foreign generation's meta and could be silently dedup-skipped
+	// — the donor blob never reached the DB. Foreign-KeyID states keep their
+	// existing relative order after the donor; an existing state with the
+	// donor's KeyID is dropped (superseded by the strictly-fresher donor).
+	//
+	// If there is no existing structure, this degenerates to the single-state
+	// install (same behaviour as before D-12 for the nil-existing case).
+	mergedStates := []*groupRecord.SenderKeyStateStructure{donorState}
 	if existing != nil {
-		donorKeyIDReplaced := false
 		for _, st := range existing.SenderKeyStates {
 			if st == nil || st.SenderChainKey == nil {
 				// Defensive skip (malformed state from prior versions).
 				continue
 			}
 			if st.KeyID == donor.KeyID {
-				// Replace with the donor's strictly-fresher state.
-				mergedStates = append(mergedStates, donorState)
-				donorKeyIDReplaced = true
-			} else {
-				// Preserve foreign-KeyID state unchanged.
-				mergedStates = append(mergedStates, st)
+				// Superseded by the strictly-fresher donor state at index 0.
+				continue
 			}
+			// Preserve foreign-KeyID state unchanged, after the donor.
+			mergedStates = append(mergedStates, st)
 		}
-		if !donorKeyIDReplaced {
-			// Donor's KeyID is not in existing — append it.
-			mergedStates = append(mergedStates, donorState)
-		}
-	} else {
-		// No existing structure: single-state install (nil-existing case).
-		mergedStates = []*groupRecord.SenderKeyStateStructure{donorState}
 	}
 
 	structure := &groupRecord.SenderKeyStructure{SenderKeyStates: mergedStates}
