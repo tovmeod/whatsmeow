@@ -471,7 +471,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		}
 		retryCount := ag.OptionalInt("count")
 		cli.cancelDelayedRequestFromPhone(info.ID)
-		cli.clearMessageRetry(info.ID)
+		cli.clearMessageRetrySender(string(info.ID), info.Sender.User)
 
 		var msg waE2E.Message
 		var handlerFailed bool

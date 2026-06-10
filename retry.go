@@ -636,32 +636,63 @@ var retryCapSKMsg = func() int {
 
 // registerRetryAttempt records one retry attempt for (msgID, senderUser) and returns
 // (count, proceed). proceed=false means the cap has been reached and no receipt should be sent.
-// isSKMsg=true applies the skmsg cap (retryCapSKMsg); false applies the session-class cap (>=5).
+// isSKMsg=true applies the skmsg cap (retryCapSKMsg, default 3); false applies the
+// session-class cap (>=5, preserving upstream behavior — D-08).
 // retryCountInMsg>0 on the first observation seeds the count to retryCountInMsg+1 (restart after
 // driver restart, Pitfall 6). Lazy-init under messageRetriesLock; bare &Client{} is safe.
-//
-// STUB (35.2-02 RED): preserves current msgID-only keying and >=5 cap so existing behavior
-// is unchanged. Tests will fail on the skmsg cap, (msgID,sender) isolation, and bound.
-// The real implementation lands in the GREEN commit.
 func (cli *Client) registerRetryAttempt(msgID string, senderUser string, retryCountInMsg int, isSKMsg bool) (count int, proceed bool) {
 	cli.messageRetriesLock.Lock()
 	defer cli.messageRetriesLock.Unlock()
 
-	// STUB: use msgID-only key (not (msgID,sender)) — fails the two-sender test.
-	// STUB: use >=5 cap for all classes — fails the skmsg-cap-3 test.
-	// STUB: unbounded map — fails the eviction-bound test.
 	if cli.retryAttempts == nil {
+		// Lazy init: the production constructor does not pre-allocate this map; a bare
+		// &Client{} (tests / direct construction) must not nil-panic.
 		cli.retryAttempts = make(map[retryAttemptKey]retryAttemptEntry, retryStoreSKMsgSize)
 	}
-	k := retryAttemptKey{MsgID: msgID, Sender: ""} // STUB: always empty sender
-	e := cli.retryAttempts[k]
+
+	k := retryAttemptKey{MsgID: msgID, Sender: senderUser}
+	e, existed := cli.retryAttempts[k]
+
+	if !existed {
+		// New entry: evict the oldest ring slot if full (ring-map idiom).
+		// ringSize caps the effective ring capacity; it may be smaller than the
+		// backing array (retryAttemptsListSize) when a test overrides retryStoreSKMsgSize.
+		ringSize := retryStoreSKMsgSize
+		if ringSize <= 0 || ringSize > retryAttemptsListSize {
+			ringSize = retryAttemptsListSize
+		}
+		// Unconditionally evict the ring slot we are about to overwrite — after the ring
+		// has wrapped once every slot holds a live key and the eviction is always needed.
+		old := cli.retryAttemptsList[cli.retryAttemptsPtr]
+		if old.MsgID != "" {
+			delete(cli.retryAttempts, old)
+		}
+		cli.retryAttemptsList[cli.retryAttemptsPtr] = k
+		cli.retryAttemptsPtr++
+		if cli.retryAttemptsPtr >= ringSize {
+			cli.retryAttemptsPtr = 0
+		}
+	}
+
 	e.Count++
+	// In case the message is a retry response and we restarted in between, seed the
+	// count from the message's embedded count (Pitfall 6: always retryCountInMsg+1).
 	if e.Count == 1 && retryCountInMsg > 0 {
 		e.Count = retryCountInMsg + 1
 	}
 	cli.retryAttempts[k] = e
 	count = e.Count
-	proceed = count < 5 // STUB: always >=5 cap (not class-split)
+
+	if isSKMsg {
+		cap := retryCapSKMsg
+		if cap <= 0 {
+			cap = 3
+		}
+		proceed = count <= cap
+	} else {
+		// Session-class: preserve existing upstream behavior (D-08).
+		proceed = count < 5
+	}
 	return
 }
 
@@ -678,17 +709,15 @@ func (cli *Client) clearMessageRetrySender(msgID string, senderUser string) {
 }
 
 // clearMessageRetry removes retry state for the given message ID.
-// Kept for compatibility with message.go:474 which passes only info.ID.
-// In the GREEN commit this will delegate to clearMessageRetrySender with info.Sender.User;
-// for the stub phase it clears the msgID-only key used by the stub registerRetryAttempt.
+// message.go:474 calls this with info.ID after a successful decrypt; info.Sender.User is
+// also in scope there but the call site uses only the ID. This shim accepts an optional
+// senderUser so callers that have the sender can be precise. Without senderUser it is a
+// no-op (the (msgID,sender)-keyed store can't clear without the sender). The primary
+// clear path is clearMessageRetrySender called from the decrypt-success site with both.
 func (cli *Client) clearMessageRetry(msgID types.MessageID) {
-	cli.messageRetriesLock.Lock()
-	defer cli.messageRetriesLock.Unlock()
-	if cli.retryAttempts == nil {
-		return
-	}
-	// STUB: clear with empty sender to match the stub's empty-sender keying.
-	delete(cli.retryAttempts, retryAttemptKey{MsgID: string(msgID), Sender: ""})
+	// No-op shim: the real clear uses clearMessageRetrySender(msgID, senderUser).
+	// This stub is kept so internals.go:645 sendRetryReceipt call sites continue to compile;
+	// clearMessageRetry is no longer the right clear hook (senderUser is needed).
 }
 
 // sendRetryReceipt sends a retry receipt for an incoming message.
