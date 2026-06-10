@@ -466,6 +466,21 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	if err != nil {
 		return "", false, err
 	}
+	// CR-01 (2026-06-10): GetSenderKeyStructure reads the DB ONLY; under
+	// write-back the DB lags the parsed cache + flusher dirty-set by up to a
+	// flush interval. Building the guard + D-12 merge from the DB snapshot
+	// alone can silently drop a cache-only fresh generation from BOTH the
+	// cache (the recovery install replaces the whole cached entry) and the DB
+	// (the enqueued merged blob replaces the dirty blob that carried it).
+	// Union the cache-resident structure with the DB read, preferring the
+	// higher iteration per KeyID, so the merge base is the freshest visible
+	// state. StoreStruct additionally rejects any recovery install whose
+	// state-set is missing a cached KeyID (defense in depth).
+	if c.parsedLoad != nil {
+		if cached, hit := c.parsedLoad(c.key(group, targetSenderID)); hit && cached != nil {
+			existing = unionSenderKeyStructures(cached, existing)
+		}
+	}
 	if existing != nil {
 		for _, st := range existing.SenderKeyStates {
 			if st == nil || st.SenderChainKey == nil {
@@ -548,6 +563,49 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 		return "", false, nil
 	}
 	return donor.OurJID, true, nil
+}
+
+// unionSenderKeyStructures merges two views of the same sender-key record,
+// preferring the state with the higher SenderChainKey.Iteration per KeyID
+// (CR-01). primary's state order is preserved (it is the parsed-cache view,
+// whose order reflects libsignal's most-recent-first prepends); states whose
+// KeyID exists only in secondary are appended after. Either argument may be
+// nil; malformed states (nil state or nil SenderChainKey) are skipped.
+func unionSenderKeyStructures(primary, secondary *groupRecord.SenderKeyStructure) *groupRecord.SenderKeyStructure {
+	if primary == nil {
+		return secondary
+	}
+	if secondary == nil {
+		return primary
+	}
+	var merged []*groupRecord.SenderKeyStateStructure
+	seen := make(map[uint32]bool, len(primary.SenderKeyStates))
+	for _, pst := range primary.SenderKeyStates {
+		if pst == nil || pst.SenderChainKey == nil {
+			continue
+		}
+		seen[pst.KeyID] = true
+		chosen := pst
+		for _, sst := range secondary.SenderKeyStates {
+			if sst == nil || sst.SenderChainKey == nil || sst.KeyID != pst.KeyID {
+				continue
+			}
+			if sst.SenderChainKey.Iteration > chosen.SenderChainKey.Iteration {
+				chosen = sst
+			}
+		}
+		merged = append(merged, chosen)
+	}
+	for _, sst := range secondary.SenderKeyStates {
+		if sst == nil || sst.SenderChainKey == nil || seen[sst.KeyID] {
+			continue
+		}
+		merged = append(merged, sst)
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return &groupRecord.SenderKeyStructure{SenderKeyStates: merged}
 }
 
 // Compile-time assertion: *SQLStore satisfies the upstream store.SenderKeyStore

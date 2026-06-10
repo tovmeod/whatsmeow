@@ -1850,3 +1850,157 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	t.Logf("CR-03: persisted %d states, state[0].KeyID=%d, cache invalidated",
 		len(persisted.SenderKeyStates), persisted.SenderKeyStates[0].KeyID)
 }
+
+// TestInlineRecoveryCacheOnlyGenerationSurvives is the CR-01 regression test.
+//
+// Loss interleaving under test: a freshly distributed generation B lives ONLY
+// in the parsed cache + flusher dirty-set (the ~1s write-back window, held
+// open deterministically by an attached-but-never-started flusher); the DB row
+// is absent. A decrypt failure for a DIFFERENT generation D of the same
+// (group, sender) triggers TryInlineRecovery, whose guard/merge read
+// (GetSenderKeyStructure) is DB-only. Pre-fix, the D-12 merge was built from
+// the stale (empty) DB snapshot, the iteration gate only compared INCOMING
+// states (B was never checked), lru.Add replaced the cached entry — B's chain
+// key gone from the cache — and the recovery enqueue replaced the dirty blob —
+// B gone from the DB on drain. All subsequent messages on B became permanently
+// undecryptable.
+//
+// Post-fix: TryInlineRecovery unions the cache-resident structure with the DB
+// read before merging (parsedLoad), so B is carried into the merge; the
+// StoreStruct missing-KeyID guard (defense in depth) rejects any recovery
+// install that would drop a cached generation.
+func TestInlineRecoveryCacheOnlyGenerationSurvives(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		group        = "recovcacheonly_group@g.us"
+		bareUser     = "55512340999_1"
+		donorSuffix  = ":5"
+		targetSuffix = ":0"
+		keyB         = uint32(60) // cache-only fresh generation (DB absent)
+		keyD         = uint32(61) // donor generation being recovered
+		iterB        = uint32(50)
+		iterD        = uint32(10)
+	)
+	donorSenderID := bareUser + donorSuffix
+	targetSenderID := bareUser + targetSuffix
+
+	ctx := context.Background()
+
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		recoveryTestJIDA, recoveryTestJIDB, group)
+
+	// Build B's store: real parsed cache, parsedReplace + parsedLoad wired,
+	// flusher attached but never started (write-back window held open).
+	jidB, err := types.ParseJID(recoveryTestJIDB)
+	if err != nil {
+		t.Fatalf("ParseJID B: %v", err)
+	}
+	containerB := sqlstore.NewWithDB(db, "postgres", nil)
+	innerB := sqlstore.NewSQLStore(containerB, jidB)
+	byteCache, _ := lru.New[string, []byte](256)
+	devCache, _ := lru.New[string, []string](256)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+
+	skLRU, _ := store.NewSKParsedLRU(256)
+	parsedCache := store.NewParsedSKCache(skLRU)
+	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, dk *uint32) store.StoreVerdict {
+		return parsedCache.StoreStruct(key, s, dk)
+	})
+	csB.SetParsedLoad(func(key string) (*groupRecord.SenderKeyStructure, bool) {
+		return parsedCache.LoadStruct(key)
+	})
+
+	flusher := sqlstore.NewSenderKeyFlusher(innerB, waLog.Noop, 0)
+	csB.SetFlusher(flusher)
+	// flusher.Start() intentionally NOT called — DB row stays absent.
+
+	// Step 1: generation B arrives via the cipher path — parsed cache + flusher
+	// dirty-set only; the DB row for B remains absent.
+	structB := buildDonorStructure(keyB, iterB, 0x81)
+	if err := csB.PutSenderKeyStructure(ctx, group, targetSenderID, structB); err != nil {
+		t.Fatalf("PutSenderKeyStructure (cache-only B seed): %v", err)
+	}
+	var dbCount int
+	_ = db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		recoveryTestJIDB, group, targetSenderID,
+	).Scan(&dbCount)
+	if dbCount != 0 {
+		t.Fatalf("pre-condition: DB row exists (count=%d), want absent", dbCount)
+	}
+
+	// Step 2: seed account A with the donor for generation D.
+	donorStruct := buildDonorStructure(keyD, iterD, 0x91)
+	insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+	// Step 3: recover generation D (targetIter=15: donor 10 <= 15 qualifies).
+	_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, keyD, 15)
+	if err != nil {
+		t.Fatalf("TryInlineRecovery: %v", err)
+	}
+	if !ok {
+		t.Fatal("TryInlineRecovery: expected true (donor found, merge valid), got false")
+	}
+
+	// Assert 1: generation B survives in the parsed cache alongside the donor.
+	cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
+	cachedSt, cacheOK := parsedCache.LoadStruct(cacheKey)
+	if !cacheOK || cachedSt == nil {
+		t.Fatal("CR-01: parsed cache miss after recovery install")
+	}
+	if bCached := findStateByKeyID(cachedSt, keyB); bCached == nil {
+		t.Error("CR-01: cache-only generation B dropped from parsed cache by recovery install")
+	} else if bCached.SenderChainKey.Iteration != iterB {
+		t.Errorf("CR-01: cached B iteration = %d, want %d", bCached.SenderChainKey.Iteration, iterB)
+	}
+	if dCached := findStateByKeyID(cachedSt, keyD); dCached == nil {
+		t.Error("CR-01: donor generation D missing from parsed cache")
+	} else if dCached.SenderChainKey.Iteration != iterD {
+		t.Errorf("CR-01: cached D iteration = %d, want %d", dCached.SenderChainKey.Iteration, iterD)
+	}
+	if got := cachedSt.SenderKeyStates[0].KeyID; got != keyD {
+		t.Errorf("CR-04: cached state[0].KeyID = %d, want %d (donor most-recent)", got, keyD)
+	}
+
+	// Assert 2: generation B survives in the drained DB blob.
+	flusher.Drain()
+	var blob []byte
+	err = db.QueryRowContext(ctx,
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		recoveryTestJIDB, group, targetSenderID,
+	).Scan(&blob)
+	if err != nil || blob == nil {
+		t.Fatalf("read drained row: err=%v blob=%v", err, blob)
+	}
+	drained, uErr := store.UnpackFlat(blob)
+	if uErr != nil || drained == nil {
+		t.Fatalf("UnpackFlat drained row: err=%v", uErr)
+	}
+	if bDB := findStateByKeyID(drained, keyB); bDB == nil {
+		t.Error("CR-01: cache-only generation B missing from drained DB blob (lost on restart)")
+	} else if bDB.SenderChainKey.Iteration != iterB {
+		t.Errorf("CR-01: drained B iteration = %d, want %d", bDB.SenderChainKey.Iteration, iterB)
+	}
+	if dDB := findStateByKeyID(drained, keyD); dDB == nil {
+		t.Error("CR-01: donor generation D missing from drained DB blob")
+	}
+	t.Logf("CR-01: cache states=%d, drained states=%d (want B@%d and D@%d in both)",
+		len(cachedSt.SenderKeyStates), len(drained.SenderKeyStates), iterB, iterD)
+}

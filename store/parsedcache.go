@@ -220,6 +220,28 @@ func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructur
 	defer c.mu.Unlock()
 
 	if cached, hit := c.lru.Get(key); hit {
+		if donorKeyID != nil {
+			// CR-01 defense in depth: a recovery install REPLACES the whole
+			// cached entry (lru.Add below), and the per-incoming loop that
+			// follows never compares a cached KeyID that is absent from the
+			// incoming state-set — so an incoming merge built from a stale DB
+			// snapshot would silently drop a cache-only generation. Reject any
+			// recovery write missing a cached KeyID, forcing the caller to
+			// re-merge from the freshest visible state.
+			for i := 0; i < int(cached.nStates); i++ {
+				cachedKeyID := cached.states[i].keyID
+				present := false
+				for _, inSt := range s.SenderKeyStates {
+					if inSt != nil && inSt.KeyID == cachedKeyID {
+						present = true
+						break
+					}
+				}
+				if !present {
+					return StoreRejectedStale // merge is missing a cached generation — re-merge required
+				}
+			}
+		}
 		// Compare per matching KeyID across ALL incoming states.
 		for _, inSt := range s.SenderKeyStates {
 			if inSt == nil || inSt.SenderChainKey == nil {

@@ -86,6 +86,17 @@ type CachedSenderKeyStore struct {
 	// class before flusher.Enqueue (verdict-before-Enqueue ordering requirement).
 	parsedReplace func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict
 
+	// Phase 35.2 (CR-01): READ callback into the parsed struct cache — set by
+	// SetParsedLoad, wired in cache_wiring.go alongside SetParsedReplace.
+	// TryInlineRecovery uses it to union the cache-resident structure (which
+	// under write-back can be AHEAD of the DB by up to a flush interval) with
+	// the DB guard read before building the D-12 donor merge. Without it the
+	// merge is built from a stale DB snapshot and can silently drop a
+	// cache-only fresh generation from both the cache and the DB. Nil when no
+	// struct cache is wired (test scenarios, pre-attachCachedStores) — the
+	// merge then uses the DB read alone.
+	parsedLoad func(key string) (*groupRecord.SenderKeyStructure, bool)
+
 	hits, misses uint64
 }
 
@@ -142,6 +153,15 @@ func (c *CachedSenderKeyStore) SetParsedInvalidate(fn func(key string)) {
 // before flusher.Enqueue for the recovery class.
 func (c *CachedSenderKeyStore) SetParsedReplace(fn func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict) {
 	c.parsedReplace = fn
+}
+
+// SetParsedLoad attaches the Phase 35.2 (CR-01) struct-cache READ callback.
+// Called by attachCachedStores alongside SetParsedReplace. TryInlineRecovery
+// uses it to build the D-12 merge base from the union of the cache-resident
+// structure and the DB read (the cache can be ahead of the DB by up to a
+// flush interval under write-back).
+func (c *CachedSenderKeyStore) SetParsedLoad(fn func(key string) (*groupRecord.SenderKeyStructure, bool)) {
+	c.parsedLoad = fn
 }
 
 func (c *CachedSenderKeyStore) key(group, user string) string {

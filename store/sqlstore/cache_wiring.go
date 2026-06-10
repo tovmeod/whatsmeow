@@ -611,6 +611,16 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 		return device.ParsedSKCache.StoreStruct(key, s, donorKeyID)
 	})
 
+	// Phase 35.2 (CR-01): READ access into the parsed cache for
+	// TryInlineRecovery's union merge. The recovery guard read
+	// (GetSenderKeyStructure) is DB-only, and under write-back the parsed
+	// cache + flusher dirty-set can be AHEAD of the DB by up to a flush
+	// interval — the D-12 merge must be built from the union of both views or
+	// a cache-only fresh generation is silently dropped from cache AND DB.
+	senderKeyStore.SetParsedLoad(func(key string) (*groupRecord.SenderKeyStructure, bool) {
+		return device.ParsedSKCache.LoadStruct(key)
+	})
+
 	// perf 260601-uuy: message-secret pair cache.
 	device.MsgSecrets = NewCachedMessageSecretStore(innerStore, jid, c.caches.MsgSecret, &c.caches.MsgSecretExplicitRemoves)
 }
