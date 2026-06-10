@@ -607,7 +607,7 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	// the recovery path's direct PutSenderKeyStructure) returns the freshly-written
 	// key without waiting for the async drain. MUST be a REPLACE, not invalidate
 	// (T-17.9-16; see CachedSenderKeyStore.parsedReplace field comment).
-	senderKeyStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+	senderKeyStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
 		return device.ParsedSKCache.StoreStruct(key, s, donorKeyID)
 	})
 

@@ -871,7 +871,7 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 	parsedCache := store.NewParsedSKCache(skLRU)
 
 	// Wire parsedReplace -> parsedCache.StoreStruct.
-	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
 		return parsedCache.StoreStruct(key, s, donorKeyID)
 	})
 
@@ -908,9 +908,15 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 	// read) — it does NOT consult the parsed cache. B's DB row is absent (flusher
 	// not drained), so the guard passes, and the stale donor installs via
 	// PutSenderKeyStructure → parsedReplace.
-	_, _, recErr := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, advancedIter+5)
+	_, recovered, recErr := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, advancedIter+5)
 	if recErr != nil {
 		t.Fatalf("TryInlineRecovery: %v", recErr)
+	}
+	// CR-03: a gate-rejected stale install must NOT be reported as a recovery —
+	// ok=false so the caller does not log SENDER_KEY_RECOVERED or retry decrypt
+	// against an unchanged cache.
+	if recovered {
+		t.Error("CR-03: TryInlineRecovery returned ok=true for a gate-rejected stale donor install")
 	}
 
 	// Step 4: Assert the parsed cache still serves Iteration=50.
@@ -991,7 +997,7 @@ func TestInlineRecoveryIterationGuard(t *testing.T) {
 	// Needed because TryInlineRecovery calls c.GetSenderKeyStructure (which reads
 	// the struct cache if warm) and must correctly see the existing B row.
 	// The parsedReplace callback here is a no-op (just wires the field).
-	csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+	csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
 
 	// Attempt inline recovery with donor at iter=50, existing at iter=100.
 	// targetIter=60 (donor=50 <= 60 so donor qualifies by forward-only filter),
@@ -1247,7 +1253,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 15)
 		if err != nil {
@@ -1320,7 +1326,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k3, 10)
 		if err != nil {
@@ -1368,7 +1374,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 10)
 		if err != nil {
@@ -1393,7 +1399,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
+		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict { return store.StoreAccepted })
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k1, 20)
 		if err != nil {
@@ -1453,7 +1459,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 
 		skLRU, _ := store.NewSKParsedLRU(256)
 		parsedCache := store.NewParsedSKCache(skLRU)
-		csBSeed.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+		csBSeed.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
 			return parsedCache.StoreStruct(key, s, donorKeyID)
 		})
 
@@ -1609,7 +1615,7 @@ func TestInlineRecoveryDonorPrependedAndFlushed(t *testing.T) {
 
 	skLRU, _ := store.NewSKParsedLRU(256)
 	parsedCache := store.NewParsedSKCache(skLRU)
-	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
 		return parsedCache.StoreStruct(key, s, donorKeyID)
 	})
 
@@ -1699,4 +1705,148 @@ func TestInlineRecoveryDonorPrependedAndFlushed(t *testing.T) {
 	}
 	t.Logf("CR-04: drained state[0]=(keyID=%d iter=%d), sk_keyid0=%d (want donor K2@9)",
 		drained.SenderKeyStates[0].KeyID, drained.SenderKeyStates[0].SenderChainKey.Iteration, keyid0)
+}
+
+// buildNStateStructure builds a SenderKeyStructure with n states: KeyIDs
+// baseKeyID..baseKeyID+n-1, iterations baseIter+i, distinct crypto material.
+func buildNStateStructure(n int, baseKeyID, baseIter uint32, tag byte) *groupRecord.SenderKeyStructure {
+	states := make([]*groupRecord.SenderKeyStateStructure, n)
+	for i := 0; i < n; i++ {
+		s := buildDonorStructure(baseKeyID+uint32(i), baseIter+uint32(i), tag+byte(i)*3)
+		states[i] = s.SenderKeyStates[0]
+	}
+	return &groupRecord.SenderKeyStructure{SenderKeyStates: states}
+}
+
+// TestInlineRecoveryUncacheableMergeStillPersists is the CR-03 uncacheable-branch
+// regression test.
+//
+// StoreStruct returns a refusal for two UNRELATED reasons: (a) the iteration
+// gate rejected a stale install, and (b) flatFromStructure refuses to cache the
+// structure (> flatMaxStates = 6 states). A D-12 merge of a 6-state existing
+// row with a NEW donor KeyID produces 7 states — PackFlat accepts it (up to
+// 255) but the flat cache cannot hold it. Pre-fix, PutSenderKeyStructureRecovery
+// treated any refusal as "stale — skip cache AND DB", silently dropping a
+// valid, strictly-fresher donor install, while TryInlineRecovery still
+// returned ok=true (phantom SENDER_KEY_RECOVERED).
+//
+// Post-fix (tri-state verdict): StoreUncacheable skips the cache (invalidating
+// the now-incomplete cached entry) but STILL persists the merged blob, and
+// TryInlineRecovery returns ok=true for a real install.
+func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		group        = "recovuncacheable_group@g.us"
+		bareUser     = "55512340888_1"
+		donorSuffix  = ":5"
+		targetSuffix = ":0"
+		baseKeyID    = uint32(70) // existing 6 states: KeyIDs 70..75
+		donorKeyID   = uint32(90) // new generation, absent from existing
+		donorIter    = uint32(9)
+	)
+	donorSenderID := bareUser + donorSuffix
+	targetSenderID := bareUser + targetSuffix
+
+	ctx := context.Background()
+
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		recoveryTestJIDA, recoveryTestJIDB, group)
+
+	// Seed B's existing row with 6 states (== flatMaxStates: cacheable as-is,
+	// but any merge adding a 7th state becomes flat-uncacheable).
+	existingStruct := buildNStateStructure(6, baseKeyID, 10, 0x61)
+	insertFlatBlobRow(t, db, recoveryTestJIDB, group, targetSenderID, existingStruct)
+
+	// Seed A's donor row: new KeyID 90 @ 9.
+	donorStruct := buildDonorStructure(donorKeyID, donorIter, 0x71)
+	insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+	// Build B's store: real parsed cache, parsedReplace AND parsedInvalidate
+	// wired, NO flusher (write-through — the DB write is synchronous).
+	jidB, err := types.ParseJID(recoveryTestJIDB)
+	if err != nil {
+		t.Fatalf("ParseJID B: %v", err)
+	}
+	containerB := sqlstore.NewWithDB(db, "postgres", nil)
+	innerB := sqlstore.NewSQLStore(containerB, jidB)
+	byteCache, _ := lru.New[string, []byte](256)
+	devCache, _ := lru.New[string, []string](256)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+
+	skLRU, _ := store.NewSKParsedLRU(256)
+	parsedCache := store.NewParsedSKCache(skLRU)
+	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, dk *uint32) store.StoreVerdict {
+		return parsedCache.StoreStruct(key, s, dk)
+	})
+	csB.SetParsedInvalidate(func(key string) {
+		parsedCache.Invalidate(key)
+	})
+
+	// Warm the parsed cache with the (cacheable) 6-state existing structure so
+	// the post-recovery invalidation is observable.
+	cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
+	if v := parsedCache.StoreStruct(cacheKey, existingStruct, nil); v != store.StoreAccepted {
+		t.Fatalf("pre-condition: warming 6-state entry: verdict=%v, want StoreAccepted", v)
+	}
+
+	// Recover donor KeyID 90 (targetIter=15: donor 9 <= 15 qualifies). The merge
+	// is [donor, 6 existing] = 7 states → flat-uncacheable.
+	_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, donorKeyID, 15)
+	if err != nil {
+		t.Fatalf("TryInlineRecovery: %v", err)
+	}
+	if !ok {
+		t.Error("CR-03: TryInlineRecovery returned ok=false for an uncacheable-but-valid donor install")
+	}
+
+	// Assert 1: the merged blob WAS persisted (pre-fix it was silently dropped).
+	var blob []byte
+	err = db.QueryRowContext(ctx,
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		recoveryTestJIDB, group, targetSenderID,
+	).Scan(&blob)
+	if err != nil || blob == nil {
+		t.Fatalf("read persisted row: err=%v blob=%v", err, blob)
+	}
+	persisted, uErr := store.UnpackFlat(blob)
+	if uErr != nil || persisted == nil {
+		t.Fatalf("UnpackFlat persisted row: err=%v", uErr)
+	}
+	if got := len(persisted.SenderKeyStates); got != 7 {
+		t.Errorf("CR-03: persisted state count = %d, want 7 (uncacheable merge dropped from DB?)", got)
+	}
+	if got := persisted.SenderKeyStates[0].KeyID; got != donorKeyID {
+		t.Errorf("CR-03/CR-04: persisted state[0].KeyID = %d, want %d (donor)", got, donorKeyID)
+	}
+	for i := 0; i < 6; i++ {
+		if findStateByKeyID(persisted, baseKeyID+uint32(i)) == nil {
+			t.Errorf("CR-03: foreign KeyID %d dropped from persisted merge", baseKeyID+uint32(i))
+		}
+	}
+
+	// Assert 2: the stale 6-state cached entry was invalidated — reads fall
+	// through to the fresh DB row instead of serving an entry that is missing
+	// the donor generation indefinitely.
+	if _, hit := parsedCache.LoadStruct(cacheKey); hit {
+		t.Error("CR-03: stale cached entry still served after uncacheable recovery install (must be invalidated)")
+	}
+	t.Logf("CR-03: persisted %d states, state[0].KeyID=%d, cache invalidated",
+		len(persisted.SenderKeyStates), persisted.SenderKeyStates[0].KeyID)
 }

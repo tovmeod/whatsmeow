@@ -527,7 +527,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	// needs the warm-cache assertion to hold).
 	skLRUB, _ := store.NewSKParsedLRU(256)
 	parsedB := store.NewParsedSKCache(skLRUB)
-	csBStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+	csBStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
 		return parsedB.StoreStruct(key, s, donorKeyID)
 	})
 
@@ -574,7 +574,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 
 	skLRUC, _ := store.NewSKParsedLRU(256)
 	parsedC := store.NewParsedSKCache(skLRUC)
-	csC.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+	csC.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
 		return parsedC.StoreStruct(key, s, donorKeyID)
 	})
 

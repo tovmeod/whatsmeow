@@ -536,8 +536,16 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	// KeyID so the iteration gate applies the recovery rule: reject unless donor
 	// strictly advances cached position for that KeyID).
 	// D-11 ordering: gate verdict evaluated BEFORE flusher.Enqueue inside the method.
-	if err := c.PutSenderKeyStructureRecovery(ctx, group, targetSenderID, structure, donor.KeyID); err != nil {
+	installed, err := c.PutSenderKeyStructureRecovery(ctx, group, targetSenderID, structure, donor.KeyID)
+	if err != nil {
 		return "", false, err
+	}
+	if !installed {
+		// CR-03: the iteration gate rejected the install (stale vs the
+		// cache-resident state) — nothing changed anywhere. Report ok=false so
+		// the caller does not retry decrypt against an unchanged cache or log
+		// SENDER_KEY_RECOVERED for a recovery that never happened.
+		return "", false, nil
 	}
 	return donor.OurJID, true, nil
 }

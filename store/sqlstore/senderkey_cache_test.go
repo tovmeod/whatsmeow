@@ -186,7 +186,7 @@ func newCohTestDevice(t *testing.T) (device *store.Device, cs *sqlstore.CachedSe
 
 	// Wire parsedReplace → device.ParsedSKCache.StoreStruct
 	// (mirrors cache_wiring.go attachCachedStores).
-	cs.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+	cs.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
 		return device.ParsedSKCache.StoreStruct(key, s, donorKeyID)
 	})
 

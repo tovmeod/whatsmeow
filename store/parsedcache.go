@@ -150,6 +150,26 @@ func (c *parsedSKCache) LoadStruct(key string) (*groupRecord.SenderKeyStructure,
 	return s, true
 }
 
+// StoreVerdict is the tri-state result of StoreStruct (CR-03, 2026-06-10).
+// The recovery install path must distinguish "the iteration gate rejected a
+// stale install" (do NOT persist, report no recovery) from "the structure is
+// valid but not representable in the flat cache" (skip the cache but STILL
+// persist — the uncached read path stays correct, just slower). A single bool
+// conflated the two, silently dropping valid donor installs from cache AND DB.
+type StoreVerdict int8
+
+const (
+	// StoreAccepted: the write passed the gate and was added to the LRU.
+	StoreAccepted StoreVerdict = iota
+	// StoreRejectedStale: the iteration gate rejected the write (stale donor /
+	// backward move). Nothing was written; recovery callers must not persist.
+	StoreRejectedStale
+	// StoreUncacheable: flatFromStructure refused the structure (0 states,
+	// > flatMaxStates states, or wrong field lengths). Nothing was written,
+	// but the structure itself may be valid — callers should still persist it.
+	StoreUncacheable
+)
+
 // StoreStruct replaces the cached structure for key, subject to a per-writer-class
 // iteration gate (refined D-11 + D-12 interaction, 2026-06-10).
 //
@@ -167,7 +187,9 @@ func (c *parsedSKCache) LoadStruct(key string) (*groupRecord.SenderKeyStructure,
 //     skipped-key consumption — accept (Pitfall 1).
 //
 // All comparisons are per-matching-KeyID across ALL states, never state[0] only.
-// Returns true if the entry was accepted and written to the LRU, false if rejected.
+// Returns StoreAccepted when the entry was written to the LRU, StoreRejectedStale
+// when the iteration gate rejected it, and StoreUncacheable when the structure
+// cannot be represented in the flat cache (CR-03 tri-state).
 //
 // Locking (CR-02, 2026-06-10): c.mu is held across the ENTIRE read-compare-add
 // sequence (lru.Get, gate evaluation, lru.Add). The gate is check-then-act —
@@ -184,10 +206,12 @@ func (c *parsedSKCache) LoadStruct(key string) (*groupRecord.SenderKeyStructure,
 //
 // Gate semantics: recovery: donor strictly advances, preserved states may be equal,
 // no backward moves; cipher: reject backward only (refined D-11 + D-12 interaction, 2026-06-10).
-func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) StoreVerdict {
 	f, ok := flatFromStructure(s)
 	if !ok {
-		return false // refuse-to-cache: leave uncached, read path stays correct
+		// Refuse-to-cache: leave uncached, read path stays correct. Distinct
+		// from a gate rejection — the caller may still persist (CR-03).
+		return StoreUncacheable
 	}
 
 	// Hold the lock across read-compare-add: the gate below is check-then-act
@@ -211,19 +235,19 @@ func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructur
 				if inSt.KeyID == *donorKeyID {
 					// Donor KeyID must strictly advance.
 					if cachedIter >= inSt.SenderChainKey.Iteration {
-						return false // donor does not strictly advance — reject
+						return StoreRejectedStale // donor does not strictly advance — reject
 					}
 				} else {
 					// Non-donor (preserved foreign) KeyID: reject only on backward move.
 					if cachedIter > inSt.SenderChainKey.Iteration {
-						return false // backward move — reject
+						return StoreRejectedStale // backward move — reject
 					}
 					// Equal iteration: preserved foreign state — accept (D-12 interaction rule).
 				}
 			} else {
 				// CIPHER write: reject only on backward move.
 				if cachedIter > inSt.SenderChainKey.Iteration {
-					return false // backward move — reject
+					return StoreRejectedStale // backward move — reject
 				}
 				// Equal iteration: skipped-key consumption — accept (Pitfall 1).
 			}
@@ -232,7 +256,7 @@ func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructur
 	// No cached entry (absent or malformed) — write proceeds.
 
 	c.lru.Add(key, f)
-	return true
+	return StoreAccepted
 }
 
 // flatMatchingIter searches the flat cached entry for a state with the given keyID
