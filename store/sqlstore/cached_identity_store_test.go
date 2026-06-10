@@ -399,6 +399,155 @@ func TestCachedIdentityStore_DeleteAllIdentities_OtherJIDEntriesSurvive(t *testi
 }
 
 // ---------------------------------------------------------------------------
+// D-10 / 35.2-03: mismatch-accept behavior tests (RED phase — currently fails
+// because IsTrustedIdentity returns (false,nil) on mismatch and
+// IdentityChangedCount is never incremented).
+// ---------------------------------------------------------------------------
+
+// TestIdentityAccept_CacheHit_MismatchAcceptsAndCounts exercises the cache-hit
+// compare site: a known sender with a DIFFERENT 32-byte key must return
+// (true, nil) and increment IdentityChangedCount by 1.
+func TestIdentityAccept_CacheHit_MismatchAcceptsAndCounts(t *testing.T) {
+	ctx := context.Background()
+	c, _ := newTestCachedIdentityStore(t, 16)
+	k1 := fillKey(0x01)
+	k2 := fillKey(0x02)
+
+	// Seed via PutIdentity so the key lands in the cache (next call is a hit).
+	if err := c.PutIdentity(ctx, "addr-Z", k1); err != nil {
+		t.Fatalf("PutIdentity seed: %v", err)
+	}
+
+	// k2 != k1 -> mismatch at cache-hit site; must accept.
+	ok, err := c.IsTrustedIdentity(ctx, "addr-Z", k2)
+	if err != nil {
+		t.Fatalf("IsTrustedIdentity mismatch (cache-hit): %v", err)
+	}
+	if !ok {
+		t.Errorf("IsTrustedIdentity mismatch (cache-hit) = false, want true (D-10 accept)")
+	}
+	if got := c.IdentityChangedCount(); got != 1 {
+		t.Errorf("IdentityChangedCount = %d, want 1 (one IDENTITY_CHANGED per mismatch)", got)
+	}
+}
+
+// TestIdentityAccept_PopulateOnMiss_MismatchAcceptsAndCounts exercises the
+// populate-on-miss compare site: cold cache, known sender, DIFFERENT key must
+// return (true, nil) and increment IdentityChangedCount by 1.
+func TestIdentityAccept_PopulateOnMiss_MismatchAcceptsAndCounts(t *testing.T) {
+	ctx := context.Background()
+	c, inner := newTestCachedIdentityStore(t, 16)
+	k1 := fillKey(0x10)
+	k2 := fillKey(0x20)
+
+	// Seed inner directly so cache stays cold.
+	if err := inner.PutIdentity(ctx, "addr-Y", k1); err != nil {
+		t.Fatalf("inner.PutIdentity seed: %v", err)
+	}
+	inner.putCalls.Store(0)
+
+	// k2 != k1 -> mismatch at populate-on-miss site; must accept.
+	ok, err := c.IsTrustedIdentity(ctx, "addr-Y", k2)
+	if err != nil {
+		t.Fatalf("IsTrustedIdentity mismatch (populate-on-miss): %v", err)
+	}
+	if !ok {
+		t.Errorf("IsTrustedIdentity mismatch (populate-on-miss) = false, want true (D-10 accept)")
+	}
+	if got := c.IdentityChangedCount(); got != 1 {
+		t.Errorf("IdentityChangedCount = %d, want 1 (one IDENTITY_CHANGED per mismatch)", got)
+	}
+}
+
+// TestIdentityAccept_SameKey_NoCount verifies that a matching key at the
+// cache-hit site does NOT increment IdentityChangedCount.
+func TestIdentityAccept_SameKey_NoCount(t *testing.T) {
+	ctx := context.Background()
+	c, _ := newTestCachedIdentityStore(t, 16)
+	k := fillKey(0x30)
+
+	if err := c.PutIdentity(ctx, "addr-X", k); err != nil {
+		t.Fatalf("PutIdentity: %v", err)
+	}
+	ok, err := c.IsTrustedIdentity(ctx, "addr-X", k)
+	if err != nil {
+		t.Fatalf("IsTrustedIdentity same key: %v", err)
+	}
+	if !ok {
+		t.Errorf("IsTrustedIdentity same key = false, want true")
+	}
+	if got := c.IdentityChangedCount(); got != 0 {
+		t.Errorf("IdentityChangedCount = %d, want 0 (same key must not count)", got)
+	}
+}
+
+// TestIdentityAccept_UnknownSender_NoCount verifies TOFU (unknown sender)
+// returns (true, nil) and does NOT increment IdentityChangedCount — TOFU is
+// unchanged by D-10.
+func TestIdentityAccept_UnknownSender_NoCount(t *testing.T) {
+	ctx := context.Background()
+	c, _ := newTestCachedIdentityStore(t, 16)
+	k := fillKey(0x40)
+
+	ok, err := c.IsTrustedIdentity(ctx, "ghost-Z", k)
+	if err != nil {
+		t.Fatalf("IsTrustedIdentity unknown sender: %v", err)
+	}
+	if !ok {
+		t.Errorf("IsTrustedIdentity unknown sender = false, want true (TOFU)")
+	}
+	if got := c.IdentityChangedCount(); got != 0 {
+		t.Errorf("IdentityChangedCount = %d, want 0 (TOFU must not increment count)", got)
+	}
+}
+
+// TestIdentityAccept_OncePerChange verifies the once-per-(sender,key) semantics:
+// after a mismatch-accept + PutIdentity(newKey), a second IsTrustedIdentity
+// with newKey compares equal → no second IdentityChangedCount increment.
+// Dedup comes from libsignal's SaveIdentity-after-trust-check + PutIdentity
+// value-equal skip — no dedup cache needed in IsTrustedIdentity.
+func TestIdentityAccept_OncePerChange(t *testing.T) {
+	ctx := context.Background()
+	c, inner := newTestCachedIdentityStore(t, 16)
+	k1 := fillKey(0x50)
+	k2 := fillKey(0x60)
+
+	// Seed inner directly (cache stays cold for the first IsTrustedIdentity).
+	if err := inner.PutIdentity(ctx, "addr-W", k1); err != nil {
+		t.Fatalf("inner.PutIdentity seed: %v", err)
+	}
+
+	// First: mismatch -> accept + count.
+	ok, err := c.IsTrustedIdentity(ctx, "addr-W", k2)
+	if err != nil {
+		t.Fatalf("first IsTrustedIdentity: %v", err)
+	}
+	if !ok {
+		t.Errorf("first IsTrustedIdentity = false, want true (mismatch-accept)")
+	}
+	if got := c.IdentityChangedCount(); got != 1 {
+		t.Errorf("after first mismatch: IdentityChangedCount = %d, want 1", got)
+	}
+
+	// libsignal's SaveIdentity-after-trust-check: persist the new key.
+	if err := c.PutIdentity(ctx, "addr-W", k2); err != nil {
+		t.Fatalf("PutIdentity(k2): %v", err)
+	}
+
+	// Second: k2 now stored; IsTrustedIdentity(k2) compares equal → no second count.
+	ok, err = c.IsTrustedIdentity(ctx, "addr-W", k2)
+	if err != nil {
+		t.Fatalf("second IsTrustedIdentity: %v", err)
+	}
+	if !ok {
+		t.Errorf("second IsTrustedIdentity = false, want true")
+	}
+	if got := c.IdentityChangedCount(); got != 1 {
+		t.Errorf("after equal check: IdentityChangedCount = %d, want 1 (no second count)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Race test: N=50 goroutines, mixed Put/IsTrustedIdentity/Delete on
 // overlapping addresses. Must run clean under `go test -race` and must
 // not deadlock.

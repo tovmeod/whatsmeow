@@ -55,6 +55,12 @@ type CachedIdentityStore struct {
 
 	hits, misses, dedupedWrites uint64
 
+	// identityChangedCount counts mismatch-accept events (D-10): IsTrustedIdentity
+	// returned (true, nil) for a sender whose stored key differed from the presented key.
+	// Incremented at both compare sites (cache-hit and populate-on-miss).
+	// Read via IdentityChangedCount(). Implementation in GREEN (feat 35.2-03).
+	identityChangedCount uint64
+
 	// explicitRemoves points at the Container-level IdentityExplicitRemoves
 	// counter (signalCaches.IdentityExplicitRemoves). Incremented at call
 	// sites of Remove() and Purge() before delegating to the LRU (Phase 17.5.2).
@@ -107,6 +113,14 @@ func (c *CachedIdentityStore) Stats() (hits, misses, dedupedWrites uint64) {
 	return atomic.LoadUint64(&c.hits),
 		atomic.LoadUint64(&c.misses),
 		atomic.LoadUint64(&c.dedupedWrites)
+}
+
+// IdentityChangedCount returns the number of mismatch-accept events (D-10)
+// fired by this wrapper's IsTrustedIdentity — once per (sender, key) change,
+// via both the cache-hit and populate-on-miss compare sites.
+// Used by tests to assert audit-log emission without a live logger.
+func (c *CachedIdentityStore) IdentityChangedCount() uint64 {
+	return atomic.LoadUint64(&c.identityChangedCount)
 }
 
 // ---------------------------------------------------------------------------
