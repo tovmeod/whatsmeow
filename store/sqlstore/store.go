@@ -108,7 +108,15 @@ func (s *SQLStore) IsTrustedIdentity(ctx context.Context, address string, key [3
 	} else if len(existingIdentity) != 32 {
 		return false, ErrInvalidLength
 	}
-	return *(*[32]byte)(existingIdentity) == key, nil
+	existing := *(*[32]byte)(existingIdentity)
+	if existing == key {
+		return true, nil
+	}
+	// D-10: auto-accept rotated identity key; emit one structured audit log.
+	// Per-(sender,key) once semantics come from libsignal's SaveIdentity-after-trust-check
+	// + PutIdentity value-equal skip (cached_identity_store.go) — do not add a dedup cache.
+	s.log.Warnf("IDENTITY_CHANGED address=%s old=%x new=%x", address, existing[:8], key[:8])
+	return true, nil
 }
 
 // getIdentityBytes is a private read accessor used by CachedIdentityStore for populate-on-miss. Not part of the IdentityStore interface.

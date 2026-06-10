@@ -13,6 +13,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 
 	"go.mau.fi/whatsmeow/store"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 // CachedIdentityStore wraps an inner store.IdentityStore with a process-shared
@@ -127,6 +128,22 @@ func (c *CachedIdentityStore) IdentityChangedCount() uint64 {
 // store.IdentityStore — read
 // ---------------------------------------------------------------------------
 
+// logIdentityChanged emits one IDENTITY_CHANGED warn line and increments
+// identityChangedCount. The logger is borrowed from c.inner when it is a
+// *SQLStore (intra-package type assertion — same idiom as recovery_sender_key.go:311-317).
+// If inner is not *SQLStore (test fakes, future wrappers) the log line is
+// skipped but the counter is still incremented — the counter is the test-visible signal.
+func (c *CachedIdentityStore) logIdentityChanged(address string, old, newKey [32]byte) {
+	atomic.AddUint64(&c.identityChangedCount, 1)
+	var log waLog.Logger
+	if sq, ok := c.inner.(*SQLStore); ok {
+		log = sq.log
+	}
+	if log != nil {
+		log.Warnf("IDENTITY_CHANGED address=%s old=%x new=%x", address, old[:8], newKey[:8])
+	}
+}
+
 func (c *CachedIdentityStore) IsTrustedIdentity(ctx context.Context, address string, key [32]byte) (bool, error) {
 	k := c.key(address)
 	if v, ok := c.cache.Get(k); ok {
@@ -136,7 +153,15 @@ func (c *CachedIdentityStore) IsTrustedIdentity(ctx context.Context, address str
 			// ErrNoRows handling: trust on first sight.
 			return true, nil
 		}
-		return *v == key, nil
+		if *v == key {
+			return true, nil
+		}
+		// D-10: cache-hit compare site — stored key differs from presented key.
+		// Accept and audit-log; do NOT update the cache here — libsignal's
+		// subsequent SaveIdentity -> PutIdentity does it, preserving the
+		// once-per-change dedup semantics.
+		c.logIdentityChanged(address, *v, key)
+		return true, nil
 	}
 	atomic.AddUint64(&c.misses, 1)
 
@@ -163,7 +188,14 @@ func (c *CachedIdentityStore) IsTrustedIdentity(ctx context.Context, address str
 	if bytes == nil {
 		return true, nil
 	}
-	return *bytes == key, nil
+	if *bytes == key {
+		return true, nil
+	}
+	// D-10: populate-on-miss compare site — stored key differs from presented key.
+	// Accept and audit-log; cache already holds the stored key (bytes) from the
+	// populate above — libsignal's SaveIdentity -> PutIdentity will update it.
+	c.logIdentityChanged(address, *bytes, key)
+	return true, nil
 }
 
 // ---------------------------------------------------------------------------
