@@ -149,21 +149,89 @@ func (c *parsedSKCache) LoadStruct(key string) (*groupRecord.SenderKeyStructure,
 	return s, true
 }
 
-// StoreStruct replaces the cached structure for key. The structure is converted
-// to its flat form first; if the length-validation guard refuses it
-// (flatFromStructure ok=false — wrong field length, 0 states, or > flatMaxStates),
-// the entry is left UNCACHED and the caller falls through to the uncached read
-// path (correct, just not cached). Holds c.mu only for the lru.Add call (not
-// across the conversion or any libsignal call). The passed-in pointer s must
-// have been produced by record.Structure() on the post-ratchet record.
-func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructure) {
+// StoreStruct replaces the cached structure for key, subject to a per-writer-class
+// iteration gate (refined D-11 + D-12 interaction, 2026-06-10).
+//
+// donorKeyID non-nil => RECOVERY write (cross-account donor install):
+//   - Reject iff the cached entry has a state matching the DONOR KeyID with
+//     cachedIteration >= donorIteration (donor must strictly advance).
+//   - Also reject if ANY incoming state with a matching cached KeyID would move
+//     BACKWARD (cachedIteration > newIteration).
+//   - Equal-iteration matches on NON-donor KeyIDs are preserved foreign states from
+//     the D-12 merge union — they MUST NOT reject (the WR-01 no-op fix).
+//
+// donorKeyID nil => CIPHER write (normal ratchet advance / skipped-key consumption):
+//   - Reject only if ANY incoming state with a matching cached KeyID would move
+//     BACKWARD (cachedIteration > newIteration). Equal iteration is legitimate
+//     skipped-key consumption — accept (Pitfall 1).
+//
+// All comparisons are per-matching-KeyID across ALL states, never state[0] only.
+// Returns true if the entry was accepted and written to the LRU, false if rejected.
+// Holds c.mu only for the lru.Add call (not across the conversion or gate reads).
+// The passed-in pointer s must have been produced by record.Structure() on the
+// post-ratchet record.
+//
+// Gate semantics: recovery: donor strictly advances, preserved states may be equal,
+// no backward moves; cipher: reject backward only (refined D-11 + D-12 interaction, 2026-06-10).
+func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
 	f, ok := flatFromStructure(s)
 	if !ok {
-		return // refuse-to-cache: leave uncached, read path stays correct
+		return false // refuse-to-cache: leave uncached, read path stays correct
 	}
+
+	// Read the cached entry for comparison (lru.Cache.Get is goroutine-safe, no lock needed).
+	if cached, hit := c.lru.Get(key); hit {
+		// Compare per matching KeyID across ALL incoming states.
+		for _, inSt := range s.SenderKeyStates {
+			if inSt == nil || inSt.SenderChainKey == nil {
+				continue
+			}
+			// Find the matching cached state for this KeyID.
+			cachedIter, found := flatMatchingIter(cached, inSt.KeyID)
+			if !found {
+				continue // no cached counterpart for this KeyID — new state, always accept
+			}
+			if donorKeyID != nil {
+				// RECOVERY write.
+				if inSt.KeyID == *donorKeyID {
+					// Donor KeyID must strictly advance.
+					if cachedIter >= inSt.SenderChainKey.Iteration {
+						return false // donor does not strictly advance — reject
+					}
+				} else {
+					// Non-donor (preserved foreign) KeyID: reject only on backward move.
+					if cachedIter > inSt.SenderChainKey.Iteration {
+						return false // backward move — reject
+					}
+					// Equal iteration: preserved foreign state — accept (D-12 interaction rule).
+				}
+			} else {
+				// CIPHER write: reject only on backward move.
+				if cachedIter > inSt.SenderChainKey.Iteration {
+					return false // backward move — reject
+				}
+				// Equal iteration: skipped-key consumption — accept (Pitfall 1).
+			}
+		}
+	}
+	// No cached entry (absent or malformed) — write proceeds.
+
 	c.mu.Lock()
 	c.lru.Add(key, f)
 	c.mu.Unlock()
+	return true
+}
+
+// flatMatchingIter searches the flat cached entry for a state with the given keyID
+// and returns its chainIter. Returns (0, false) if no matching state is found.
+// Used by StoreStruct's per-writer-class iteration gate to compare per matching KeyID.
+func flatMatchingIter(f flatSenderKey, keyID uint32) (iter uint32, found bool) {
+	for i := 0; i < int(f.nStates); i++ {
+		if f.states[i].keyID == keyID {
+			return f.states[i].chainIter, true
+		}
+	}
+	return 0, false
 }
 
 // Invalidate removes the entry for key. D-04 hook — Phase 17.10 will call

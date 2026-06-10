@@ -76,7 +76,13 @@ type CachedSenderKeyStore struct {
 	// because GetSenderKeyStructure reads DB columns that may not yet be drained;
 	// invalidate-then-Load would read pre-drain (nil) columns = silent decrypt failure
 	// on immediate read-after-write and recovery paths (T-17.9-16).
-	parsedReplace func(key string, s *groupRecord.SenderKeyStructure)
+	//
+	// Phase 35.2-04 (D-11 iteration gate): the signature is extended with
+	// donorKeyID *uint32 (nil = cipher write, non-nil = recovery install of that KeyID)
+	// and returns bool (true = accepted, false = rejected — stale install skipped).
+	// The caller MUST check the return value for the recovery class and skip
+	// flusher.Enqueue on rejection (verdict-before-Enqueue ordering requirement).
+	parsedReplace func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool
 
 	hits, misses uint64
 }
@@ -127,7 +133,12 @@ func (c *CachedSenderKeyStore) SetParsedInvalidate(fn func(key string)) {
 // and direct recovery writes) to synchronously replace the cached
 // *SenderKeyStructure before the async flusher drains the DB columns.
 // MUST be a REPLACE (not invalidate) — see parsedReplace field comment.
-func (c *CachedSenderKeyStore) SetParsedReplace(fn func(key string, s *groupRecord.SenderKeyStructure)) {
+//
+// Phase 35.2-04 (D-11): the callback signature now carries donorKeyID *uint32
+// (nil = cipher/ratchet write; non-nil = recovery install) and returns bool
+// (true = accepted, false = rejected by the iteration gate). The caller
+// evaluates the verdict before flusher.Enqueue for the recovery class.
+func (c *CachedSenderKeyStore) SetParsedReplace(fn func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool) {
 	c.parsedReplace = fn
 }
 
@@ -304,14 +315,15 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 	keyID, iter := extractStructMeta(s)
 
 	if c.flusher != nil {
-		// Write-back: enqueue flat blob to flusher (dedup + batched async drain).
+		// Cipher write-back: enqueue flat blob to flusher (dedup + batched async drain).
 		c.flusher.Enqueue(group, user, blob, keyID, iter, false)
 
 		// REPLACE-on-write coherence (T-17.9-16): replace the parsed cache entry
 		// with the in-hand structure so LoadSenderKey returns the fresh key before
 		// the async flusher drains the DB row.
+		// donorKeyID=nil => cipher write (backward-only gate, equal-iter accepted).
 		if c.parsedReplace != nil {
-			c.parsedReplace(c.key(group, user), s)
+			c.parsedReplace(c.key(group, user), s, nil)
 		}
 
 		// Update device-set index (Phase 27 logic unchanged).
@@ -336,8 +348,81 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 	}
 
 	// Write-through path: also replace the parsed cache for coherence.
+	// donorKeyID=nil => cipher write (backward-only gate, equal-iter accepted).
 	if c.parsedReplace != nil {
-		c.parsedReplace(c.key(group, user), s)
+		c.parsedReplace(c.key(group, user), s, nil)
+	}
+
+	c.updateDeviceCache(group, user)
+	return nil
+}
+
+// PutSenderKeyStructureRecovery is the recovery-class variant of PutSenderKeyStructure.
+// It carries donorKeyID (the KeyID from the cross-account donor) so the parsed-cache
+// iteration gate can apply the stricter recovery rule: reject unless the donor strictly
+// advances the cached position for that KeyID (cached.Iteration >= donor.Iteration =>
+// reject). Preserved foreign-KeyID states in a merged install are not penalised
+// (equal-iteration matches on non-donor KeyIDs are accepted — D-12 interaction rule).
+//
+// Ordering: for the recovery class, the gate verdict is evaluated BEFORE
+// flusher.Enqueue — a rejected stale install does not enter the flusher dirty-set
+// and therefore cannot persist its stale blob to DB via last-wins drain.
+//
+// Callers: TryInlineRecovery (recovery_sender_key.go install site).
+func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context, group, user string, s *groupRecord.SenderKeyStructure, donorKeyID uint32) error {
+	blob, ok := store.PackFlat(s)
+	if !ok {
+		// 0-state or invalid structure — fall back to legacy PutSenderKey (safety net).
+		sk, _ := groupRecord.NewSenderKeyFromStruct(s,
+			store.SignalProtobufSerializer.SenderKeyRecord,
+			store.SignalProtobufSerializer.SenderKeyState)
+		var legacyBlob []byte
+		if sk != nil {
+			legacyBlob = sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
+		}
+		return c.inner.PutSenderKey(ctx, group, user, legacyBlob)
+	}
+
+	keyID, iter := extractStructMeta(s)
+
+	// ORDERING: evaluate the parsed-cache gate BEFORE flusher.Enqueue for recovery.
+	// A rejected stale install must not enter the dirty-set (prevents last-wins drain
+	// of a stale blob to DB even when the cache correctly holds the advanced state).
+	cacheKey := c.key(group, user)
+	if c.parsedReplace != nil {
+		accepted := c.parsedReplace(cacheKey, s, &donorKeyID)
+		if !accepted {
+			// Gate rejected: stale donor — skip both flusher and DB write.
+			return nil
+		}
+		// Accepted: now enqueue to flusher (if wired) or write through.
+		if c.flusher != nil {
+			c.flusher.Enqueue(group, user, blob, keyID, iter, false)
+			c.updateDeviceCache(group, user)
+			return nil
+		}
+	} else {
+		// No gate wired (test context / pre-wiring) — write through unconditionally.
+	}
+
+	// Write-through fallback (flusher nil or parsedReplace nil).
+	if c.flusher != nil {
+		// parsedReplace was nil — still enqueue (gate not active, write proceeds).
+		c.flusher.Enqueue(group, user, blob, keyID, iter, false)
+		c.updateDeviceCache(group, user)
+		return nil
+	}
+
+	if putMany, ok := c.inner.(interface {
+		PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error
+	}); ok {
+		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Blob: blob}}); err != nil {
+			return err
+		}
+	} else {
+		if err := c.inner.PutSenderKey(ctx, group, user, blob); err != nil {
+			return err
+		}
 	}
 
 	c.updateDeviceCache(group, user)

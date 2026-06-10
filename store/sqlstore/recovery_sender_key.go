@@ -379,9 +379,11 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 		},
 	}
 
-	// Install via PutSenderKeyStructure (fires parsedReplace synchronously).
-	// The inline retry reads from the warm parsedReplace cache — no DB round-trip.
-	if err := c.PutSenderKeyStructure(ctx, group, targetSenderID, structure); err != nil {
+	// Install via PutSenderKeyStructureRecovery (fires parsedReplace with the donor
+	// KeyID so the iteration gate applies the recovery rule: reject unless donor
+	// strictly advances cached position for that KeyID).
+	// D-11 ordering: gate verdict evaluated BEFORE flusher.Enqueue inside the method.
+	if err := c.PutSenderKeyStructureRecovery(ctx, group, targetSenderID, structure, donor.KeyID); err != nil {
 		return "", false, err
 	}
 	return donor.OurJID, true, nil

@@ -84,7 +84,7 @@ func TestDecodedSKCacheHit(t *testing.T) {
 	key := "group1|user1"
 	s := validSKStructure(1)
 
-	cache.StoreStruct(key, s)
+	cache.StoreStruct(key, s, nil)
 	got, ok := cache.LoadStruct(key)
 	if !ok {
 		t.Fatal("LoadStruct after StoreStruct: want ok=true, got false")
@@ -130,7 +130,7 @@ func TestDecodedSKCacheStoreMutex(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s := validSKStructure(2)
-			cache.StoreStruct(key, s)
+			cache.StoreStruct(key, s, nil)
 		}()
 	}
 	wg.Wait()
@@ -155,7 +155,7 @@ func TestDecodedSKCacheInvalidate(t *testing.T) {
 	key := "group-inv|user-inv"
 	s := validSKStructure(3)
 
-	cache.StoreStruct(key, s)
+	cache.StoreStruct(key, s, nil)
 	cache.Invalidate(key)
 
 	_, ok := cache.LoadStruct(key)
@@ -182,7 +182,7 @@ func TestParsedSKCacheRebuildIndependence(t *testing.T) {
 	key := "group-ro|user-ro"
 	s := validSKStructure(4)
 
-	cache.StoreStruct(key, s)
+	cache.StoreStruct(key, s, nil)
 
 	a, ok := cache.LoadStruct(key)
 	if !ok {
@@ -212,7 +212,7 @@ func TestParsedSKCacheRebuildIndependence(t *testing.T) {
 	}
 
 	// Re-storing a retrieved structure round-trips to a value-equal result.
-	cache.StoreStruct(key, c)
+	cache.StoreStruct(key, c, nil)
 	d, ok := cache.LoadStruct(key)
 	if !ok {
 		t.Fatal("LoadStruct after re-store: want ok=true")

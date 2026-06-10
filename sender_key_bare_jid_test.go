@@ -527,8 +527,8 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	// needs the warm-cache assertion to hold).
 	skLRUB, _ := store.NewSKParsedLRU(256)
 	parsedB := store.NewParsedSKCache(skLRUB)
-	csBStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
-		parsedB.StoreStruct(key, s)
+	csBStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+		return parsedB.StoreStruct(key, s, donorKeyID)
 	})
 
 	// Build a Device for B so builder.Process routes writes through csBStore.
@@ -574,8 +574,8 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 
 	skLRUC, _ := store.NewSKParsedLRU(256)
 	parsedC := store.NewParsedSKCache(skLRUC)
-	csC.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
-		parsedC.StoreStruct(key, s)
+	csC.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+		return parsedC.StoreStruct(key, s, donorKeyID)
 	})
 
 	deviceC := &store.Device{

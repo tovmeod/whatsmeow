@@ -870,10 +870,8 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 	parsedCache := store.NewParsedSKCache(skLRU)
 
 	// Wire parsedReplace -> parsedCache.StoreStruct.
-	// The closure signature must match what Task 2 changes it to; for Task 1
-	// (red test against CURRENT code) the existing signature is fine.
-	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
-		parsedCache.StoreStruct(key, s)
+	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+		return parsedCache.StoreStruct(key, s, donorKeyID)
 	})
 
 	// Wire a flusher that is NOT started (attached-not-drained = stale DB window).
@@ -992,7 +990,7 @@ func TestInlineRecoveryIterationGuard(t *testing.T) {
 	// Needed because TryInlineRecovery calls c.GetSenderKeyStructure (which reads
 	// the struct cache if warm) and must correctly see the existing B row.
 	// The parsedReplace callback here is a no-op (just wires the field).
-	csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure) {})
+	csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) bool { return true })
 
 	// Attempt inline recovery with donor at iter=50, existing at iter=100.
 	// targetIter=60 (donor=50 <= 60 so donor qualifies by forward-only filter),

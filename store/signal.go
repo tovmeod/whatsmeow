@@ -213,7 +213,8 @@ func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protoco
 	// this StoreStruct then becomes a redundant same-structure replace (harmless).
 	if device.ID != nil && device.ParsedSKCache != nil {
 		cacheKey := device.ID.String() + "|" + groupID + "|" + senderString
-		device.ParsedSKCache.StoreStruct(cacheKey, keyRecord.Structure())
+		// Cipher write (normal ratchet advance): donorKeyID=nil.
+		device.ParsedSKCache.StoreStruct(cacheKey, keyRecord.Structure(), nil)
 	}
 
 	// Phase 17.9: columnar hot path — no Serialize on the per-message write.
@@ -265,7 +266,8 @@ func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol
 				return groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState), nil
 			}
 			// Populate parsed cache from recompose (NOT from Deserialize — no JSON on miss).
-			device.ParsedSKCache.StoreStruct(cacheKey, structure)
+			// Cipher/read-miss path: donorKeyID=nil.
+			device.ParsedSKCache.StoreStruct(cacheKey, structure, nil)
 			return groupRecord.NewSenderKeyFromStruct(structure, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
 		}
 
@@ -285,7 +287,8 @@ func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol
 			return nil, fmt.Errorf("failed to deserialize sender key from %s for %s: %w", senderString, groupID, err)
 		}
 		// Populate struct cache for legacy rows (decode-once benefit on legacy stores).
-		device.ParsedSKCache.StoreStruct(cacheKey, structure)
+		// Cipher/read-miss path: donorKeyID=nil.
+		device.ParsedSKCache.StoreStruct(cacheKey, structure, nil)
 		return groupRecord.NewSenderKeyFromStruct(structure, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
 	}
 

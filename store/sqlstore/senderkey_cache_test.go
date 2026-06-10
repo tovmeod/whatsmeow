@@ -186,8 +186,8 @@ func newCohTestDevice(t *testing.T) (device *store.Device, cs *sqlstore.CachedSe
 
 	// Wire parsedReplace → device.ParsedSKCache.StoreStruct
 	// (mirrors cache_wiring.go attachCachedStores).
-	cs.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure) {
-		device.ParsedSKCache.StoreStruct(key, s)
+	cs.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) bool {
+		return device.ParsedSKCache.StoreStruct(key, s, donorKeyID)
 	})
 
 	// Wire a flusher that is NOT started. Enqueue adds to dirty-set only.
