@@ -805,17 +805,46 @@ func (cli *Client) clearMessageRetry(msgID types.MessageID) {
 	// clearMessageRetry is no longer the right clear hook (senderUser is needed).
 }
 
+// classifyRetryEnc scans a message node's children for <enc> nodes and returns
+// the embedded retry count and whether the failing class is skmsg.
+//
+// WR-01 (2026-06-10): the previous classification required exactly one child
+// (len(children) == 1 && children[0].Tag == "enc"). The node passed to
+// sendRetryReceipt is the FULL message node (message.go decryptMessages error
+// path), which routinely carries non-enc children (meta, verified_name,
+// franking — see parseMessageInfo) and can carry multiple enc children
+// (pkmsg + skmsg on group sends with an attached SKDM — the
+// SENDER_KEY_MISMATCH class). Any such node misclassified a failing skmsg as
+// session-class: cap 5 instead of 3, NO SENDERKEY_TERMINAL line (D-04
+// permanent-loss numerator undercount), and lost retryCountInMsg
+// restart-seeding.
+//
+// Classification rule: if ANY enc child has type=skmsg, the message is
+// skmsg-class (for mixed pkmsg+skmsg the pairwise leg decrypts via the normal
+// session; the leg that fails and drives the group retry loop is the
+// sender-key one). retryCountInMsg is taken from the skmsg child when present,
+// else from a session-class enc child (preserving the previous session-class
+// seeding behavior).
+func classifyRetryEnc(children []waBinary.Node) (retryCountInMsg int, isSKMsg bool) {
+	for _, child := range children {
+		if child.Tag != "enc" {
+			continue
+		}
+		ag := child.AttrGetter()
+		if ag.OptionalString("type") == "skmsg" {
+			isSKMsg = true
+			retryCountInMsg = ag.OptionalInt("count")
+		} else if !isSKMsg {
+			retryCountInMsg = ag.OptionalInt("count")
+		}
+	}
+	return
+}
+
 // sendRetryReceipt sends a retry receipt for an incoming message.
 func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, forceIncludeIdentity bool) {
 	id, _ := node.Attrs["id"].(string)
-	children := node.GetChildren()
-	var retryCountInMsg int
-	var isSKMsg bool
-	if len(children) == 1 && children[0].Tag == "enc" {
-		ag := children[0].AttrGetter()
-		retryCountInMsg = ag.OptionalInt("count")
-		isSKMsg = ag.OptionalString("type") == "skmsg"
-	}
+	retryCountInMsg, isSKMsg := classifyRetryEnc(node.GetChildren())
 
 	retryCount, proceed, logTerminal := cli.registerRetryAttempt(id, info.Sender.User, info.Chat.String(), retryCountInMsg, isSKMsg)
 	if !proceed {

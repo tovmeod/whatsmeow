@@ -25,6 +25,8 @@ package whatsmeow
 
 import (
 	"testing"
+
+	waBinary "go.mau.fi/whatsmeow/binary"
 )
 
 // --- helpers ------------------------------------------------------------------
@@ -307,6 +309,92 @@ func TestSenderKeyTerminal_RecoveredSetBounded(t *testing.T) {
 
 	if n > 4 {
 		t.Errorf("recovered set holds %d entries after 5 inserts into cap-4 ring; want <= 4", n)
+	}
+}
+
+// --- WR-01 tests: enc-node classification on multi-child message nodes ---
+
+// TestClassifyRetryEnc_MetaPlusSKMsg asserts that a full message node carrying a
+// non-enc sibling (meta) plus an enc(type=skmsg) child is classified skmsg-class
+// with the embedded count read from the enc child. Against the pre-WR-01 code
+// (len(children)==1 requirement) this returns isSKMsg=false (session-class
+// misclassification: cap 5, no SENDERKEY_TERMINAL, seeding lost).
+func TestClassifyRetryEnc_MetaPlusSKMsg(t *testing.T) {
+	children := []waBinary.Node{
+		{Tag: "meta", Attrs: waBinary.Attrs{"target_id": "x"}},
+		{Tag: "enc", Attrs: waBinary.Attrs{"type": "skmsg", "count": "2", "v": "2"}},
+	}
+	count, isSK := classifyRetryEnc(children)
+	if !isSK {
+		t.Error("meta+enc(skmsg): want isSKMsg=true, got false (WR-01 misclassification)")
+	}
+	if count != 2 {
+		t.Errorf("meta+enc(skmsg): want retryCountInMsg=2, got %d", count)
+	}
+}
+
+// TestClassifyRetryEnc_PKMsgPlusSKMsg asserts the mixed pkmsg+skmsg node (group
+// send with attached SKDM — the SENDER_KEY_MISMATCH class) classifies skmsg,
+// with the count taken from the skmsg child.
+func TestClassifyRetryEnc_PKMsgPlusSKMsg(t *testing.T) {
+	children := []waBinary.Node{
+		{Tag: "enc", Attrs: waBinary.Attrs{"type": "pkmsg", "count": "1", "v": "2"}},
+		{Tag: "enc", Attrs: waBinary.Attrs{"type": "skmsg", "count": "3", "v": "2"}},
+	}
+	count, isSK := classifyRetryEnc(children)
+	if !isSK {
+		t.Error("pkmsg+skmsg: want isSKMsg=true (skmsg leg drives the retry loop)")
+	}
+	if count != 3 {
+		t.Errorf("pkmsg+skmsg: want retryCountInMsg=3 (from the skmsg child), got %d", count)
+	}
+}
+
+// TestClassifyRetryEnc_SessionOnly asserts a single session-class enc node keeps
+// the previous behavior: isSKMsg=false, count read from the enc child.
+func TestClassifyRetryEnc_SessionOnly(t *testing.T) {
+	children := []waBinary.Node{
+		{Tag: "enc", Attrs: waBinary.Attrs{"type": "msg", "count": "4", "v": "2"}},
+	}
+	count, isSK := classifyRetryEnc(children)
+	if isSK {
+		t.Error("session-only: want isSKMsg=false")
+	}
+	if count != 4 {
+		t.Errorf("session-only: want retryCountInMsg=4, got %d", count)
+	}
+}
+
+// TestClassifyRetryEnc_SKMsgCapAndTerminal asserts the WR-01 end-to-end contract:
+// a meta-bearing skmsg node feeds isSKMsg=true into registerRetryAttempt, so the
+// skmsg cap (3) applies and SENDERKEY_TERMINAL fires on the 4th attempt.
+func TestClassifyRetryEnc_SKMsgCapAndTerminal(t *testing.T) {
+	cli := newRetryCap()
+	const msgID = "msg-wr01-1"
+	const sender = "15550003001"
+	const group = "120363000000000020@g.us"
+
+	children := []waBinary.Node{
+		{Tag: "meta"},
+		{Tag: "enc", Attrs: waBinary.Attrs{"type": "skmsg", "v": "2"}},
+	}
+	count, isSK := classifyRetryEnc(children)
+	if !isSK || count != 0 {
+		t.Fatalf("classify: want (0, true), got (%d, %v)", count, isSK)
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		_, proceed, _ := cli.registerRetryAttempt(msgID, sender, group, count, isSK)
+		if !proceed {
+			t.Fatalf("attempt %d: want proceed=true under skmsg cap 3", attempt)
+		}
+	}
+	_, proceed, logTerminal := cli.registerRetryAttempt(msgID, sender, group, count, isSK)
+	if proceed {
+		t.Error("attempt 4 (past skmsg cap 3): want proceed=false")
+	}
+	if !logTerminal {
+		t.Error("attempt 4: want logTerminal=true (SENDERKEY_TERMINAL fires for skmsg class)")
 	}
 }
 
