@@ -1,0 +1,364 @@
+// Copyright (c) 2026 Kavtov Platform (Phase 35.2-09)
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+// session_flusher.go implements SessionFlusher — the per-JID async write-back
+// flusher for the whatsmeow_sessions table (D-15 Lever 2, Phase 35.2-09).
+// It is a near-clone of SenderKeyFlusher (flusher.go), adapted for sessions.
+//
+// Design reference:
+//
+//	.planning/phases/17.7-*/17.7-WRITEBACK-CACHE-DESIGN.md §5 §6 §8
+//	.planning/phases/35.2-.../35.2-D15-LEVERS.md (Lever 2 measured load)
+//
+// # Why write-back is safe for sessions (at these parameters)
+//
+// Measured prod load: ~2,450 session upserts/min; 72.5% of those upsert the
+// same (jid, address) within a short window (coalescable). Sessions are
+// the #1 DB write source at 32.5% of total pg exec time.
+//
+// Chosen defaults: N=1 (KAVTOV_FLUSH_SESSION_N), T=5000ms
+// (KAVTOV_FLUSH_SESSION_T_MS), cap=100_000 (KAVTOV_FLUSH_SESSION_CAP).
+//
+// N=1 means each distinct address is flush-signalled on its FIRST Enqueue,
+// so the async goroutine drains the dirty-set approximately every 1s (the
+// ticker cadence). Same-address repeats arriving inside the in-flight drain
+// window coalesce to last-wins. The 5s ticker is a hard bound on staleness
+// for addresses that never received a second signal. The crash window is
+// therefore bounded: at most ~5s of ratchet advances in the dirty-set
+// survive a crash. See 35.2-09-CRASH-LOSS.md for the full analysis.
+//
+// DM Double-Ratchet has no replayable genesis: a crash during the flush
+// window loses those ratchet advances permanently. This is acceptable for
+// the prod write-reduction benefit, but the operator must decide whether
+// to deploy. See 35.2-09-CRASH-LOSS.md and the SUMMARY deploy-decision
+// section.
+package sqlstore
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+
+	waLog "go.mau.fi/whatsmeow/util/log"
+)
+
+// flushSessionBatch is the interface the flusher needs from the store layer.
+// *SQLStore satisfies this via PutManySessions.
+type flushSessionBatch interface {
+	PutManySessions(ctx context.Context, sessions map[string][]byte) error
+}
+
+// sessionDirtyEntry tracks one pending session write in the dirty-set.
+type sessionDirtyEntry struct {
+	blob      []byte // latest flat session blob (last-wins for same address)
+	advCount  uint32 // number of Enqueues for this address (N-boundary counter)
+	lastDrain uint32 // advCount at last successful DB write
+}
+
+// SessionFlusher batches dirty session entries and drains them asynchronously
+// via PutManySessions. One instance per (Container, JID).
+//
+// Flush triggers:
+//  1. N-boundary crossing: advCount crosses a multiple of N (default N=1,
+//     so every new entry signals a flush immediately)
+//  2. T-timer: the flush interval ticker fires (default T=5s)
+//  3. Synchronous drain on shutdown (Drain / Stop)
+//
+// Backpressure: when dirty-set > backpressureCap, Enqueue performs a
+// synchronous inline write for that address before returning.
+type SessionFlusher struct {
+	store waLog.Logger // kept only for error logging
+	log   waLog.Logger
+
+	db              flushSessionBatch
+	cap             int    // max dirty-set entries (KAVTOV_FLUSH_SESSION_CAP)
+	boundaryN       uint32 // advance-count boundary (KAVTOV_FLUSH_SESSION_N)
+	backpressureCap int    // inline sync write above this size
+	dropCap         int    // drop coldest above this size when DB is failing
+
+	mu    sync.Mutex
+	dirty map[string]*sessionDirtyEntry // key = address (no jid prefix; flusher is per-JID)
+
+	flushCh chan struct{}
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
+
+	flushInterval time.Duration // injectable for tests; default 5s
+}
+
+// envIntOrDefaultSession reads an integer from an env var with a compiled
+// default. Separate helper so we do not shadow flusher.go's envIntOrDefault
+// in the same package (they differ only in name).
+func envIntOrDefaultSession(key string, fallback int) int {
+	s := os.Getenv(key)
+	if s == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+// NewSessionFlusher constructs a SessionFlusher with prod defaults. cap=0 uses
+// the env var / compiled default. log is used for error / info logging.
+func NewSessionFlusher(db flushSessionBatch, log waLog.Logger, cap int) *SessionFlusher {
+	if cap <= 0 {
+		cap = envIntOrDefaultSession("KAVTOV_FLUSH_SESSION_CAP", 100_000)
+	}
+	n := uint32(envIntOrDefaultSession("KAVTOV_FLUSH_SESSION_N", 1))
+	if n == 0 {
+		n = 1
+	}
+	tms := envIntOrDefaultSession("KAVTOV_FLUSH_SESSION_T_MS", 5000)
+	return &SessionFlusher{
+		log:             log,
+		db:              db,
+		cap:             cap,
+		boundaryN:       n,
+		backpressureCap: cap / 5,
+		dropCap:         cap * 2 / 5,
+		dirty:           make(map[string]*sessionDirtyEntry, 1024),
+		flushCh:         make(chan struct{}, 1),
+		stopCh:          make(chan struct{}),
+		flushInterval:   time.Duration(tms) * time.Millisecond,
+	}
+}
+
+// newSessionFlusherForTest constructs a SessionFlusher with a custom flush
+// interval for unit tests. Tests pass a short interval (e.g. 50ms) to avoid
+// sleeping the full 5s default.
+func newSessionFlusherForTest(db flushSessionBatch, cap int, flushInterval time.Duration) *SessionFlusher {
+	f := NewSessionFlusher(db, waLog.Noop, cap)
+	f.flushInterval = flushInterval
+	return f
+}
+
+// DirtyCount returns the current dirty-set size.
+func (f *SessionFlusher) DirtyCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.dirty)
+}
+
+// crossesBoundary returns true when the advance count crosses an N-boundary
+// relative to lastDrain. Design §5: floor(adv/N) > floor(lastDrain/N).
+func (f *SessionFlusher) crossesBoundary(adv, lastDrain uint32) bool {
+	return adv/f.boundaryN > lastDrain/f.boundaryN
+}
+
+// Enqueue records a dirty session entry. Last-wins for same address.
+// Signals the async flusher goroutine when the N-boundary is crossed.
+// Performs an inline synchronous write when dirty-set > backpressureCap.
+func (f *SessionFlusher) Enqueue(address string, blob []byte) {
+	f.mu.Lock()
+
+	entry, exists := f.dirty[address]
+	var adv uint32
+	var lastDrain uint32
+	if exists {
+		entry.blob = copyBytes(blob) // last-wins, store our own copy
+		entry.advCount++
+		adv = entry.advCount
+		lastDrain = entry.lastDrain
+	} else {
+		entry = &sessionDirtyEntry{
+			blob:     copyBytes(blob),
+			advCount: 1,
+		}
+		f.dirty[address] = entry
+		adv = 1
+		lastDrain = 0
+	}
+
+	crosses := f.crossesBoundary(adv, lastDrain)
+	dirtyLen := len(f.dirty)
+	needsInline := dirtyLen > f.backpressureCap
+
+	f.mu.Unlock()
+
+	// Signal the async flusher on N-boundary crossing.
+	if crosses {
+		select {
+		case f.flushCh <- struct{}{}:
+		default:
+		}
+	}
+
+	// Inline synchronous write on backpressure.
+	if needsInline {
+		f.flushOneSynchronous(address, blob)
+	}
+}
+
+// Peek returns the dirty blob for address if it is in the dirty-set (not yet
+// flushed). Returns (copy, true) on hit; (nil, false) on miss.
+// The returned slice is a heap-private copy — callers may mutate it.
+func (f *SessionFlusher) Peek(address string) ([]byte, bool) {
+	f.mu.Lock()
+	entry, ok := f.dirty[address]
+	if !ok {
+		f.mu.Unlock()
+		return nil, false
+	}
+	out := copyBytes(entry.blob)
+	f.mu.Unlock()
+	return out, true
+}
+
+// Remove drops the dirty entry for address, preventing a stale buffered blob
+// from persisting after a DeleteSession. No-op if address is not dirty.
+func (f *SessionFlusher) Remove(address string) {
+	f.mu.Lock()
+	delete(f.dirty, address)
+	f.mu.Unlock()
+}
+
+// flushOneSynchronous performs a single-address synchronous write on the
+// backpressure path. Clears the dirty entry on success.
+// Must NOT be called while f.mu is held.
+func (f *SessionFlusher) flushOneSynchronous(address string, blob []byte) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := f.db.PutManySessions(ctx, map[string][]byte{address: blob})
+	if err != nil {
+		slog.Error(fmt.Sprintf("SessionFlusher inline flush failed addr=%s: %v", address, err))
+		f.mu.Lock()
+		if len(f.dirty) > f.dropCap {
+			f.dropColdestLocked()
+		}
+		f.mu.Unlock()
+		return
+	}
+	f.mu.Lock()
+	if e, ok := f.dirty[address]; ok {
+		e.lastDrain = e.advCount
+		delete(f.dirty, address)
+	}
+	f.mu.Unlock()
+}
+
+// dropColdestLocked removes one entry from the dirty-set (pseudo-random map
+// iteration). Must be called with f.mu held.
+func (f *SessionFlusher) dropColdestLocked() {
+	for addr, e := range f.dirty {
+		slog.Error(fmt.Sprintf("SessionFlusher DROP dirty entry (catastrophe) addr=%s advCount=%d", addr, e.advCount))
+		delete(f.dirty, addr)
+		return
+	}
+}
+
+// Drain flushes the entire dirty-set synchronously, retrying on transient
+// failure. Blocks until the dirty-set is empty. Called during Stop().
+func (f *SessionFlusher) Drain() {
+	for {
+		f.mu.Lock()
+		if len(f.dirty) == 0 {
+			f.mu.Unlock()
+			return
+		}
+		// Snapshot under lock; release before calling DB.
+		batch := make(map[string][]byte, len(f.dirty))
+		addrs := make([]string, 0, len(f.dirty))
+		for addr, e := range f.dirty {
+			batch[addr] = copyBytes(e.blob)
+			addrs = append(addrs, addr)
+		}
+		f.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := f.db.PutManySessions(ctx, batch)
+		cancel()
+
+		if err != nil {
+			f.log.Errorf("SessionFlusher Drain batch failed (%d rows): %v — retrying", len(batch), err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		f.mu.Lock()
+		for _, addr := range addrs {
+			if e, ok := f.dirty[addr]; ok {
+				e.lastDrain = e.advCount
+				delete(f.dirty, addr)
+			}
+		}
+		drained := len(addrs)
+		f.mu.Unlock()
+
+		f.log.Infof("SessionFlusher: drained %d on shutdown", drained)
+		return
+	}
+}
+
+// runFlush drains the dirty-set once. Called from the async goroutine.
+// A failed batch retains dirty state (retried next cycle). Does NOT retry.
+func (f *SessionFlusher) runFlush() {
+	f.mu.Lock()
+	if len(f.dirty) == 0 {
+		f.mu.Unlock()
+		return
+	}
+	batch := make(map[string][]byte, len(f.dirty))
+	addrs := make([]string, 0, len(f.dirty))
+	for addr, e := range f.dirty {
+		batch[addr] = copyBytes(e.blob)
+		addrs = append(addrs, addr)
+	}
+	f.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := f.db.PutManySessions(ctx, batch)
+	cancel()
+
+	if err != nil {
+		f.log.Errorf("SessionFlusher batch flush failed (%d rows): %v", len(batch), err)
+		return
+	}
+
+	f.mu.Lock()
+	for _, addr := range addrs {
+		if e, ok := f.dirty[addr]; ok {
+			e.lastDrain = e.advCount
+			delete(f.dirty, addr)
+		}
+	}
+	f.mu.Unlock()
+}
+
+// Start launches the async flusher goroutine. Must be called once after
+// NewSessionFlusher and before any Enqueue calls in production.
+func (f *SessionFlusher) Start() {
+	f.wg.Add(1)
+	go func() {
+		defer f.wg.Done()
+		ticker := time.NewTicker(f.flushInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-f.stopCh:
+				return
+			case <-ticker.C:
+				f.runFlush()
+			case <-f.flushCh:
+				f.runFlush()
+			}
+		}
+	}()
+}
+
+// Stop signals the async goroutine to exit, waits for it, then calls Drain()
+// synchronously to flush any remaining dirty entries before the DB closes.
+func (f *SessionFlusher) Stop() {
+	close(f.stopCh)
+	f.wg.Wait()
+	f.Drain()
+}

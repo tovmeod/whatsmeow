@@ -18,6 +18,7 @@ package sqlstore
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -190,7 +191,7 @@ func TestSessionFlusher_MultiAddressCoalescing(t *testing.T) {
 }
 
 func addressForIdx(i int) string {
-	return "user" + string(rune('a'+i%26)) + ":0"
+	return fmt.Sprintf("user%d:0", i)
 }
 
 // ---------------------------------------------------------------------------
