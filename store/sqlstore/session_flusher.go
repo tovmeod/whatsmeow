@@ -191,6 +191,12 @@ func (f *SessionFlusher) Enqueue(address string, blob []byte) {
 		lastDrain = 0
 	}
 
+	// CR-03: snapshot the advance count for this blob while still holding
+	// f.mu, so the inline path below can verify the entry is unchanged
+	// before writing and before clearing (mirrors the SenderKeyFlusher
+	// template's highIter guard at flusher.go flushOneSynchronous).
+	advSnap := adv
+
 	crosses := f.crossesBoundary(adv, lastDrain)
 	dirtyLen := len(f.dirty)
 	needsInline := dirtyLen > f.backpressureCap
@@ -207,7 +213,7 @@ func (f *SessionFlusher) Enqueue(address string, blob []byte) {
 
 	// Inline synchronous write on backpressure.
 	if needsInline {
-		f.flushOneSynchronous(address, blob)
+		f.flushOneSynchronous(address, blob, advSnap)
 	}
 }
 
@@ -266,18 +272,27 @@ func (f *SessionFlusher) WithFlushBlocked(fn func() error) error {
 }
 
 // flushOneSynchronous performs a single-address synchronous write on the
-// backpressure path. Clears the dirty entry on success.
+// backpressure path. advSnap is the entry's advCount captured under f.mu by
+// the Enqueue that produced blob. Clears the dirty entry on success only if
+// the entry is still at advSnap (CR-03 staleness guard, mirroring the
+// SenderKeyFlusher template's highIter check): an inline flush of an older
+// blob must neither overwrite a newer concurrent inline write in the DB nor
+// clear a dirty entry that already holds a newer blob.
 // Must NOT be called while f.mu is held.
-func (f *SessionFlusher) flushOneSynchronous(address string, blob []byte) {
-	// CR-01: serialize against deletes and batch flush cycles. If a delete
-	// completed while we waited for flushMu, the dirty entry is gone — skip
-	// the write entirely so the deleted row is not resurrected.
+func (f *SessionFlusher) flushOneSynchronous(address string, blob []byte, advSnap uint32) {
+	// CR-01/CR-03: serialize against deletes and other flush cycles. If a
+	// delete completed while we waited for flushMu, the entry is gone — skip
+	// the write so the deleted row is not resurrected. If a newer Enqueue
+	// superseded this blob, skip too — the newer Enqueue's own inline write
+	// (or the next batch) persists the newer blob, and writing the older
+	// blob here could land AFTER the newer one (unordered DB writes).
 	f.flushMu.Lock()
 	defer f.flushMu.Unlock()
 	f.mu.Lock()
-	_, stillDirty := f.dirty[address]
+	e, stillDirty := f.dirty[address]
+	current := stillDirty && e.advCount == advSnap
 	f.mu.Unlock()
-	if !stillDirty {
+	if !current {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -293,8 +308,8 @@ func (f *SessionFlusher) flushOneSynchronous(address string, blob []byte) {
 		return
 	}
 	f.mu.Lock()
-	if e, ok := f.dirty[address]; ok {
-		e.lastDrain = e.advCount
+	if e, ok := f.dirty[address]; ok && e.advCount == advSnap {
+		e.lastDrain = advSnap
 		delete(f.dirty, address)
 	}
 	f.mu.Unlock()

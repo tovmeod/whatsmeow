@@ -547,6 +547,65 @@ func TestSessionFlusher_CR02_EnqueueDuringInflightBatchRetained(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestSessionFlusher_CR03_InlineFlushDoesNotClobberNewerWrite
+// CR-03 regression: under backpressure, two Enqueues for the same address take
+// the inline path with differently-aged blobs. Without serialization + the
+// advSnap staleness guard, the older write can land after the newer one
+// (leaving the DB at v1) and/or the older flush clears the dirty entry that
+// already holds v2 — dropping v2 from the durable path.
+// ---------------------------------------------------------------------------
+
+func TestSessionFlusher_CR03_InlineFlushDoesNotClobberNewerWrite(t *testing.T) {
+	mock := newMockFlushSessionStore()
+	b := newBlockingFlushSessionStore(mock)
+	// cap=5 → backpressureCap=1: the second distinct address triggers the
+	// inline synchronous path.
+	f := newSessionFlusherForTest(b, 5, 5000*time.Second)
+
+	f.Enqueue("filler:0", []byte("filler")) // dirty=1, below backpressureCap
+
+	enq1Done := make(chan struct{})
+	go func() {
+		f.Enqueue("cr03-addr:0", []byte("v1")) // dirty=2 > 1 → inline write, blocked in mock
+		close(enq1Done)
+	}()
+	<-b.writeStarted // inline v1 write is in flight (post-snapshot, pre-apply)
+
+	enq2Done := make(chan struct{})
+	go func() {
+		f.Enqueue("cr03-addr:0", []byte("v2")) // updates entry to v2; its inline write must serialize after v1's
+		close(enq2Done)
+	}()
+
+	// With the fix, enq2's inline write blocks behind flushMu (timeout
+	// branch); without it, enq2's write lands while v1 is paused (enq2Done
+	// branch) and the released v1 write then clobbers it. The final-state
+	// assertions below detect the bug deterministically either way.
+	select {
+	case <-enq2Done:
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(b.writeRelease)
+	<-enq1Done
+	<-enq2Done
+
+	got, ok := mock.getSession("cr03-addr:0")
+	if !ok {
+		t.Fatal("cr03-addr:0 never reached the store")
+	}
+	if string(got) != "v2" {
+		t.Fatalf("store = %q, want v2 — older inline write clobbered the newer one (CR-03)", got)
+	}
+	// Whatever is (or is not) left dirty, the durable end-state after a full
+	// drain must be v2.
+	f.Drain()
+	if v, _ := mock.getSession("cr03-addr:0"); string(v) != "v2" {
+		t.Fatalf("store = %q after Drain, want v2 (CR-03 lost update on inline path)", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestSessionFlusher_DirtyCount
 // DirtyCount reflects the current dirty-set size correctly.
 // ---------------------------------------------------------------------------
