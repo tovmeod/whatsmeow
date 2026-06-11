@@ -418,18 +418,26 @@ type signalCaches struct {
 	// The LRU eviction callback looks up the flusher by JID (parsed from the
 	// cache key) to re-enqueue dirty entries before LRU drops them.
 	// Stopped (with synchronous drain) by closeSignalCaches.
-	// senderKeyFlushersMu guards concurrent reads/writes.
-	senderKeyFlushersMu sync.RWMutex
-	senderKeyFlusherMap map[string]*SenderKeyFlusher // key: JID string
+	// senderKeyFlushersMu guards concurrent reads/writes, including the
+	// senderKeyFlushersClosed flag (WR-02): once closeSignalCaches has
+	// snapshotted-and-stopped the flushers, attachCachedStores must not
+	// create new ones — they would never be Stop()ed (leaked goroutine,
+	// dirty entries never drained before the DB closes). Post-close attaches
+	// fall back to write-through (nil flusher).
+	senderKeyFlushersMu     sync.RWMutex
+	senderKeyFlusherMap     map[string]*SenderKeyFlusher // key: JID string
+	senderKeyFlushersClosed bool
 
 	// Phase 35.2-09: per-device write-back flushers for whatsmeow_sessions.
 	// Same singleton-reuse lifecycle as senderKeyFlusherMap — attachCachedStores
 	// re-runs on every Device.Save; the flusher must be reused, not recreated,
 	// to avoid leaking a ticking goroutine (the 6963-goroutine-leak class).
 	// Stopped (with synchronous Drain) by closeSignalCaches alongside the
-	// sender-key flushers.
-	sessionFlushersMu  sync.RWMutex
-	sessionFlusherMap  map[string]*SessionFlusher // key: JID string
+	// sender-key flushers. sessionFlushersClosed: same WR-02 semantics as
+	// senderKeyFlushersClosed above.
+	sessionFlushersMu     sync.RWMutex
+	sessionFlusherMap     map[string]*SessionFlusher // key: JID string
+	sessionFlushersClosed bool
 
 	// Phase 17.5.1 WR-01: cancellable ctx for emitMetricsLoop. Cancelled
 	// by Container.Close() (via closeSignalCaches) so the metrics
@@ -572,12 +580,19 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	// Phase 35.2-09: per-device session flusher, same singleton-reuse pattern as
 	// senderKeyFlusherMap (check-then-create under mutex so concurrent Device.Save
 	// calls for the same JID can't both create a flusher).
+	// WR-02: after closeSignalCaches has run, do NOT create (or hand out) a
+	// flusher — a flusher created post-snapshot would never be Stop()ed and
+	// its dirty sessions never drained. nil flusher = write-through fallback.
 	c.caches.sessionFlushersMu.Lock()
-	sessionFlusher, sessionFlusherExists := c.caches.sessionFlusherMap[jid]
-	if !sessionFlusherExists {
-		sessionFlusher = NewSessionFlusher(innerStore, c.log, 0)
-		c.caches.sessionFlusherMap[jid] = sessionFlusher
-		sessionFlusher.Start()
+	var sessionFlusher *SessionFlusher
+	if !c.caches.sessionFlushersClosed {
+		var sessionFlusherExists bool
+		sessionFlusher, sessionFlusherExists = c.caches.sessionFlusherMap[jid]
+		if !sessionFlusherExists {
+			sessionFlusher = NewSessionFlusher(innerStore, c.log, 0)
+			c.caches.sessionFlusherMap[jid] = sessionFlusher
+			sessionFlusher.Start()
+		}
 	}
 	c.caches.sessionFlushersMu.Unlock()
 	sessionStore.SetFlusher(sessionFlusher)
@@ -598,12 +613,19 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	// first attach for a JID constructs + Start()s it. Check+create under the
 	// mutex so concurrent saves for the same JID can't both create one.
 	senderKeyStore := NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices, &c.caches.DonorSF)
+	// WR-02: same post-close guard as the session flusher block above —
+	// never create or hand out a flusher after closeSignalCaches snapshotted
+	// and stopped them; nil flusher = write-through fallback.
 	c.caches.senderKeyFlushersMu.Lock()
-	flusher, exists := c.caches.senderKeyFlusherMap[jid]
-	if !exists {
-		flusher = NewSenderKeyFlusher(innerStore, c.log, 0)
-		c.caches.senderKeyFlusherMap[jid] = flusher
-		flusher.Start()
+	var flusher *SenderKeyFlusher
+	if !c.caches.senderKeyFlushersClosed {
+		var exists bool
+		flusher, exists = c.caches.senderKeyFlusherMap[jid]
+		if !exists {
+			flusher = NewSenderKeyFlusher(innerStore, c.log, 0)
+			c.caches.senderKeyFlusherMap[jid] = flusher
+			flusher.Start()
+		}
 	}
 	c.caches.senderKeyFlushersMu.Unlock()
 	senderKeyStore.SetFlusher(flusher)
@@ -661,18 +683,34 @@ func closeSignalCaches(c *Container) {
 	// Phase 17.7-03: stop all per-device sender-key flushers. Each Stop()
 	// closes the async goroutine and then calls Drain() synchronously,
 	// ensuring all dirty entries are written before the DB connection closes.
+	//
+	// WR-02: copy the VALUES out under the lock (copying the map reference
+	// and iterating after unlock raced a concurrent attachCachedStores map
+	// write — a fatal "concurrent map read and map write") and set the
+	// closed flag so attachCachedStores cannot create a flusher after this
+	// snapshot (such a flusher would never be Stop()ed: leaked goroutine,
+	// dirty entries never drained before the DB closes).
 	c.caches.senderKeyFlushersMu.Lock()
-	flusherMap := c.caches.senderKeyFlusherMap
+	c.caches.senderKeyFlushersClosed = true
+	skFlushers := make([]*SenderKeyFlusher, 0, len(c.caches.senderKeyFlusherMap))
+	for _, f := range c.caches.senderKeyFlusherMap {
+		skFlushers = append(skFlushers, f)
+	}
 	c.caches.senderKeyFlushersMu.Unlock()
-	for _, f := range flusherMap {
+	for _, f := range skFlushers {
 		f.Stop()
 	}
 	// Phase 35.2-09: stop all per-device session flushers synchronously so
-	// buffered sessions reach the DB before the connection closes.
+	// buffered sessions reach the DB before the connection closes. Same
+	// WR-02 snapshot + closed-flag discipline as the sender-key block above.
 	c.caches.sessionFlushersMu.Lock()
-	sessionFlusherMap := c.caches.sessionFlusherMap
+	c.caches.sessionFlushersClosed = true
+	sessionFlushers := make([]*SessionFlusher, 0, len(c.caches.sessionFlusherMap))
+	for _, f := range c.caches.sessionFlusherMap {
+		sessionFlushers = append(sessionFlushers, f)
+	}
 	c.caches.sessionFlushersMu.Unlock()
-	for _, f := range sessionFlusherMap {
+	for _, f := range sessionFlushers {
 		f.Stop()
 	}
 }
