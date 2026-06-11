@@ -666,6 +666,3 @@ func TestSessionFlusher_DirtyCount(t *testing.T) {
 		t.Fatalf("after 2 distinct Enqueues: DirtyCount = %d, want 2", n)
 	}
 }
-
-// Ensure atomic.Int64 is accessible from tests (compile-time check).
-var _ = (*atomic.Int64)(nil)
