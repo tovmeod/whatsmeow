@@ -721,10 +721,15 @@ func formatCacheMetrics(c *Container) string {
 			c.caches.MsgSecret.Len(), signalMsgSecretCacheCap, msgSecEvic, msgSecCap, msgSecExp,
 		)
 	}
+	// WR-02 (2026-06-10): identity_changed surfaces the process-global D-10
+	// mismatch-accept counter (identityChangedTotal) in the 5-minute log line.
+	// D-10 auto-accepts every key rotation fleet-wide, so this aggregate is the
+	// only alerting-ready signal for an anomalous rotation spike (the realistic
+	// attack/abuse signature is a single address rotating repeatedly).
 	return fmt.Sprintf(
-		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
+		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d, identity_changed=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
 		c.caches.Session.Len(), signalSessionCacheCap, sessEvic, sessCap, sessExp,
-		c.caches.Identity.Len(), signalIdentityCacheCap, idntEvic, idntCap, idntExp,
+		c.caches.Identity.Len(), signalIdentityCacheCap, idntEvic, idntCap, idntExp, identityChangedTotal.Load(),
 		c.caches.SenderKey.Len(), signalSenderKeyCacheCap, sndkEvic, sndkCap, sndkExp,
 		msgSecBlock,
 		walltime.DecryptHistogram.Quantile(0.5),

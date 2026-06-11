@@ -76,6 +76,24 @@ type CachedIdentityStore struct {
 
 var _ store.IdentityStore = (*CachedIdentityStore)(nil)
 
+// identityChangedTotal is the process-global aggregate of D-10 mismatch-accept
+// (IDENTITY_CHANGED) events across ALL CachedIdentityStore wrappers (one per
+// device). The per-wrapper identityChangedCount remains the test-visible
+// per-device counter; this aggregate is what emitMetricsLoop surfaces every 5
+// minutes in the identities={...} block (WR-02: without it the counter was
+// write-only in production — D-10 disables the Signal protocol's session-level
+// MITM defense fleet-wide, and an anomalous spike, e.g. a single address
+// rotating repeatedly, had no alerting path). Read via IdentityChangedTotal().
+var identityChangedTotal atomic.Uint64
+
+// IdentityChangedTotal returns the process-global count of D-10
+// mismatch-accept (IDENTITY_CHANGED) events across all device wrappers.
+// Exported for the driver's DebugStats payload (manager.go) — the same
+// observability seam as store.SenderKeyParsedCacheStats and Container.CacheLens.
+func IdentityChangedTotal() uint64 {
+	return identityChangedTotal.Load()
+}
+
 // identityReader is the unexported populate-on-miss seam. The concrete
 // *SQLStore (in this package) and the in-package fakeIdentityStore both
 // satisfy it. The cache uses a runtime type-assertion against this
@@ -135,6 +153,7 @@ func (c *CachedIdentityStore) IdentityChangedCount() uint64 {
 // skipped but the counter is still incremented — the counter is the test-visible signal.
 func (c *CachedIdentityStore) logIdentityChanged(address string, old, newKey [32]byte) {
 	atomic.AddUint64(&c.identityChangedCount, 1)
+	identityChangedTotal.Add(1) // WR-02: process-global aggregate for emitMetricsLoop/DebugStats
 	var log waLog.Logger
 	if sq, ok := c.inner.(*SQLStore); ok {
 		log = sq.log

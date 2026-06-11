@@ -170,6 +170,7 @@ func TestCacheMetricsLogFormat_ExtendedFields(t *testing.T) {
 	// perf 260601-uuy: MsgSecretCapacityEvictions=5, no explicit removes.
 	atomic.StoreUint64(&c.caches.MsgSecretCapacityEvictions, 5)
 
+	identityChangedBefore := identityChangedTotal.Load()
 	msg := formatCacheMetrics(c)
 
 	// Check evictions sum for identities: capClean(7) + explicit(3) = 10.
@@ -184,8 +185,12 @@ func TestCacheMetricsLogFormat_ExtendedFields(t *testing.T) {
 	// evictions= sum: we need to locate the identity block specifically to
 	// avoid false match from another cache's evictions=0. Use fmt.Sprintf
 	// to build the expected identity prefix.
-	idntBlock := fmt.Sprintf("identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d}",
-		0, signalIdentityCacheCap, 10, 7, 3)
+	// WR-02: the block carries identity_changed= (process-global D-10
+	// mismatch-accept aggregate); other tests in this package may have
+	// incremented it, so the expectation uses the live value captured above
+	// the formatCacheMetrics call (identityChangedBefore).
+	idntBlock := fmt.Sprintf("identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d, identity_changed=%d}",
+		0, signalIdentityCacheCap, 10, 7, 3, identityChangedBefore)
 	if !strings.Contains(msg, idntBlock) {
 		t.Errorf("expected identity block %q in msg: %s", idntBlock, msg)
 	}

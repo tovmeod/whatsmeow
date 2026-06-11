@@ -300,6 +300,15 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 			}
 			builder := session.NewBuilderFromSignal(cli.Store, encryptionIdentity.SignalAddress(), pbSerializer)
 			processErr := builder.ProcessBundle(ctx, bundle)
+			// WR-02 note (2026-06-10): D-10 (35.2-03) makes the whatsmeow-store
+			// IsTrustedIdentity accept every key rotation (store.go +
+			// cached_identity_store.go), so a STORE-level untrusted-identity verdict
+			// can no longer reach this branch. It is deliberately KEPT (not dead
+			// code): libsignal can still surface ErrUntrustedIdentity from its own
+			// internal state diverging (e.g. a stale session record's identity vs the
+			// stored one), and clearing + reprocessing remains the correct response
+			// for that class. Same applies to clearUntrustedIdentity (message.go) and
+			// the decryptDM AutoTrustIdentity retry.
 			if cli.AutoTrustIdentity && errors.Is(processErr, signalerror.ErrUntrustedIdentity) {
 				cli.Log.Warnf("Got untrusted identity processing prekey bundle from retry receipt from %s, clearing and retrying", receipt.Sender)
 				if clearErr := cli.clearUntrustedIdentity(ctx, encryptionIdentity); clearErr != nil {
