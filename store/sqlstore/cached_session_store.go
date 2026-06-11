@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Kavtov Platform (Phase 17.5)
+// Copyright (c) 2026 Kavtov Platform (Phase 17.5 / Phase 35.2-09)
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -17,70 +17,85 @@ import (
 )
 
 // CachedSessionStore wraps an inner store.SessionStore with a process-shared
-// *lru.Cache[string, []byte]. It is a strict write-through cache: every
-// mutating method calls the inner store FIRST and only updates the cache on
-// success. There is no write-back buffer, no deferred-write timer, no
-// coalesce window, and no flush gate — those constructs (introduced by
-// Plans 17.5-02 and 17.5-04) were rewritten out by the Phase 17.5 FIX
-// cycle after review found six BLOCKER-class data-loss paths rooted in the
-// timer-vs-Delete race and the "clear state before inner write" inversion.
+// *lru.Cache[string, []byte] and an optional per-JID SessionFlusher for
+// bounded-staleness write-back (Phase 35.2-09 D-15 Lever 2).
 //
-// Correctness guarantees:
+// # Write semantics (when flusher is set — Phase 35.2-09)
 //
-//   - PutSession returns only after inner.PutSession returns nil. By the
-//     time PutSession returns, the row is durable in the inner store; there
-//     is no "pending dirty state" the wrapper has to flush before acking.
-//     This trivially satisfies the D-CACHE-03 "ack-after-flush" invariant
-//     that the prior write-back design tried to enforce via a separate gate.
+// PutSession and PutManySessions now defer writes to the per-JID
+// SessionFlusher instead of writing through to the inner store immediately.
+// The flusher batches writes and drains them asynchronously with bounded
+// staleness (N=1 advance per address OR T=5s, whichever first). The row is
+// durable within (N, T) or on graceful closeSignalCaches Drain — NOT
+// necessarily by the time PutSession returns. The prior strict-write-through
+// guarantee ("durable by the time PutSession returns") no longer holds when
+// the flusher is set. See 35.2-09-CRASH-LOSS.md for the crash-loss analysis.
 //
-//   - DeleteSession / DeleteAllSessions / MigratePNToLID call inner first,
-//     then update the cache to mirror the inner state. A failed inner call
-//     leaves the cache untouched, so the cache and inner can never diverge
-//     after a failed mutation.
+// # Read coherence under deferral (the 17.13 guard)
 //
-//   - GetSession / GetManySessions / HasSession return cached values when
-//     the cache is warm; a miss fans through to inner and (on success)
-//     populates the cache with a heap-private copy.
+// GetSession, GetManySessions, and HasSession consult the flusher's dirty-set
+// (via flusher.Peek) AFTER an LRU miss and BEFORE falling through to the
+// inner DB read. This ensures that a just-written but not-yet-flushed session
+// is always readable, even if it was evicted from the LRU by capacity
+// pressure. ContainsSession at send.go:1398 / sendfb.go:618 / retry.go:228
+// calls HasSession OUTSIDE any WithCachedSessions scope — missing the dirty-
+// set here caused ErrNoSession / WhatsApp 479 (the 17.13 read-gap class).
 //
-// Copy discipline (Phase 17.5 FIX CR-06):
+// # Delete coherence (17.5 data-loss path T-35.2-09-04 re-audit)
 //
-//   - PutSession stores a copy of the caller's slice in the cache. The
-//     caller is free to reuse / mutate its buffer after PutSession returns.
-//   - GetSession returns a copy of the cached slice. The caller is free to
-//     mutate the returned slice without corrupting the cache.
-//   - GetManySessions returns a map whose values are copies of the cached
-//     slices (mirroring the per-key Get behaviour).
-//   - Nil values are NEVER cached (Pitfall 5). An inner store that returns
-//     (nil, nil) for an absent address must hit inner on every Get; caching
-//     nil would silently mask a later PutSession for the same address.
+// DeleteSession and DeleteAllSessions call flusher.Remove (or a per-address
+// Remove sweep) to drop matching dirty entries AND still write the delete
+// through to the inner store synchronously. Deletes are NOT deferred. This
+// prevents the Phase-17.5 timer-vs-Delete race (a deferred delete racing a
+// buffered re-add would resurrect a deleted session).
 //
-// Bulk-mutation key scoping (Phase 24: O(K) secondary-index lookup):
+// # Phase-17.5 data-loss paths re-audit (W2)
 //
-//   - DeleteAllSessions(phone): looks up matching entries in the secondary
-//     index for (jid, phone) and removes them via O(K) SnapshotKeys lookup
-//     (matching the SQL `their_id >= phone||':' AND their_id < phone||';'`
-//     predicate from deleteAllSessionsQuery in store.go). Other wrappers'
-//     entries in the shared LRU are left untouched — the index is (jid,
-//     phone)-scoped so cross-wrapper isolation is preserved by construction.
+// The six BLOCKER-class paths from the 17.5 review are addressed as follows:
 //
-//   - MigratePNToLID(pn, lid): inner.MigratePNToLID FIRST; on success,
-//     looks up matching entries via O(K) SnapshotKeys on (jid,
-//     pn.SignalAddressUser()) and EVICTS them. The inner SQL row has already
-//     been migrated to the LID address; reads under the new LID address will
-//     cache-miss, fetch from inner, and repopulate the cache with the LID key
-//     on first access. Cache keys store the libsignal-format address
-//     (`<SignalAddressUser>:<device>`, e.g. `"12345:0"`), NOT the full JID
-//     form (`"12345@s.whatsapp.net"`).
+//  1. Timer-vs-Delete race: deletes stay synchronous-through-inner-plus-Remove,
+//     so no buffered write can persist after a delete completes.
+//  2. "Clear state before inner write" inversion: the flusher snapshots-then-writes
+//     and only clears the dirty entry on a confirmed drain — never clears state
+//     before the DB write lands.
+//  3. Ack-before-flush: acked by Drain-on-Stop (closeSignalCaches calls
+//     flusher.Stop which calls Drain synchronously before DB closes).
+//  4. Read-drop on LRU eviction: the Peek path covers LRU-evicted dirty entries
+//     on EVERY reader (Get/GetMany/HasSession).
+//  5. Double-write / write-through alongside flusher: inner.Put* is reachable
+//     ONLY on the nil-flusher fallback branch (no double-write).
+//  6. Cross-wrapper LRU pollution on DeleteAllSessions: unchanged — the O(K)
+//     secondary-index scope still restricts evictions to (jid, phone).
 //
-// Single-writer assumption: every mutation to whatsmeow_sessions for this
-// device's JID MUST go through this wrapper. Out-of-band mutations to the
-// underlying SQL table cannot be observed by the cache and will produce
-// stale reads until the cache entry naturally evicts.
-// (WR-04 closure: re-audited 17.5.1-02, no code change needed.)
+// # Write-through fallback (nil flusher)
+//
+// When no flusher is set (flusher == nil), PutSession / PutManySessions
+// fall through to the original strict write-through path (inner.Put* first,
+// then cache.Add). This preserves backward compatibility for test contexts
+// and any code path that constructs a CachedSessionStore without wiring a
+// flusher.
+//
+// # Copy discipline (Phase 17.5 FIX CR-06 — unchanged)
+//
+//   - PutSession stores a copy of the caller's slice in the cache and flusher.
+//   - GetSession returns a copy of the cached / dirty slice.
+//   - GetManySessions returns a map whose values are copies.
+//   - Nil values are NEVER cached (Pitfall 5).
+//
+// # Bulk-mutation key scoping (Phase 24: O(K) secondary-index lookup — unchanged)
+//
+//   - DeleteAllSessions(phone): O(K) secondary-index SnapshotKeys lookup.
+//   - MigratePNToLID(pn, lid): inner first, then O(K) eviction of PN-keyed entries.
+//
+// # Single-writer assumption (unchanged)
+//
+// Every mutation to whatsmeow_sessions for this device's JID MUST go through
+// this wrapper. Out-of-band mutations cannot be observed by the cache.
 type CachedSessionStore struct {
-	inner store.SessionStore
-	jid   string
-	cache *lru.Cache[string, []byte]
+	inner   store.SessionStore
+	jid     string
+	cache   *lru.Cache[string, []byte]
+	flusher *SessionFlusher // nil = write-through fallback (Phase 35.2-09)
 
 	hits, misses, evictions uint64
 
@@ -110,6 +125,14 @@ func NewCachedSessionStore(inner store.SessionStore, jid string, cache *lru.Cach
 		explicitRemoves: explicitRemoves,
 		secondaryIndex:  secondaryIndex,
 	}
+}
+
+// SetFlusher attaches the write-back flusher. Called by cache_wiring.go after
+// wireSignalCaches constructs the per-JID SessionFlusher. Must be called
+// before any PutSession calls in production; nil is safe (write-through
+// fallback preserved for backward compat).
+func (c *CachedSessionStore) SetFlusher(f *SessionFlusher) {
+	c.flusher = f
 }
 
 func (c *CachedSessionStore) key(address string) string {
@@ -144,6 +167,18 @@ func (c *CachedSessionStore) GetSession(ctx context.Context, address string) ([]
 		return copyBytes(v), nil
 	}
 	atomic.AddUint64(&c.misses, 1)
+	// Phase 35.2-09: consult the flusher dirty-set before the inner read.
+	// A dirty-but-unflushed entry (including one evicted from the LRU by
+	// capacity pressure) must be readable here — failing to do so reproduces
+	// the 17.13 read-gap class (ContainsSession false -> ErrNoSession -> 479).
+	if c.flusher != nil {
+		if blob, ok := c.flusher.Peek(address); ok {
+			// Repopulate the LRU so repeated reads hit the cache.
+			c.cache.Add(k, copyBytes(blob))
+			c.secondaryIndex.Insert(c.jid, addressUser(address), k)
+			return blob, nil // blob is already a copy from Peek
+		}
+	}
 	v, err := c.inner.GetSession(ctx, address)
 	if err != nil {
 		return nil, err
@@ -173,6 +208,17 @@ func (c *CachedSessionStore) HasSession(ctx context.Context, address string) (bo
 		return true, nil
 	}
 	atomic.AddUint64(&c.misses, 1)
+	// Phase 35.2-09: consult the flusher dirty-set BEFORE the inner read.
+	// ContainsSession calls this at send.go:1398 / sendfb.go:618 /
+	// retry.go:228 OUTSIDE any WithCachedSessions scope. If the session for
+	// this address was written via PutSession but not yet flushed AND was
+	// evicted from the LRU, a false result here causes ErrNoSession ->
+	// WhatsApp 479 (the 17.13 read-gap class). flusher.Peek covers this gap.
+	if c.flusher != nil {
+		if _, ok := c.flusher.Peek(address); ok {
+			return true, nil
+		}
+	}
 	// Intentionally do NOT cache the boolean result. The cache only stores
 	// session payloads, populated by PutSession / GetSession. Caching a
 	// "true" sentinel would have no payload to serve from and caching a
@@ -195,7 +241,29 @@ func (c *CachedSessionStore) GetManySessions(ctx context.Context, addresses []st
 	if len(misses) == 0 {
 		return result, nil
 	}
-	fetched, err := c.inner.GetManySessions(ctx, misses)
+	// Phase 35.2-09: on LRU miss, consult the flusher dirty-set before the
+	// inner read. Same read-coherence requirement as GetSession / HasSession:
+	// WithCachedSessions prefetch (GetManySessions) must see dirty-but-unflushed
+	// AND LRU-evicted sessions so sends don't hit ErrNoSession.
+	var innerMisses []string
+	if c.flusher != nil {
+		for _, addr := range misses {
+			if blob, ok := c.flusher.Peek(addr); ok {
+				k := c.key(addr)
+				c.cache.Add(k, copyBytes(blob))
+				c.secondaryIndex.Insert(c.jid, addressUser(addr), k)
+				result[addr] = blob // blob is already a copy from Peek
+			} else {
+				innerMisses = append(innerMisses, addr)
+			}
+		}
+	} else {
+		innerMisses = misses
+	}
+	if len(innerMisses) == 0 {
+		return result, nil
+	}
+	fetched, err := c.inner.GetManySessions(ctx, innerMisses)
 	if err != nil {
 		return nil, err
 	}
@@ -218,13 +286,29 @@ func (c *CachedSessionStore) GetManySessions(ctx context.Context, addresses []st
 }
 
 // ---------------------------------------------------------------------------
-// store.SessionStore — write methods (strict write-through)
+// store.SessionStore — write methods
 // ---------------------------------------------------------------------------
 
-// PutSession writes synchronously through to the inner store, then mirrors
-// the value into the cache on success. Caller may reuse the session buffer
-// after this call returns; the cache stores its own copy.
+// PutSession enqueues the session into the per-JID flusher (write-back) when
+// the flusher is set, mirroring the blob into the LRU for read hits. When no
+// flusher is set, falls back to strict write-through (inner first, then cache).
+//
+// Phase 35.2-09: on the flusher-set path, inner.PutSession is NOT called here
+// (zero double-write, W3). The flusher drains to DB asynchronously. Caller
+// may reuse the session buffer after this call returns; both the cache and the
+// flusher store their own copies.
 func (c *CachedSessionStore) PutSession(ctx context.Context, address string, session []byte) error {
+	if c.flusher != nil {
+		// Write-back path: enqueue into flusher, mirror into LRU for read hits.
+		// No inner.PutSession call (zero double-write — inner.Put* is only on
+		// the nil-flusher fallback branch below).
+		c.flusher.Enqueue(address, session)
+		k := c.key(address)
+		c.cache.Add(k, copyBytes(session))
+		c.secondaryIndex.Insert(c.jid, addressUser(address), k)
+		return nil
+	}
+	// Nil-flusher fallback: strict write-through (original behavior).
 	if err := c.inner.PutSession(ctx, address, session); err != nil {
 		return err
 	}
@@ -236,9 +320,25 @@ func (c *CachedSessionStore) PutSession(ctx context.Context, address string, ses
 	return nil
 }
 
-// PutManySessions writes through to inner.PutManySessions and then populates
-// the cache with copies of every value on success.
+// PutManySessions enqueues every session into the per-JID flusher (write-back)
+// when the flusher is set, mirroring each blob into the LRU. When no flusher
+// is set, falls back to strict write-through.
+//
+// Phase 35.2-09: on the flusher-set path, inner.PutManySessions is NOT called
+// here (zero double-write, W3). This covers write path #2 (PutCachedSessions
+// at end-of-batch send flush via store/sessioncache.go).
 func (c *CachedSessionStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
+	if c.flusher != nil {
+		// Write-back path: enqueue each address into the flusher, mirror into LRU.
+		for addr, v := range sessions {
+			c.flusher.Enqueue(addr, v)
+			k := c.key(addr)
+			c.cache.Add(k, copyBytes(v))
+			c.secondaryIndex.Insert(c.jid, addressUser(addr), k)
+		}
+		return nil
+	}
+	// Nil-flusher fallback: strict write-through (original behavior).
 	if err := c.inner.PutManySessions(ctx, sessions); err != nil {
 		return err
 	}
@@ -252,10 +352,17 @@ func (c *CachedSessionStore) PutManySessions(ctx context.Context, sessions map[s
 }
 
 // DeleteSession writes through to inner and (on success) removes the cache
-// entry for this address.
+// entry for this address. Also drops any dirty flusher entry so a buffered
+// blob cannot resurrect a deleted session (Phase 35.2-09 T-35.2-09-04,
+// re-audit of the 17.5 timer-vs-Delete race; deletes stay synchronous).
 func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) error {
 	if err := c.inner.DeleteSession(ctx, address); err != nil {
 		return err
+	}
+	// Phase 35.2-09: drop any dirty flusher entry for this address so a
+	// buffered blob cannot resurrect the session after deletion.
+	if c.flusher != nil {
+		c.flusher.Remove(address)
 	}
 	// kavtov-fork: Phase 17.5.2 - pre-increment explicit-remove counter (see Plan 17.5.2-03)
 	atomic.AddUint64(c.explicitRemoves, 1)
@@ -288,6 +395,26 @@ func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) 
 func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string) error {
 	if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
 		return err
+	}
+	// Phase 35.2-09: drop dirty flusher entries whose address starts with
+	// phone+":" so buffered blobs cannot resurrect deleted sessions. The
+	// flusher dirty-set key is the raw address (no jid prefix) so we must
+	// iterate dirty keys and Remove matching ones. This is the per-JID flusher
+	// so no cross-JID contamination risk.
+	if c.flusher != nil {
+		pfx := phone + ":"
+		// Snapshot dirty addresses under the flusher mutex, then remove outside.
+		var toRemove []string
+		c.flusher.mu.Lock()
+		for addr := range c.flusher.dirty {
+			if len(addr) >= len(pfx) && addr[:len(pfx)] == pfx {
+				toRemove = append(toRemove, addr)
+			}
+		}
+		c.flusher.mu.Unlock()
+		for _, addr := range toRemove {
+			c.flusher.Remove(addr)
+		}
 	}
 	// Phase 24: single O(K) lookup instead of O(N) cache.Keys() scan.
 	// SnapshotKeys acquires a read lock, copies the bucket, and releases

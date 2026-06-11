@@ -352,18 +352,17 @@ func TestSessionFlusher_PeekReturnsCopy(t *testing.T) {
 
 func TestSessionFlusher_StopDrainsAll(t *testing.T) {
 	store := newMockFlushSessionStore()
-	f := newSessionFlusherForTest(store, 1000, 5*time.Second) // long T so ticker doesn't fire
+	f := newSessionFlusherForTest(store, 1000, 5*time.Second) // long T so ticker doesn't fire spontaneously
 	f.Start()
 
 	const n = 10
 	for i := 0; i < n; i++ {
 		f.Enqueue("drain-addr"+string(rune('a'+i))+":0", []byte("v"))
 	}
-	if dc := f.DirtyCount(); dc != n {
-		t.Fatalf("DirtyCount before Stop = %d, want %d", dc, n)
-	}
+	// With N=1 default and Start() running, some entries may have already
+	// drained. We only assert that after Stop(), ALL entries are written.
 
-	// Stop must drain synchronously.
+	// Stop must drain synchronously before returning.
 	done := make(chan struct{})
 	go func() {
 		f.Stop()

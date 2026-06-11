@@ -71,9 +71,11 @@ func newTestCachedSessionStoreWithFlusher(t *testing.T, capSize int) (
 	var dummyExplicitRemoves uint64
 	wrapper := NewCachedSessionStore(inner, "test-jid", sessionCache, &dummyExplicitRemoves, idx)
 
-	flusher := newSessionFlusherForTest(flushBacking, 1000, 5_000_000_000 /* 5000s: ticker never fires in tests */)
-	flusher.Start()
-	t.Cleanup(flusher.Stop)
+	// Do NOT Start() the flusher here — the goroutine racing with assertions
+	// would make dirty-count checks racy. Tests use Drain() for synchronous
+	// draining; TestCachedSession_DrainFlushesAll calls Stop() explicitly.
+	flusher := newSessionFlusherForTest(flushBacking, 1000, 5_000_000_000 /* 5000s: ticker irrelevant without Start */)
+	t.Cleanup(flusher.Drain) // Drain is safe to call when not started
 
 	wrapper.SetFlusher(flusher)
 	return wrapper, inner, flushBacking, flusher, sessionCache

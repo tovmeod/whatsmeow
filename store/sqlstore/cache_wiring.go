@@ -422,6 +422,15 @@ type signalCaches struct {
 	senderKeyFlushersMu sync.RWMutex
 	senderKeyFlusherMap map[string]*SenderKeyFlusher // key: JID string
 
+	// Phase 35.2-09: per-device write-back flushers for whatsmeow_sessions.
+	// Same singleton-reuse lifecycle as senderKeyFlusherMap — attachCachedStores
+	// re-runs on every Device.Save; the flusher must be reused, not recreated,
+	// to avoid leaking a ticking goroutine (the 6963-goroutine-leak class).
+	// Stopped (with synchronous Drain) by closeSignalCaches alongside the
+	// sender-key flushers.
+	sessionFlushersMu  sync.RWMutex
+	sessionFlusherMap  map[string]*SessionFlusher // key: JID string
+
 	// Phase 17.5.1 WR-01: cancellable ctx for emitMetricsLoop. Cancelled
 	// by Container.Close() (via closeSignalCaches) so the metrics
 	// goroutine cleanly exits and does not race with logger teardown
@@ -459,6 +468,8 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 	// Phase 17.7-03: initialize the JID→flusher map before constructing the
 	// SenderKey LRU so the eviction callback can safely read from it.
 	c.caches.senderKeyFlusherMap = make(map[string]*SenderKeyFlusher)
+	// Phase 35.2-09: initialize the session flusher map.
+	c.caches.sessionFlusherMap = make(map[string]*SessionFlusher)
 
 	c.caches.Session, err = lru.NewWithEvict[string, []byte](signalSessionCacheCap, func(key string, _ []byte) {
 		atomic.AddUint64(&c.caches.SessionCapacityEvictions, 1)
@@ -557,7 +568,20 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 // this window.
 func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore) {
 	jid := device.ID.String()
-	device.Sessions = NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
+	sessionStore := NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
+	// Phase 35.2-09: per-device session flusher, same singleton-reuse pattern as
+	// senderKeyFlusherMap (check-then-create under mutex so concurrent Device.Save
+	// calls for the same JID can't both create a flusher).
+	c.caches.sessionFlushersMu.Lock()
+	sessionFlusher, sessionFlusherExists := c.caches.sessionFlusherMap[jid]
+	if !sessionFlusherExists {
+		sessionFlusher = NewSessionFlusher(innerStore, c.log, 0)
+		c.caches.sessionFlusherMap[jid] = sessionFlusher
+		sessionFlusher.Start()
+	}
+	c.caches.sessionFlushersMu.Unlock()
+	sessionStore.SetFlusher(sessionFlusher)
+	device.Sessions = sessionStore
 	device.Identities = NewCachedIdentityStore(innerStore, jid, c.caches.Identity, &c.caches.IdentityExplicitRemoves, c.caches.IdentityIndex)
 
 	// Phase 17.7-03: per-device write-back flusher, registered with the Container
@@ -634,13 +658,21 @@ func closeSignalCaches(c *Container) {
 	if c.caches.metricsCancel != nil {
 		c.caches.metricsCancel()
 	}
-	// Phase 17.7-03: stop all per-device flushers. Each Stop() closes the
-	// async goroutine and then calls Drain() synchronously, ensuring all
-	// dirty entries are written before the DB connection closes.
+	// Phase 17.7-03: stop all per-device sender-key flushers. Each Stop()
+	// closes the async goroutine and then calls Drain() synchronously,
+	// ensuring all dirty entries are written before the DB connection closes.
 	c.caches.senderKeyFlushersMu.Lock()
 	flusherMap := c.caches.senderKeyFlusherMap
 	c.caches.senderKeyFlushersMu.Unlock()
 	for _, f := range flusherMap {
+		f.Stop()
+	}
+	// Phase 35.2-09: stop all per-device session flushers synchronously so
+	// buffered sessions reach the DB before the connection closes.
+	c.caches.sessionFlushersMu.Lock()
+	sessionFlusherMap := c.caches.sessionFlusherMap
+	c.caches.sessionFlushersMu.Unlock()
+	for _, f := range sessionFlusherMap {
 		f.Stop()
 	}
 }
