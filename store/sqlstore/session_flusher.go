@@ -43,6 +43,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,6 +86,14 @@ type SessionFlusher struct {
 
 	mu    sync.Mutex
 	dirty map[string]*sessionDirtyEntry // key = address (no jid prefix; flusher is per-JID)
+
+	// flushMu serializes every snapshot→DB-write→clear flush cycle (runFlush,
+	// each Drain iteration, flushOneSynchronous) against deletes (CR-01).
+	// DeleteSession / DeleteAllSessions / MigratePNToLID run their inner DB
+	// mutation inside WithFlushBlocked so an in-flight flush snapshot cannot
+	// re-upsert a row after the delete lands. Lock order: flushMu strictly
+	// before mu — never acquire flushMu while holding mu.
+	flushMu sync.Mutex
 
 	flushCh chan struct{}
 	stopCh  chan struct{}
@@ -216,16 +225,58 @@ func (f *SessionFlusher) Peek(address string) ([]byte, bool) {
 
 // Remove drops the dirty entry for address, preventing a stale buffered blob
 // from persisting after a DeleteSession. No-op if address is not dirty.
+// Only takes f.mu — safe to call from inside WithFlushBlocked.
 func (f *SessionFlusher) Remove(address string) {
 	f.mu.Lock()
 	delete(f.dirty, address)
 	f.mu.Unlock()
 }
 
+// RemovePrefix drops every dirty entry whose address starts with prefix.
+// Used by DeleteAllSessions (inside WithFlushBlocked) so buffered blobs
+// cannot resurrect bulk-deleted sessions. Only takes f.mu — safe to call
+// from inside WithFlushBlocked.
+func (f *SessionFlusher) RemovePrefix(prefix string) {
+	f.mu.Lock()
+	for addr := range f.dirty {
+		if strings.HasPrefix(addr, prefix) {
+			delete(f.dirty, addr)
+		}
+	}
+	f.mu.Unlock()
+}
+
+// WithFlushBlocked runs fn while no flush cycle (async batch, shutdown-drain
+// iteration, or inline backpressure write) is in flight. Callers performing
+// DB deletes (DeleteSession / DeleteAllSessions / MigratePNToLID) MUST run
+// the inner DB mutation AND the matching dirty-set removal inside fn —
+// otherwise a flush snapshot taken before the delete can re-upsert the
+// deleted row after the delete completes (CR-01 delete-resurrection race).
+//
+// fn must not call WithFlushBlocked, Drain, Stop, or Enqueue (whose inline
+// backpressure path re-takes flushMu); Remove and RemovePrefix are safe
+// (they only take f.mu).
+func (f *SessionFlusher) WithFlushBlocked(fn func() error) error {
+	f.flushMu.Lock()
+	defer f.flushMu.Unlock()
+	return fn()
+}
+
 // flushOneSynchronous performs a single-address synchronous write on the
 // backpressure path. Clears the dirty entry on success.
 // Must NOT be called while f.mu is held.
 func (f *SessionFlusher) flushOneSynchronous(address string, blob []byte) {
+	// CR-01: serialize against deletes and batch flush cycles. If a delete
+	// completed while we waited for flushMu, the dirty entry is gone — skip
+	// the write entirely so the deleted row is not resurrected.
+	f.flushMu.Lock()
+	defer f.flushMu.Unlock()
+	f.mu.Lock()
+	_, stillDirty := f.dirty[address]
+	f.mu.Unlock()
+	if !stillDirty {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	err := f.db.PutManySessions(ctx, map[string][]byte{address: blob})
@@ -260,9 +311,14 @@ func (f *SessionFlusher) dropColdestLocked() {
 // failure. Blocks until the dirty-set is empty. Called during Stop().
 func (f *SessionFlusher) Drain() {
 	for {
+		// CR-01: hold flushMu across this iteration's snapshot→DB-write→clear
+		// so a concurrent delete cannot complete inside the window and then
+		// have its row re-upserted by this batch.
+		f.flushMu.Lock()
 		f.mu.Lock()
 		if len(f.dirty) == 0 {
 			f.mu.Unlock()
+			f.flushMu.Unlock()
 			return
 		}
 		// Snapshot under lock; release before calling DB.
@@ -279,6 +335,7 @@ func (f *SessionFlusher) Drain() {
 		cancel()
 
 		if err != nil {
+			f.flushMu.Unlock()
 			f.log.Errorf("SessionFlusher Drain batch failed (%d rows): %v — retrying", len(batch), err)
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -293,6 +350,7 @@ func (f *SessionFlusher) Drain() {
 		}
 		drained := len(addrs)
 		f.mu.Unlock()
+		f.flushMu.Unlock()
 
 		f.log.Infof("SessionFlusher: drained %d on shutdown", drained)
 		return
@@ -302,6 +360,11 @@ func (f *SessionFlusher) Drain() {
 // runFlush drains the dirty-set once. Called from the async goroutine.
 // A failed batch retains dirty state (retried next cycle). Does NOT retry.
 func (f *SessionFlusher) runFlush() {
+	// CR-01: hold flushMu across snapshot→DB-write→clear so a concurrent
+	// delete (running inside WithFlushBlocked) cannot complete inside the
+	// window and then have its row re-upserted by this batch.
+	f.flushMu.Lock()
+	defer f.flushMu.Unlock()
 	f.mu.Lock()
 	if len(f.dirty) == 0 {
 		f.mu.Unlock()

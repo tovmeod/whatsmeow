@@ -25,6 +25,7 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 )
@@ -57,7 +58,19 @@ func newTestCachedSessionStoreWithFlusher(t *testing.T, capSize int) (
 	t.Helper()
 	inner := newFakeSessionStore()
 	flushBacking := &countingFlushStore{backing: inner}
+	wrapper, flusher, sessionCache := newTestCachedSessionStoreWiring(t, capSize, flushBacking, inner)
+	return wrapper, inner, flushBacking, flusher, sessionCache
+}
 
+// newTestCachedSessionStoreWiring is the lower-level wiring helper: it accepts
+// an arbitrary flushSessionBatch (e.g. blockingFlushSessionStore for the CR-01
+// interleaving tests) and the inner fakeSessionStore the wrapper delegates to.
+func newTestCachedSessionStoreWiring(t *testing.T, capSize int, flushBacking flushSessionBatch, inner *fakeSessionStore) (
+	*CachedSessionStore,
+	*SessionFlusher,
+	*lru.Cache[string, []byte],
+) {
+	t.Helper()
 	idx := newSessionSecondaryIndex()
 	sessionCache, err := lru.NewWithEvict[string, []byte](capSize, func(key string, _ []byte) {
 		if jid, phone, ok := parseCacheKey(key); ok {
@@ -74,11 +87,11 @@ func newTestCachedSessionStoreWithFlusher(t *testing.T, capSize int) (
 	// Do NOT Start() the flusher here — the goroutine racing with assertions
 	// would make dirty-count checks racy. Tests use Drain() for synchronous
 	// draining; TestCachedSession_DrainFlushesAll calls Stop() explicitly.
-	flusher := newSessionFlusherForTest(flushBacking, 1000, 5_000_000_000 /* 5000s: ticker irrelevant without Start */)
+	flusher := newSessionFlusherForTest(flushBacking, 1000, 5000*time.Second /* ticker irrelevant without Start */)
 	t.Cleanup(flusher.Drain) // Drain is safe to call when not started
 
 	wrapper.SetFlusher(flusher)
-	return wrapper, inner, flushBacking, flusher, sessionCache
+	return wrapper, flusher, sessionCache
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +358,127 @@ func TestCachedSession_DrainFlushesAll(t *testing.T) {
 		if !bytes.Equal(got, want) {
 			t.Errorf("inner[%s] = %q, want %q", addr, got, want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestCachedSession_CR01_DeleteSessionNotResurrectedByInflightFlush
+// CR-01 regression: a DeleteSession completing while a flush batch is in
+// flight (snapshotted but not yet written) must NOT have its row re-upserted
+// by that batch. The blockingFlushSessionStore holds the flush open between
+// snapshot and DB-write apply; the delete is issued inside that window.
+// ---------------------------------------------------------------------------
+
+func TestCachedSession_CR01_DeleteSessionNotResurrectedByInflightFlush(t *testing.T) {
+	ctx := context.Background()
+	inner := newFakeSessionStore()
+	blocking := newBlockingFlushSessionStore(inner)
+	c, flusher, _ := newTestCachedSessionStoreWiring(t, 100, blocking, inner)
+
+	if err := c.PutSession(ctx, "cr01-addr:0", []byte("doomed")); err != nil {
+		t.Fatalf("PutSession: %v", err)
+	}
+
+	flushDone := make(chan struct{})
+	go func() {
+		flusher.runFlush()
+		close(flushDone)
+	}()
+	<-blocking.writeStarted // flush has snapshotted the dirty-set and is mid-DB-write
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- c.DeleteSession(ctx, "cr01-addr:0")
+	}()
+
+	// With the CR-01 fix the delete is serialized behind the in-flight flush
+	// (blocks on flushMu); without it the delete completes inside the open
+	// window and the released batch resurrects the row. The select only
+	// sequences the release — the final-state assertions below are the actual
+	// check, deterministic on both the fixed and the broken interleaving.
+	select {
+	case err := <-deleteDone:
+		// Pre-fix interleaving: delete won the race while the flush was paused.
+		if err != nil {
+			t.Fatalf("DeleteSession: %v", err)
+		}
+		close(blocking.writeRelease)
+		<-flushDone
+	case <-time.After(200 * time.Millisecond):
+		// Fixed behavior: delete is blocked behind the in-flight flush cycle.
+		close(blocking.writeRelease)
+		<-flushDone
+		if err := <-deleteDone; err != nil {
+			t.Fatalf("DeleteSession: %v", err)
+		}
+	}
+
+	if has, err := inner.HasSession(ctx, "cr01-addr:0"); err != nil {
+		t.Fatalf("inner.HasSession: %v", err)
+	} else if has {
+		t.Fatal("deleted session resurrected in inner store by in-flight flush batch (CR-01)")
+	}
+	if _, ok := flusher.Peek("cr01-addr:0"); ok {
+		t.Fatal("dirty entry survived DeleteSession (CR-01)")
+	}
+	flusher.Drain()
+	if has, _ := inner.HasSession(ctx, "cr01-addr:0"); has {
+		t.Fatal("deleted session resurrected by post-delete Drain (CR-01)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestCachedSession_CR01_DeleteAllSessionsNotResurrectedByInflightFlush
+// Same race as above for the DeleteAllSessions sweep path (identity change →
+// DeleteAllSessions is live in prod at notification.go:59).
+// ---------------------------------------------------------------------------
+
+func TestCachedSession_CR01_DeleteAllSessionsNotResurrectedByInflightFlush(t *testing.T) {
+	ctx := context.Background()
+	inner := newFakeSessionStore()
+	blocking := newBlockingFlushSessionStore(inner)
+	c, flusher, _ := newTestCachedSessionStoreWiring(t, 100, blocking, inner)
+
+	if err := c.PutSession(ctx, "cr01b:0", []byte("doomed-all")); err != nil {
+		t.Fatalf("PutSession: %v", err)
+	}
+
+	flushDone := make(chan struct{})
+	go func() {
+		flusher.runFlush()
+		close(flushDone)
+	}()
+	<-blocking.writeStarted
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- c.DeleteAllSessions(ctx, "cr01b")
+	}()
+
+	select {
+	case err := <-deleteDone:
+		if err != nil {
+			t.Fatalf("DeleteAllSessions: %v", err)
+		}
+		close(blocking.writeRelease)
+		<-flushDone
+	case <-time.After(200 * time.Millisecond):
+		close(blocking.writeRelease)
+		<-flushDone
+		if err := <-deleteDone; err != nil {
+			t.Fatalf("DeleteAllSessions: %v", err)
+		}
+	}
+
+	if has, _ := inner.HasSession(ctx, "cr01b:0"); has {
+		t.Fatal("bulk-deleted session resurrected in inner store by in-flight flush batch (CR-01)")
+	}
+	if _, ok := flusher.Peek("cr01b:0"); ok {
+		t.Fatal("dirty entry survived DeleteAllSessions sweep (CR-01)")
+	}
+	flusher.Drain()
+	if has, _ := inner.HasSession(ctx, "cr01b:0"); has {
+		t.Fatal("bulk-deleted session resurrected by post-delete Drain (CR-01)")
 	}
 }
 

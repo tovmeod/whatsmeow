@@ -80,6 +80,39 @@ func (m *mockFlushSessionStore) getSession(addr string) ([]byte, bool) {
 }
 
 // ---------------------------------------------------------------------------
+// blockingFlushSessionStore wraps any flushSessionBatch and blocks the FIRST
+// PutManySessions call between "write started" and "write released". This is
+// the deterministic interleaving hook the CR-01/CR-02/CR-03/WR-01 regression
+// tests use to hold a flush cycle open between its dirty-set snapshot and the
+// DB-write apply, without sleeps.
+// ---------------------------------------------------------------------------
+
+type blockingFlushSessionStore struct {
+	inner        flushSessionBatch
+	blockNext    atomic.Bool
+	writeStarted chan struct{}
+	writeRelease chan struct{}
+}
+
+func newBlockingFlushSessionStore(inner flushSessionBatch) *blockingFlushSessionStore {
+	b := &blockingFlushSessionStore{
+		inner:        inner,
+		writeStarted: make(chan struct{}),
+		writeRelease: make(chan struct{}),
+	}
+	b.blockNext.Store(true)
+	return b
+}
+
+func (b *blockingFlushSessionStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
+	if b.blockNext.CompareAndSwap(true, false) {
+		close(b.writeStarted)
+		<-b.writeRelease
+	}
+	return b.inner.PutManySessions(ctx, sessions)
+}
+
+// ---------------------------------------------------------------------------
 // newTestSessionFlusher builds a SessionFlusher with a small cap for test
 // isolation and a short injectable flush interval.
 // ---------------------------------------------------------------------------

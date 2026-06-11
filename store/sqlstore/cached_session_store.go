@@ -41,20 +41,24 @@ import (
 // calls HasSession OUTSIDE any WithCachedSessions scope — missing the dirty-
 // set here caused ErrNoSession / WhatsApp 479 (the 17.13 read-gap class).
 //
-// # Delete coherence (17.5 data-loss path T-35.2-09-04 re-audit)
+// # Delete coherence (17.5 data-loss path T-35.2-09-04 re-audit + CR-01)
 //
-// DeleteSession and DeleteAllSessions call flusher.Remove (or a per-address
-// Remove sweep) to drop matching dirty entries AND still write the delete
-// through to the inner store synchronously. Deletes are NOT deferred. This
-// prevents the Phase-17.5 timer-vs-Delete race (a deferred delete racing a
-// buffered re-add would resurrect a deleted session).
+// DeleteSession and DeleteAllSessions run the synchronous inner delete AND
+// the matching dirty-entry removal inside flusher.WithFlushBlocked, which
+// serializes them against every in-flight flush cycle (async batch, shutdown
+// drain, inline backpressure write). Deletes are NOT deferred. This prevents
+// both the Phase-17.5 timer-vs-Delete race (a deferred delete racing a
+// buffered re-add) and the CR-01 snapshot race (a flush batch snapshotted
+// BEFORE the delete re-upserting the row AFTER the delete completes).
 //
 // # Phase-17.5 data-loss paths re-audit (W2)
 //
 // The six BLOCKER-class paths from the 17.5 review are addressed as follows:
 //
-//  1. Timer-vs-Delete race: deletes stay synchronous-through-inner-plus-Remove,
-//     so no buffered write can persist after a delete completes.
+//  1. Timer-vs-Delete race: deletes stay synchronous-through-inner-plus-Remove
+//     AND run inside WithFlushBlocked (CR-01), so no buffered write — including
+//     an already-snapshotted in-flight batch — can persist after a delete
+//     completes.
 //  2. "Clear state before inner write" inversion: the flusher snapshots-then-writes
 //     and only clears the dirty entry on a confirmed drain — never clears state
 //     before the DB write lands.
@@ -356,13 +360,25 @@ func (c *CachedSessionStore) PutManySessions(ctx context.Context, sessions map[s
 // blob cannot resurrect a deleted session (Phase 35.2-09 T-35.2-09-04,
 // re-audit of the 17.5 timer-vs-Delete race; deletes stay synchronous).
 func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) error {
-	if err := c.inner.DeleteSession(ctx, address); err != nil {
-		return err
-	}
-	// Phase 35.2-09: drop any dirty flusher entry for this address so a
-	// buffered blob cannot resurrect the session after deletion.
+	// Phase 35.2-09 CR-01: the inner DB delete AND the dirty-entry removal
+	// must both run while flushes are blocked. An in-flight flush snapshots
+	// the dirty-set, releases the flusher mutex, and then writes the batch —
+	// without the flush-blocked section a delete completing inside that
+	// window would have its row re-upserted (resurrected) by the in-flight
+	// batch. Deletes are a security/correctness action (identity change,
+	// corrupt session); resurrection is a crypto-store integrity violation.
 	if c.flusher != nil {
-		c.flusher.Remove(address)
+		if err := c.flusher.WithFlushBlocked(func() error {
+			if err := c.inner.DeleteSession(ctx, address); err != nil {
+				return err
+			}
+			c.flusher.Remove(address)
+			return nil
+		}); err != nil {
+			return err
+		}
+	} else if err := c.inner.DeleteSession(ctx, address); err != nil {
+		return err
 	}
 	// kavtov-fork: Phase 17.5.2 - pre-increment explicit-remove counter (see Plan 17.5.2-03)
 	atomic.AddUint64(c.explicitRemoves, 1)
@@ -393,28 +409,24 @@ func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) 
 // the index is (jid, phone)-scoped, so SnapshotKeys never returns keys
 // belonging to other wrappers.
 func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string) error {
-	if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
-		return err
-	}
-	// Phase 35.2-09: drop dirty flusher entries whose address starts with
-	// phone+":" so buffered blobs cannot resurrect deleted sessions. The
-	// flusher dirty-set key is the raw address (no jid prefix) so we must
-	// iterate dirty keys and Remove matching ones. This is the per-JID flusher
-	// so no cross-JID contamination risk.
+	// Phase 35.2-09 CR-01: inner DB delete + dirty-set prefix sweep both run
+	// while flushes are blocked, so an in-flight flush snapshot cannot
+	// re-upsert deleted rows after the delete completes (same resurrection
+	// race as DeleteSession above). The flusher dirty-set key is the raw
+	// address (no jid prefix) and the flusher is per-JID, so the phone+":"
+	// prefix sweep has no cross-JID contamination risk.
 	if c.flusher != nil {
-		pfx := phone + ":"
-		// Snapshot dirty addresses under the flusher mutex, then remove outside.
-		var toRemove []string
-		c.flusher.mu.Lock()
-		for addr := range c.flusher.dirty {
-			if len(addr) >= len(pfx) && addr[:len(pfx)] == pfx {
-				toRemove = append(toRemove, addr)
+		if err := c.flusher.WithFlushBlocked(func() error {
+			if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
+				return err
 			}
+			c.flusher.RemovePrefix(phone + ":")
+			return nil
+		}); err != nil {
+			return err
 		}
-		c.flusher.mu.Unlock()
-		for _, addr := range toRemove {
-			c.flusher.Remove(addr)
-		}
+	} else if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
+		return err
 	}
 	// Phase 24: single O(K) lookup instead of O(N) cache.Keys() scan.
 	// SnapshotKeys acquires a read lock, copies the bucket, and releases
