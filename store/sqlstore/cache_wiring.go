@@ -17,8 +17,6 @@ package sqlstore
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,24 +31,13 @@ import (
 	"go.mau.fi/whatsmeow/util/walltime"
 )
 
-// envCapOrDefault reads an integer LRU capacity from the named env var. A blank,
-// non-integer, or non-positive value falls back to the compiled default. Lets
-// the operator reduce (or raise) caps without a fork rebuild — clamps malicious
-// values to the safe default by construction.
-func envCapOrDefault(key string, fallback int) int {
-	s := os.Getenv(key)
-	if s == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil || n <= 0 {
-		return fallback
-	}
-	return n
-}
-
 // Shared LRU capacities for the signal-store caches. Resolved once at package
-// init from env vars (KAVTOV_CACHE_*_CAP) with the compiled defaults below.
+// init from env vars (KAVTOV_CACHE_*_CAP) with the compiled defaults below,
+// via the single package-level envIntOrDefault helper (flusher.go; IN-06 —
+// formerly a byte-identical envCapOrDefault copy lived here). A blank,
+// non-integer, or non-positive value falls back to the compiled default, so
+// the operator can reduce (or raise) caps without a fork rebuild and
+// malicious values clamp to the safe default by construction.
 // The original const names are kept as vars so wireSignalCaches /
 // formatCacheMetrics references stay identical.
 //
@@ -88,14 +75,14 @@ func envCapOrDefault(key string, fallback int) int {
 //	TestCacheMemoryBudget in cache_sizing_test.go.
 //	Override env vars to reduce caps without a fork rebuild.
 var (
-	signalSessionCacheCap   = envCapOrDefault("KAVTOV_CACHE_SESSION_CAP", 100_000)
-	signalIdentityCacheCap  = envCapOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 150_000)
-	signalSenderKeyCacheCap = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 500_000)
+	signalSessionCacheCap   = envIntOrDefault("KAVTOV_CACHE_SESSION_CAP", 100_000)
+	signalIdentityCacheCap  = envIntOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 150_000)
+	signalSenderKeyCacheCap = envIntOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 500_000)
 	// kavtov-fork: Phase 27 — device-set index (one small []string per
 	// jid|group|userBare).
-	signalSenderKeyDevicesCacheCap = envCapOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 300_000)
+	signalSenderKeyDevicesCacheCap = envIntOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 300_000)
 	// perf 260601-uuy: message-secret pair cache (secret + realSender).
-	signalMsgSecretCacheCap = envCapOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 300_000)
+	signalMsgSecretCacheCap = envIntOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 300_000)
 	// Phase 17.8: decoded struct-LRU for flat sender-key values.
 	//
 	// 2026-06-10 GC-storm: caee645 raised this from 500k to 1.5M; the resulting
@@ -105,7 +92,7 @@ var (
 	// Host-only drop-in (KAVTOV_CACHE_SENDERKEY_DECODED_CAP=500000) removed in
 	// Phase 35.1-02 after this default is deployed. This is the AUTHORITATIVE prod
 	// cap (wireSignalCaches builds the prod LRU from it); env-overridable.
-	signalSKParsedCacheCap = envCapOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
+	signalSKParsedCacheCap = envIntOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
 )
 
 // ---------------------------------------------------------------------------

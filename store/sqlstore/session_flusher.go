@@ -42,8 +42,6 @@ package sqlstore
 
 import (
 	"context"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -102,32 +100,18 @@ type SessionFlusher struct {
 	flushInterval time.Duration // injectable for tests; default 5s
 }
 
-// envIntOrDefaultSession reads an integer from an env var with a compiled
-// default. Separate helper so we do not shadow flusher.go's envIntOrDefault
-// in the same package (they differ only in name).
-func envIntOrDefaultSession(key string, fallback int) int {
-	s := os.Getenv(key)
-	if s == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil || n <= 0 {
-		return fallback
-	}
-	return n
-}
-
 // NewSessionFlusher constructs a SessionFlusher with prod defaults. cap=0 uses
 // the env var / compiled default. log is used for error / info logging.
+// IN-06: uses the single package-level envIntOrDefault helper (flusher.go).
 func NewSessionFlusher(db flushSessionBatch, log waLog.Logger, cap int) *SessionFlusher {
 	if cap <= 0 {
-		cap = envIntOrDefaultSession("KAVTOV_FLUSH_SESSION_CAP", 100_000)
+		cap = envIntOrDefault("KAVTOV_FLUSH_SESSION_CAP", 100_000)
 	}
-	n := uint32(envIntOrDefaultSession("KAVTOV_FLUSH_SESSION_N", 1))
+	n := uint32(envIntOrDefault("KAVTOV_FLUSH_SESSION_N", 1))
 	if n == 0 {
 		n = 1
 	}
-	tms := envIntOrDefaultSession("KAVTOV_FLUSH_SESSION_T_MS", 5000)
+	tms := envIntOrDefault("KAVTOV_FLUSH_SESSION_T_MS", 5000)
 	return &SessionFlusher{
 		log:             log,
 		db:              db,
