@@ -606,6 +606,50 @@ func TestSessionFlusher_CR03_InlineFlushDoesNotClobberNewerWrite(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestSessionFlusher_WR01_DrainLoopsUntilEmpty
+// WR-01 regression: Drain's docstring promises "blocks until the dirty-set is
+// empty", but the success path returned after the FIRST batch. Entries
+// enqueued during the final batch's DB write (and CR-02-retained newer
+// generations) were never drained — silent shutdown data loss.
+// ---------------------------------------------------------------------------
+
+func TestSessionFlusher_WR01_DrainLoopsUntilEmpty(t *testing.T) {
+	mock := newMockFlushSessionStore()
+	b := newBlockingFlushSessionStore(mock)
+	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
+
+	f.Enqueue("wr01-a:0", []byte("a-v1"))
+
+	drainDone := make(chan struct{})
+	go func() {
+		f.Drain()
+		close(drainDone)
+	}()
+	<-b.writeStarted
+	// Arrive during the final batch's in-flight DB write: a brand-new
+	// address AND a newer generation of the in-flight address.
+	f.Enqueue("wr01-b:0", []byte("b-v1"))
+	f.Enqueue("wr01-a:0", []byte("a-v2"))
+	close(b.writeRelease)
+
+	select {
+	case <-drainDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not complete within 5 seconds")
+	}
+
+	if n := f.DirtyCount(); n != 0 {
+		t.Fatalf("DirtyCount after Drain = %d, want 0 — Drain returned before the dirty-set was empty (WR-01)", n)
+	}
+	if v, ok := mock.getSession("wr01-b:0"); !ok || string(v) != "b-v1" {
+		t.Fatalf("wr01-b:0 = %q (found=%v) — entry enqueued during the final batch was never drained (WR-01)", v, ok)
+	}
+	if v, _ := mock.getSession("wr01-a:0"); string(v) != "a-v2" {
+		t.Fatalf("wr01-a:0 = %q, want a-v2 — CR-02-retained newer generation must drain on shutdown (WR-01)", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestSessionFlusher_DirtyCount
 // DirtyCount reflects the current dirty-set size correctly.
 // ---------------------------------------------------------------------------

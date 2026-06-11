@@ -408,7 +408,11 @@ func (f *SessionFlusher) Drain() {
 		f.flushMu.Unlock()
 
 		f.log.Infof("SessionFlusher: drained %d on shutdown", drained)
-		return
+		// WR-01: loop back to the empty-check instead of returning — entries
+		// enqueued during this batch's DB write (handlers are not guaranteed
+		// quiescent at shutdown) and CR-02-retained newer generations must
+		// also reach the DB before the process exits. Mirrors flusher.go's
+		// Drain loop.
 	}
 }
 
