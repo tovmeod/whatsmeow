@@ -505,6 +505,48 @@ func TestSessionFlusher_Race_ConcurrentEnqueueDrain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestSessionFlusher_CR02_EnqueueDuringInflightBatchRetained
+// CR-02 regression: an Enqueue landing between a batch's dirty-set snapshot
+// and its post-write clear must NOT be deleted by that clear — otherwise the
+// newer blob is dropped from the durable path forever (the DB holds the
+// snapshot generation; the only remaining copy would be the evictable LRU
+// mirror). The blocking store holds the batch open deterministically.
+// ---------------------------------------------------------------------------
+
+func TestSessionFlusher_CR02_EnqueueDuringInflightBatchRetained(t *testing.T) {
+	mock := newMockFlushSessionStore()
+	b := newBlockingFlushSessionStore(mock)
+	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
+
+	f.Enqueue("cr02-addr:0", []byte("v1"))
+
+	flushDone := make(chan struct{})
+	go func() {
+		f.runFlush()
+		close(flushDone)
+	}()
+	<-b.writeStarted
+	// Lands between the snapshot (which captured v1) and the post-write clear.
+	f.Enqueue("cr02-addr:0", []byte("v2"))
+	close(b.writeRelease)
+	<-flushDone
+
+	got, ok := f.Peek("cr02-addr:0")
+	if !ok {
+		t.Fatal("dirty entry deleted by batch clear despite a newer Enqueue during the in-flight write — v2 dropped from the durable path (CR-02 lost update)")
+	}
+	if string(got) != "v2" {
+		t.Fatalf("retained dirty blob = %q, want v2", got)
+	}
+
+	// The retained generation must reach the DB on the next drain.
+	f.Drain()
+	if v, _ := mock.getSession("cr02-addr:0"); string(v) != "v2" {
+		t.Fatalf("store = %q after Drain, want v2 (newer generation never persisted)", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestSessionFlusher_DirtyCount
 // DirtyCount reflects the current dirty-set size correctly.
 // ---------------------------------------------------------------------------

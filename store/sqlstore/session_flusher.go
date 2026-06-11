@@ -25,10 +25,13 @@
 // N=1 means each distinct address is flush-signalled on its FIRST Enqueue,
 // so the async goroutine drains the dirty-set approximately every 1s (the
 // ticker cadence). Same-address repeats arriving inside the in-flight drain
-// window coalesce to last-wins. The 5s ticker is a hard bound on staleness
-// for addresses that never received a second signal. The crash window is
-// therefore bounded: at most ~5s of ratchet advances in the dirty-set
-// survive a crash. See 35.2-09-CRASH-LOSS.md for the full analysis.
+// window coalesce to last-wins: the CR-02 staleness guard keeps an entry
+// dirty when a newer Enqueue landed during the batch's DB write (clearing
+// unconditionally would drop the newer blob from the durable path), so the
+// newer generation flushes on the next cycle. The 5s ticker is a hard bound
+// on staleness for addresses that never received a second signal. The crash
+// window is therefore bounded: at most ~5s of ratchet advances in the
+// dirty-set survive a crash. See 35.2-09-CRASH-LOSS.md for the full analysis.
 //
 // DM Double-Ratchet has no replayable genesis: a crash during the flush
 // window loses those ratchet advances permanently. This is acceptable for
@@ -323,10 +326,10 @@ func (f *SessionFlusher) Drain() {
 		}
 		// Snapshot under lock; release before calling DB.
 		batch := make(map[string][]byte, len(f.dirty))
-		addrs := make([]string, 0, len(f.dirty))
+		advAt := make(map[string]uint32, len(f.dirty))
 		for addr, e := range f.dirty {
 			batch[addr] = copyBytes(e.blob)
-			addrs = append(addrs, addr)
+			advAt[addr] = e.advCount
 		}
 		f.mu.Unlock()
 
@@ -341,14 +344,17 @@ func (f *SessionFlusher) Drain() {
 			continue
 		}
 
+		// CR-02 staleness guard — see runFlush for the rationale.
 		f.mu.Lock()
-		for _, addr := range addrs {
+		for addr, snapAdv := range advAt {
 			if e, ok := f.dirty[addr]; ok {
-				e.lastDrain = e.advCount
-				delete(f.dirty, addr)
+				e.lastDrain = snapAdv
+				if e.advCount == snapAdv {
+					delete(f.dirty, addr)
+				}
 			}
 		}
-		drained := len(addrs)
+		drained := len(batch)
 		f.mu.Unlock()
 		f.flushMu.Unlock()
 
@@ -371,10 +377,10 @@ func (f *SessionFlusher) runFlush() {
 		return
 	}
 	batch := make(map[string][]byte, len(f.dirty))
-	addrs := make([]string, 0, len(f.dirty))
+	advAt := make(map[string]uint32, len(f.dirty))
 	for addr, e := range f.dirty {
 		batch[addr] = copyBytes(e.blob)
-		addrs = append(addrs, addr)
+		advAt[addr] = e.advCount
 	}
 	f.mu.Unlock()
 
@@ -387,11 +393,21 @@ func (f *SessionFlusher) runFlush() {
 		return
 	}
 
+	// CR-02 staleness guard: only clear an entry if no newer Enqueue arrived
+	// during the in-flight DB write. Deleting unconditionally would drop the
+	// newer blob from the durable path forever (DB holds the snapshot
+	// generation; the only copy of the newer blob would be the evictable LRU
+	// mirror) — a no-crash lost update outside the documented N/T staleness
+	// bound. Mirrors the SenderKeyFlusher inline-path highIter guard.
 	f.mu.Lock()
-	for _, addr := range addrs {
+	for addr, snapAdv := range advAt {
 		if e, ok := f.dirty[addr]; ok {
-			e.lastDrain = e.advCount
-			delete(f.dirty, addr)
+			e.lastDrain = snapAdv
+			if e.advCount == snapAdv {
+				delete(f.dirty, addr)
+			}
+			// else: a newer blob arrived mid-write — the entry stays dirty
+			// (with the newer blob) and flushes on the next cycle.
 		}
 	}
 	f.mu.Unlock()
