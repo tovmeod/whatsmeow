@@ -393,9 +393,11 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	// (group, senderBare, keyID) via the process-global singleflight.Group.
 	// N accounts missing the same key will share ONE donor DB scan; each
 	// account then independently runs the downgrade guard + install below.
-	// targetIter is excluded from the key (RESEARCH Open Q1): the per-account
-	// iteration-downgrade guard already handles the case where a shared donor
-	// is inapplicable at a lower target iteration.
+	// targetIter is excluded from the key (RESEARCH Open Q1); because the
+	// shared closure captures the LEADER's targetIter, every coalesced caller
+	// must re-check the returned donor against its OWN targetIter (the WR-04
+	// forward-only re-check below — the per-account downgrade guard alone does
+	// NOT cover the no-existing-state case).
 	// The "|" separator prevents key collisions between distinct tuples that
 	// share a prefix (T-29-01-01 mitigation).
 	sfKey := group + "|" + senderBare + "|" + strconv.FormatUint(uint64(targetKeyID), 10)
@@ -437,6 +439,20 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 		if findErr != nil {
 			return "", false, findErr
 		}
+	}
+	// WR-04 (2026-06-10): forward-only re-check against the CALLER's own
+	// targetIter. The singleflight key excludes targetIter and the shared
+	// closure captures the LEADER's targetIter, so a coalesced FOLLOWER with a
+	// lower target can receive a shared donor whose iteration is AHEAD of its
+	// target. The per-account downgrade guard below only compares
+	// existing-vs-donor and passes when the follower has NO existing state for
+	// the KeyID — installing a donor the failing message cannot use
+	// (forward-only ratchet: a higher-iteration chain key cannot re-derive an
+	// earlier iteration, and the donor's skipped keys are unlikely to cover
+	// it), returning ok=true, and burning the inline decrypt retry. Mirror
+	// findSenderKeyDonor's own donorIter > targetIter filter here.
+	if donor != nil && donor.Iteration > targetIter {
+		return "", false, nil // not recovered: shared donor is past this caller's target
 	}
 	if donor == nil {
 		// D-03 / 999.19: sampled SENDERKEY_SUBCLASS classifier.
