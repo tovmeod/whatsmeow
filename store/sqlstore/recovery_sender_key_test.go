@@ -2014,3 +2014,143 @@ func TestInlineRecoveryCacheOnlyGenerationSurvives(t *testing.T) {
 	t.Logf("CR-01: cache states=%d, drained states=%d (want B@%d and D@%d in both)",
 		len(cachedSt.SenderKeyStates), len(drained.SenderKeyStates), iterB, iterD)
 }
+
+// addSkippedKeysToState appends valid-length skipped message keys (one per
+// iteration) to a state, for the WR-05 skipped-key union test. Field lengths
+// must satisfy the flat codec invariant (iv=16, cipherKey=32, seed=32).
+func addSkippedKeysToState(st *groupRecord.SenderKeyStateStructure, tag byte, iters ...uint32) {
+	for _, it := range iters {
+		fill := func(n int) []byte {
+			b := make([]byte, n)
+			for i := range b {
+				b[i] = tag + byte(it) + byte(i)
+			}
+			return b
+		}
+		st.Keys = append(st.Keys, &ratchet.SenderMessageKeyStructure{
+			Iteration: it,
+			IV:        fill(16),
+			CipherKey: fill(32),
+			Seed:      fill(32),
+		})
+	}
+}
+
+// skippedKeyIterSet returns the set of iterations present in a state's Keys.
+func skippedKeyIterSet(st *groupRecord.SenderKeyStateStructure) map[uint32]bool {
+	out := make(map[uint32]bool, len(st.Keys))
+	for _, k := range st.Keys {
+		if k != nil {
+			out[k.Iteration] = true
+		}
+	}
+	return out
+}
+
+// TestInlineRecoveryMergeKeepsExistingSkippedKeys exercises WR-05 end-to-end:
+// the D-12 merge supersedes an existing same-KeyID state with the donor, but
+// must UNION the existing state's skipped message keys (the recovering
+// account's own out-of-order coverage) into the donor state instead of
+// dropping them — the donor's higher-iteration chain key cannot re-derive
+// earlier iterations (forward-only ratchet).
+//
+// Scenario: B holds K@10 with skipped keys at iterations 3 and 5; donor A
+// holds K@50 with its own skipped key at 7. After recovery the persisted
+// structure's K state must sit at iteration 50, at state[0] (CR-04 invariant),
+// and carry skipped keys {3, 5, 7}.
+func TestInlineRecoveryMergeKeepsExistingSkippedKeys(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
+	t.Cleanup(func() {
+		cleanupA()
+		cleanupB()
+		db.Close()
+	})
+
+	const (
+		group        = "recovwr05_group@g.us"
+		bareUser     = "55512340105_1"
+		donorSuffix  = ":5"
+		targetSuffix = ":0"
+		keyK         = uint32(42)
+	)
+	donorSenderID := bareUser + donorSuffix
+	targetSenderID := bareUser + targetSuffix
+
+	ctx := context.Background()
+
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		recoveryTestJIDA, recoveryTestJIDB, group)
+
+	// Seed B: existing K@10 with skipped keys at iterations 3 and 5.
+	existingStruct := buildDonorStructure(keyK, 10, 0xA1)
+	addSkippedKeysToState(existingStruct.SenderKeyStates[0], 0x10, 3, 5)
+	insertFlatBlobRow(t, db, recoveryTestJIDB, group, targetSenderID, existingStruct)
+
+	// Seed A: donor K@50 with its own skipped key at iteration 7.
+	donorStruct := buildDonorStructure(keyK, 50, 0xB1)
+	addSkippedKeysToState(donorStruct.SenderKeyStates[0], 0x40, 7)
+	insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
+
+	csB := newRecoveryTestStoreB(t, db)
+
+	// Recover with targetIter=60 (donor 50 <= 60 qualifies; existing K@10 < 50
+	// so the downgrade guard passes and the donor supersedes the existing state).
+	_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, keyK, 60)
+	if err != nil {
+		t.Fatalf("TryInlineRecovery: %v", err)
+	}
+	if !ok {
+		t.Fatal("TryInlineRecovery: expected true (donor strictly fresher), got false")
+	}
+
+	// Read the persisted row and verify the union.
+	var blob []byte
+	err = db.QueryRowContext(ctx,
+		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
+		recoveryTestJIDB, group, targetSenderID,
+	).Scan(&blob)
+	if err != nil || blob == nil {
+		t.Fatalf("read recovered row: err=%v blob=%v", err, blob)
+	}
+	merged, uErr := store.UnpackFlat(blob)
+	if uErr != nil || merged == nil || len(merged.SenderKeyStates) == 0 {
+		t.Fatalf("UnpackFlat: err=%v got=%v", uErr, merged)
+	}
+
+	kState := findStateByKeyID(merged, keyK)
+	if kState == nil {
+		t.Fatal("K state missing from merged result")
+	}
+	if kState.SenderChainKey.Iteration != 50 {
+		t.Errorf("K iteration = %d, want 50 (donor)", kState.SenderChainKey.Iteration)
+	}
+	if merged.SenderKeyStates[0].KeyID != keyK {
+		t.Errorf("state[0].KeyID = %d, want %d (CR-04 donor-most-recent invariant)",
+			merged.SenderKeyStates[0].KeyID, keyK)
+	}
+
+	iters := skippedKeyIterSet(kState)
+	for _, want := range []uint32{3, 5, 7} {
+		if !iters[want] {
+			t.Errorf("WR-05: skipped key at iteration %d missing from merged K state "+
+				"(existing account's out-of-order coverage dropped); have=%v", want, iters)
+		}
+	}
+	if len(kState.Keys) != 3 {
+		t.Errorf("WR-05: merged K state carries %d skipped keys, want 3 ({3,5} existing + {7} donor)",
+			len(kState.Keys))
+	}
+	t.Logf("WR-05: merged K@%d at state[0] with skipped iterations %v",
+		kState.SenderChainKey.Iteration, iters)
+}

@@ -554,6 +554,15 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 			}
 			if st.KeyID == donor.KeyID {
 				// Superseded by the strictly-fresher donor state at index 0.
+				// WR-05 (2026-06-10): the superseded state's Keys are the
+				// RECOVERING account's accumulated skipped message keys —
+				// covering out-of-order messages it has not yet received. The
+				// donor's higher-iteration chain key cannot re-derive earlier
+				// iterations (forward-only ratchet), so dropping them would
+				// make any pending message at those iterations permanently
+				// undecryptable. Union them into the donor state (donor
+				// entries win on iteration collision).
+				donorState.Keys = unionSkippedKeys(st.Keys, donorState.Keys)
 				continue
 			}
 			// Preserve foreign-KeyID state unchanged, after the donor.
@@ -610,6 +619,18 @@ func unionSenderKeyStructures(primary, secondary *groupRecord.SenderKeyStructure
 				chosen = sst
 			}
 		}
+		if chosen != pst && len(pst.Keys) > 0 {
+			// WR-05 (2026-06-10): the secondary view superseded the primary for
+			// this KeyID — the primary state's skipped message keys would be
+			// silently dropped (same loss shape as the D-12 donor replace; the
+			// forward-only ratchet cannot re-derive them). Union them into a
+			// shallow copy of the winning state (winner's entries win on
+			// iteration collision); copy so the per-call structures handed in
+			// are never mutated in place.
+			withKeys := *chosen
+			withKeys.Keys = unionSkippedKeys(pst.Keys, chosen.Keys)
+			chosen = &withKeys
+		}
 		merged = append(merged, chosen)
 	}
 	for _, sst := range secondary.SenderKeyStates {
@@ -622,6 +643,41 @@ func unionSenderKeyStructures(primary, secondary *groupRecord.SenderKeyStructure
 		return nil
 	}
 	return &groupRecord.SenderKeyStructure{SenderKeyStates: merged}
+}
+
+// unionSkippedKeys merges two skipped-message-key lists for the same sender-key
+// state (WR-05). Entries from winner win on iteration collision; entries from
+// loser whose iteration is not covered by winner are KEPT — they are the
+// recovering account's own skipped keys for out-of-order messages it has not
+// yet received, and the forward-only ratchet cannot re-derive them. Order:
+// surviving loser entries first (preserving their relative order), then
+// winner's. The flat codec (packSkipped/unpackSkipped) imposes no ordering
+// constraint on Keys and libsignal consumes skipped keys by iteration lookup,
+// so any order is valid. nil entries are skipped. Returns winner unchanged
+// when loser is empty (the common no-skipped-keys case allocates nothing).
+func unionSkippedKeys(loser, winner []*ratchet.SenderMessageKeyStructure) []*ratchet.SenderMessageKeyStructure {
+	if len(loser) == 0 {
+		return winner
+	}
+	winnerIters := make(map[uint32]bool, len(winner))
+	for _, smk := range winner {
+		if smk != nil {
+			winnerIters[smk.Iteration] = true
+		}
+	}
+	merged := make([]*ratchet.SenderMessageKeyStructure, 0, len(loser)+len(winner))
+	for _, smk := range loser {
+		if smk == nil || winnerIters[smk.Iteration] {
+			continue
+		}
+		merged = append(merged, smk)
+	}
+	for _, smk := range winner {
+		if smk != nil {
+			merged = append(merged, smk)
+		}
+	}
+	return merged
 }
 
 // Compile-time assertion: *SQLStore satisfies the upstream store.SenderKeyStore

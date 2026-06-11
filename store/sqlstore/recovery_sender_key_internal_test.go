@@ -5,8 +5,9 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 // recovery_sender_key_internal_test.go — in-package tests for the WR-04
-// coalesced-follower forward-only guard. These need unexported symbols
-// (senderKeyRecoveryReader, donorSenderKeyState), so they live in package
+// coalesced-follower forward-only guard and the WR-05 skipped-key union.
+// These need unexported symbols (senderKeyRecoveryReader, donorSenderKeyState,
+// unionSkippedKeys, unionSenderKeyStructures), so they live in package
 // sqlstore. No DB required.
 
 package sqlstore
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
@@ -207,5 +210,116 @@ func TestInlineRecoveryCoalescedFollowerForwardOnly(t *testing.T) {
 	}
 	if got := stub.putCalls.Load(); got != 1 {
 		t.Errorf("want exactly 1 install (leader only), got %d", got)
+	}
+}
+
+// --- WR-05: skipped-key union ---
+
+func mkSkipped(iter uint32, tag byte) *ratchet.SenderMessageKeyStructure {
+	fill := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = tag + byte(i)
+		}
+		return b
+	}
+	return &ratchet.SenderMessageKeyStructure{
+		Iteration: iter,
+		IV:        fill(16),
+		CipherKey: fill(32),
+		Seed:      fill(32),
+	}
+}
+
+func skippedIters(keys []*ratchet.SenderMessageKeyStructure) []uint32 {
+	out := make([]uint32, 0, len(keys))
+	for _, k := range keys {
+		if k != nil {
+			out = append(out, k.Iteration)
+		}
+	}
+	return out
+}
+
+// TestUnionSkippedKeys asserts the WR-05 merge rule: loser entries whose
+// iteration is not covered by the winner are KEPT; winner entries win on
+// iteration collision.
+func TestUnionSkippedKeys(t *testing.T) {
+	existing := []*ratchet.SenderMessageKeyStructure{mkSkipped(3, 0x10), mkSkipped(5, 0x20), mkSkipped(7, 0x30)}
+	donor := []*ratchet.SenderMessageKeyStructure{mkSkipped(7, 0x40), mkSkipped(9, 0x50)}
+
+	merged := unionSkippedKeys(existing, donor)
+
+	got := skippedIters(merged)
+	want := []uint32{3, 5, 7, 9}
+	if len(got) != len(want) {
+		t.Fatalf("merged iterations = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("merged iterations = %v, want %v", got, want)
+		}
+	}
+	// Collision at iter 7: the donor (winner) entry must win.
+	for _, k := range merged {
+		if k.Iteration == 7 && k.IV[0] != 0x40 {
+			t.Errorf("iter-7 collision: want donor entry (tag 0x40), got tag %#x", k.IV[0])
+		}
+	}
+
+	// Empty loser: winner returned unchanged.
+	if out := unionSkippedKeys(nil, donor); len(out) != len(donor) {
+		t.Errorf("nil loser: want winner unchanged (%d entries), got %d", len(donor), len(out))
+	}
+}
+
+// TestUnionSenderKeyStructuresKeepsLoserSkippedKeys asserts the WR-05 fix in
+// unionSenderKeyStructures: when the secondary (DB) view supersedes the
+// primary (cache) view for the same KeyID, the primary state's skipped keys
+// are unioned into the chosen state instead of being dropped.
+func TestUnionSenderKeyStructuresKeepsLoserSkippedKeys(t *testing.T) {
+	mkState := func(keyID, iter uint32, keys ...*ratchet.SenderMessageKeyStructure) *groupRecord.SenderKeyStateStructure {
+		pub := make([]byte, 33)
+		pub[0] = 0x05
+		return &groupRecord.SenderKeyStateStructure{
+			KeyID: keyID,
+			SenderChainKey: &ratchet.SenderChainKeyStructure{
+				Iteration: iter,
+				ChainKey:  make([]byte, 32),
+			},
+			SigningKeyPublic: pub,
+			Keys:             keys,
+		}
+	}
+
+	// Primary (cache view): K@10 with skipped keys at 3 and 5.
+	primary := &groupRecord.SenderKeyStructure{SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+		mkState(42, 10, mkSkipped(3, 0x10), mkSkipped(5, 0x20)),
+	}}
+	// Secondary (DB view): same KeyID at a higher iteration with its own key at 8.
+	secondaryState := mkState(42, 30, mkSkipped(8, 0x60))
+	secondary := &groupRecord.SenderKeyStructure{SenderKeyStates: []*groupRecord.SenderKeyStateStructure{secondaryState}}
+
+	merged := unionSenderKeyStructures(primary, secondary)
+	if merged == nil || len(merged.SenderKeyStates) != 1 {
+		t.Fatalf("merged = %+v, want exactly one state", merged)
+	}
+	st := merged.SenderKeyStates[0]
+	if st.SenderChainKey.Iteration != 30 {
+		t.Errorf("chosen iteration = %d, want 30 (secondary supersedes)", st.SenderChainKey.Iteration)
+	}
+	got := skippedIters(st.Keys)
+	want := map[uint32]bool{3: true, 5: true, 8: true}
+	if len(got) != 3 {
+		t.Fatalf("merged Keys iterations = %v, want {3,5,8}", got)
+	}
+	for _, it := range got {
+		if !want[it] {
+			t.Fatalf("merged Keys iterations = %v, want {3,5,8}", got)
+		}
+	}
+	// The handed-in secondary state must NOT have been mutated in place.
+	if len(secondaryState.Keys) != 1 {
+		t.Errorf("secondary state mutated in place: Keys=%v", skippedIters(secondaryState.Keys))
 	}
 }
