@@ -171,6 +171,23 @@ func (f *SessionFlusher) crossesBoundary(adv, lastDrain uint32) bool {
 // Signals the async flusher goroutine when the N-boundary is crossed.
 // Performs an inline synchronous write when dirty-set > backpressureCap.
 func (f *SessionFlusher) Enqueue(address string, blob []byte) {
+	f.EnqueueAndMirror(address, blob, nil)
+}
+
+// EnqueueAndMirror is Enqueue with an optional mirror callback executed under
+// f.mu, immediately after the dirty entry is updated (WR-03 coherence
+// invariant): every LRU.Add that mirrors a write for an address MUST happen
+// inside this callback, so the dirty-set (the durable winner) and the LRU
+// (what readers serve first) always agree on the winning blob for an address.
+// Two unsynchronized operations — Enqueue then cache.Add — allowed the
+// interleaving Enqueue(A,v1); Enqueue(A,v2); cache.Add(A,v2); cache.Add(A,v1):
+// the DB persists v2 while readers serve v1 from the LRU indefinitely.
+//
+// mirror must be fast and must not call back into the flusher (it runs under
+// f.mu). Calling LRU methods inside it is safe: the established lock order is
+// f.mu → LRU internal lock → secondary-index lock, and no LRU eviction
+// callback or index method calls into the flusher.
+func (f *SessionFlusher) EnqueueAndMirror(address string, blob []byte, mirror func()) {
 	f.mu.Lock()
 
 	entry, exists := f.dirty[address]
@@ -196,6 +213,12 @@ func (f *SessionFlusher) Enqueue(address string, blob []byte) {
 	// before writing and before clearing (mirrors the SenderKeyFlusher
 	// template's highIter guard at flusher.go flushOneSynchronous).
 	advSnap := adv
+
+	// WR-03: mirror the blob into the LRU under the same lock that decided
+	// the dirty-set winner, so LRU and dirty-set cannot disagree.
+	if mirror != nil {
+		mirror()
+	}
 
 	crosses := f.crossesBoundary(adv, lastDrain)
 	dirtyLen := len(f.dirty)
@@ -228,6 +251,27 @@ func (f *SessionFlusher) Peek(address string) ([]byte, bool) {
 		return nil, false
 	}
 	out := copyBytes(entry.blob)
+	f.mu.Unlock()
+	return out, true
+}
+
+// PeekAndMirror is Peek with an optional mirror callback executed under f.mu
+// with a copy of the dirty blob (WR-03): the read-path LRU repopulate after a
+// Peek hit must also happen under the flusher lock — repopulating outside it
+// could install an older blob over a concurrent EnqueueAndMirror's newer one,
+// reopening the LRU-vs-dirty-set disagreement on the read path. Same mirror
+// constraints as EnqueueAndMirror.
+func (f *SessionFlusher) PeekAndMirror(address string, mirror func(blob []byte)) ([]byte, bool) {
+	f.mu.Lock()
+	entry, ok := f.dirty[address]
+	if !ok {
+		f.mu.Unlock()
+		return nil, false
+	}
+	out := copyBytes(entry.blob)
+	if mirror != nil {
+		mirror(out)
+	}
 	f.mu.Unlock()
 	return out, true
 }

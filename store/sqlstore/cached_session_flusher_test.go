@@ -24,6 +24,8 @@ package sqlstore
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -531,6 +533,56 @@ func TestCachedSession_CR04_MigratePNToLIDSweepsDirtySet(t *testing.T) {
 	flusher.Drain()
 	if has, _ := inner.HasSession(ctx, pnAddr); has {
 		t.Fatal("zombie pn row written to inner store after migration (CR-04)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestCachedSession_WR03_LRUAndDirtySetAgreeUnderConcurrentWriters
+// WR-03 regression: flusher.Enqueue and cache.Add used to be two separate
+// atomic operations with no common lock, so concurrent same-address writers
+// (receive-path StoreSession vs send-path PutCachedSessions) could leave the
+// dirty-set/DB at v2 and the LRU at v1 — readers (LRU-first) then serve a
+// different blob than what gets persisted, indefinitely. With the
+// EnqueueAndMirror invariant both views are updated under the flusher mutex,
+// so at quiescence they MUST agree. (Deterministic pass with the fix; the
+// disagreement interleaving is probabilistic, so this is a regression canary
+// rather than a guaranteed-fail-without-fix test.)
+// ---------------------------------------------------------------------------
+
+func TestCachedSession_WR03_LRUAndDirtySetAgreeUnderConcurrentWriters(t *testing.T) {
+	ctx := context.Background()
+	c, _, _, flusher, cache := newTestCachedSessionStoreWithFlusher(t, 100)
+
+	var wg sync.WaitGroup
+	const writers = 8
+	const writesPerWriter = 200
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < writesPerWriter; j++ {
+				blob := []byte(fmt.Sprintf("w%d-%d", i, j))
+				// Exercise BOTH documented session write paths.
+				if i%2 == 0 {
+					_ = c.PutSession(ctx, "wr03-addr:0", blob)
+				} else {
+					_ = c.PutManySessions(ctx, map[string][]byte{"wr03-addr:0": blob})
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	dirtyBlob, ok := flusher.Peek("wr03-addr:0")
+	if !ok {
+		t.Fatal("no dirty entry after concurrent writes")
+	}
+	lruBlob, ok := cache.Get(c.key("wr03-addr:0"))
+	if !ok {
+		t.Fatal("no LRU entry after concurrent writes")
+	}
+	if !bytes.Equal(dirtyBlob, lruBlob) {
+		t.Fatalf("LRU (%q) and dirty-set (%q) disagree — readers would serve a different blob than what gets persisted (WR-03)", lruBlob, dirtyBlob)
 	}
 }
 

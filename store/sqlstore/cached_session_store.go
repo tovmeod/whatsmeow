@@ -177,11 +177,14 @@ func (c *CachedSessionStore) GetSession(ctx context.Context, address string) ([]
 	// capacity pressure) must be readable here — failing to do so reproduces
 	// the 17.13 read-gap class (ContainsSession false -> ErrNoSession -> 479).
 	if c.flusher != nil {
-		if blob, ok := c.flusher.Peek(address); ok {
-			// Repopulate the LRU so repeated reads hit the cache.
-			c.cache.Add(k, copyBytes(blob))
+		// WR-03: repopulate the LRU under the flusher mutex (PeekAndMirror)
+		// so this cannot install an older blob over a concurrent writer's
+		// newer EnqueueAndMirror mirror.
+		if blob, ok := c.flusher.PeekAndMirror(address, func(b []byte) {
+			c.cache.Add(k, copyBytes(b))
 			c.secondaryIndex.Insert(c.jid, addressUser(address), k)
-			return blob, nil // blob is already a copy from Peek
+		}); ok {
+			return blob, nil // blob is already a copy from PeekAndMirror
 		}
 	}
 	v, err := c.inner.GetSession(ctx, address)
@@ -253,11 +256,13 @@ func (c *CachedSessionStore) GetManySessions(ctx context.Context, addresses []st
 	var innerMisses []string
 	if c.flusher != nil {
 		for _, addr := range misses {
-			if blob, ok := c.flusher.Peek(addr); ok {
-				k := c.key(addr)
-				c.cache.Add(k, copyBytes(blob))
+			k := c.key(addr)
+			// WR-03: repopulate under the flusher mutex — see GetSession.
+			if blob, ok := c.flusher.PeekAndMirror(addr, func(b []byte) {
+				c.cache.Add(k, copyBytes(b))
 				c.secondaryIndex.Insert(c.jid, addressUser(addr), k)
-				result[addr] = blob // blob is already a copy from Peek
+			}); ok {
+				result[addr] = blob // blob is already a copy from PeekAndMirror
 			} else {
 				innerMisses = append(innerMisses, addr)
 			}
@@ -307,10 +312,17 @@ func (c *CachedSessionStore) PutSession(ctx context.Context, address string, ses
 		// Write-back path: enqueue into flusher, mirror into LRU for read hits.
 		// No inner.PutSession call (zero double-write — inner.Put* is only on
 		// the nil-flusher fallback branch below).
-		c.flusher.Enqueue(address, session)
+		// WR-03: the LRU mirror runs under the flusher mutex (EnqueueAndMirror)
+		// so concurrent same-address writers (receive-path StoreSession vs
+		// send-path PutCachedSessions) cannot leave the LRU and the dirty-set
+		// disagreeing on the winning blob — readers check the LRU first and
+		// would otherwise serve a stale blob indefinitely while a different
+		// one gets persisted.
 		k := c.key(address)
-		c.cache.Add(k, copyBytes(session))
-		c.secondaryIndex.Insert(c.jid, addressUser(address), k)
+		c.flusher.EnqueueAndMirror(address, session, func() {
+			c.cache.Add(k, copyBytes(session))
+			c.secondaryIndex.Insert(c.jid, addressUser(address), k)
+		})
 		return nil
 	}
 	// Nil-flusher fallback: strict write-through (original behavior).
@@ -334,12 +346,14 @@ func (c *CachedSessionStore) PutSession(ctx context.Context, address string, ses
 // at end-of-batch send flush via store/sessioncache.go).
 func (c *CachedSessionStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
 	if c.flusher != nil {
-		// Write-back path: enqueue each address into the flusher, mirror into LRU.
+		// Write-back path: enqueue each address into the flusher, mirror into
+		// LRU. WR-03: mirror under the flusher mutex — see PutSession above.
 		for addr, v := range sessions {
-			c.flusher.Enqueue(addr, v)
 			k := c.key(addr)
-			c.cache.Add(k, copyBytes(v))
-			c.secondaryIndex.Insert(c.jid, addressUser(addr), k)
+			c.flusher.EnqueueAndMirror(addr, v, func() {
+				c.cache.Add(k, copyBytes(v))
+				c.secondaryIndex.Insert(c.jid, addressUser(addr), k)
+			})
 		}
 		return nil
 	}
