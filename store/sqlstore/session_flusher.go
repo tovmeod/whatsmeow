@@ -78,8 +78,7 @@ type sessionDirtyEntry struct {
 // Backpressure: when dirty-set > backpressureCap, Enqueue performs a
 // synchronous inline write for that address before returning.
 type SessionFlusher struct {
-	store waLog.Logger // kept only for error logging
-	log   waLog.Logger
+	log waLog.Logger
 
 	db              flushSessionBatch
 	cap             int    // max dirty-set entries (KAVTOV_FLUSH_SESSION_CAP)
