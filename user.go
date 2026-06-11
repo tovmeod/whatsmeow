@@ -453,6 +453,18 @@ func (cli *Client) GetUserDevicesContext(ctx context.Context, jids []types.JID) 
 	return cli.GetUserDevices(ctx, jids)
 }
 
+// FlushUserDevicesCache removes the given JIDs from the in-memory user-devices cache so the
+// next GetUserDevices call triggers a fresh server usync instead of returning cached devices.
+// kavtov-fork diagnostic helper (sender-key fan-out investigation): lets an operator confirm
+// what a peer's usync query would actually return for an account right now.
+func (cli *Client) FlushUserDevicesCache(jids ...types.JID) {
+	cli.userDevicesCacheLock.Lock()
+	defer cli.userDevicesCacheLock.Unlock()
+	for _, jid := range jids {
+		delete(cli.userDevicesCache, jid)
+	}
+}
+
 // GetUserDevices gets the list of devices that the given user has. The input should be a list of
 // regular JIDs, and the output will be a list of AD JIDs. The local device will not be included in
 // the output even if the user's JID is included in the input. All other devices will be included.
