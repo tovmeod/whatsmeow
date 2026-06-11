@@ -37,8 +37,18 @@ import (
 type stubRecoveryInner struct {
 	donor *donorSenderKeyState
 
+	// existing, when non-nil, is returned by GetSenderKey — lets a test seed
+	// the recovering account's pre-merge structure (a PackFlat blob) for the
+	// D-12 merge-cap assertions.
+	existing []byte
+
 	findCalls atomic.Int32
 	putCalls  atomic.Int32
+
+	// putMu guards lastPut (PutSenderKey is called from multiple goroutines in
+	// the coalescing tests).
+	putMu   sync.Mutex
+	lastPut []byte
 
 	// entered receives one token per findSenderKeyDonor entry (non-blocking
 	// send); release, when non-nil, blocks findSenderKeyDonor until closed.
@@ -62,11 +72,21 @@ func (s *stubRecoveryInner) findSenderKeyDonor(ctx context.Context, group, sende
 
 func (s *stubRecoveryInner) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
 	s.putCalls.Add(1)
+	s.putMu.Lock()
+	s.lastPut = session
+	s.putMu.Unlock()
 	return nil
 }
 
+// lastPutBlob returns the most recent blob handed to PutSenderKey.
+func (s *stubRecoveryInner) lastPutBlob() []byte {
+	s.putMu.Lock()
+	defer s.putMu.Unlock()
+	return s.lastPut
+}
+
 func (s *stubRecoveryInner) GetSenderKey(ctx context.Context, group, user string) ([]byte, error) {
-	return nil, nil
+	return s.existing, nil
 }
 
 func (s *stubRecoveryInner) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
@@ -321,5 +341,238 @@ func TestUnionSenderKeyStructuresKeepsLoserSkippedKeys(t *testing.T) {
 	// The handed-in secondary state must NOT have been mutated in place.
 	if len(secondaryState.Keys) != 1 {
 		t.Errorf("secondary state mutated in place: Keys=%v", skippedIters(secondaryState.Keys))
+	}
+}
+
+// --- QUICK-SKCAP-01: libsignal-limit caps on the fork's merge paths ---
+
+// mkCapState builds a SenderKeyStateStructure with PackFlat-valid field lengths
+// (chainKey=32, signingPub=33) for the cap tests.
+func mkCapState(keyID, iter uint32, keys ...*ratchet.SenderMessageKeyStructure) *groupRecord.SenderKeyStateStructure {
+	pub := make([]byte, 33)
+	pub[0] = 0x05
+	return &groupRecord.SenderKeyStateStructure{
+		KeyID: keyID,
+		SenderChainKey: &ratchet.SenderChainKeyStructure{
+			Iteration: iter,
+			ChainKey:  make([]byte, 32),
+		},
+		SigningKeyPublic: pub,
+		Keys:             keys,
+	}
+}
+
+// TestCapSkippedKeys asserts the cap helper in isolation: over-cap inputs keep
+// exactly the maxSenderKeyMessageKeys HIGHEST iterations, deterministically;
+// under-cap inputs are returned unchanged.
+func TestCapSkippedKeys(t *testing.T) {
+	// Over-cap: cap+5 entries in a deterministic shuffled order.
+	// 7919 is prime and coprime with n, so (i*7919)%n is a permutation of 0..n-1.
+	const n = maxSenderKeyMessageKeys + 5
+	shuffled := make([]*ratchet.SenderMessageKeyStructure, 0, n)
+	for i := 0; i < n; i++ {
+		shuffled = append(shuffled, mkSkipped(uint32((i*7919)%n), byte(i)))
+	}
+
+	capped := capSkippedKeys(shuffled)
+	if len(capped) != maxSenderKeyMessageKeys {
+		t.Fatalf("len(capped) = %d, want %d", len(capped), maxSenderKeyMessageKeys)
+	}
+	// Survivors must be exactly the cap-many HIGHEST iterations (5..n-1).
+	seen := make(map[uint32]bool, len(capped))
+	for _, k := range capped {
+		if k.Iteration < 5 {
+			t.Fatalf("iteration %d survived; want only the %d highest (>= 5)", k.Iteration, maxSenderKeyMessageKeys)
+		}
+		if seen[k.Iteration] {
+			t.Fatalf("duplicate iteration %d in capped output", k.Iteration)
+		}
+		seen[k.Iteration] = true
+	}
+
+	// Determinism: same input → identical output sequence.
+	capped2 := capSkippedKeys(shuffled)
+	for i := range capped {
+		if capped[i].Iteration != capped2[i].Iteration {
+			t.Fatalf("non-deterministic truncation: run1[%d]=%d run2[%d]=%d",
+				i, capped[i].Iteration, i, capped2[i].Iteration)
+		}
+	}
+
+	// Under-cap: returned unchanged (same length, same entries, same order).
+	small := []*ratchet.SenderMessageKeyStructure{mkSkipped(3, 0x10), mkSkipped(1, 0x20)}
+	out := capSkippedKeys(small)
+	if len(out) != len(small) {
+		t.Fatalf("under-cap: len = %d, want %d", len(out), len(small))
+	}
+	for i := range small {
+		if out[i] != small[i] {
+			t.Fatalf("under-cap input modified at index %d", i)
+		}
+	}
+}
+
+// TestUnionSkippedKeysCapped asserts that unionSkippedKeys output is bounded at
+// maxSenderKeyMessageKeys when loser+winner exceed the cap: the winner still
+// wins iteration collisions BEFORE truncation, and the survivors are the
+// highest iterations of the merged set. (The existing TestUnionSkippedKeys
+// covers the below-cap WR-05 semantics.)
+func TestUnionSkippedKeysCapped(t *testing.T) {
+	// loser: iterations 0..1499 (the recovering account's own keys).
+	loser := make([]*ratchet.SenderMessageKeyStructure, 0, 1500)
+	for i := uint32(0); i < 1500; i++ {
+		loser = append(loser, mkSkipped(i, 0x10))
+	}
+	// winner: iterations 1200..2199 (donor) — collisions at 1200..1499.
+	winner := make([]*ratchet.SenderMessageKeyStructure, 0, 1000)
+	for i := uint32(1200); i < 2200; i++ {
+		winner = append(winner, mkSkipped(i, 0x40))
+	}
+
+	merged := unionSkippedKeys(loser, winner)
+	if len(merged) != maxSenderKeyMessageKeys {
+		t.Fatalf("len(merged) = %d, want cap %d", len(merged), maxSenderKeyMessageKeys)
+	}
+	// Pre-cap union = loser 0..1199 + winner 1200..2199 = 2200 entries; the cap
+	// keeps the 2000 highest → iterations 200..2199.
+	for _, k := range merged {
+		if k.Iteration < 200 {
+			t.Fatalf("iteration %d survived; want only the %d highest (>= 200)", k.Iteration, maxSenderKeyMessageKeys)
+		}
+		if k.Iteration >= 1200 && k.Iteration < 1500 && k.IV[0] != 0x40 {
+			t.Fatalf("collision at iteration %d: want winner entry (tag 0x40), got tag %#x", k.Iteration, k.IV[0])
+		}
+	}
+}
+
+// TestCapSenderKeyStates asserts order-preserving prefix truncation at
+// maxSenderKeyStates with index 0 (active/donor) preserved as-is.
+func TestCapSenderKeyStates(t *testing.T) {
+	states := make([]*groupRecord.SenderKeyStateStructure, 0, 7)
+	for i := uint32(0); i < 7; i++ {
+		states = append(states, mkCapState(100+i, 10*i))
+	}
+
+	capped := capSenderKeyStates(states)
+	if len(capped) != maxSenderKeyStates {
+		t.Fatalf("len(capped) = %d, want %d", len(capped), maxSenderKeyStates)
+	}
+	if capped[0] != states[0] {
+		t.Error("index 0 (active/donor) must be the SAME state pointer")
+	}
+	for i := 0; i < maxSenderKeyStates; i++ {
+		if capped[i] != states[i] {
+			t.Errorf("survivor[%d].KeyID = %d, want input[%d].KeyID = %d (order-preserving prefix)",
+				i, capped[i].KeyID, i, states[i].KeyID)
+		}
+	}
+
+	// Under-cap: same slice back, unchanged.
+	small := states[:3]
+	out := capSenderKeyStates(small)
+	if len(out) != 3 || out[0] != small[0] || out[2] != small[2] {
+		t.Error("under-cap input must be returned unchanged")
+	}
+}
+
+// TestUnionSenderKeyStructuresCapped asserts the unionSenderKeyStructures
+// output is bounded at maxSenderKeyStates when primary(3) + secondary(4
+// disjoint) merge, with primary order preserved (most-recent-first kept).
+func TestUnionSenderKeyStructuresCapped(t *testing.T) {
+	primary := &groupRecord.SenderKeyStructure{SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+		mkCapState(1, 10), mkCapState(2, 20), mkCapState(3, 30),
+	}}
+	secondary := &groupRecord.SenderKeyStructure{SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+		mkCapState(4, 40), mkCapState(5, 50), mkCapState(6, 60), mkCapState(7, 70),
+	}}
+
+	merged := unionSenderKeyStructures(primary, secondary)
+	if merged == nil {
+		t.Fatal("merged = nil")
+	}
+	if len(merged.SenderKeyStates) != maxSenderKeyStates {
+		t.Fatalf("merged states = %d, want %d", len(merged.SenderKeyStates), maxSenderKeyStates)
+	}
+	wantKeyIDs := []uint32{1, 2, 3, 4, 5}
+	for i, st := range merged.SenderKeyStates {
+		if st.KeyID != wantKeyIDs[i] {
+			t.Fatalf("merged[%d].KeyID = %d, want %d", i, st.KeyID, wantKeyIDs[i])
+		}
+	}
+}
+
+// TestInlineRecoveryMergeCapsStatesAndDonorKeys is the D-12 end-to-end cap
+// assertion via TryInlineRecovery with the stub harness: an existing structure
+// with 6 foreign-KeyID states plus a donor whose own skipped-key list is
+// over-cap must install a structure with exactly maxSenderKeyStates states,
+// the donor KeyID at index 0, the first 4 (= most recent) foreign states kept,
+// and the donor state's Keys bounded at maxSenderKeyMessageKeys.
+//
+// Install observation: the stub harness has no flusher and no
+// PutManySenderKeys, so PutSenderKeyStructureRecovery falls through to
+// inner.PutSenderKey with the PackFlat blob — captured by the stub and
+// UnpackFlat'd here.
+func TestInlineRecoveryMergeCapsStatesAndDonorKeys(t *testing.T) {
+	// Existing structure: 6 foreign-KeyID states (none == donor KeyID 7), so
+	// the iteration-downgrade guard passes and every state survives the merge
+	// loop. PackFlat accepts 6 states (its limit is 255).
+	existingStates := make([]*groupRecord.SenderKeyStateStructure, 0, 6)
+	for i := uint32(0); i < 6; i++ {
+		existingStates = append(existingStates, mkCapState(100+i, 10))
+	}
+	existingBlob, packOK := store.PackFlat(&groupRecord.SenderKeyStructure{SenderKeyStates: existingStates})
+	if !packOK {
+		t.Fatal("PackFlat(existing) rejected the seed structure")
+	}
+
+	// Fat donor: over-cap skipped-key list (iterations 0..cap+99).
+	donor := stubDonor(7, 50)
+	for i := uint32(0); i < maxSenderKeyMessageKeys+100; i++ {
+		donor.SkippedKeys = append(donor.SkippedKeys, mkSkipped(i, 0x70))
+	}
+
+	stub := &stubRecoveryInner{donor: donor, existing: existingBlob}
+	cs := newStubCachedStore(t, stub, nil)
+
+	_, recovered, err := cs.TryInlineRecovery(context.Background(), "skcapgroup@g.us", "777_1:0", "777_1", 7, 100)
+	if err != nil {
+		t.Fatalf("TryInlineRecovery: %v", err)
+	}
+	if !recovered {
+		t.Fatal("want ok=true (donor iter=50 <= target=100, all existing KeyIDs foreign)")
+	}
+
+	blob := stub.lastPutBlob()
+	if blob == nil {
+		t.Fatal("no blob reached PutSenderKey")
+	}
+	installed, err := store.UnpackFlat(blob)
+	if err != nil {
+		t.Fatalf("installed blob is not flat-codec: %v", err)
+	}
+	if len(installed.SenderKeyStates) != maxSenderKeyStates {
+		t.Fatalf("installed states = %d, want %d", len(installed.SenderKeyStates), maxSenderKeyStates)
+	}
+	if got := installed.SenderKeyStates[0].KeyID; got != 7 {
+		t.Fatalf("state[0].KeyID = %d, want donor KeyID 7 (CR-04 invariant)", got)
+	}
+	// Survivors after the donor = the FIRST 4 foreign states (most recent).
+	for i := 1; i < maxSenderKeyStates; i++ {
+		want := uint32(100 + i - 1)
+		if got := installed.SenderKeyStates[i].KeyID; got != want {
+			t.Fatalf("state[%d].KeyID = %d, want %d", i, got, want)
+		}
+	}
+	// Donor skipped keys capped at the libsignal limit, highest iterations kept
+	// (0..2099 input → survivors 100..2099).
+	keys := installed.SenderKeyStates[0].Keys
+	if len(keys) != maxSenderKeyMessageKeys {
+		t.Fatalf("donor state keys = %d, want %d", len(keys), maxSenderKeyMessageKeys)
+	}
+	for _, k := range keys {
+		if k.Iteration < 100 {
+			t.Fatalf("skipped-key iteration %d survived; want the %d highest kept (>= 100)",
+				k.Iteration, maxSenderKeyMessageKeys)
+		}
 	}
 }

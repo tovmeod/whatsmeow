@@ -228,6 +228,19 @@ func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructur
 			// snapshot would silently drop a cache-only generation. Reject any
 			// recovery write missing a cached KeyID, forcing the caller to
 			// re-merge from the freshest visible state.
+			//
+			// QUICK-SKCAP-01 interaction: the D-12 merge is now capped at
+			// MaxSenderKeyStates (libsignal's maxStates=5). A capped merge keeps
+			// the donor at index 0 plus the 4 MOST-RECENT existing states — the
+			// cached states at positions >= MaxSenderKeyStates-1 (the oldest;
+			// both the cached entry and the merge base preserve most-recent-first
+			// order) are dropped BY DESIGN, matching libsignal's own oldest-state
+			// trim. Without this tolerance a 5+-state cached entry would make
+			// every capped recovery install StoreRejectedStale forever. Tolerate
+			// a missing cached KeyID iff the incoming set is at the cap AND the
+			// missing state is one of the oldest; a missing FRESH generation
+			// (cached position < MaxSenderKeyStates-1) is still a stale-snapshot
+			// merge — reject and force a re-merge.
 			for i := 0; i < int(cached.nStates); i++ {
 				cachedKeyID := cached.states[i].keyID
 				present := false
@@ -238,6 +251,9 @@ func (c *parsedSKCache) StoreStruct(key string, s *groupRecord.SenderKeyStructur
 					}
 				}
 				if !present {
+					if len(s.SenderKeyStates) >= MaxSenderKeyStates && i >= MaxSenderKeyStates-1 {
+						continue // cap-dropped oldest state — tolerated (QUICK-SKCAP-01)
+					}
 					return StoreRejectedStale // merge is missing a cached generation — re-merge required
 				}
 			}

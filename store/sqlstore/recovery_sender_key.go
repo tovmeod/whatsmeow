@@ -528,6 +528,10 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 			Seed:      smk.Seed,
 		}
 	}
+	// QUICK-SKCAP-01: a fat donor row can itself carry more than libsignal's
+	// 2000-key limit — cap before install so the fork never re-persists an
+	// over-cap list verbatim.
+	skippedKeys = capSkippedKeys(skippedKeys)
 	donorState := &groupRecord.SenderKeyStateStructure{
 		KeyID: donor.KeyID,
 		SenderChainKey: &ratchet.SenderChainKeyStructure{
@@ -579,6 +583,12 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 			mergedStates = append(mergedStates, st)
 		}
 	}
+	// QUICK-SKCAP-01: bound the merged record at libsignal's maxStates (5).
+	// Prefix truncation keeps the donor at index 0 (the CR-04 hard invariant —
+	// extractStructMeta, sk_keyid0, flusher same-generation dedup) and the
+	// first 4 foreign states = the 4 most recent (the merge loop preserves
+	// existing most-recent-first order).
+	mergedStates = capSenderKeyStates(mergedStates)
 
 	structure := &groupRecord.SenderKeyStructure{SenderKeyStates: mergedStates}
 
@@ -652,7 +662,10 @@ func unionSenderKeyStructures(primary, secondary *groupRecord.SenderKeyStructure
 	if len(merged) == 0 {
 		return nil
 	}
-	return &groupRecord.SenderKeyStructure{SenderKeyStates: merged}
+	// QUICK-SKCAP-01: bound the merged view at libsignal's maxStates (5).
+	// Primary order is preserved (most-recent-first), so prefix truncation
+	// keeps the 5 most recent states.
+	return &groupRecord.SenderKeyStructure{SenderKeyStates: capSenderKeyStates(merged)}
 }
 
 // unionSkippedKeys merges two skipped-message-key lists for the same sender-key
@@ -664,10 +677,17 @@ func unionSenderKeyStructures(primary, secondary *groupRecord.SenderKeyStructure
 // winner's. The flat codec (packSkipped/unpackSkipped) imposes no ordering
 // constraint on Keys and libsignal consumes skipped keys by iteration lookup,
 // so any order is valid. nil entries are skipped. Returns winner unchanged
-// when loser is empty (the common no-skipped-keys case allocates nothing).
+// when loser is empty and under the cap (the common no-skipped-keys case
+// allocates nothing).
+//
+// QUICK-SKCAP-01: the output is ALWAYS bounded at maxSenderKeyMessageKeys
+// (libsignal's per-state limit) via capSkippedKeys — winner wins collisions
+// BEFORE truncation, then the highest-iteration entries survive. Uncapped
+// unions let prod records grow to ~35k skipped keys (1.6MB rows, dead-TOAST
+// churn → disk-full outage).
 func unionSkippedKeys(loser, winner []*ratchet.SenderMessageKeyStructure) []*ratchet.SenderMessageKeyStructure {
 	if len(loser) == 0 {
-		return winner
+		return capSkippedKeys(winner)
 	}
 	winnerIters := make(map[uint32]bool, len(winner))
 	for _, smk := range winner {
@@ -687,7 +707,7 @@ func unionSkippedKeys(loser, winner []*ratchet.SenderMessageKeyStructure) []*rat
 			merged = append(merged, smk)
 		}
 	}
-	return merged
+	return capSkippedKeys(merged)
 }
 
 // Compile-time assertion: *SQLStore satisfies the upstream store.SenderKeyStore

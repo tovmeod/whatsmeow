@@ -74,6 +74,14 @@ const (
 // ok=false from flatFromStructure and stay uncached (correct, just slower).
 const flatMaxStates = 6
 
+// MaxSenderKeyStates is a fork-local mirror of libsignal's unexported
+// maxStates (go.mau.fi/libsignal@v0.2.1 groups/state/record/SenderKeyRecord.go:10).
+// QUICK-SKCAP-01: the fork's recovery-merge helpers (sqlstore/senderkey_caps.go)
+// cap merged records at this limit, and StoreStruct's CR-01 missing-KeyID guard
+// (parsedcache.go) tolerates cap-dropped oldest states against it. Exported so
+// both packages share one source of truth.
+const MaxSenderKeyStates = 5
+
 // flatState is one SenderKeyState worth of crypto material, packed into fixed
 // value arrays. ZERO pointers — the whole struct is scanned by the GC as plain
 // bytes.

@@ -1729,21 +1729,24 @@ func buildNStateStructure(n int, baseKeyID, baseIter uint32, tag byte) *groupRec
 	return &groupRecord.SenderKeyStructure{SenderKeyStates: states}
 }
 
-// TestInlineRecoveryUncacheableMergeStillPersists is the CR-03 uncacheable-branch
-// regression test.
+// TestInlineRecoveryUncacheableMergeStillPersists — repurposed by
+// QUICK-SKCAP-01 as the capped-merge-vs-full-cache e2e test.
 //
-// StoreStruct returns a refusal for two UNRELATED reasons: (a) the iteration
-// gate rejected a stale install, and (b) flatFromStructure refuses to cache the
-// structure (> flatMaxStates = 6 states). A D-12 merge of a 6-state existing
-// row with a NEW donor KeyID produces 7 states — PackFlat accepts it (up to
-// 255) but the flat cache cannot hold it. Pre-fix, PutSenderKeyStructureRecovery
-// treated any refusal as "stale — skip cache AND DB", silently dropping a
-// valid, strictly-fresher donor install, while TryInlineRecovery still
-// returned ok=true (phantom SENDER_KEY_RECOVERED).
+// HISTORY (CR-03): this test originally exercised the StoreUncacheable branch
+// via a D-12 merge of a 6-state existing row + a new donor KeyID = 7 states
+// (> flatMaxStates = 6 → flat-uncacheable, but PackFlat-persistable). Since
+// QUICK-SKCAP-01 the D-12 merge is capped at maxSenderKeyStates (libsignal
+// maxStates = 5) BEFORE install, so the merge path can no longer produce a
+// > flatMaxStates structure; the StoreUncacheable branch in
+// PutSenderKeyStructureRecovery remains as defense in depth (wrong-length
+// fields would also be rejected by PackFlat first).
 //
-// Post-fix (tri-state verdict): StoreUncacheable skips the cache (invalidating
-// the now-incomplete cached entry) but STILL persists the merged blob, and
-// TryInlineRecovery returns ok=true for a real install.
+// CURRENT CONTRACT: the same seed (6-state existing row + cache warmed with
+// it + new donor KeyID) must now produce a CAPPED install: 5 states persisted,
+// donor at index 0 (CR-04), the 4 MOST-RECENT foreign states kept, the 2
+// oldest dropped — and StoreStruct's relaxed CR-01 guard ACCEPTS the capped
+// merge (cache replaced, not invalidated), so 5+-state senders stay
+// recoverable instead of being StoreRejectedStale forever.
 func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	db, err := sql.Open("pgx", batchTestDSN())
 	if err != nil {
@@ -1818,16 +1821,19 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	}
 
 	// Recover donor KeyID 90 (targetIter=15: donor 9 <= 15 qualifies). The merge
-	// is [donor, 6 existing] = 7 states → flat-uncacheable.
+	// is [donor, 6 existing] = 7 states pre-cap → capped to 5 (QUICK-SKCAP-01).
 	_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, donorKeyID, 15)
 	if err != nil {
 		t.Fatalf("TryInlineRecovery: %v", err)
 	}
 	if !ok {
-		t.Error("CR-03: TryInlineRecovery returned ok=false for an uncacheable-but-valid donor install")
+		t.Error("QUICK-SKCAP-01: TryInlineRecovery returned ok=false for a capped-but-valid donor install " +
+			"(CR-01 guard must tolerate cap-dropped oldest states)")
 	}
 
-	// Assert 1: the merged blob WAS persisted (pre-fix it was silently dropped).
+	// Assert 1: the CAPPED merged blob WAS persisted: 5 states, donor at index
+	// 0, the 4 most-recent foreign states (70..73) kept, the 2 oldest (74, 75)
+	// dropped.
 	var blob []byte
 	err = db.QueryRowContext(ctx,
 		`SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`,
@@ -1840,25 +1846,33 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	if uErr != nil || persisted == nil {
 		t.Fatalf("UnpackFlat persisted row: err=%v", uErr)
 	}
-	if got := len(persisted.SenderKeyStates); got != 7 {
-		t.Errorf("CR-03: persisted state count = %d, want 7 (uncacheable merge dropped from DB?)", got)
+	if got := len(persisted.SenderKeyStates); got != 5 {
+		t.Errorf("QUICK-SKCAP-01: persisted state count = %d, want 5 (libsignal maxStates cap)", got)
 	}
 	if got := persisted.SenderKeyStates[0].KeyID; got != donorKeyID {
-		t.Errorf("CR-03/CR-04: persisted state[0].KeyID = %d, want %d (donor)", got, donorKeyID)
+		t.Errorf("CR-04: persisted state[0].KeyID = %d, want %d (donor)", got, donorKeyID)
 	}
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 4; i++ {
 		if findStateByKeyID(persisted, baseKeyID+uint32(i)) == nil {
-			t.Errorf("CR-03: foreign KeyID %d dropped from persisted merge", baseKeyID+uint32(i))
+			t.Errorf("QUICK-SKCAP-01: most-recent foreign KeyID %d dropped from capped merge", baseKeyID+uint32(i))
+		}
+	}
+	for i := 4; i < 6; i++ {
+		if findStateByKeyID(persisted, baseKeyID+uint32(i)) != nil {
+			t.Errorf("QUICK-SKCAP-01: oldest foreign KeyID %d survived the cap (want dropped)", baseKeyID+uint32(i))
 		}
 	}
 
-	// Assert 2: the stale 6-state cached entry was invalidated — reads fall
-	// through to the fresh DB row instead of serving an entry that is missing
-	// the donor generation indefinitely.
-	if _, hit := parsedCache.LoadStruct(cacheKey); hit {
-		t.Error("CR-03: stale cached entry still served after uncacheable recovery install (must be invalidated)")
+	// Assert 2: the capped 5-state merge is flat-cacheable and the relaxed
+	// CR-01 guard accepted it — the cache is REPLACED with the merged entry
+	// (donor at state[0]), not invalidated.
+	cachedStruct, hit := parsedCache.LoadStruct(cacheKey)
+	if !hit {
+		t.Error("QUICK-SKCAP-01: parsed cache empty after capped recovery install (want replaced entry)")
+	} else if got := cachedStruct.SenderKeyStates[0].KeyID; got != donorKeyID {
+		t.Errorf("QUICK-SKCAP-01: cached state[0].KeyID = %d, want donor %d", got, donorKeyID)
 	}
-	t.Logf("CR-03: persisted %d states, state[0].KeyID=%d, cache invalidated",
+	t.Logf("QUICK-SKCAP-01: persisted %d states, state[0].KeyID=%d, cache replaced with capped merge",
 		len(persisted.SenderKeyStates), persisted.SenderKeyStates[0].KeyID)
 }
 

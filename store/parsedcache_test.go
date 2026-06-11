@@ -222,3 +222,98 @@ func TestParsedSKCacheRebuildIndependence(t *testing.T) {
 		t.Fatalf("re-store round-trip differs:\n c=%+v\n d=%+v", c, d)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// QUICK-SKCAP-01: CR-01 missing-KeyID guard vs the capped D-12 merge.
+//
+// The recovery merge is capped at MaxSenderKeyStates (libsignal maxStates=5),
+// which BY DESIGN drops the oldest cached states (positions >=
+// MaxSenderKeyStates-1; most-recent-first order). The guard must tolerate
+// exactly that drop — and ONLY that drop: a missing FRESH generation (early
+// cached position) is still a stale-snapshot merge and must reject.
+// ---------------------------------------------------------------------------
+
+// validSKStructureN builds a length-valid structure with n states, KeyIDs
+// baseKeyID..baseKeyID+n-1 in slice order, all at iteration iter.
+func validSKStructureN(n int, baseKeyID, iter uint32) *groupRecord.SenderKeyStructure {
+	mk := func(ln, b int) []byte {
+		out := make([]byte, ln)
+		for i := range out {
+			out[i] = byte(b + i)
+		}
+		return out
+	}
+	states := make([]*groupRecord.SenderKeyStateStructure, n)
+	for i := 0; i < n; i++ {
+		states[i] = &groupRecord.SenderKeyStateStructure{
+			KeyID: baseKeyID + uint32(i),
+			SenderChainKey: &ratchet.SenderChainKeyStructure{
+				Iteration: iter,
+				ChainKey:  mk(flatChainKeyLen, 0x10+i),
+			},
+			SigningKeyPublic:  mk(flatSigningPubLen, 0x20+i),
+			SigningKeyPrivate: mk(flatSigningPrivLen, 0x30+i),
+		}
+	}
+	return &groupRecord.SenderKeyStructure{SenderKeyStates: states}
+}
+
+func TestStoreStructRecoveryToleratesCapDroppedOldestState(t *testing.T) {
+	cache := newSKCache(t, 8)
+	const key = "acct|group|sender"
+
+	// Cached entry: 5 states, KeyIDs 70..74 (position 4 = KeyID 74 = oldest).
+	cached := validSKStructureN(5, 70, 10)
+	if v := cache.StoreStruct(key, cached, nil); v != StoreAccepted {
+		t.Fatalf("warm cache: verdict=%v, want StoreAccepted", v)
+	}
+
+	// Capped recovery merge: donor 90 at index 0 + the 4 most-recent cached
+	// states (70..73). Cached KeyID 74 (position 4) is cap-dropped.
+	donorKeyID := uint32(90)
+	merge := validSKStructureN(4, 70, 10)
+	donorState := validSKStructureN(1, donorKeyID, 50).SenderKeyStates[0]
+	merge.SenderKeyStates = append(
+		[]*groupRecord.SenderKeyStateStructure{donorState}, merge.SenderKeyStates...)
+
+	if v := cache.StoreStruct(key, merge, &donorKeyID); v != StoreAccepted {
+		t.Fatalf("capped merge dropping the OLDEST cached state: verdict=%v, want StoreAccepted", v)
+	}
+	got, ok := cache.LoadStruct(key)
+	if !ok || got.SenderKeyStates[0].KeyID != donorKeyID {
+		t.Fatalf("post-install cache: ok=%v state[0].KeyID=%d, want donor %d",
+			ok, got.SenderKeyStates[0].KeyID, donorKeyID)
+	}
+}
+
+func TestStoreStructRecoveryStillRejectsMissingFreshGeneration(t *testing.T) {
+	cache := newSKCache(t, 8)
+	const key = "acct|group|sender2"
+
+	// Cached entry: 5 states, KeyIDs 70..74. Position 0 (KeyID 70) is the
+	// most-recent generation.
+	cached := validSKStructureN(5, 70, 10)
+	if v := cache.StoreStruct(key, cached, nil); v != StoreAccepted {
+		t.Fatalf("warm cache: verdict=%v, want StoreAccepted", v)
+	}
+
+	// Stale-snapshot merge: full at the cap (5 states) but missing the FRESH
+	// cached generation at position 0 (KeyID 70) — keeps 71..74 instead.
+	donorKeyID := uint32(90)
+	merge := validSKStructureN(4, 71, 10)
+	donorState := validSKStructureN(1, donorKeyID, 50).SenderKeyStates[0]
+	merge.SenderKeyStates = append(
+		[]*groupRecord.SenderKeyStateStructure{donorState}, merge.SenderKeyStates...)
+
+	if v := cache.StoreStruct(key, merge, &donorKeyID); v != StoreRejectedStale {
+		t.Fatalf("merge missing the FRESH cached generation: verdict=%v, want StoreRejectedStale", v)
+	}
+
+	// Under-cap merge missing ANY cached KeyID must also still reject.
+	smallMerge := validSKStructureN(3, 71, 10)
+	smallMerge.SenderKeyStates = append(
+		[]*groupRecord.SenderKeyStateStructure{donorState}, smallMerge.SenderKeyStates...)
+	if v := cache.StoreStruct(key, smallMerge, &donorKeyID); v != StoreRejectedStale {
+		t.Fatalf("under-cap merge missing cached KeyIDs: verdict=%v, want StoreRejectedStale", v)
+	}
+}
