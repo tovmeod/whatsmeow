@@ -42,8 +42,6 @@ package sqlstore
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -376,7 +374,7 @@ func (f *SessionFlusher) flushOneSynchronous(address string, blob []byte, advSna
 	defer cancel()
 	err := f.db.PutManySessions(ctx, map[string][]byte{address: blob})
 	if err != nil {
-		slog.Error(fmt.Sprintf("SessionFlusher inline flush failed addr=%s: %v", address, err))
+		f.log.Errorf("SessionFlusher inline flush failed addr=%s: %v", address, err)
 		f.mu.Lock()
 		if len(f.dirty) > f.dropCap {
 			f.dropColdestLocked()
@@ -396,7 +394,7 @@ func (f *SessionFlusher) flushOneSynchronous(address string, blob []byte, advSna
 // iteration). Must be called with f.mu held.
 func (f *SessionFlusher) dropColdestLocked() {
 	for addr, e := range f.dirty {
-		slog.Error(fmt.Sprintf("SessionFlusher DROP dirty entry (catastrophe) addr=%s advCount=%d", addr, e.advCount))
+		f.log.Errorf("SessionFlusher DROP dirty entry (catastrophe) addr=%s advCount=%d", addr, e.advCount)
 		delete(f.dirty, addr)
 		return
 	}
