@@ -2154,3 +2154,86 @@ func TestInlineRecoveryMergeKeepsExistingSkippedKeys(t *testing.T) {
 	t.Logf("WR-05: merged K@%d at state[0] with skipped iterations %v",
 		kState.SenderChainKey.Iteration, iters)
 }
+
+// TestClassifyNoDonorLIDMapSuffix is the regression test for the agent-suffix
+// stripping fix in classifyNoDonor.
+//
+// LID Signal-address users arrive as "<digits>_<agent>" (e.g. "238877608562780_1")
+// but whatsmeow_lid_map stores bare digits with no suffix. Before the fix,
+// subclassLIDMapQuery received the unsuffixed form verbatim and always returned
+// "unmapped" for LID senders — corrupting the SENDERKEY_SUBCLASS diagnostic field.
+//
+// Two arms:
+//  - lid_mapped: senderBare="238877608562780_1" (LID with agent suffix);
+//    lid_map row has lid="238877608562780"; expected LIDMap="lid-mapped"
+//  - pn_mapped: senderBare="972501234567" (pure PN, no underscore);
+//    lid_map row has pn="972501234567"; expected LIDMap="pn-mapped"
+func TestClassifyNoDonorLIDMapSuffix(t *testing.T) {
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		t.Skipf("test Postgres not reachable: %v", err)
+	}
+
+	const (
+		classifyTestJID = "17799990030@s.whatsapp.net"
+		testLID         = "238877608562780"
+		testPN          = "972501234567"
+		testSenderLID   = testLID + "_1" // LID Signal-address with agent suffix
+		testGroup       = "classifylidmap_test@g.us"
+	)
+
+	cleanupDev := insertRecoveryTestDevice(t, db, classifyTestJID)
+	t.Cleanup(func() {
+		cleanupDev()
+		db.Close()
+	})
+
+	// Seed a single whatsmeow_lid_map row covering both arms.
+	ctx := context.Background()
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO whatsmeow_lid_map (lid, pn) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		testLID, testPN,
+	)
+	if err != nil {
+		t.Fatalf("seed whatsmeow_lid_map: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(),
+			`DELETE FROM whatsmeow_lid_map WHERE lid=$1`, testLID)
+	})
+
+	// Build the SQLStore for the test account.
+	jid, err := types.ParseJID(classifyTestJID)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	classifyContainer := sqlstore.NewWithDB(db, "postgres", nil)
+	classifyStore := sqlstore.NewSQLStore(classifyContainer, jid)
+
+	// lid_mapped arm: senderBare carries the agent suffix "_1"; the lid_map row
+	// has the bare lid "238877608562780". After the fix, classifyNoDonor strips
+	// the suffix and finds the row as "lid-mapped".
+	t.Run("lid_mapped", func(t *testing.T) {
+		fields := sqlstore.ClassifyNoDonor(ctx, classifyStore, classifyTestJID, testGroup, testSenderLID)
+		if fields.LIDMap != "lid-mapped" {
+			t.Errorf("lid_mapped arm: LIDMap = %q, want %q (agent-suffix strip missing or broken)",
+				fields.LIDMap, "lid-mapped")
+		}
+		t.Logf("lid_mapped arm: LIDMap=%s KeysElsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
+	})
+
+	// pn_mapped arm: senderBare is a plain PN (no underscore). The lid_map row
+	// has pn="972501234567". Expected: "pn-mapped".
+	t.Run("pn_mapped", func(t *testing.T) {
+		fields := sqlstore.ClassifyNoDonor(ctx, classifyStore, classifyTestJID, testGroup, testPN)
+		if fields.LIDMap != "pn-mapped" {
+			t.Errorf("pn_mapped arm: LIDMap = %q, want %q",
+				fields.LIDMap, "pn-mapped")
+		}
+		t.Logf("pn_mapped arm: LIDMap=%s KeysElsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
+	})
+}

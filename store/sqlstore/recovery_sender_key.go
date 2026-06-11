@@ -44,6 +44,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
@@ -194,8 +195,17 @@ func classifyNoDonor(ctx context.Context, s *SQLStore, ourJID, group, senderBare
 
 	// (a) LID-map state: does senderBare appear in whatsmeow_lid_map as either
 	// a PN or a LID?
+	//
+	// LID Signal-address users arrive as "<digits>_<agent>" (e.g.
+	// "238877608562780_1") but whatsmeow_lid_map stores bare digits with no
+	// suffix. Strip everything from the first underscore before querying so
+	// that LID senders are not silently reported as "unmapped".
+	// PN users (pure digits, never contain underscore) are unaffected.
+	// senderBare (original, possibly suffixed) is kept unchanged for section
+	// (b)'s LIKE match against whatsmeow_sender_keys.
+	lidMapKey, _, _ := strings.Cut(senderBare, "_")
 	var lidKind string
-	err := s.db.QueryRow(ctx, subclassLIDMapQuery, senderBare).Scan(&lidKind)
+	err := s.db.QueryRow(ctx, subclassLIDMapQuery, lidMapKey).Scan(&lidKind)
 	if errors.Is(err, sql.ErrNoRows) {
 		fields.LIDMap = "unmapped"
 	} else if err == nil {
