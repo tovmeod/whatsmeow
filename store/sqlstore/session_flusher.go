@@ -255,6 +255,40 @@ func (f *SessionFlusher) RemovePrefix(prefix string) {
 	f.mu.Unlock()
 }
 
+// flushPrefixBlocked synchronously writes every dirty entry whose address
+// starts with prefix to the DB, then removes ALL prefix-matching entries from
+// the dirty-set. Caller MUST hold flushMu (i.e. call this from inside
+// WithFlushBlocked). Used by MigratePNToLID (CR-04) so that (a) the
+// migration's SELECT copies the freshest ratchet state — not a stale DB blob
+// — to the LID key, and (b) no buffered PN-addressed blob can flush back as
+// a zombie pn row after the migration deletes the pn rows (post-migration
+// reads are LID-addressed and would never consult it; the once-per-process
+// migration gate means a re-migration would not heal it).
+//
+// The clear is deliberately unconditional for prefix-matching entries
+// (including ones enqueued during the DB write above): retaining a
+// newer-generation pn entry (the CR-02 pattern) would be wrong here because
+// it would later flush back as a zombie pn row. A writer mutating a PN
+// address concurrently with its own migration races the migration itself,
+// independent of the flusher — that residual is not fixable at this layer.
+func (f *SessionFlusher) flushPrefixBlocked(ctx context.Context, prefix string) error {
+	f.mu.Lock()
+	batch := make(map[string][]byte)
+	for addr, e := range f.dirty {
+		if strings.HasPrefix(addr, prefix) {
+			batch[addr] = copyBytes(e.blob)
+		}
+	}
+	f.mu.Unlock()
+	if len(batch) > 0 {
+		if err := f.db.PutManySessions(ctx, batch); err != nil {
+			return err
+		}
+	}
+	f.RemovePrefix(prefix)
+	return nil
+}
+
 // WithFlushBlocked runs fn while no flush cycle (async batch, shutdown-drain
 // iteration, or inline backpressure write) is in flight. Callers performing
 // DB deletes (DeleteSession / DeleteAllSessions / MigratePNToLID) MUST run

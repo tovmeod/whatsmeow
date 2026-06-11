@@ -28,6 +28,8 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -479,6 +481,56 @@ func TestCachedSession_CR01_DeleteAllSessionsNotResurrectedByInflightFlush(t *te
 	flusher.Drain()
 	if has, _ := inner.HasSession(ctx, "cr01b:0"); has {
 		t.Fatal("bulk-deleted session resurrected by post-delete Drain (CR-01)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestCachedSession_CR04_MigratePNToLIDSweepsDirtySet
+// CR-04 regression: a PN-addressed session that is dirty (buffered, not yet
+// flushed) at MigratePNToLID time must (a) be flushed to the DB before the
+// inner migration so the freshest ratchet state migrates to the LID key, and
+// (b) be removed from the dirty-set so it cannot later flush back as a
+// zombie pn row that post-migration LID-addressed reads never consult.
+// ---------------------------------------------------------------------------
+
+func TestCachedSession_CR04_MigratePNToLIDSweepsDirtySet(t *testing.T) {
+	ctx := context.Background()
+	c, inner, _, flusher, _ := newTestCachedSessionStoreWithFlusher(t, 100)
+
+	pn := types.JID{User: "12345", Server: types.DefaultUserServer}
+	lid := types.JID{User: "777", Server: types.HiddenUserServer}
+	pnAddr := pn.SignalAddressUser() + ":0"
+	lidAddr := lid.SignalAddressUser() + ":0"
+
+	fresh := []byte("freshest-ratchet")
+	if err := c.PutSession(ctx, pnAddr, fresh); err != nil {
+		t.Fatalf("PutSession: %v", err)
+	}
+	// Setup invariant: the blob is dirty (buffered), NOT yet in the inner store.
+	if has, _ := inner.HasSession(ctx, pnAddr); has {
+		t.Fatal("setup: pn session already flushed to inner — test needs it dirty")
+	}
+
+	if err := c.MigratePNToLID(ctx, pn, lid); err != nil {
+		t.Fatalf("MigratePNToLID: %v", err)
+	}
+
+	// (a) The freshest (dirty) blob must have been migrated to the LID key.
+	got, err := inner.GetSession(ctx, lidAddr)
+	if err != nil {
+		t.Fatalf("inner.GetSession(%s): %v", lidAddr, err)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("migrated LID session = %q, want %q — dirty PN state missed the migration (stale LID row, CR-04)", got, fresh)
+	}
+	// (b) No PN-addressed dirty entry may survive the migration.
+	if _, ok := flusher.Peek(pnAddr); ok {
+		t.Fatal("PN dirty entry survived MigratePNToLID — would flush back as a zombie pn row (CR-04)")
+	}
+	// (c) A post-migration drain must not resurrect the pn row.
+	flusher.Drain()
+	if has, _ := inner.HasSession(ctx, pnAddr); has {
+		t.Fatal("zombie pn row written to inner store after migration (CR-04)")
 	}
 }
 

@@ -8,6 +8,7 @@ package sqlstore
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -448,9 +449,11 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 	return nil
 }
 
-// MigratePNToLID writes through to inner FIRST (Phase 17.5 FIX CR-04
-// regression: the prior implementation dropped pending writes and purged
-// caches BEFORE calling inner, leaving the migrated row at a stale value).
+// MigratePNToLID first flushes PN-prefixed dirty flusher entries to the DB
+// (Phase 35.2-09 CR-04 — this WRITES pending state, unlike the Phase 17.5
+// regression where pending writes were DROPPED and caches purged before
+// calling inner, leaving the migrated row stale), then writes through to
+// inner, both inside the flusher's flush-blocked section.
 // On success, EVICTS any cache entries under this wrapper's JID prefix
 // whose libsignal address-user equals pn.SignalAddressUser(). Subsequent
 // reads against the new LID address will cache-miss, fetch the migrated
@@ -482,7 +485,25 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 // steady-state PN→LID migration rate" was contradicted by that profile;
 // the O(K) implementation makes it genuinely negligible.
 func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
-	if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
+	// Phase 35.2-09 CR-04: force PN-prefixed dirty entries down to the DB and
+	// remove them BEFORE the inner migration, inside the flush-blocked
+	// section, so (a) the migration's SELECT copies the freshest ratchet
+	// state to the LID key (a dirty-but-unflushed PN session would otherwise
+	// miss the migration — stale LID row) and (b) neither an in-flight flush
+	// snapshot nor a later drain can re-insert a zombie pn row after the
+	// migration deletes the pn rows. On sweep failure the migration is
+	// aborted (fail closed); the inner once-per-process gate is not consumed,
+	// so a retry can still heal.
+	if c.flusher != nil {
+		if err := c.flusher.WithFlushBlocked(func() error {
+			if err := c.flusher.flushPrefixBlocked(ctx, pn.SignalAddressUser()+":"); err != nil {
+				return fmt.Errorf("failed to flush pending sessions before PN->LID migration: %w", err)
+			}
+			return c.inner.MigratePNToLID(ctx, pn, lid)
+		}); err != nil {
+			return err
+		}
+	} else if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
 		return err
 	}
 	// Phase 24: single O(K) lookup instead of the former O(N) two-pass
