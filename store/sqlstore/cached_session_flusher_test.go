@@ -43,7 +43,7 @@ import (
 // countingFlushStore counts PutManySessions calls and delegates to the same
 // fakeSessionStore so Get-after-drain reads back the written data.
 type countingFlushStore struct {
-	backing  *fakeSessionStore
+	backing   *fakeSessionStore
 	callCount int
 }
 

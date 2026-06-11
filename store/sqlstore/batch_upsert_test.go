@@ -18,8 +18,8 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/serialize"
 
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -298,10 +298,10 @@ func normalizeSenderKeyStructure(sk *groupRecord.SenderKeyStructure) *groupRecor
 	result := &groupRecord.SenderKeyStructure{}
 	for _, st := range sk.SenderKeyStates {
 		ns := &groupRecord.SenderKeyStateStructure{
-			KeyID:            st.KeyID,
+			KeyID:             st.KeyID,
 			SigningKeyPublic:  st.SigningKeyPublic,
 			SigningKeyPrivate: st.SigningKeyPrivate,
-			SenderChainKey:   st.SenderChainKey,
+			SenderChainKey:    st.SenderChainKey,
 		}
 		// Normalize Keys: treat nil and [] as equivalent (both mean "no skipped keys").
 		if len(st.Keys) > 0 {

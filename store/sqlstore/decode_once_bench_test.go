@@ -38,15 +38,16 @@ var pbSerializer = serialize.NewProtoBufSerializer()
 // buildSessionBlob constructs a synthetic session blob with the given number
 // of skipped-message-keys in the first receiver chain.
 // Structure:
-//   SessionState.SenderChain with no skipped keys
-//   ReceiverChains[0].MessageKeys with numKeys entries (worst-case ratchet lag)
+//
+//	SessionState.SenderChain with no skipped keys
+//	ReceiverChains[0].MessageKeys with numKeys entries (worst-case ratchet lag)
 //
 // Each skipped MessageKey is represented as a *message.KeysStructure with
 // fixed 32-byte arrays; this matches the worst-case in the wild.
 func buildSessionBlob(numKeys int) []byte {
 	type chainKeyStruct struct {
-		Index  uint32
-		Key    []byte
+		Index uint32
+		Key   []byte
 	}
 	type msgKeyStruct struct {
 		CipherKey []byte
@@ -339,10 +340,10 @@ func buildSenderKeyBlob(numKeys int) []byte {
 	}
 	type senderKeyRecordStruct struct {
 		SenderKeyStates []struct {
-			KeyID          uint32
-			SenderChainKey chainKeyStruct
-			Keys           []senderMsgKeyStruct
-			SigningKeyPublic []byte
+			KeyID             uint32
+			SenderChainKey    chainKeyStruct
+			Keys              []senderMsgKeyStruct
+			SigningKeyPublic  []byte
 			SigningKeyPrivate []byte
 		}
 	}
@@ -382,10 +383,10 @@ func buildSenderKeyBlob(numKeys int) []byte {
 
 	record := senderKeyRecordStruct{}
 	record.SenderKeyStates = []struct {
-		KeyID          uint32
-		SenderChainKey chainKeyStruct
-		Keys           []senderMsgKeyStruct
-		SigningKeyPublic []byte
+		KeyID             uint32
+		SenderChainKey    chainKeyStruct
+		Keys              []senderMsgKeyStruct
+		SigningKeyPublic  []byte
 		SigningKeyPrivate []byte
 	}{
 		{
@@ -394,7 +395,7 @@ func buildSenderKeyBlob(numKeys int) []byte {
 				Iteration: uint32(numKeys),
 				ChainKey:  key32(),
 			},
-			Keys:             msgKeys,
+			Keys:              msgKeys,
 			SigningKeyPublic:  pub33(),
 			SigningKeyPrivate: key32(),
 		},

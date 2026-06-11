@@ -529,11 +529,11 @@ func NewSenderKeyRow(group, user string, s *groupRecord.SenderKeyStructure) Send
 type senderKeyColumns struct {
 	fmtVer int16
 
-	stKeyID              []int64
-	stChainKeyIteration  []int64
-	stChainKey           [][]byte
-	stSigningKeyPublic   [][]byte
-	stSigningKeyPrivate  [][]byte
+	stKeyID             []int64
+	stChainKeyIteration []int64
+	stChainKey          [][]byte
+	stSigningKeyPublic  [][]byte
+	stSigningKeyPrivate [][]byte
 
 	smkStateIdx  []int32
 	smkIteration []int64
@@ -693,10 +693,10 @@ func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) e
 			n := rowsAdded * paramsPerRow
 			fmt.Fprintf(&qb, "($%d,$%d,$%d,$%d)", n+1, n+2, n+3, n+4)
 			args = append(args,
-				s.JID,      // $1 our_jid
-				row.Group,  // $2 chat_id
-				row.User,   // $3 sender_id
-				row.Blob,   // $4 sender_key (PackFlat bytea)
+				s.JID,     // $1 our_jid
+				row.Group, // $2 chat_id
+				row.User,  // $3 sender_id
+				row.Blob,  // $4 sender_key (PackFlat bytea)
 			)
 			rowsAdded++
 		}

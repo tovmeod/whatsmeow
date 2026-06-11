@@ -59,8 +59,8 @@ import (
 
 // Fixed per-state byte-field sizes (verified on 20,000 prod fmt_ver=2 rows).
 const (
-	flatChainKeyLen   = 32 // SenderChainKey.ChainKey
-	flatSigningPubLen = 33 // SigningKeyPublic (serialized DjbECPublicKey: 0x05||32)
+	flatChainKeyLen    = 32 // SenderChainKey.ChainKey
+	flatSigningPubLen  = 33 // SigningKeyPublic (serialized DjbECPublicKey: 0x05||32)
 	flatSigningPrivLen = 32 // SigningKeyPrivate (nullable; zeroed + hasPriv=false when absent)
 
 	flatIVLen        = 16 // SenderMessageKey.IV
@@ -79,11 +79,11 @@ const flatMaxStates = 6
 // bytes.
 type flatState struct {
 	keyID       uint32
-	chainIter   uint32                  // SenderChainKey.Iteration
-	chainKey    [flatChainKeyLen]byte   // SenderChainKey.ChainKey
-	signingPub  [flatSigningPubLen]byte // SigningKeyPublic
+	chainIter   uint32                   // SenderChainKey.Iteration
+	chainKey    [flatChainKeyLen]byte    // SenderChainKey.ChainKey
+	signingPub  [flatSigningPubLen]byte  // SigningKeyPublic
 	signingPriv [flatSigningPrivLen]byte // SigningKeyPrivate (zeroed when absent)
-	hasPriv     bool                    // SigningKeyPrivate != nil
+	hasPriv     bool                     // SigningKeyPrivate != nil
 }
 
 // flatSenderKey is the cache value type. The states array is by value

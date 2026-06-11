@@ -33,8 +33,8 @@ import (
 	"testing"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 
 	"go.mau.fi/whatsmeow/store/sqlstore"
 )
@@ -88,18 +88,18 @@ func buildColumnarTestStructure(keyID uint32) *groupRecord.SenderKeyStructure {
 	return &groupRecord.SenderKeyStructure{
 		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
 			{
-				KeyID:            keyID,
-				SenderChainKey:   &ratchet.SenderChainKeyStructure{Iteration: 5, ChainKey: chainKey},
+				KeyID:             keyID,
+				SenderChainKey:    &ratchet.SenderChainKeyStructure{Iteration: 5, ChainKey: chainKey},
 				SigningKeyPublic:  pub,
 				SigningKeyPrivate: priv,
-				Keys:             []*ratchet.SenderMessageKeyStructure{smk},
+				Keys:              []*ratchet.SenderMessageKeyStructure{smk},
 			},
 			{
-				KeyID:            keyID + 1,
-				SenderChainKey:   &ratchet.SenderChainKeyStructure{Iteration: 3, ChainKey: chainKey2},
+				KeyID:             keyID + 1,
+				SenderChainKey:    &ratchet.SenderChainKeyStructure{Iteration: 3, ChainKey: chainKey2},
 				SigningKeyPublic:  pub2,
 				SigningKeyPrivate: nil, // nil = received key (dominant shape)
-				Keys:             nil,
+				Keys:              nil,
 			},
 		},
 	}
@@ -126,8 +126,8 @@ func normalizeSKStructure(sk *groupRecord.SenderKeyStructure) *groupRecord.Sende
 	out := &groupRecord.SenderKeyStructure{}
 	for _, st := range sk.SenderKeyStates {
 		ns := &groupRecord.SenderKeyStateStructure{
-			KeyID:           st.KeyID,
-			SenderChainKey:  st.SenderChainKey,
+			KeyID:            st.KeyID,
+			SenderChainKey:   st.SenderChainKey,
 			SigningKeyPublic: st.SigningKeyPublic,
 		}
 		// Normalize SigningKeyPrivate: nil and all-zero are both "no private key"

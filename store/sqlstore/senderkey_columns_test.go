@@ -25,8 +25,8 @@ import (
 	"reflect"
 	"testing"
 
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 )
 
 // mkChainKey builds a SenderChainKeyStructure with deterministic test data.
@@ -90,11 +90,11 @@ func TestSenderKeyRoundTrip(t *testing.T) {
 		in := &groupRecord.SenderKeyStructure{
 			SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
 				{
-					KeyID:            42,
-					SenderChainKey:   mkChainKey(7, 0xA0),
+					KeyID:             42,
+					SenderChainKey:    mkChainKey(7, 0xA0),
 					SigningKeyPublic:  mkSigningPub(0x10),
 					SigningKeyPrivate: mkSigningPriv(0x20),
-					Keys:             nil,
+					Keys:              nil,
 				},
 			},
 		}
@@ -109,11 +109,11 @@ func TestSenderKeyRoundTrip(t *testing.T) {
 		var states []*groupRecord.SenderKeyStateStructure
 		for i := 0; i < 5; i++ {
 			states = append(states, &groupRecord.SenderKeyStateStructure{
-				KeyID:            uint32(100 + i),
-				SenderChainKey:   mkChainKey(uint32(i*3), byte(i*7)),
+				KeyID:             uint32(100 + i),
+				SenderChainKey:    mkChainKey(uint32(i*3), byte(i*7)),
 				SigningKeyPublic:  mkSigningPub(byte(0x30 + i)),
 				SigningKeyPrivate: mkSigningPriv(byte(0x50 + i)),
-				Keys:             nil,
+				Keys:              nil,
 			})
 		}
 		in := &groupRecord.SenderKeyStructure{SenderKeyStates: states}
@@ -132,11 +132,11 @@ func TestSenderKeyRoundTrip(t *testing.T) {
 		in := &groupRecord.SenderKeyStructure{
 			SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
 				{
-					KeyID:            99,
-					SenderChainKey:   mkChainKey(31, 0xCC),
+					KeyID:             99,
+					SenderChainKey:    mkChainKey(31, 0xCC),
 					SigningKeyPublic:  mkSigningPub(0x77),
 					SigningKeyPrivate: mkSigningPriv(0x88),
-					Keys:             smks,
+					Keys:              smks,
 				},
 			},
 		}
@@ -152,11 +152,11 @@ func TestSenderKeyRoundTrip(t *testing.T) {
 		var states []*groupRecord.SenderKeyStateStructure
 		for i := 0; i < 3; i++ {
 			states = append(states, &groupRecord.SenderKeyStateStructure{
-				KeyID:            uint32(200 + i),
-				SenderChainKey:   mkChainKey(uint32(i*5), byte(i*11)),
+				KeyID:             uint32(200 + i),
+				SenderChainKey:    mkChainKey(uint32(i*5), byte(i*11)),
 				SigningKeyPublic:  mkSigningPub(byte(0x40 + i)),
 				SigningKeyPrivate: nil, // received key — MUST round-trip as nil
-				Keys:             nil,
+				Keys:              nil,
 			})
 		}
 		in := &groupRecord.SenderKeyStructure{SenderKeyStates: states}
@@ -178,8 +178,8 @@ func TestSenderKeyRoundTrip(t *testing.T) {
 		in := &groupRecord.SenderKeyStructure{
 			SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
 				{
-					KeyID:            1,
-					SenderChainKey:   mkChainKey(10, 0x01),
+					KeyID:             1,
+					SenderChainKey:    mkChainKey(10, 0x01),
 					SigningKeyPublic:  mkSigningPub(0x01),
 					SigningKeyPrivate: mkSigningPriv(0x01),
 					Keys: []*ratchet.SenderMessageKeyStructure{
@@ -188,15 +188,15 @@ func TestSenderKeyRoundTrip(t *testing.T) {
 					},
 				},
 				{
-					KeyID:            2,
-					SenderChainKey:   mkChainKey(20, 0x02),
+					KeyID:             2,
+					SenderChainKey:    mkChainKey(20, 0x02),
 					SigningKeyPublic:  mkSigningPub(0x02),
 					SigningKeyPrivate: nil,
-					Keys:             nil,
+					Keys:              nil,
 				},
 				{
-					KeyID:            3,
-					SenderChainKey:   mkChainKey(30, 0x03),
+					KeyID:             3,
+					SenderChainKey:    mkChainKey(30, 0x03),
 					SigningKeyPublic:  mkSigningPub(0x03),
 					SigningKeyPrivate: mkSigningPriv(0x03),
 					Keys: []*ratchet.SenderMessageKeyStructure{

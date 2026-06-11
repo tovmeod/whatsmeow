@@ -26,8 +26,8 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
@@ -80,13 +80,13 @@ func buildTestDonorState(keyID, iter uint32) *donorSenderKeyState {
 		priv[i] = byte(i + 0x80)
 	}
 	return &donorSenderKeyState{
-		OurJID:           "donor@s.whatsapp.net",
-		KeyID:            keyID,
-		Iteration:        iter,
-		ChainKey:         chainKey,
+		OurJID:            "donor@s.whatsapp.net",
+		KeyID:             keyID,
+		Iteration:         iter,
+		ChainKey:          chainKey,
 		SigningKeyPublic:  pub,
 		SigningKeyPrivate: priv,
-		SkippedKeys:      nil,
+		SkippedKeys:       nil,
 	}
 }
 
@@ -127,7 +127,7 @@ func TestSingleFlightDonorCoalesces(t *testing.T) {
 	const keyID = uint32(42)
 
 	var (
-		sf        singleflight.Group
+		sf             singleflight.Group
 		donorCallCount atomic.Int64
 		// release unblocks all goroutines waiting inside the fake donor.
 		release = make(chan struct{})

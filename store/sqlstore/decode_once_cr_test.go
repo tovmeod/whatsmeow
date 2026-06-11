@@ -30,8 +30,8 @@ import (
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/keys/chain"
 	"go.mau.fi/libsignal/keys/message"
-	librecord "go.mau.fi/libsignal/state/record"
 	"go.mau.fi/libsignal/protocol"
+	librecord "go.mau.fi/libsignal/state/record"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -50,7 +50,7 @@ type testDeviceHandles struct {
 	skStore     *CachedSenderKeyStore
 	skLRU       *lru.Cache[string, []byte]
 	skParsedLRU *store.SKParsedLRU // Phase 17.9: flat value-struct LRU
-	testJID string // the JID string (== device.ID.String())
+	testJID     string             // the JID string (== device.ID.String())
 }
 
 // buildTestDeviceWithParsedCache constructs a *store.Device fully wired with
@@ -258,7 +258,7 @@ func buildFlatSenderKeyBlob(numKeys int) []byte {
 				},
 				SigningKeyPublic:  sigPub,
 				SigningKeyPrivate: sigPriv,
-				Keys:             smks,
+				Keys:              smks,
 			},
 		},
 	}

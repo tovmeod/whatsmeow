@@ -66,17 +66,17 @@ import (
 
 // Fixed per-field byte-field sizes (verified on libsignal v0.2.1 sources).
 const (
-	flatSessIdentityKeyLen   = 33 // LocalIdentityPublic, RemoteIdentityPublic (0x05 || 32-byte Curve25519)
-	flatSessRootKeyLen       = 32 // RootKey
-	flatSessSenderBaseKeyLen = 33 // SenderBaseKey (0x05-prefixed; nullable — hasSenderBaseKey flag)
-	flatSessRatchetPubLen    = 33 // SenderRatchetKeyPublic (0x05-prefixed Curve25519)
-	flatSessRatchetPrivLen   = 32 // SenderRatchetKeyPrivate (nullable — hasRatchetPrivate flag)
-	flatSessChainKeyLen      = 32 // ChainKey.Key
-	flatSessMsgCipherKeyLen  = 32 // message.KeysStructure.CipherKey
-	flatSessMsgMacKeyLen     = 32 // message.KeysStructure.MacKey
-	flatSessMsgIVLen         = 16 // message.KeysStructure.IV
+	flatSessIdentityKeyLen    = 33 // LocalIdentityPublic, RemoteIdentityPublic (0x05 || 32-byte Curve25519)
+	flatSessRootKeyLen        = 32 // RootKey
+	flatSessSenderBaseKeyLen  = 33 // SenderBaseKey (0x05-prefixed; nullable — hasSenderBaseKey flag)
+	flatSessRatchetPubLen     = 33 // SenderRatchetKeyPublic (0x05-prefixed Curve25519)
+	flatSessRatchetPrivLen    = 32 // SenderRatchetKeyPrivate (nullable — hasRatchetPrivate flag)
+	flatSessChainKeyLen       = 32 // ChainKey.Key
+	flatSessMsgCipherKeyLen   = 32 // message.KeysStructure.CipherKey
+	flatSessMsgMacKeyLen      = 32 // message.KeysStructure.MacKey
+	flatSessMsgIVLen          = 16 // message.KeysStructure.IV
 	flatSessPendingBaseKeyLen = 33 // PendingPreKeyStructure.BaseKey (0x05-prefixed)
-	flatSessExchangeKeyLen   = 32 // PendingKeyExchangeStructure keys: raw DjbECKey, NOT 0x05-prefixed (Pitfall 8)
+	flatSessExchangeKeyLen    = 32 // PendingKeyExchangeStructure keys: raw DjbECKey, NOT 0x05-prefixed (Pitfall 8)
 
 	// flatSessMsgKeyLen is the fixed on-wire size per messageKeyRecord:
 	// u32 index + 32 cipherKey + 32 macKey + 16 iv = 84 bytes.

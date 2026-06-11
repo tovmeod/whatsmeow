@@ -22,7 +22,7 @@ func TestInt64Array_RoundTrip(t *testing.T) {
 		{"empty", int64Array{}, "{}", false},
 		{"single", int64Array{42}, "{42}", false},
 		{"multi", int64Array{1, 2, 3, 999, -5}, "{1,2,3,999,-5}", false},
-		{"big", int64Array{int64(1<<32), int64(-1 << 32)}, "{4294967296,-4294967296}", false},
+		{"big", int64Array{int64(1 << 32), int64(-1 << 32)}, "{4294967296,-4294967296}", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

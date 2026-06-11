@@ -22,8 +22,8 @@ import (
 	"reflect"
 	"testing"
 
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 )
 
 // FuzzSenderKeyRoundTrip asserts recompose(decompose(in)) == in for all
@@ -31,9 +31,9 @@ import (
 func FuzzSenderKeyRoundTrip(f *testing.F) {
 	// Seed corpus 1: 0-key, 1 state, nil signing private.
 	f.Add(
-		uint8(1),  // nStates: 1
-		uint8(0),  // nKeys0: 0 skipped keys for state[0]
-		uint8(70), // sigPrivNilMask: >= 70 → nil (this is 70 → nil)
+		uint8(1),                       // nStates: 1
+		uint8(0),                       // nKeys0: 0 skipped keys for state[0]
+		uint8(70),                      // sigPrivNilMask: >= 70 → nil (this is 70 → nil)
 		[]byte{0xAA, 0xBB, 0xCC, 0xDD}, // chainKeyExtra
 		[]byte{0x05, 0x11, 0x22, 0x33}, // sigPubExtra
 	)

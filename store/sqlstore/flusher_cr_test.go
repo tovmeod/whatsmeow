@@ -222,11 +222,11 @@ func TestCR04MigrateBeforeFlush(t *testing.T) {
 	colsStale := testBlob(1, 5)
 
 	// Enqueue the high-iter entry (simulating the most-recent dirty write).
-	f.Enqueue(group, user, colsHigh, /*keyID=*/ 1, /*iter=*/ 10, false)
+	f.Enqueue(group, user, colsHigh /*keyID=*/, 1 /*iter=*/, 10, false)
 
 	// Simulate a cache-miss re-population at a stale lower iteration.
 	// SKDM dedup must reject this (same keyID, iter 5 < highIter 10).
-	f.Enqueue(group, user, colsStale, /*keyID=*/ 1, /*iter=*/ 5, false)
+	f.Enqueue(group, user, colsStale /*keyID=*/, 1 /*iter=*/, 5, false)
 
 	// Verify the dirty entry retains the high-iter DTO.
 	// Phase 17.9: session → cols; no bytes.Equal; check highIter + cols pointer.

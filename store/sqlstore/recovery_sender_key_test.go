@@ -43,8 +43,8 @@ import (
 	"testing"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -127,7 +127,7 @@ func buildDonorStructure(keyID, iter uint32, tag byte) *groupRecord.SenderKeyStr
 				},
 				SigningKeyPublic:  pub,
 				SigningKeyPrivate: priv,
-				Keys:             nil,
+				Keys:              nil,
 			},
 		},
 	}
@@ -217,7 +217,7 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		targetSuffix = ":0"
 		targetKeyID  = uint32(42)
 	)
-	donorSenderID  := bareUser + donorSuffix  // A's sender_id
+	donorSenderID := bareUser + donorSuffix   // A's sender_id
 	targetSenderID := bareUser + targetSuffix // B's target sender_id for recovery write
 
 	// -----------------------------------------------------------------------
@@ -393,14 +393,14 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		storeA := newSeedStoreA(t, db)
 		csB := newRecoveryTestStoreB(t, db)
 
-		donorSenderID5  := fmt.Sprintf("%s:5", bareUser)
+		donorSenderID5 := fmt.Sprintf("%s:5", bareUser)
 		donorSenderID7 := fmt.Sprintf("%s:7", bareUser)
 
-		struct5  := buildDonorStructure(targetKeyID, 5,  0xD1)
+		struct5 := buildDonorStructure(targetKeyID, 5, 0xD1)
 		struct12 := buildDonorStructure(targetKeyID, 12, 0xD2)
 
 		rows := []sqlstore.SenderKeyRow{
-			sqlstore.NewSenderKeyRow(group, donorSenderID5,  struct5),
+			sqlstore.NewSenderKeyRow(group, donorSenderID5, struct5),
 			sqlstore.NewSenderKeyRow(group, donorSenderID7, struct12),
 		}
 		if err := storeA.PutManySenderKeys(ctx, rows); err != nil {
@@ -483,14 +483,14 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 //
 // BLOCKING gate (must be --- PASS, never --- SKIP, when the test DB is reachable):
 //
-//  Arm 1 — fast path: single-state donor, state[0].KeyID == targetKeyID.
-//    recoveryScanQueryFast (chat_id + sk_keyid0=$targetKeyID + LIKE) finds the donor.
-//    UnpackFlat returns correct KeyID and Iteration.
+//	Arm 1 — fast path: single-state donor, state[0].KeyID == targetKeyID.
+//	  recoveryScanQueryFast (chat_id + sk_keyid0=$targetKeyID + LIKE) finds the donor.
+//	  UnpackFlat returns correct KeyID and Iteration.
 //
-//  Arm 2 — fallback path: two-state donor, targetKeyID is in state[1] only.
-//    recoveryScanQueryFast misses (sk_keyid0 = state[0].KeyID ≠ targetKeyID).
-//    recoveryScanQuery (LIKE-only, all states) finds the donor in state[1].
-//    UnpackFlat returns correct KeyID and Iteration.
+//	Arm 2 — fallback path: two-state donor, targetKeyID is in state[1] only.
+//	  recoveryScanQueryFast misses (sk_keyid0 = state[0].KeyID ≠ targetKeyID).
+//	  recoveryScanQuery (LIKE-only, all states) finds the donor in state[1].
+//	  UnpackFlat returns correct KeyID and Iteration.
 //
 // Both arms insert flat PackFlat blobs directly via SQL (not via the columnar
 // PutManySenderKeys path — the columnar columns no longer exist after upgrade 19).
@@ -693,10 +693,10 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 			flatTestJIDA, flatTestJIDB, flatGroup)
 
 		const (
-			state0KeyID     = uint32(88) // state[0] — does NOT match targetKeyID
-			fallbackTarget  = uint32(99) // state[1] — DOES match targetKeyID
-			state0Iter      = uint32(5)
-			state1Iter      = uint32(12)
+			state0KeyID        = uint32(88) // state[0] — does NOT match targetKeyID
+			fallbackTarget     = uint32(99) // state[1] — DOES match targetKeyID
+			state0Iter         = uint32(5)
+			state1Iter         = uint32(12)
 			fallbackTargetIter = uint32(20) // targetIter > both donors → accepted
 		)
 
@@ -844,7 +844,7 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 		advancedIter = uint32(50)
 		staleIter    = uint32(10)
 	)
-	donorSenderID  := bareUser + donorSuffix
+	donorSenderID := bareUser + donorSuffix
 	targetSenderID := bareUser + targetSuffix
 
 	ctx := context.Background()
@@ -971,7 +971,7 @@ func TestInlineRecoveryIterationGuard(t *testing.T) {
 		targetSuffix = ":0"
 		targetKeyID  = uint32(3)
 	)
-	donorSenderID  := bareUser + donorSuffix
+	donorSenderID := bareUser + donorSuffix
 	targetSenderID := bareUser + targetSuffix
 
 	ctx := context.Background()
@@ -1056,11 +1056,11 @@ func TestSenderKeySubclass(t *testing.T) {
 	}
 
 	const (
-		subclassJIDB  = "17799990020@s.whatsapp.net" // account under test
-		failGroup     = "subclass_fail_group@g.us"   // the group where the key is missing
-		otherGroup    = "subclass_other_group@g.us"  // a different group for keys_elsewhere
-		senderBare    = "55512340099_sub"
-		senderID      = senderBare + ":0"
+		subclassJIDB = "17799990020@s.whatsapp.net" // account under test
+		failGroup    = "subclass_fail_group@g.us"   // the group where the key is missing
+		otherGroup   = "subclass_other_group@g.us"  // a different group for keys_elsewhere
+		senderBare   = "55512340099_sub"
+		senderID     = senderBare + ":0"
 	)
 
 	cleanupB := insertRecoveryTestDevice(t, db, subclassJIDB)
@@ -1133,8 +1133,9 @@ func TestSenderKeySubclass(t *testing.T) {
 }
 
 // buildMultiStateStructure builds a SenderKeyStructure with two states:
-//   state[0]: keyID=k1, iter=iter1
-//   state[1]: keyID=k2, iter=iter2
+//
+//	state[0]: keyID=k1, iter=iter1
+//	state[1]: keyID=k2, iter=iter2
 func buildMultiStateStructure(k1, iter1, k2, iter2 uint32, tag1, tag2 byte) *groupRecord.SenderKeyStructure {
 	makeChainKey := func(base byte) []byte {
 		ck := make([]byte, 32)
@@ -1232,7 +1233,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		k2           = uint32(20)
 		k3           = uint32(30)
 	)
-	donorSenderID  := bareUser + donorSuffix
+	donorSenderID := bareUser + donorSuffix
 	targetSenderID := bareUser + targetSuffix
 
 	ctx := context.Background()
@@ -2164,10 +2165,10 @@ func TestInlineRecoveryMergeKeepsExistingSkippedKeys(t *testing.T) {
 // "unmapped" for LID senders — corrupting the SENDERKEY_SUBCLASS diagnostic field.
 //
 // Two arms:
-//  - lid_mapped: senderBare="238877608562780_1" (LID with agent suffix);
-//    lid_map row has lid="238877608562780"; expected LIDMap="lid-mapped"
-//  - pn_mapped: senderBare="972501234567" (pure PN, no underscore);
-//    lid_map row has pn="972501234567"; expected LIDMap="pn-mapped"
+//   - lid_mapped: senderBare="238877608562780_1" (LID with agent suffix);
+//     lid_map row has lid="238877608562780"; expected LIDMap="lid-mapped"
+//   - pn_mapped: senderBare="972501234567" (pure PN, no underscore);
+//     lid_map row has pn="972501234567"; expected LIDMap="pn-mapped"
 func TestClassifyNoDonorLIDMapSuffix(t *testing.T) {
 	db, err := sql.Open("pgx", batchTestDSN())
 	if err != nil {

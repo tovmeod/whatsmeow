@@ -9,9 +9,10 @@
 // sender-key blobs and drains them in batches via PutManySenderKeys.
 //
 // Design reference: .planning/phases/17.7-*/17.7-WRITEBACK-CACHE-DESIGN.md
-//   §5  flush triggers
-//   §6  flusher, backpressure & failure
-//   §8  telemetry
+//
+//	§5  flush triggers
+//	§6  flusher, backpressure & failure
+//	§8  telemetry
 package sqlstore
 
 import (

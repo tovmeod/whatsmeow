@@ -10,12 +10,13 @@
 // Phase 17.13: parsedSessionCache removed (D-04a); session cache tests removed.
 //
 // Coverage:
-//   SC-1: hit path returns cached pointer without deserialization.
-//   SC-6: Invalidate removes the entry; subsequent LoadStruct returns a miss.
-//   Store-time mutex: concurrent StoreStruct calls produce no data race.
-//   Read-only discipline: re-storing a retrieved pointer is a no-op (the
-//     discipline is that callers never mutate it; -race enforces this at
-//     runtime).
+//
+//	SC-1: hit path returns cached pointer without deserialization.
+//	SC-6: Invalidate removes the entry; subsequent LoadStruct returns a miss.
+//	Store-time mutex: concurrent StoreStruct calls produce no data race.
+//	Read-only discipline: re-storing a retrieved pointer is a no-op (the
+//	  discipline is that callers never mutate it; -race enforces this at
+//	  runtime).
 //
 // All tests run under -race; no external DB or SQL involved.
 package store

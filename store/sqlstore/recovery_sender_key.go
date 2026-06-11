@@ -47,8 +47,8 @@ import (
 	"strings"
 	"sync/atomic"
 
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 
 	"go.mau.fi/whatsmeow/store"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -177,7 +177,7 @@ const subclassKeysElsewhereQuery = `
 // noDonorFields is the result of classifyNoDonor — factored out so tests can
 // assert the field values without triggering the log emission.
 type noDonorFields struct {
-	LIDMap       string // "pn-mapped", "lid-mapped", "unmapped", or "err"
+	LIDMap        string // "pn-mapped", "lid-mapped", "unmapped", or "err"
 	KeysElsewhere bool   // true = sender has keys with us in at least one other group
 }
 
@@ -308,13 +308,13 @@ func scanFlatRows(rows interface {
 				}
 			}
 			best = &donorSenderKeyState{
-				OurJID:           ourJID,
-				KeyID:            st.KeyID,
-				Iteration:        donorIter,
-				ChainKey:         st.SenderChainKey.ChainKey,
+				OurJID:            ourJID,
+				KeyID:             st.KeyID,
+				Iteration:         donorIter,
+				ChainKey:          st.SenderChainKey.ChainKey,
 				SigningKeyPublic:  st.SigningKeyPublic,
 				SigningKeyPrivate: st.SigningKeyPrivate,
-				SkippedKeys:      skipped,
+				SkippedKeys:       skipped,
 			}
 		}
 	}

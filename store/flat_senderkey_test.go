@@ -204,8 +204,8 @@ func TestFlatStateUnpackSkippedMalformed(t *testing.T) {
 	}
 	// well-formed length but stateIdx out of range.
 	rec := make([]byte, 4+skippedRecordLen)
-	rec[3] = 1            // count = 1
-	rec[4] = 9            // stateIdx = 9 (only 1 state exists)
+	rec[3] = 1 // count = 1
+	rec[4] = 9 // stateIdx = 9 (only 1 state exists)
 	if err := unpackSkipped(rec, states); err == nil {
 		t.Fatal("expected error for out-of-range stateIdx")
 	}

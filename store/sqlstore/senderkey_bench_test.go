@@ -50,10 +50,10 @@ import (
 	"runtime"
 	"testing"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
 	lru "github.com/hashicorp/golang-lru/v2"
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
@@ -160,9 +160,11 @@ var jsonBlob32 = func() []byte {
 // benchmark.
 //
 // Column order mirrors recoveryScanQuery and getSenderKeyDecomposed:
-//   st_key_id, st_chain_key_iteration, st_chain_key,
-//   st_signing_key_public, st_signing_key_private,
-//   smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed
+//
+//	st_key_id, st_chain_key_iteration, st_chain_key,
+//	st_signing_key_public, st_signing_key_private,
+//	smk_state_idx, smk_iteration, smk_iv, smk_cipher_key, smk_seed
+//
 // ---------------------------------------------------------------------------
 func colsRoundTrip(in *senderKeyColumns) (*senderKeyColumns, error) {
 	// --- encode (driver.Valuer: Go → PG text) ---
@@ -578,12 +580,12 @@ func gcTrend(deltaFromPrev int64, newEntries int) string {
 // ---------------------------------------------------------------------------
 
 const (
-	recovBenchDSN     = "postgresql://kavtov_test:kavtov_test@localhost:5433/kavtov_test"
-	recovBenchJIDA    = "18811110001@s.whatsapp.net"
-	recovBenchJIDB    = "18811110002@s.whatsapp.net"
-	recovBenchGroup   = "recovbench@g.us"
-	recovBenchSender  = "55500001_1"
-	recovBenchKeyID   = uint32(77)
+	recovBenchDSN    = "postgresql://kavtov_test:kavtov_test@localhost:5433/kavtov_test"
+	recovBenchJIDA   = "18811110001@s.whatsapp.net"
+	recovBenchJIDB   = "18811110002@s.whatsapp.net"
+	recovBenchGroup  = "recovbench@g.us"
+	recovBenchSender = "55500001_1"
+	recovBenchKeyID  = uint32(77)
 )
 
 // recovBenchDSNOrEnv returns the test DSN, honouring TEST_DSN / KAVTOV_TEST_DSN.

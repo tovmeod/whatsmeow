@@ -316,4 +316,3 @@ func AddFlatToLRU(lru *SKParsedLRU, key string, s *groupRecord.SenderKeyStructur
 	lru.Add(key, f)
 	return true
 }
-

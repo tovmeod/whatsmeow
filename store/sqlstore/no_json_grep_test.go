@@ -99,7 +99,9 @@ var jsonCallPatterns = []string{
 // A line containing one of these markers (as a substring) is an allowed exception.
 // ALLOW-JSON-DRAIN-BLOB: Serialize fallback in PutSenderKeyStructure when PackFlat fails.
 // ALLOW-JSON-LEGACY-READ: Serialize/Deserialize in store/signal.go for non-columnar store
-//   fallback (non-production path: fires only when CachedSenderKeyStore is not wired).
+//
+//	fallback (non-production path: fires only when CachedSenderKeyStore is not wired).
+//
 // Stage 3: JSON session drain markers removed — session paths permanently flat-only.
 var allowMarkers = []string{
 	"ALLOW-JSON-DRAIN-BLOB",

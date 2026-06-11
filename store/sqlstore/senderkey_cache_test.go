@@ -40,8 +40,8 @@ import (
 	"testing"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	libprotocol "go.mau.fi/libsignal/protocol"
 
 	"go.mau.fi/whatsmeow/store"
@@ -78,7 +78,7 @@ func buildAdvancedStructure(keyID uint32, iter uint32) *groupRecord.SenderKeyStr
 				},
 				SigningKeyPublic:  pub,
 				SigningKeyPrivate: priv,
-				Keys:             nil,
+				Keys:              nil,
 			},
 		},
 	}

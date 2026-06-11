@@ -260,12 +260,12 @@ type Device struct {
 
 	FacebookUUID uuid.UUID
 
-	Initialized   bool
-	Deleted       bool
-	Identities    IdentityStore
-	Sessions      SessionStore
-	PreKeys       PreKeyStore
-	SenderKeys    SenderKeyStore
+	Initialized bool
+	Deleted     bool
+	Identities  IdentityStore
+	Sessions    SessionStore
+	PreKeys     PreKeyStore
+	SenderKeys  SenderKeyStore
 	// Phase 17.8: decode-once struct-LRU cache for sender keys. Wired by attachCachedStores.
 	// Phase 17.13: parsedSessionCache removed (D-04a); sessions cached as flat []byte only.
 	ParsedSKCache *parsedSKCache
@@ -273,16 +273,16 @@ type Device struct {
 	// Nil before attachCachedStores wires it. message.go gates on nil before
 	// calling TryInlineRecovery — no-op when not wired (test environments, pre-init).
 	InlineRecoverer SenderKeyInlineRecoverer
-	AppStateKeys  AppStateSyncKeyStore
-	AppState      AppStateStore
-	Contacts      ContactStore
-	ChatSettings  ChatSettingsStore
-	MsgSecrets    MsgSecretStore
-	PrivacyTokens PrivacyTokenStore
-	NCTSalt       NCTSaltStore
-	EventBuffer   EventBuffer
-	LIDs          LIDStore
-	Container     DeviceContainer
+	AppStateKeys    AppStateSyncKeyStore
+	AppState        AppStateStore
+	Contacts        ContactStore
+	ChatSettings    ChatSettingsStore
+	MsgSecrets      MsgSecretStore
+	PrivacyTokens   PrivacyTokenStore
+	NCTSalt         NCTSaltStore
+	EventBuffer     EventBuffer
+	LIDs            LIDStore
+	Container       DeviceContainer
 }
 
 func (device *Device) GetJID() types.JID {

@@ -1477,7 +1477,7 @@ func (f *concurrentFakeSessionStore) PutManySessions(_ context.Context, sessions
 }
 
 func (f *concurrentFakeSessionStore) DeleteAllSessions(_ context.Context, _ string) error { return nil }
-func (f *concurrentFakeSessionStore) DeleteSession(_ context.Context, _ string) error      { return nil }
+func (f *concurrentFakeSessionStore) DeleteSession(_ context.Context, _ string) error     { return nil }
 func (f *concurrentFakeSessionStore) MigratePNToLID(_ context.Context, _, _ types.JID) error {
 	return nil
 }
