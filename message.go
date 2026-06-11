@@ -375,6 +375,13 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		if encType == "pkmsg" || encType == "msg" {
 			decrypted, ciphertextHash, err = cli.decryptDM(ctx, &child, senderEncryptionJID, encType == "pkmsg", info.Timestamp)
 			containsDirectMsg = true
+			if skdmTraceUser(info.Sender.User) {
+				if err != nil {
+					cli.Log.Infof("SKDM_TRACE stage=dm-decrypt-FAIL sender=%s device=%d enc=%s group=%s msgid=%s err=%v", info.Sender.User, info.Sender.Device, encType, info.Chat.String(), info.ID, err)
+				} else {
+					cli.Log.Infof("SKDM_TRACE stage=dm-decrypt-OK sender=%s device=%d enc=%s group=%s msgid=%s", info.Sender.User, info.Sender.Device, encType, info.Chat.String(), info.ID)
+				}
+			}
 		} else if info.IsGroup && encType == "skmsg" {
 			decrypted, ciphertextHash, err = cli.decryptGroupMsg(ctx, &child, senderEncryptionJID, info.Chat, info.Timestamp)
 		} else if encType == "msmsg" && info.Sender.IsBot() {
@@ -1038,7 +1045,42 @@ func padMessage(plaintext []byte) []byte {
 	return plaintext
 }
 
+// skdmTraceSenders is the watchlist of bare sender users (LID or PN, no agent suffix, no device)
+// whose SKDM receive path is fully traced at INFO. Default = the institutional dispatch-bot LIDs
+// under investigation; override with KAVTOV_SKDM_TRACE_SENDERS (comma-separated). Empty disables.
+// kavtov-fork diagnostic: settles whether these bots ever send us an SKDM and whether we drop it.
+var skdmTraceSenders = func() map[string]struct{} {
+	list := os.Getenv("KAVTOV_SKDM_TRACE_SENDERS")
+	if list == "" {
+		list = "169415706468483,238877608562780,11957960757468,275956749045930,86819156803715,110183409778907,72980755439821,166615454851235,115556699119745,76189129568360,110853827350758,157475730911281"
+	}
+	m := map[string]struct{}{}
+	for _, s := range strings.Split(list, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			m[s] = struct{}{}
+		}
+	}
+	return m
+}()
+
+// skdmTraceUser reports whether the given sender user (possibly "<id>_<agent>") is watchlisted.
+func skdmTraceUser(user string) bool {
+	if len(skdmTraceSenders) == 0 {
+		return false
+	}
+	base := user
+	if i := strings.IndexByte(base, '_'); i >= 0 {
+		base = base[:i]
+	}
+	_, ok := skdmTraceSenders[base]
+	return ok
+}
+
 func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat, from types.JID, axolotlSKDM []byte) {
+	traced := skdmTraceUser(from.User)
+	if traced {
+		cli.Log.Infof("SKDM_TRACE stage=recv sender=%s device=%d group=%s len=%d", from.User, from.Device, chat.String(), len(axolotlSKDM))
+	}
 	// kavtov-fork: Phase 27 — device-qualified store; the message keyID disambiguates devices; device-tolerant lookup (27-01) finds the record regardless of which device the skmsg is labeled with.
 	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
 	// kavtov-fork (STEP 1 instrument): is this arriving SKDM for a tuple that is CURRENTLY stuck (a
@@ -1053,6 +1095,9 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(axolotlSKDM, pbSerializer.SenderKeyDistributionMessage)
 	if err != nil {
 		cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
+		if traced {
+			cli.Log.Infof("SKDM_TRACE stage=parse-FAIL sender=%s device=%d group=%s err=%v", from.User, from.Device, chat.String(), err)
+		}
 		if wasFailed {
 			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=parse", from.SignalAddressUser(), from.Device, chat.String())
 		}
@@ -1070,6 +1115,9 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	skdmIter := sdkMsg.Iteration()
 	if !wasFailed {
 		if seenIter, ok := cli.skdmProcessedIteration(senderStr, chat.String(), keyID); ok && skdmIter <= seenIter {
+			if traced {
+				cli.Log.Infof("SKDM_TRACE stage=dedup-SKIP sender=%s device=%d group=%s keyid=%d iter=%d seen=%d", from.User, from.Device, chat.String(), keyID, skdmIter, seenIter)
+			}
 			if n := skdmDedupSkipped.Add(1); n%skdmDedupLogEvery == 0 {
 				cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d group=%s keyid=%d iter=%d seen=%d", skdmDedupProcessed.Load(), n, chat.String(), keyID, skdmIter, seenIter)
 			}
@@ -1080,10 +1128,16 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	err = builder.Process(ctx, senderKeyName, sdkMsg)
 	if err != nil {
 		cli.Log.Errorf("Failed to process sender key distribution message from %s for %s: %v", from, chat, err)
+		if traced {
+			cli.Log.Infof("SKDM_TRACE stage=process-FAIL sender=%s device=%d group=%s keyid=%d iter=%d err=%v", from.User, from.Device, chat.String(), keyID, skdmIter, err)
+		}
 		if wasFailed {
 			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=process", from.SignalAddressUser(), from.Device, chat.String())
 		}
 		return
+	}
+	if traced {
+		cli.Log.Infof("SKDM_TRACE stage=INSTALLED-OK sender=%s device=%d group=%s keyid=%d iter=%d", from.User, from.Device, chat.String(), keyID, skdmIter)
 	}
 	cli.markSKDMProcessed(senderStr, chat.String(), keyID, skdmIter)
 	// kavtov-fork (29-08 gap-closure): emit SKDM_DEDUP on the processed path every
