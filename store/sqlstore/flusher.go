@@ -271,10 +271,10 @@ func (f *SenderKeyFlusher) Drain() {
 		}
 		// Snapshot under lock; release before calling DB.
 		rows := make([]SenderKeyRow, 0, len(f.dirty))
-		keys := make([]string, 0, len(f.dirty))
+		snaps := make(map[string]senderKeyFlushSnap, len(f.dirty))
 		for k, e := range f.dirty {
 			rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob})
-			keys = append(keys, k)
+			snaps[k] = senderKeyFlushSnap{keyID: e.keyID, iter: e.highIter}
 		}
 		f.mu.Unlock()
 
@@ -288,13 +288,9 @@ func (f *SenderKeyFlusher) Drain() {
 			continue
 		}
 
+		// CR-02 staleness guard (35.2-09 follow-up) — see runFlush.
 		f.mu.Lock()
-		for _, k := range keys {
-			if e, ok := f.dirty[k]; ok {
-				e.lastFlushed = e.highIter
-				delete(f.dirty, k)
-			}
-		}
+		clearFlushedSenderKeysLocked(f.dirty, snaps)
 		drained := len(rows)
 		f.mu.Unlock()
 
@@ -312,10 +308,10 @@ func (f *SenderKeyFlusher) runFlush() {
 		return
 	}
 	rows := make([]SenderKeyRow, 0, len(f.dirty))
-	keys := make([]string, 0, len(f.dirty))
+	snaps := make(map[string]senderKeyFlushSnap, len(f.dirty))
 	for k, e := range f.dirty {
 		rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob})
-		keys = append(keys, k)
+		snaps[k] = senderKeyFlushSnap{keyID: e.keyID, iter: e.highIter}
 	}
 	f.mu.Unlock()
 
@@ -328,14 +324,46 @@ func (f *SenderKeyFlusher) runFlush() {
 		return
 	}
 
+	// CR-02 staleness guard (35.2-09 follow-up): only clear an entry if no
+	// newer Enqueue arrived during the in-flight DB write — same lost-update
+	// flaw the session flusher had in its batch clears, and the inline path
+	// here already guards against (highIter == iter check in
+	// flushOneSynchronous). Clearing unconditionally dropped a newer blob
+	// from the durable path: the DB holds the snapshot generation and the
+	// newer ratchet state existed nowhere durable.
 	f.mu.Lock()
-	for _, k := range keys {
-		if e, ok := f.dirty[k]; ok {
-			e.lastFlushed = e.highIter
-			delete(f.dirty, k)
+	clearFlushedSenderKeysLocked(f.dirty, snaps)
+	f.mu.Unlock()
+}
+
+// senderKeyFlushSnap records the (keyID, highIter) generation of a dirty
+// entry at batch-snapshot time, for the CR-02 staleness guard.
+type senderKeyFlushSnap struct {
+	keyID uint32
+	iter  uint32
+}
+
+// clearFlushedSenderKeysLocked applies the CR-02 staleness guard to the batch
+// clear: an entry is deleted only if it is still at the snapshotted
+// (keyID, highIter) generation. If a newer iteration of the SAME generation
+// arrived during the in-flight write, the entry stays dirty (newer blob) and
+// lastFlushed records the drained iteration so N-boundary math stays correct.
+// If the keyID changed (generation rotation mid-write), the entry stays dirty
+// and lastFlushed is left untouched — iteration numbering restarted, so the
+// drained iteration is meaningless for the new generation.
+// Must be called with f.mu held.
+func clearFlushedSenderKeysLocked(dirty map[string]*dirtyEntry, snaps map[string]senderKeyFlushSnap) {
+	for k, snap := range snaps {
+		if e, ok := dirty[k]; ok {
+			if e.keyID != snap.keyID {
+				continue
+			}
+			e.lastFlushed = snap.iter
+			if e.highIter == snap.iter {
+				delete(dirty, k)
+			}
 		}
 	}
-	f.mu.Unlock()
 }
 
 // Start launches the async flusher goroutine. Must be called once per

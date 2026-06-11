@@ -34,6 +34,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -453,5 +454,77 @@ func TestSynchronousShutdownDrain(t *testing.T) {
 	// (b) Dirty-set must be empty after Stop() returns.
 	if n := f.DirtyCount(); n != 0 {
 		t.Fatalf("TestSynchronousShutdownDrain: DirtyCount after Stop = %d, want 0", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestSenderKeyFlusher_BatchClearRetainsNewerEnqueue
+//
+// 35.2-09 CR-02 follow-up: the batch-clear loops in runFlush/Drain deleted
+// dirty entries unconditionally. An Enqueue with a newer iteration landing
+// between the batch snapshot and the post-write clear had its entry deleted
+// anyway — the newer blob was dropped from the durable path (the DB holds the
+// snapshot generation). The inline path always had this guard
+// (flushOneSynchronous's highIter == iter check); this test pins it for the
+// batch path. blockingFlushSenderKeyStore holds the batch open between
+// snapshot and DB-write apply as a deterministic interleaving hook.
+// ---------------------------------------------------------------------------
+
+type blockingFlushSenderKeyStore struct {
+	*mockFlushStore
+	blockNext    atomic.Bool
+	writeStarted chan struct{}
+	writeRelease chan struct{}
+}
+
+func (b *blockingFlushSenderKeyStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error {
+	if b.blockNext.CompareAndSwap(true, false) {
+		close(b.writeStarted)
+		<-b.writeRelease
+	}
+	return b.mockFlushStore.PutManySenderKeys(ctx, keys)
+}
+
+func TestSenderKeyFlusher_BatchClearRetainsNewerEnqueue(t *testing.T) {
+	mock := &mockFlushStore{}
+	b := &blockingFlushSenderKeyStore{
+		mockFlushStore: mock,
+		writeStarted:   make(chan struct{}),
+		writeRelease:   make(chan struct{}),
+	}
+	b.blockNext.Store(true)
+	f := NewSenderKeyFlusher(b, waLog.Noop, 1000)
+
+	blobV1 := testBlob(7, 100)
+	blobV2 := testBlob(7, 101)
+	f.Enqueue("g-cr02", "u-cr02:0", blobV1, 7, 100, false)
+
+	flushDone := make(chan struct{})
+	go func() {
+		f.runFlush()
+		close(flushDone)
+	}()
+	<-b.writeStarted
+	// Newer iteration of the same generation lands between the snapshot
+	// (which captured iter=100) and the post-write clear.
+	f.Enqueue("g-cr02", "u-cr02:0", blobV2, 7, 101, false)
+	close(b.writeRelease)
+	<-flushDone
+
+	if n := f.DirtyCount(); n != 1 {
+		t.Fatalf("DirtyCount = %d after newer Enqueue during in-flight batch, want 1 — newer blob dropped from durable path (CR-02 lost update)", n)
+	}
+
+	// The retained newer generation must reach the DB on drain, last.
+	f.Drain()
+	mock.mu.Lock()
+	if len(mock.rows) == 0 {
+		mock.mu.Unlock()
+		t.Fatal("no rows written")
+	}
+	last := mock.rows[len(mock.rows)-1]
+	mock.mu.Unlock()
+	if !bytes.Equal(last.Blob, blobV2) {
+		t.Fatal("last persisted blob is not the newer (iter=101) generation — CR-02 lost update on the sender-key batch path")
 	}
 }
