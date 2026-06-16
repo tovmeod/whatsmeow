@@ -96,6 +96,51 @@ type MessageDebugTimings struct {
 // are high volume); enable for a measurement window, then remove.
 var sendTimingLog = os.Getenv("KAVTOV_SEND_TIMING_LOG") == "1"
 
+// msgTypeLabel returns which content field a sent message carries, so the
+// SEND_TIMING log identifies what is actually being sent (not inferred).
+func msgTypeLabel(m *waE2E.Message) string {
+	switch {
+	case m == nil:
+		return "nil"
+	case m.Conversation != nil:
+		return "conversation"
+	case m.ExtendedTextMessage != nil:
+		return "extended_text"
+	case m.ProtocolMessage != nil:
+		return "protocol:" + m.ProtocolMessage.GetType().String()
+	case m.DeviceSentMessage != nil:
+		return "device_sent"
+	case m.SenderKeyDistributionMessage != nil:
+		return "skdm"
+	case m.ReactionMessage != nil:
+		return "reaction"
+	case m.ButtonsResponseMessage != nil:
+		return "buttons_response"
+	case m.ButtonsMessage != nil:
+		return "buttons"
+	case m.InteractiveMessage != nil:
+		return "interactive"
+	case m.InteractiveResponseMessage != nil:
+		return "interactive_response"
+	case m.ImageMessage != nil:
+		return "image"
+	case m.AudioMessage != nil:
+		return "audio"
+	case m.VideoMessage != nil:
+		return "video"
+	case m.StickerMessage != nil:
+		return "sticker"
+	case m.PollCreationMessage != nil:
+		return "poll_creation"
+	case m.PollUpdateMessage != nil:
+		return "poll_update"
+	case m.MessageContextInfo != nil:
+		return "context_info_only"
+	default:
+		return "other"
+	}
+}
+
 func (mdt MessageDebugTimings) MarshalZerologObject(evt *zerolog.Event) {
 	if mdt.LIDFetch != 0 {
 		evt.Dur("lid_fetch", mdt.LIDFetch)
@@ -482,8 +527,8 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		if sessSizeTracker != nil {
 			maxSessBytes = *sessSizeTracker
 		}
-		cli.Log.Infof("SEND_TIMING to=%s group=%t max_session_bytes=%d queue_us=%d marshal_us=%d lid_fetch_us=%d get_devices_us=%d get_participants_us=%d peer_encrypt_us=%d send_us=%d resp_us=%d",
-			to, to.Server == types.GroupServer, maxSessBytes,
+		cli.Log.Infof("SEND_TIMING to=%s self=%t msg_type=%s peer=%t group=%t max_session_bytes=%d queue_us=%d marshal_us=%d lid_fetch_us=%d get_devices_us=%d get_participants_us=%d peer_encrypt_us=%d send_us=%d resp_us=%d",
+			to, to.User == ownID.User, msgTypeLabel(message), req.Peer, to.Server == types.GroupServer, maxSessBytes,
 			resp.DebugTimings.Queue.Microseconds(),
 			resp.DebugTimings.Marshal.Microseconds(),
 			resp.DebugTimings.LIDFetch.Microseconds(),
