@@ -457,17 +457,9 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				cli.sendRetryReceipt(ctx, node, info, isUnavailable)
 				// TODO this probably isn't supposed to ack
 				cli.sendAck(ctx, node, 0)
-				// Proactively establish session for pairwise session errors
-				if errors.Is(err, signalerror.ErrNoSessionForUser) {
-					go cli.establishSessionWithSender(context.WithoutCancel(ctx), senderEncryptionJID)
-				}
 			} else {
 				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
 				go cli.sendAck(ctx, node, 0)
-				// Proactively establish session for pairwise session errors
-				if errors.Is(err, signalerror.ErrNoSessionForUser) {
-					go cli.establishSessionWithSender(context.WithoutCancel(ctx), senderEncryptionJID)
-				}
 			}
 			cli.dispatchEvent(&events.UndecryptableMessage{
 				Info:            *info,
@@ -1611,40 +1603,14 @@ func (cli *Client) SendProtocolMessageReceipt(ctx context.Context, id types.Mess
 	return nil
 }
 
-// establishSessionWithSender proactively fetches prekeys and establishes a Signal session.
-// This allows future messages from the sender to be decrypted.
-// Should be called in a goroutine after a decryption failure with ErrNoSessionForUser.
-func (cli *Client) establishSessionWithSender(ctx context.Context, sender types.JID) {
-	cli.sessionRecreateHistoryLock.Lock()
-	lastAttempt, ok := cli.sessionRecreateHistory[sender]
-	if ok && time.Since(lastAttempt) < 5*time.Minute {
-		cli.sessionRecreateHistoryLock.Unlock()
-		cli.Log.Debugf("Skipping session establishment with %s (attempted %s ago)", sender, time.Since(lastAttempt))
-		return
-	}
-	cli.sessionRecreateHistory[sender] = time.Now()
-	cli.sessionRecreateHistoryLock.Unlock()
-
-	cli.Log.Infof("Proactively fetching prekeys to establish session with %s", sender)
-	bundles := cli.fetchPreKeysNoError(ctx, []types.JID{sender})
-	bundle, ok := bundles[sender]
-	if !ok || bundle == nil {
-		cli.Log.Warnf("No prekey bundle received for %s", sender)
-		return
-	}
-	builder := session.NewBuilderFromSignal(cli.Store, sender.SignalAddress(), pbSerializer)
-	err := builder.ProcessBundle(ctx, bundle)
-	if cli.AutoTrustIdentity && errors.Is(err, signalerror.ErrUntrustedIdentity) {
-		cli.Log.Warnf("Got untrusted identity while establishing session with %s, clearing and retrying", sender)
-		if clearErr := cli.clearUntrustedIdentity(ctx, sender); clearErr != nil {
-			cli.Log.Errorf("Failed to clear untrusted identity for %s: %v", sender, clearErr)
-			return
-		}
-		err = builder.ProcessBundle(ctx, bundle)
-	}
-	if err != nil {
-		cli.Log.Warnf("Failed to establish session with %s: %v", sender, err)
-	} else {
-		cli.Log.Infof("Successfully established session with %s", sender)
-	}
-}
+// NOTE: a receiver-side establishSessionWithSender (proactively fetching the peer's
+// prekeys + ProcessBundle on an inbound decrypt failure) was REMOVED 2026-06-16. It
+// was non-conformant and a functional no-op: WA Web's response to an inbound decrypt
+// failure is retry-receipt-only — re-establishment is the SENDER's job, carried by
+// their resend (a receiver-initiated session can't decrypt an already-sent message,
+// and can't produce a missing group sender key). The proactive fetch only burned the
+// peer's one-time prekeys and bloated our pairwise session (PROCESSBUNDLE archives a
+// state each time -> the slow-encrypt root cause). See wa_protocol
+// docs/spec/inbound-decrypt-failure-response.md. Conformant behavior = send the retry
+// receipt and wait for the sender's resend. (The sender-side recreate on an incoming
+// retry request lives in retry.go shouldRecreateSession and is unaffected.)

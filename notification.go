@@ -243,7 +243,8 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 	}
 	if len(removedDevices) > 0 {
 		// Run the store deletes off the userDevicesCacheLock and detached from the
-		// notification ctx (matches the established establishSessionWithSender pattern).
+		// notification ctx (WithoutCancel + goroutine, so the cache lock isn't held
+		// during store I/O).
 		go cli.deleteRemovedDeviceData(context.WithoutCancel(ctx), removedDevices)
 	}
 }
