@@ -63,6 +63,7 @@ func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
 }
 
 func (cli *Client) sendKeepAlive(ctx context.Context) (isSuccess, shouldContinue bool) {
+	start := time.Now()
 	respCh, err := cli.sendIQAsync(ctx, infoQuery{
 		Namespace: "w:p",
 		Type:      "get",
@@ -76,7 +77,12 @@ func (cli *Client) sendKeepAlive(ctx context.Context) (isSuccess, shouldContinue
 	}
 	select {
 	case <-respCh:
-		// All good
+		// KEEPALIVE_RTT traverses the same socket + single read loop as a send-ack,
+		// but with near-zero server-side processing. Comparing it to the send resp
+		// (~137ms) isolates read-loop delay (driver) from WhatsApp ack latency.
+		if sendTimingLog {
+			cli.Log.Infof("KEEPALIVE_RTT us=%d", time.Since(start).Microseconds())
+		}
 		return true, true
 	case <-time.After(KeepAliveResponseDeadline):
 		cli.Log.Warnf("Keepalive timed out")
