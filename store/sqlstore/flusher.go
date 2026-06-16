@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,13 @@ type SenderKeyFlusher struct {
 	boundaryN       uint32 // iteration boundary N (KAVTOV_FLUSH_SENDERKEY_N)
 	backpressureCap int    // dirty-set size above which inline sync write fires
 	dropCap         int    // dirty-set size above which drop+log fires on DB failure
+
+	// onDrained is called AFTER each successful DB commit, ONCE per dirty-set
+	// entry that was ACTUALLY deleted from f.dirty (NOT once per snapshotted
+	// entry — see the CR-02 rule). It is invoked WITHOUT holding f.mu
+	// (lock-ordering rule: onDrained takes pinnedMu in CachedSenderKeyStore;
+	// calling it under f.mu would invert the lock order and deadlock). nil = no-op.
+	onDrained func(group, user string)
 
 	mu    sync.Mutex
 	dirty map[string]*dirtyEntry // key = "<group>|<user>"
@@ -124,6 +132,14 @@ func (f *SenderKeyFlusher) DirtyCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.dirty)
+}
+
+// SetOnDrained wires the post-commit callback. Must be called before Start().
+// The callback fires after every successful DB write, once per dirty entry
+// actually removed from the dirty-set, OUTSIDE f.mu — safe to take external
+// locks in the callback.
+func (f *SenderKeyFlusher) SetOnDrained(fn func(group, user string)) {
+	f.onDrained = fn
 }
 
 // crossesBoundary returns true when iter crosses an N-boundary relative to
@@ -240,11 +256,22 @@ func (f *SenderKeyFlusher) flushOneSynchronous(group, user string, blob []byte, 
 	// On success, clear the entry from dirty-set.
 	k := group + "|" + user
 	f.mu.Lock()
+	deleted := false
 	if e, ok := f.dirty[k]; ok && e.highIter == iter {
 		e.lastFlushed = iter
 		delete(f.dirty, k)
+		deleted = true
 	}
 	f.mu.Unlock()
+
+	// Fire onDrained ONLY on a confirmed delete (entry gone from the dirty-set =>
+	// the committed blob is authoritative for this device). A concurrent Enqueue
+	// that advanced highIter leaves deleted=false and the entry dirty — do NOT
+	// unpin (its newer key is not yet in the DB). Reached only on success: the
+	// error path returned early above. Invoked outside f.mu (lock-ordering rule).
+	if deleted && f.onDrained != nil {
+		f.onDrained(group, user)
+	}
 }
 
 // dropColdestLocked removes one entry from the dirty-set (the first one
@@ -290,9 +317,16 @@ func (f *SenderKeyFlusher) Drain() {
 
 		// CR-02 staleness guard (35.2-09 follow-up) — see runFlush.
 		f.mu.Lock()
-		clearFlushedSenderKeysLocked(f.dirty, snaps)
+		drainedKeys := clearFlushedSenderKeysLocked(f.dirty, snaps)
 		drained := len(rows)
 		f.mu.Unlock()
+
+		if f.onDrained != nil {
+			for _, k := range drainedKeys {
+				group, user, _ := strings.Cut(k, "|")
+				f.onDrained(group, user)
+			}
+		}
 
 		f.log.Infof("flush: drained %d on shutdown", drained)
 	}
@@ -332,8 +366,17 @@ func (f *SenderKeyFlusher) runFlush() {
 	// from the durable path: the DB holds the snapshot generation and the
 	// newer ratchet state existed nowhere durable.
 	f.mu.Lock()
-	clearFlushedSenderKeysLocked(f.dirty, snaps)
+	drainedKeys := clearFlushedSenderKeysLocked(f.dirty, snaps)
 	f.mu.Unlock()
+
+	// Fire onDrained for ONLY the entries actually deleted (CR-02-safe).
+	// Outside f.mu so the callback may take pinnedMu (lock-ordering rule).
+	if f.onDrained != nil {
+		for _, k := range drainedKeys {
+			group, user, _ := strings.Cut(k, "|")
+			f.onDrained(group, user)
+		}
+	}
 }
 
 // senderKeyFlushSnap records the (keyID, highIter) generation of a dirty
@@ -351,8 +394,12 @@ type senderKeyFlushSnap struct {
 // If the keyID changed (generation rotation mid-write), the entry stays dirty
 // and lastFlushed is left untouched — iteration numbering restarted, so the
 // drained iteration is meaningless for the new generation.
+// Returns the dirty-map keys it ACTUALLY deleted (those still at the snapshotted
+// generation). Callers fire onDrained for exactly these keys — never for an entry
+// that stayed dirty because a concurrent Enqueue advanced highIter.
 // Must be called with f.mu held.
-func clearFlushedSenderKeysLocked(dirty map[string]*dirtyEntry, snaps map[string]senderKeyFlushSnap) {
+func clearFlushedSenderKeysLocked(dirty map[string]*dirtyEntry, snaps map[string]senderKeyFlushSnap) []string {
+	var deleted []string
 	for k, snap := range snaps {
 		if e, ok := dirty[k]; ok {
 			if e.keyID != snap.keyID {
@@ -361,9 +408,11 @@ func clearFlushedSenderKeysLocked(dirty map[string]*dirtyEntry, snaps map[string
 			e.lastFlushed = snap.iter
 			if e.highIter == snap.iter {
 				delete(dirty, k)
+				deleted = append(deleted, k)
 			}
 		}
 	}
+	return deleted
 }
 
 // Start launches the async flusher goroutine. Must be called once per

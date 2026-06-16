@@ -9,6 +9,7 @@ package sqlstore
 import (
 	"context"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -63,6 +64,18 @@ type CachedSenderKeyStore struct {
 	// Phase 17.7-03: write-back flusher. May be nil before Start() wiring
 	// (will fall back to write-through when nil, preserving backward compat).
 	flusher *SenderKeyFlusher
+
+	// pinnedMu guards the pinned overlay. Lock order: pinnedMu may be taken while
+	// NOT holding the LRU's internal lock and NOT holding flusher.mu. The flusher's
+	// onDrained callback acquires pinnedMu outside flusher.mu — never call flusher
+	// methods while holding pinnedMu (would invert the order).
+	pinnedMu sync.Mutex
+	// pinned holds device sids for writes that have not yet drained to DB.
+	// Key: same dk as deviceCache (c.key(group, senderKeyUserBare(user))).
+	// Value: set of device-qualified sender_id strings (e.g. "9725..._1:0").
+	// On write: the device sid is added. On drain callback: sid removed; inner
+	// map deleted when empty. GetSenderKeyDevices returns pinned UNION DB-result.
+	pinned map[string]map[string]struct{}
 
 	// Phase 17.8: optional callback to invalidate the decoded struct cache on
 	// wasFailed=true recovery writes (Pitfall 4 / T-17.8-05 mitigation). Nil
@@ -122,14 +135,34 @@ func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.
 		cache:       cache,
 		deviceCache: deviceCache,
 		sf:          sf,
+		pinned:      make(map[string]map[string]struct{}),
 	}
 }
 
 // SetFlusher attaches the write-back flusher. Called by cache_wiring.go after
 // wireSignalCaches constructs the flusher. Must be called before any
 // PutSenderKey calls in production.
+//
+// Wires the onDrained unpin callback so that after a successful DB commit the
+// device sid is removed from the pinned overlay. Lock order: pinnedMu is taken
+// inside the callback AFTER flusher.mu is released (Task 1 ensures the hook
+// fires outside flusher.mu). The callback does NOT call any flusher method.
 func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 	c.flusher = f
+	if f == nil {
+		return
+	}
+	f.SetOnDrained(func(group, user string) {
+		dk := c.key(group, senderKeyUserBare(user))
+		c.pinnedMu.Lock()
+		if ps := c.pinned[dk]; ps != nil {
+			delete(ps, user)
+			if len(ps) == 0 {
+				delete(c.pinned, dk)
+			}
+		}
+		c.pinnedMu.Unlock()
+	})
 }
 
 // SetParsedInvalidate attaches the Phase 17.8 struct-cache invalidation callback.
@@ -340,6 +373,11 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 		// Cipher write-back: enqueue flat blob to flusher (dedup + batched async drain).
 		c.flusher.Enqueue(group, user, blob, keyID, iter, false)
 
+		// Write-through []byte cache so GetSenderKey returns the fresh blob before
+		// the flusher drains (D-03: blob is PackFlat output = byte-identical to DB
+		// sender_key column value; safe to cache directly).
+		c.cache.Add(c.key(group, user), copyBytes(blob))
+
 		// REPLACE-on-write coherence (T-17.9-16): replace the parsed cache entry
 		// with the in-hand structure so LoadSenderKey returns the fresh key before
 		// the async flusher drains the DB row.
@@ -368,6 +406,9 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 			return err
 		}
 	}
+
+	// Write-through []byte cache (D-03) on the synchronous fallback path.
+	c.cache.Add(c.key(group, user), copyBytes(blob))
 
 	// Write-through path: also replace the parsed cache for coherence.
 	// donorKeyID=nil => cipher write (backward-only gate, equal-iter accepted).
@@ -459,6 +500,12 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 	// Persist: enqueue to the write-back flusher when wired, else write through.
 	if c.flusher != nil {
 		c.flusher.Enqueue(group, user, blob, keyID, iter, false)
+
+		// Write-through []byte cache so GetSenderKey returns the fresh blob before
+		// the flusher drains (D-03). Covers both StoreAccepted and StoreUncacheable —
+		// both paths reach this block (StoreRejectedStale returned early above).
+		c.cache.Add(c.key(group, user), copyBytes(blob))
+
 		c.updateDeviceCache(group, user)
 		return true, nil
 	}
@@ -475,42 +522,93 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 		}
 	}
 
+	// Write-through []byte cache (D-03) on the synchronous fallback path.
+	c.cache.Add(c.key(group, user), copyBytes(blob))
+
 	c.updateDeviceCache(group, user)
 	return true, nil
 }
 
-// updateDeviceCache keeps the device-set index fresh. PutSenderKey fires
-// on every ratchet write-back, so invalidate ONLY when this device is not
-// already in the cached set (a genuinely new device, e.g. a fresh SKDM).
-// Invalidating on every write-back would defeat the device-set cache.
+// updateDeviceCache adds device sid to both the deviceCache LRU and the pinned
+// overlay on every sender-key write. For the LRU: if an entry is already cached,
+// append the sid if not present (add-on-write, O(1)). If no LRU entry exists,
+// do NOT create one — GetSenderKeyDevices will cold-load from DB on first call
+// and the pinned overlay covers the pre-drain window.
+// Per D-01: add-on-write replaces the old invalidate-on-new-device behavior.
 func (c *CachedSenderKeyStore) updateDeviceCache(group, user string) {
 	dk := c.key(group, senderKeyUserBare(user))
-	if set, ok := c.deviceCache.Get(dk); ok && !containsString(set, user) {
-		c.deviceCache.Remove(dk)
+
+	// Always add to pinned under pinnedMu (D-04: eviction-safe anchor).
+	c.pinnedMu.Lock()
+	if c.pinned[dk] == nil {
+		c.pinned[dk] = make(map[string]struct{})
+	}
+	c.pinned[dk][user] = struct{}{}
+	c.pinnedMu.Unlock()
+
+	// Update the LRU cache if an entry already exists — add the device sid.
+	// If the entry was evicted or never loaded, leave it absent; the pinned
+	// overlay ensures GetSenderKeyDevices still returns this device.
+	if existing, ok := c.deviceCache.Get(dk); ok {
+		if !containsString(existing, user) {
+			c.deviceCache.Add(dk, append(existing, user))
+		}
 	}
 }
 
 // GetSenderKeyDevices answers the device-tolerant lookup's enumerate from the
 // dedicated device-set LRU (keyed jid|group|userBare), falling to the inner
-// store once on a cold key. kavtov-fork Phase 27: this replaces the old DB
-// passthrough so the hot path issues 0 DB queries. The staleness risk the old
-// passthrough cited is handled by PutSenderKey, which invalidates this key when
-// a genuinely new device appears.
+// store once on a cold key. Returns pinned UNION DB result so a just-written
+// device is visible immediately, even before the async flusher drains to DB.
 func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
 	dk := c.key(group, userBare)
+
+	// Snapshot pinned set first, outside LRU lock.
+	c.pinnedMu.Lock()
+	var pinnedSids []string
+	if ps := c.pinned[dk]; len(ps) > 0 {
+		pinnedSids = make([]string, 0, len(ps))
+		for sid := range ps {
+			pinnedSids = append(pinnedSids, sid)
+		}
+	}
+	c.pinnedMu.Unlock()
+
+	// Try LRU cache.
 	if v, ok := c.deviceCache.Get(dk); ok {
 		atomic.AddUint64(&c.hits, 1)
-		return append([]string(nil), v...), nil // copy-out (CR-06)
+		return mergeDeviceSets(v, pinnedSids), nil
 	}
+
 	atomic.AddUint64(&c.misses, 1)
 	devices, err := c.inner.GetSenderKeyDevices(ctx, group, userBare)
 	if err != nil {
-		return nil, err // never cache on error
+		return nil, err
 	}
-	// An empty set is safe to cache: PutSenderKey invalidates this key when a
-	// new device's SKDM arrives, so a cached empty cannot go permanently stale.
-	c.deviceCache.Add(dk, append([]string(nil), devices...))
-	return devices, nil
+	// D-02: do NOT cache empty sets. An empty result means the sender has
+	// no DB row yet (or the key truly doesn't exist). A flusher drain will
+	// commit the row and fire onDrained; subsequent GetSenderKeyDevices calls
+	// must re-query so they see it. Caching empty would freeze the absence.
+	if len(devices) > 0 {
+		c.deviceCache.Add(dk, append([]string(nil), devices...))
+	}
+	return mergeDeviceSets(devices, pinnedSids), nil
+}
+
+// mergeDeviceSets returns the union of base and extra, deduplicated.
+// Allocates a new slice; caller owns the result.
+func mergeDeviceSets(base, extra []string) []string {
+	if len(extra) == 0 {
+		return append([]string(nil), base...)
+	}
+	out := make([]string, len(base), len(base)+len(extra))
+	copy(out, base)
+	for _, sid := range extra {
+		if !containsString(out, sid) {
+			out = append(out, sid)
+		}
+	}
+	return out
 }
 
 // senderKeyUserBare strips the device qualifier from a device-qualified

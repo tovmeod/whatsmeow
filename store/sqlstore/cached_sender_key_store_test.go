@@ -223,7 +223,8 @@ func TestCachedSenderKeyStore_EvictionAtCap(t *testing.T) {
 // Cold call reaches inner once and caches; warm call is served from the
 // device-set cache (inner not called again). A ratchet write-back (Put of an
 // already-known device) must NOT invalidate; a genuinely new device's SKDM
-// MUST invalidate so the next call re-queries inner and includes it.
+// MUST be returned without re-querying inner (add-on-write: appended to LRU +
+// pinned overlay, D-01 decision).
 // ---------------------------------------------------------------------------
 
 func TestCachedSenderKeyStore_GetSenderKeyDevices_CacheServedAndInvalidatedOnNewDevice(t *testing.T) {
@@ -269,7 +270,9 @@ func TestCachedSenderKeyStore_GetSenderKeyDevices_CacheServedAndInvalidatedOnNew
 		t.Errorf("inner.devicesCalls after write-back = %d, want 1 (write-back must not invalidate)", got)
 	}
 
-	// (4) New device's SKDM → invalidates; next call re-queries inner, includes it.
+	// (4) New device's SKDM → add-on-write (D-01): device is appended directly
+	// to the LRU entry + pinned overlay; inner is NOT re-queried.
+	// GetSenderKeyDevices must return all 3 devices without an extra inner call.
 	if err := c.PutSenderKey(ctx, "group-X", "99user_1:7", []byte("sk-7")); err != nil {
 		t.Fatalf("Put new device: %v", err)
 	}
@@ -277,8 +280,10 @@ func TestCachedSenderKeyStore_GetSenderKeyDevices_CacheServedAndInvalidatedOnNew
 	if err != nil {
 		t.Fatalf("GetSenderKeyDevices after new-device Put: %v", err)
 	}
-	if got := inner.devicesCalls.Load(); got != 2 {
-		t.Errorf("inner.devicesCalls after new-device Put = %d, want 2 (new device invalidates)", got)
+	// Under add-on-write the new device is appended to the LRU (no invalidate),
+	// so inner is not re-queried — devicesCalls stays at 1.
+	if got := inner.devicesCalls.Load(); got != 1 {
+		t.Errorf("inner.devicesCalls after new-device Put = %d, want 1 (add-on-write, no re-query)", got)
 	}
 	if len(devices3) != 3 {
 		t.Errorf("after new device returned %d devices, want 3; got %v", len(devices3), devices3)
