@@ -23,6 +23,11 @@ import (
 // off (and restarting) instantly reverts to full-decode behavior — no code rollback.
 var lazySessionDecode = os.Getenv("KAVTOV_LAZY_SESSION_DECODE") == "1"
 
+// sendTimingDebug emits a one-line diagnostic from WithCachedSessions so the
+// send-size attribution can be debugged (addresses queried, sessions loaded, max
+// bytes, whether the byte tracker reached this ctx). Gated by the same flag.
+var sendTimingDebug = os.Getenv("KAVTOV_SEND_TIMING_LOG") == "1"
+
 type contextKey int
 
 const (
@@ -199,6 +204,10 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 	}
 
 	recordSessionBytes(ctx, maxSessionBytes)
+	if sendTimingDebug && device.Log != nil {
+		_, trackerFound := ctx.Value(contextKeySessionByteTracker).(*int)
+		device.Log.Warnf("WCS_DEBUG addrs=%d loaded=%d maxBytes=%d trackerFound=%t", len(addresses), len(sessions), maxSessionBytes, trackerFound)
+	}
 	ctx = context.WithValue(ctx, contextKeySessionCache, (*sessionCache)(exsync.NewMapWithData(wrapped)))
 	return existingSessions, ctx, nil
 }
