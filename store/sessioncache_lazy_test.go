@@ -20,6 +20,8 @@ import (
 	"context"
 	"reflect"
 	"testing"
+
+	"go.mau.fi/libsignal/state/record"
 )
 
 func TestUnpackFlatSessionCurrentOnlyRoundTrip(t *testing.T) {
@@ -58,6 +60,66 @@ func TestUnpackFlatSessionCurrentOnlyRoundTrip(t *testing.T) {
 	}
 	if len(got.PreviousStates) != 10 {
 		t.Fatalf("decoded %d archived states, want 10", len(got.PreviousStates))
+	}
+}
+
+// benchFatBlob builds a realistic fat session where the ARCHIVED states carry the
+// message keys (as in prod): 40 archived states, each with a sender chain + 3
+// receiver chains × 200 skipped keys ≈ 32k keys total. (makeSessionStructure's own
+// previous states have 0 keys, which is NOT representative — the bloat is in the
+// archived chains, so the fixture must put keys there.)
+func benchFatBlob(tb testing.TB) []byte {
+	cur := makeStateStructure(0x01, false, 3, 200, true, 2, true)
+	prev := make([]*record.StateStructure, 40)
+	for i := range prev {
+		prev[i] = makeStateStructure(byte(i+2), false, 3, 200, false, 0, false)
+	}
+	s := &record.SessionStructure{SessionState: cur, PreviousStates: prev}
+	blob, ok := PackFlatSession(s)
+	if !ok {
+		tb.Fatal("PackFlatSession refused fat fixture")
+	}
+	return blob
+}
+
+// BenchmarkSendCodecWhole measures the per-send codec cost on the OLD path: decode
+// the entire fat session (UnpackFlatSession) + re-serialize (PackFlatSession).
+func BenchmarkSendCodecWhole(b *testing.B) {
+	blob := benchFatBlob(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := UnpackFlatSession(blob)
+		if err != nil {
+			b.Fatal(err)
+		}
+		out, ok := PackFlatSession(s)
+		if !ok {
+			b.Fatal("PackFlatSession refused")
+		}
+		_ = out
+	}
+}
+
+// BenchmarkSendCodecLazy measures the per-send codec cost on the NEW path: decode
+// only the current state (UnpackFlatSessionCurrentOnly) + re-pack current + raw
+// tail re-attach. Same end result, but the ~32k archived keys are never parsed.
+func BenchmarkSendCodecLazy(b *testing.B) {
+	blob := benchFatBlob(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cur, tail, nPrev, err := UnpackFlatSessionCurrentOnly(blob)
+		if err != nil {
+			b.Fatal(err)
+		}
+		live, ok := PackFlatSession(cur)
+		if !ok {
+			b.Fatal("PackFlatSession refused")
+		}
+		out := append(append([]byte{}, live...), tail...)
+		out[1] = byte(len(cur.PreviousStates) + nPrev)
+		_ = out
 	}
 }
 
