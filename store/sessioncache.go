@@ -27,7 +27,21 @@ type contextKey int
 
 const (
 	contextKeySessionCache contextKey = iota
+	contextKeyMaxSessionBytes
 )
+
+// MaxCachedSessionBytes returns the largest raw session blob size (bytes) loaded
+// by the most recent WithCachedSessions on this ctx, or 0. Used by the send-timing
+// log to attribute latency to fat sessions directly (no JID inference).
+func MaxCachedSessionBytes(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	if v, ok := ctx.Value(contextKeyMaxSessionBytes).(int); ok {
+		return v
+	}
+	return 0
+}
 
 type sessionCacheEntry struct {
 	Dirty  bool
@@ -120,7 +134,11 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 	}
 	wrapped := make(map[string]sessionCacheEntry, len(sessions))
 	existingSessions := make(map[string]bool, len(sessions))
+	maxSessionBytes := 0
 	for addr, rawSess := range sessions {
+		if len(rawSess) > maxSessionBytes {
+			maxSessionBytes = len(rawSess)
+		}
 		var sessionRecord *record.Session
 		var found bool
 		var lazy bool
@@ -177,6 +195,7 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 	}
 
 	ctx = context.WithValue(ctx, contextKeySessionCache, (*sessionCache)(exsync.NewMapWithData(wrapped)))
+	ctx = context.WithValue(ctx, contextKeyMaxSessionBytes, maxSessionBytes)
 	return existingSessions, ctx, nil
 }
 

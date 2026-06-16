@@ -34,6 +34,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waAICommon"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -471,8 +472,8 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	if sendTimingLog {
 		// Real server-side send timing. peer_encrypt is the session decode+encrypt
 		// cost (the fat-session lever); send/resp bracket the network round-trip.
-		cli.Log.Infof("SEND_TIMING to=%s group=%t peer_encrypt_us=%d send_us=%d resp_us=%d",
-			to, to.Server == types.GroupServer,
+		cli.Log.Infof("SEND_TIMING to=%s group=%t max_session_bytes=%d peer_encrypt_us=%d send_us=%d resp_us=%d",
+			to, to.Server == types.GroupServer, store.MaxCachedSessionBytes(ctx),
 			resp.DebugTimings.PeerEncrypt.Microseconds(),
 			resp.DebugTimings.Send.Microseconds(),
 			resp.DebugTimings.Resp.Microseconds())
