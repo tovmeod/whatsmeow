@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -88,6 +89,11 @@ type MessageDebugTimings struct {
 	Resp  time.Duration
 	Retry time.Duration
 }
+
+// sendTimingLog enables an Info-level per-send timing line (KAVTOV_SEND_TIMING_LOG=1),
+// for measuring real server-side send latency in prod. Default off (per-send Info logs
+// are high volume); enable for a measurement window, then remove.
+var sendTimingLog = os.Getenv("KAVTOV_SEND_TIMING_LOG") == "1"
 
 func (mdt MessageDebugTimings) MarshalZerologObject(evt *zerolog.Event) {
 	if mdt.LIDFetch != 0 {
@@ -461,6 +467,15 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			delete(cli.userDevicesCache, to)
 			cli.userDevicesCacheLock.Unlock()
 		}
+	}
+	if sendTimingLog {
+		// Real server-side send timing. peer_encrypt is the session decode+encrypt
+		// cost (the fat-session lever); send/resp bracket the network round-trip.
+		cli.Log.Infof("SEND_TIMING to=%s group=%t peer_encrypt_us=%d send_us=%d resp_us=%d",
+			to, to.Server == types.GroupServer,
+			resp.DebugTimings.PeerEncrypt.Microseconds(),
+			resp.DebugTimings.Send.Microseconds(),
+			resp.DebugTimings.Resp.Microseconds())
 	}
 	return
 }
