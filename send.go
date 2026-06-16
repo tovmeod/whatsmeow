@@ -96,6 +96,13 @@ type MessageDebugTimings struct {
 // are high volume); enable for a measurement window, then remove.
 var sendTimingLog = os.Getenv("KAVTOV_SEND_TIMING_LOG") == "1"
 
+// narrowSendLock releases messageSendLock after the frame is sent, before the
+// server-ack wait (which touches no session/retry state), so sends pipeline
+// instead of serializing behind each other's ~137ms ack round-trip. Encrypt +
+// frame-out + the recent-message (retry) write stay under the lock. Default off;
+// enable with KAVTOV_NARROW_SEND_LOCK=1, remove to revert instantly.
+var narrowSendLock = os.Getenv("KAVTOV_NARROW_SEND_LOCK") == "1"
+
 // msgTypeLabel returns which content field a sent message carries, so the
 // SEND_TIMING log identifies what is actually being sent (not inferred).
 func msgTypeLabel(m *waE2E.Message) string {
@@ -423,7 +430,14 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	// (everything will explode if you send a message to the same user twice in parallel)
 	cli.messageSendLock.Lock()
 	resp.DebugTimings.Queue = time.Since(start)
-	defer cli.messageSendLock.Unlock()
+	sendLockHeld := true
+	releaseSendLock := func() {
+		if sendLockHeld {
+			cli.messageSendLock.Unlock()
+			sendLockHeld = false
+		}
+	}
+	defer releaseSendLock()
 
 	// kavtov: always store outgoing messages for retry. Peer messages (req.Peer) are
 	// kept in the in-memory ring only (addRecentMessage skips the DB write when isPeer)
@@ -469,6 +483,12 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	if err != nil {
 		cli.cancelResponse(req.ID, respChan)
 		return
+	}
+	// Frame sent; session + retry state already persisted under the lock. The ack
+	// wait below touches no shared state — release here so the next send proceeds
+	// in parallel instead of serializing behind this send's ~137ms ack round-trip.
+	if narrowSendLock {
+		releaseSendLock()
 	}
 	var respNode *waBinary.Node
 	var timeoutChan <-chan time.Time
