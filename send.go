@@ -482,8 +482,13 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		if sessSizeTracker != nil {
 			maxSessBytes = *sessSizeTracker
 		}
-		cli.Log.Infof("SEND_TIMING to=%s group=%t max_session_bytes=%d peer_encrypt_us=%d send_us=%d resp_us=%d",
+		cli.Log.Infof("SEND_TIMING to=%s group=%t max_session_bytes=%d queue_us=%d marshal_us=%d lid_fetch_us=%d get_devices_us=%d get_participants_us=%d peer_encrypt_us=%d send_us=%d resp_us=%d",
 			to, to.Server == types.GroupServer, maxSessBytes,
+			resp.DebugTimings.Queue.Microseconds(),
+			resp.DebugTimings.Marshal.Microseconds(),
+			resp.DebugTimings.LIDFetch.Microseconds(),
+			resp.DebugTimings.GetDevices.Microseconds(),
+			resp.DebugTimings.GetParticipants.Microseconds(),
 			resp.DebugTimings.PeerEncrypt.Microseconds(),
 			resp.DebugTimings.Send.Microseconds(),
 			resp.DebugTimings.Resp.Microseconds())
