@@ -1292,6 +1292,7 @@ func (cli *Client) encryptMessageForDevices(
 	ownLID := cli.getOwnLID()
 	includeIdentity := false
 	participantNodes := make([]waBinary.Node, 0, len(allDevices))
+	fnStart := time.Now()
 
 	var pnDevices []types.JID
 	for _, jid := range allDevices {
@@ -1322,18 +1323,24 @@ func (cli *Client) encryptMessageForDevices(
 		sessionAddressToJID[addr] = jid
 	}
 
+	setupDur := time.Since(fnStart)
+	prefetchStart := time.Now()
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
 	}
+	prefetchDur := time.Since(prefetchStart)
 	var retryDevices []types.JID
 	for addr, exists := range existingSessions {
 		if !exists {
 			retryDevices = append(retryDevices, sessionAddressToJID[addr])
 		}
 	}
+	prekeyStart := time.Now()
 	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
+	prekeyDur := time.Since(prekeyStart)
 
+	loopStart := time.Now()
 	for _, jid := range allDevices {
 		plaintext := msgPlaintext
 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
@@ -1362,6 +1369,17 @@ func (cli *Client) encryptMessageForDevices(
 	err = cli.Store.PutCachedSessions(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
+	}
+	if sendTimingLog {
+		total := time.Since(fnStart)
+		if total > 500*time.Millisecond {
+			// Breakdown of a SLOW send, so we know which phase actually costs the
+			// time (decode prefetch vs prekey-fetch network vs the encrypt loop).
+			cli.Log.Warnf("SLOW_SEND total_ms=%d setup_ms=%d prefetch_ms=%d prekey_fetch_ms=%d encrypt_loop_ms=%d devices=%d retry_devices=%d max_session_bytes=%d",
+				total.Milliseconds(), setupDur.Milliseconds(), prefetchDur.Milliseconds(),
+				prekeyDur.Milliseconds(), time.Since(loopStart).Milliseconds(),
+				len(allDevices), len(retryDevices), store.MaxCachedSessionBytes(ctx))
+		}
 	}
 	return participantNodes, includeIdentity, nil
 }

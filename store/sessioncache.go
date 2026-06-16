@@ -52,6 +52,15 @@ func recordSessionBytes(ctx context.Context, n int) {
 	}
 }
 
+// MaxCachedSessionBytes returns the largest raw session blob recorded by the byte
+// tracker on this ctx (0 if no tracker or nothing loaded).
+func MaxCachedSessionBytes(ctx context.Context) int {
+	if t, ok := ctx.Value(contextKeySessionByteTracker).(*int); ok {
+		return *t
+	}
+	return 0
+}
+
 type sessionCacheEntry struct {
 	Dirty  bool
 	Found  bool
