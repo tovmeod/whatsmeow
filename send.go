@@ -400,6 +400,12 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	respChan := cli.waitResponse(req.ID)
 	var phash string
 	var data []byte
+	var sessSizeTracker *int
+	if sendTimingLog {
+		// Install a shared tracker so WithCachedSessions (deep in sendDM/sendGroup)
+		// can report the largest session blob this send touched, back here.
+		ctx, sessSizeTracker = store.ContextWithSessionByteTracker(ctx)
+	}
 	switch to.Server {
 	case types.GroupServer, types.BroadcastServer:
 		phash, data, err = cli.sendGroup(ctx, ownID, to, groupParticipants, req.ID, message, &resp.DebugTimings, extraParams)
@@ -472,8 +478,12 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	if sendTimingLog {
 		// Real server-side send timing. peer_encrypt is the session decode+encrypt
 		// cost (the fat-session lever); send/resp bracket the network round-trip.
+		maxSessBytes := 0
+		if sessSizeTracker != nil {
+			maxSessBytes = *sessSizeTracker
+		}
 		cli.Log.Infof("SEND_TIMING to=%s group=%t max_session_bytes=%d peer_encrypt_us=%d send_us=%d resp_us=%d",
-			to, to.Server == types.GroupServer, store.MaxCachedSessionBytes(ctx),
+			to, to.Server == types.GroupServer, maxSessBytes,
 			resp.DebugTimings.PeerEncrypt.Microseconds(),
 			resp.DebugTimings.Send.Microseconds(),
 			resp.DebugTimings.Resp.Microseconds())

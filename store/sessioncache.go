@@ -27,20 +27,24 @@ type contextKey int
 
 const (
 	contextKeySessionCache contextKey = iota
-	contextKeyMaxSessionBytes
+	contextKeySessionByteTracker
 )
 
-// MaxCachedSessionBytes returns the largest raw session blob size (bytes) loaded
-// by the most recent WithCachedSessions on this ctx, or 0. Used by the send-timing
-// log to attribute latency to fat sessions directly (no JID inference).
-func MaxCachedSessionBytes(ctx context.Context) int {
-	if ctx == nil {
-		return 0
+// ContextWithSessionByteTracker installs a shared tracker that WithCachedSessions
+// updates with the largest raw session blob it loads on this ctx OR any descendant
+// ctx (it's a pointer, so it survives the inner ctx reassignment that a value would
+// not). Returns the new ctx and the pointer to read after the send completes — used
+// by the send-timing log to attribute latency to fat sessions directly. Caller must
+// not share the tracker across goroutines (one per send).
+func ContextWithSessionByteTracker(ctx context.Context) (context.Context, *int) {
+	tracker := new(int)
+	return context.WithValue(ctx, contextKeySessionByteTracker, tracker), tracker
+}
+
+func recordSessionBytes(ctx context.Context, n int) {
+	if t, ok := ctx.Value(contextKeySessionByteTracker).(*int); ok && n > *t {
+		*t = n
 	}
-	if v, ok := ctx.Value(contextKeyMaxSessionBytes).(int); ok {
-		return v
-	}
-	return 0
 }
 
 type sessionCacheEntry struct {
@@ -194,8 +198,8 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 		wrapped[addr] = sessionCacheEntry{Record: sessionRecord, Found: found, Lazy: lazy, LazyTail: lazyTail, LazyNPrev: lazyNPrev}
 	}
 
+	recordSessionBytes(ctx, maxSessionBytes)
 	ctx = context.WithValue(ctx, contextKeySessionCache, (*sessionCache)(exsync.NewMapWithData(wrapped)))
-	ctx = context.WithValue(ctx, contextKeyMaxSessionBytes, maxSessionBytes)
 	return existingSessions, ctx, nil
 }
 
