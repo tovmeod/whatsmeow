@@ -182,6 +182,7 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 		cachedLIDHash = participantListHashV2(cachedLID.devices)
 	}
 	cachedParticipantHash := participantListHashV2(cached.devices)
+	var removedDevices []types.JID
 	for _, child := range node.GetChildren() {
 		cag := child.AttrGetter()
 		deviceHash := cag.String("device_hash")
@@ -203,6 +204,14 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 				cachedLID.devices = slices.DeleteFunc(cachedLID.devices, func(existing types.JID) bool {
 					return existing == *changedDeviceLID
 				})
+			}
+			// A removed device's pairwise session/identity are cryptographically
+			// dead; retaining them only accumulates stale rows. Delete them
+			// (matches WA Web's deleteRemoteInfo on device removal). Both the PN
+			// and LID address forms are deleted since sessions may be keyed either way.
+			removedDevices = append(removedDevices, changedDeviceJID)
+			if changedDeviceLID != nil {
+				removedDevices = append(removedDevices, *changedDeviceLID)
 			}
 		case "update":
 			// Exact meaning of "update" is unknown, clear device list cache to be safe
@@ -232,6 +241,30 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 			}
 		}
 	}
+	if len(removedDevices) > 0 {
+		// Run the store deletes off the userDevicesCacheLock and detached from the
+		// notification ctx (matches the established establishSessionWithSender pattern).
+		go cli.deleteRemovedDeviceData(context.WithoutCancel(ctx), removedDevices)
+	}
+}
+
+// deleteRemovedDeviceData deletes the pairwise session + identity for devices that
+// were removed from a peer's device list (<notification type="devices"><remove>).
+// WA Web does this (deleteRemoteInfo): a removed device is cryptographically dead,
+// so keeping its session only accumulates stale whatsmeow_sessions rows — the
+// primary 1:1-session disk-bloat source for peers that cycle devices (dispatch bots).
+// Per-device failures are logged and skipped, not fatal.
+func (cli *Client) deleteRemovedDeviceData(ctx context.Context, devices []types.JID) {
+	for _, device := range devices {
+		addr := device.SignalAddress().String()
+		if err := cli.Store.Sessions.DeleteSession(ctx, addr); err != nil {
+			cli.Log.Warnf("DEVICE_REMOVED: failed to delete session for %s: %v", addr, err)
+		}
+		if err := cli.Store.Identities.DeleteIdentity(ctx, addr); err != nil {
+			cli.Log.Warnf("DEVICE_REMOVED: failed to delete identity for %s: %v", addr, err)
+		}
+	}
+	cli.Log.Infof("DEVICE_REMOVED: cleaned session+identity for %d removed device(s)", len(devices))
 }
 
 func (cli *Client) handleFBDeviceNotification(ctx context.Context, node *waBinary.Node) {
