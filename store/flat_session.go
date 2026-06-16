@@ -470,6 +470,35 @@ func UnpackFlatSession(b []byte) (*record.SessionStructure, error) {
 	}, nil
 }
 
+// UnpackFlatSessionCurrentOnly decodes ONLY the current state from a flat whole-blob
+// (magic 0x01), returning a SessionStructure with just the current state, the raw
+// bytes of the archived previous states (the "tail", carried verbatim), and the
+// original previous-state count.
+//
+// Phase 38.4 send-path optimization: the encrypt path only ever touches the current
+// state (sender encryption never reads previousSessions), yet the prefetch used to
+// parse all ~40 archived states + their thousands of message keys on every send —
+// the GC-hostile cost behind slow peer_encrypt on fat sessions. This parses only the
+// current state; the tail is re-emitted unchanged on write-back, so NO archived state
+// is lost (it is not a cap or a split — the stored blob is byte-identical after a
+// no-op, and full after an encrypt). Fully bounds-checked; never panics. The returned
+// tail aliases b — the caller must not mutate b while the tail is held.
+func UnpackFlatSessionCurrentOnly(b []byte) (current *record.SessionStructure, tail []byte, nPrev int, err error) {
+	if len(b) < 2 {
+		return nil, nil, 0, fmt.Errorf("UnpackFlatSessionCurrentOnly: buffer too short (%d bytes, need at least 2)", len(b))
+	}
+	if b[0] != flatSessionMagic {
+		return nil, nil, 0, fmt.Errorf("UnpackFlatSessionCurrentOnly: wrong magic byte 0x%02X (expected 0x%02X)", b[0], flatSessionMagic)
+	}
+	nPrev = int(b[1])
+	currentState, off, err := unpackState(b, 2)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("UnpackFlatSessionCurrentOnly: current state: %w", err)
+	}
+	// tail = the archived previous states, raw and unparsed (empty when nPrev==0).
+	return &record.SessionStructure{SessionState: currentState, PreviousStates: nil}, b[off:], nPrev, nil
+}
+
 // unpackState decodes one StateStructure from b starting at off.
 // Returns (state, newOff, error).
 func unpackState(b []byte, off int) (*record.StateStructure, int, error) {

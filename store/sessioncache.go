@@ -9,11 +9,19 @@ package store
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"go.mau.fi/libsignal/state/record"
 
 	"go.mau.fi/util/exsync"
 )
+
+// lazySessionDecode gates the Phase 38.4 send-path optimization: decode only the
+// current state on the encrypt prefetch and carry the archived states as raw bytes,
+// instead of parsing all ~40 archived states + thousands of message keys per send.
+// Read once at package load; enable with KAVTOV_LAZY_SESSION_DECODE=1. Flipping it
+// off (and restarting) instantly reverts to full-decode behavior — no code rollback.
+var lazySessionDecode = os.Getenv("KAVTOV_LAZY_SESSION_DECODE") == "1"
 
 type contextKey int
 
@@ -25,6 +33,15 @@ type sessionCacheEntry struct {
 	Dirty  bool
 	Found  bool
 	Record *record.Session
+
+	// Lazy send-path fields (set only when lazySessionDecode and the blob had
+	// archived states). LazyTail is the raw, unparsed archived-states suffix of the
+	// original flat blob; LazyNPrev is its archived-state count. On write-back the
+	// (encrypt-mutated) live states are packed and LazyTail is appended verbatim, so
+	// no archived state is lost. See UnpackFlatSessionCurrentOnly.
+	Lazy      bool
+	LazyTail  []byte
+	LazyNPrev int
 }
 
 type sessionCache = exsync.Map[string, sessionCacheEntry]
@@ -60,11 +77,21 @@ func putCachedSession(ctx context.Context, addr string, record *record.Session) 
 	if cache == nil {
 		return false
 	}
-	cache.Set(addr, sessionCacheEntry{
+	entry := sessionCacheEntry{
 		Dirty:  true,
 		Found:  true,
 		Record: record,
-	})
+	}
+	// Phase 38.4 CORRECTNESS-CRITICAL: the cipher calls StoreSession (→ here) after
+	// mutating the current state on encrypt. If this entry was loaded current-only,
+	// the original archived tail MUST survive into the new entry, or PutCachedSessions
+	// would write the current-only record and silently drop every archived state.
+	if prev, ok := cache.Get(addr); ok && prev.Lazy {
+		entry.Lazy = true
+		entry.LazyTail = prev.LazyTail
+		entry.LazyNPrev = prev.LazyNPrev
+	}
+	cache.Set(addr, entry)
 	return true
 }
 
@@ -96,6 +123,9 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 	for addr, rawSess := range sessions {
 		var sessionRecord *record.Session
 		var found bool
+		var lazy bool
+		var lazyTail []byte
+		var lazyNPrev int
 		if rawSess == nil {
 			sessionRecord = record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
 		} else {
@@ -109,13 +139,7 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 			// leaves the cache entry absent, hasCachedSession reports Found=false,
 			// ContainsSession short-circuits to false, and the send aborts with
 			// ErrNoSession → WhatsApp 479 (the exact bug this read-gap caused).
-			var structure *record.SessionStructure
-			if len(rawSess) > 0 && rawSess[0] == 0x01 {
-				structure, err = UnpackFlatSession(rawSess)
-				if err != nil {
-					return nil, ctx, fmt.Errorf("WithCachedSessions: failed to deserialize flat session with %s: %w", addr, err)
-				}
-			} else {
+			if len(rawSess) == 0 || rawSess[0] != 0x01 {
 				var byte0desc string
 				if len(rawSess) == 0 {
 					byte0desc = "empty blob"
@@ -124,13 +148,32 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 				}
 				return nil, ctx, fmt.Errorf("WithCachedSessions: non-flat session blob for %s (%s); JSON read path removed in Stage 3", addr, byte0desc)
 			}
+			var structure *record.SessionStructure
+			if lazySessionDecode {
+				// Phase 38.4: decode only the current state; carry the archived
+				// states as a raw tail re-emitted unchanged on write-back. The
+				// encrypt path never reads previousSessions, and an existing
+				// session is never ProcessBundle'd in the send path (it has no
+				// bundle), so previousSessions stays empty through the encrypt and
+				// the tail is the complete, untouched archived set.
+				structure, lazyTail, lazyNPrev, err = UnpackFlatSessionCurrentOnly(rawSess)
+				if err != nil {
+					return nil, ctx, fmt.Errorf("WithCachedSessions: failed to deserialize flat session (current-only) with %s: %w", addr, err)
+				}
+				lazy = true
+			} else {
+				structure, err = UnpackFlatSession(rawSess)
+				if err != nil {
+					return nil, ctx, fmt.Errorf("WithCachedSessions: failed to deserialize flat session with %s: %w", addr, err)
+				}
+			}
 			sessionRecord, err = record.NewSessionFromStructure(structure, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
 			if err != nil {
 				return nil, ctx, fmt.Errorf("WithCachedSessions: failed to build session record for %s: %w", addr, err)
 			}
 		}
 		existingSessions[addr] = found
-		wrapped[addr] = sessionCacheEntry{Record: sessionRecord, Found: found}
+		wrapped[addr] = sessionCacheEntry{Record: sessionRecord, Found: found, Lazy: lazy, LazyTail: lazyTail, LazyNPrev: lazyNPrev}
 	}
 
 	ctx = context.WithValue(ctx, contextKeySessionCache, (*sessionCache)(exsync.NewMapWithData(wrapped)))
@@ -154,6 +197,23 @@ func (device *Device) PutCachedSessions(ctx context.Context) error {
 		flat, ok := PackFlatSession(structure)
 		if !ok {
 			return fmt.Errorf("PutCachedSessions: PackFlatSession refused for %s: codec bug", addr)
+		}
+		if item.Lazy {
+			// Phase 38.4: this entry was loaded current-only. Re-attach the raw
+			// archived tail verbatim so no archived state is lost. `flat` holds
+			// [magic][len(livePrev)][current][livePrev...]; the live previous states
+			// are normally empty (pure encrypt) but may be non-empty if the record
+			// archived during the op — either way append the original tail and set
+			// the count to live+original. Lossless in both cases.
+			total := len(structure.PreviousStates) + item.LazyNPrev
+			if total > 255 {
+				return fmt.Errorf("PutCachedSessions: %s archived-state count %d exceeds 255 after lazy re-attach", addr, total)
+			}
+			merged := make([]byte, 0, len(flat)+len(item.LazyTail))
+			merged = append(merged, flat...)
+			merged = append(merged, item.LazyTail...)
+			merged[1] = byte(total)
+			flat = merged
 		}
 		dirtySessions[addr] = flat
 	}
