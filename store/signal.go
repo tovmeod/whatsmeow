@@ -203,19 +203,9 @@ func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protoco
 	groupID := senderKeyName.GroupID()
 	senderString := senderKeyName.Sender().String()
 
-	// Phase 17.8: update struct cache with post-ratchet structure (write-side feed).
-	// cacheKey includes device JID prefix — required because ParsedSKCache is a
-	// shared process-level LRU; device scoping prevents cross-account collisions
-	// (matches CachedSenderKeyStore.key format). REPLACE, not invalidate — avoids
-	// stale-after-write against async flusher (Pitfall 2).
-	// NOTE: plan 04 wires the AUTHORITATIVE replace at the PutSenderKeyStructure
-	// chokepoint (which also covers the recovery path that never reaches this line);
-	// this StoreStruct then becomes a redundant same-structure replace (harmless).
-	if device.ID != nil && device.ParsedSKCache != nil {
-		cacheKey := device.ID.String() + "|" + groupID + "|" + senderString
-		// Cipher write (normal ratchet advance): donorKeyID=nil.
-		device.ParsedSKCache.StoreStruct(cacheKey, keyRecord.Structure(), nil)
-	}
+	// Phase 38.4-03: parsed struct-cache (SKParsed) deleted. The write-through flat
+	// c.cache inside CachedSenderKeyStore.PutSenderKeyStructure is the authoritative
+	// write path. No StoreStruct call here.
 
 	// Phase 17.9: columnar hot path — no Serialize on the per-message write.
 	// Type-assert device.SenderKeys to the fork-local optional interface.
@@ -245,54 +235,27 @@ func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol
 	groupID := senderKeyName.GroupID()
 	senderString := senderKeyName.Sender().String()
 
-	// Phase 17.8 / 17.9: struct-cache hit path. cacheKey includes device JID prefix
-	// (shared LRU, device scoping required for multi-account correctness).
-	if device.ID != nil && device.ParsedSKCache != nil {
-		cacheKey := device.ID.String() + "|" + groupID + "|" + senderString
+	// Phase 38.4-03: parsed struct-cache (SKParsed) deleted. LoadSenderKey now reads
+	// the flat []byte cache directly via GetSenderKeyStructure (cache-aware since
+	// Plan 02). Decode flat bytes → record per decrypt (transient; GC'd immediately —
+	// no pointer-dense graph retained, per the Phase 17.8/17.9 GC decision).
 
-		// 1. ParsedSKCache hit: return the ready-to-use parsed object (no DB, no parse).
-		if s, ok := device.ParsedSKCache.LoadStruct(cacheKey); ok {
-			return groupRecord.NewSenderKeyFromStruct(s, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
-		}
-
-		// 2. Cache miss: try the columnar read path (fmt_ver=2 → recompose, no JSON).
-		if csk, ok := device.SenderKeys.(SenderKeyColumnarStore); ok {
-			structure, err := csk.GetSenderKeyStructure(ctx, groupID, senderString)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load sender key structure from %s for %s: %w", senderString, groupID, err)
-			}
-			if structure == nil {
-				// Absent row: return empty record, do NOT cache empty (recovery invariant).
-				return groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState), nil
-			}
-			// Populate parsed cache from recompose (NOT from Deserialize — no JSON on miss).
-			// Cipher/read-miss path: donorKeyID=nil.
-			device.ParsedSKCache.StoreStruct(cacheKey, structure, nil)
-			return groupRecord.NewSenderKeyFromStruct(structure, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
-		}
-
-		// 3. Fallback: store does not implement SenderKeyColumnarStore (legacy / test stores).
-		// Use the []byte GetSenderKey + Deserialize path.
-		rawKey, err := device.SenderKeys.GetSenderKey(ctx, groupID, senderString)
+	// 1. Columnar read path (fmt_ver=2 → flat bytes → structure, no JSON).
+	// GetSenderKeyStructure is cache-aware (Plan 02): checks c.cache before DB.
+	if csk, ok := device.SenderKeys.(SenderKeyColumnarStore); ok {
+		structure, err := csk.GetSenderKeyStructure(ctx, groupID, senderString)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load sender key from %s for %s: %w", senderString, groupID, err)
+			return nil, fmt.Errorf("failed to load sender key structure from %s for %s: %w", senderString, groupID, err)
 		}
-		if rawKey == nil {
+		if structure == nil {
+			// Absent row: return empty record (recovery invariant — never cache nil).
 			return groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState), nil
 		}
-
-		// Deserialize once: JSON → structure (legacy path only — non-columnar store fallback).
-		structure, err := SignalProtobufSerializer.SenderKeyRecord.Deserialize(rawKey) // ALLOW-JSON-LEGACY-READ (non-columnar store fallback)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize sender key from %s for %s: %w", senderString, groupID, err)
-		}
-		// Populate struct cache for legacy rows (decode-once benefit on legacy stores).
-		// Cipher/read-miss path: donorKeyID=nil.
-		device.ParsedSKCache.StoreStruct(cacheKey, structure, nil)
 		return groupRecord.NewSenderKeyFromStruct(structure, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
 	}
 
-	// Fallback: no JID or no parsed cache wired (test or pre-init scenarios).
+	// 2. Fallback: store does not implement SenderKeyColumnarStore (legacy / test stores).
+	// Use the []byte GetSenderKey + Deserialize path (ALLOW-JSON-LEGACY-READ).
 	rawKey, err := device.SenderKeys.GetSenderKey(ctx, groupID, senderString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load sender key from %s for %s: %w", senderString, groupID, err)

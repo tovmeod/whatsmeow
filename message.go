@@ -758,9 +758,9 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 				from.SignalAddressUser(), chat.String(), msg.KeyID(), recErr)
 			// fall through to fail-open (D-07)
 		} else if recovered {
-			// Donor installed into ParsedSKCache — retry decrypt directly under labeled.
+			// Donor installed — retry decrypt directly under labeled.
 			// MUST NOT call GetSenderKeyDevices: flusher has not ticked; DB row absent;
-			// warm parsedReplace cache is the only source. (RESEARCH Constraint 2)
+			// warm flat c.cache write-through from PutSenderKeyStructureRecovery is the only source. (RESEARCH Constraint 2)
 			sep := strings.LastIndex(labeled, ":")
 			devID, _ := strconv.ParseUint(labeled[sep+1:], 10, 32)
 			name := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(labeled[:sep], uint32(devID)))

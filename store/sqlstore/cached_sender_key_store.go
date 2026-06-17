@@ -87,39 +87,6 @@ type CachedSenderKeyStore struct {
 	// Unpinned inside the EXISTING SetFlusher onDrained closure (no second hook).
 	pinnedBlobs map[string][]byte
 
-	// Phase 17.8: optional callback to invalidate the decoded struct cache on
-	// wasFailed=true recovery writes (Pitfall 4 / T-17.8-05 mitigation). Nil
-	// when no struct cache is wired (test scenarios, pre-attachCachedStores).
-	parsedInvalidate func(key string)
-
-	// Phase 17.9 (Task 3): REPLACE callback — set by SetParsedReplace, wired in
-	// cache_wiring.go. Fires at the PutSenderKeyStructure chokepoint to synchronously
-	// replace the cached *SenderKeyStructure with the in-hand structure BEFORE the
-	// async flusher drains the DB columns. REPLACE (not invalidate) is required
-	// because GetSenderKeyStructure reads DB columns that may not yet be drained;
-	// invalidate-then-Load would read pre-drain (nil) columns = silent decrypt failure
-	// on immediate read-after-write and recovery paths (T-17.9-16).
-	//
-	// Phase 35.2-04 (D-11 iteration gate): the signature is extended with
-	// donorKeyID *uint32 (nil = cipher write, non-nil = recovery install of that KeyID)
-	// and returns store.StoreVerdict (CR-03 tri-state): StoreAccepted,
-	// StoreRejectedStale (stale install — recovery callers skip flusher AND DB),
-	// or StoreUncacheable (flat-cache refusal — recovery callers skip the cache
-	// but still persist). The caller MUST evaluate the verdict for the recovery
-	// class before flusher.Enqueue (verdict-before-Enqueue ordering requirement).
-	parsedReplace func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict
-
-	// Phase 35.2 (CR-01): READ callback into the parsed struct cache — set by
-	// SetParsedLoad, wired in cache_wiring.go alongside SetParsedReplace.
-	// TryInlineRecovery uses it to union the cache-resident structure (which
-	// under write-back can be AHEAD of the DB by up to a flush interval) with
-	// the DB guard read before building the D-12 donor merge. Without it the
-	// merge is built from a stale DB snapshot and can silently drop a
-	// cache-only fresh generation from both the cache and the DB. Nil when no
-	// struct cache is wired (test scenarios, pre-attachCachedStores) — the
-	// merge then uses the DB read alone.
-	parsedLoad func(key string) (*groupRecord.SenderKeyStructure, bool)
-
 	hits, misses uint64
 }
 
@@ -178,38 +145,6 @@ func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 		delete(c.pinnedBlobs, bk)
 		c.pinnedMu.Unlock()
 	})
-}
-
-// SetParsedInvalidate attaches the Phase 17.8 struct-cache invalidation callback.
-// Called by attachCachedStores after the parsed LRU is wired to the device.
-// The callback fires when wasFailed=true (failed-tuple recovery) to ensure
-// the next LoadSenderKey re-parses the recovered []byte (Pitfall 4 guard).
-func (c *CachedSenderKeyStore) SetParsedInvalidate(fn func(key string)) {
-	c.parsedInvalidate = fn
-}
-
-// SetParsedReplace attaches the Phase 17.9 struct-cache REPLACE callback.
-// Called by attachCachedStores alongside SetParsedInvalidate. The callback
-// fires at the PutSenderKeyStructure chokepoint (both normal ratchet-advance
-// and direct recovery writes) to synchronously replace the cached
-// *SenderKeyStructure before the async flusher drains the DB columns.
-// MUST be a REPLACE (not invalidate) — see parsedReplace field comment.
-//
-// Phase 35.2-04 (D-11): the callback signature now carries donorKeyID *uint32
-// (nil = cipher/ratchet write; non-nil = recovery install) and returns the
-// store.StoreVerdict tri-state (CR-03). The caller evaluates the verdict
-// before flusher.Enqueue for the recovery class.
-func (c *CachedSenderKeyStore) SetParsedReplace(fn func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict) {
-	c.parsedReplace = fn
-}
-
-// SetParsedLoad attaches the Phase 35.2 (CR-01) struct-cache READ callback.
-// Called by attachCachedStores alongside SetParsedReplace. TryInlineRecovery
-// uses it to build the D-12 merge base from the union of the cache-resident
-// structure and the DB read (the cache can be ahead of the DB by up to a
-// flush interval under write-back).
-func (c *CachedSenderKeyStore) SetParsedLoad(fn func(key string) (*groupRecord.SenderKeyStructure, bool)) {
-	c.parsedLoad = fn
 }
 
 func (c *CachedSenderKeyStore) key(group, user string) string {
@@ -380,13 +315,6 @@ func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, 
 	// Update the read cache immediately so subsequent GetSenderKey calls are warm.
 	c.cache.Add(c.key(group, user), copyBytes(session))
 
-	// Phase 17.8: on a failed-tuple recovery write, invalidate the decoded
-	// struct cache so the next LoadSenderKey re-parses the recovered []byte
-	// instead of serving the pre-recovery struct (Pitfall 4 / T-17.8-05).
-	if wasFailed && c.parsedInvalidate != nil {
-		c.parsedInvalidate(c.key(group, user))
-	}
-
 	// Update device-set index (Phase 27 logic unchanged).
 	c.updateDeviceCache(group, user)
 
@@ -439,14 +367,6 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 		c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
 		c.pinnedMu.Unlock()
 
-		// REPLACE-on-write coherence (T-17.9-16): replace the parsed cache entry
-		// with the in-hand structure so LoadSenderKey returns the fresh key before
-		// the async flusher drains the DB row.
-		// donorKeyID=nil => cipher write (backward-only gate, equal-iter accepted).
-		if c.parsedReplace != nil {
-			c.parsedReplace(c.key(group, user), s, nil)
-		}
-
 		// Update device-set index (Phase 27 logic unchanged).
 		c.updateDeviceCache(group, user)
 		return nil
@@ -477,12 +397,6 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 	c.pinnedMu.Lock()
 	c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
 	c.pinnedMu.Unlock()
-
-	// Write-through path: also replace the parsed cache for coherence.
-	// donorKeyID=nil => cipher write (backward-only gate, equal-iter accepted).
-	if c.parsedReplace != nil {
-		c.parsedReplace(c.key(group, user), s, nil)
-	}
 
 	c.updateDeviceCache(group, user)
 	return nil
@@ -537,33 +451,14 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 		}
 	}
 
-	// ORDERING: evaluate the parsed-cache gate BEFORE flusher.Enqueue for recovery.
-	// A rejected stale install must not enter the dirty-set (prevents last-wins drain
-	// of a stale blob to DB even when the cache correctly holds the advanced state).
-	// When parsedReplace is nil (test context / pre-wiring) the gate is not active
-	// and the write proceeds unconditionally.
-	cacheKey := c.key(group, user)
-	if c.parsedReplace != nil {
-		switch c.parsedReplace(cacheKey, s, &donorKeyID) {
-		case store.StoreRejectedStale:
-			// Gate rejected: stale install — skip both flusher and DB write, and
-			// report installed=false so TryInlineRecovery returns ok=false (CR-03:
-			// no phantom SENDER_KEY_RECOVERED for an install that never happened).
-			return false, nil
-		case store.StoreUncacheable:
-			// Structure valid but not flat-cacheable (e.g. a D-12 merge exceeding
-			// flatMaxStates states). Skip the cache but STILL persist (CR-03) —
-			// exactly what the cipher path does by ignoring the verdict.
-			// Invalidate the stale cached entry so reads fall through to the DB
-			// row (which will carry the donor) instead of serving a pre-recovery
-			// entry that is missing the donor generation indefinitely.
-			if c.parsedInvalidate != nil {
-				c.parsedInvalidate(cacheKey)
-			}
-		case store.StoreAccepted:
-			// Cache replaced — fall through to persistence.
-		}
-	}
+	// TODO-RISK-B: port the backward-only / strictly-advancing iteration gate from
+	// parsedcache.go StoreStruct onto this flat write path. Task 2 replaces this stub
+	// with the real gate (reads GetSenderKeyStructure cache-aware and rejects a stale
+	// donor install). The write path below remains functional in the meantime.
+	//
+	// NOTE: the recovery_sender_key.go downgrade guard (L510-519) still runs BEFORE
+	// this site (via TryInlineRecovery), providing first-line protection. The ported
+	// gate here adds defense-in-depth for direct callers of PutSenderKeyStructureRecovery.
 
 	// Persist: enqueue to the write-back flusher when wired, else write through.
 	if c.flusher != nil {
