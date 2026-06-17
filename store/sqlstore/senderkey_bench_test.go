@@ -443,8 +443,8 @@ func BenchmarkSenderKeyWrite_Serialize_MaxSkipped(b *testing.B) {
 // ---------------------------------------------------------------------------
 // Arm F — Local GC pre-check (TestSenderKeyGCPreCheck)
 //
-// Fills an LRU cache (same type as device.ParsedSKCache) with N distinct
-// *SenderKeyStructure values and measures HeapObjects + HeapInuse per entry
+// Fills an LRU cache of N distinct *SenderKeyStructure values (the parsed form
+// the deleted struct cache used to retain) and measures HeapObjects + HeapInuse per entry
 // at several fill levels. Reports whether the curve is flat (plateau) or rising.
 //
 // This is the LOCAL sanity check for the GC gate. The prod soak (gcBgMarkWorker

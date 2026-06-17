@@ -522,14 +522,9 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	devB, _ := lru.New[string, []string](256)
 	csBStore := sqlstore.NewCachedSenderKeyStore(innerB, inlineTestJIDB, byteB, devB, nil)
 
-	// Wire parsedReplace on B's store (needed by PutSenderKeyStructure coherence
-	// path, but the parsed cache object itself doesn't matter for B — only C
-	// needs the warm-cache assertion to hold).
-	skLRUB, _ := store.NewSKParsedLRU(256)
-	parsedB := store.NewParsedSKCache(skLRUB)
-	csBStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
-		return parsedB.StoreStruct(key, s, donorKeyID)
-	})
+	// Phase 38.4-03: the parsed struct cache is deleted. The flat c.cache
+	// write-through inside PutSenderKeyStructure is the single sender-key cache;
+	// no parsed-cache wiring is needed.
 
 	// Build a Device for B so builder.Process routes writes through csBStore.
 	// aliceAddr is "alice:0", so the key is stored under sender_id="alice:0".
@@ -537,7 +532,6 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 		SenderKeys: csBStore,
 		Log:        waLog.Noop,
 		ID:         &jidBParsed,
-		ParsedSKCache: parsedB,
 	}
 
 	// Clean up leftover rows from previous test runs.
@@ -559,9 +553,10 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	t.Logf("B processed Alice SKDM — key stored under our_jid=%s", inlineTestJIDB)
 
 	// Step 3: Build C's CachedSenderKeyStore on the SAME shared DB.
-	// C has NO Alice key. C's parsedReplace is wired into a real ParsedSKCache
-	// so that after TryInlineRecovery's PutSenderKeyStructure, the warm-cache
-	// hit in LoadSenderKey during the cipher.Decrypt retry succeeds.
+	// C has NO Alice key. After TryInlineRecovery's PutSenderKeyStructure write-
+	// through populates the flat c.cache, the warm-cache hit in LoadSenderKey
+	// during the cipher.Decrypt retry succeeds — no parsed-cache wiring needed
+	// (Phase 38.4-03: parsed struct cache deleted).
 	jidCParsed, err := types.ParseJID(inlineTestJIDC)
 	if err != nil {
 		t.Fatalf("ParseJID C: %v", err)
@@ -572,18 +567,11 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	devC, _ := lru.New[string, []string](256)
 	csC := sqlstore.NewCachedSenderKeyStore(innerC, inlineTestJIDC, byteC, devC, nil)
 
-	skLRUC, _ := store.NewSKParsedLRU(256)
-	parsedC := store.NewParsedSKCache(skLRUC)
-	csC.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
-		return parsedC.StoreStruct(key, s, donorKeyID)
-	})
-
 	deviceC := &store.Device{
-		SenderKeys:    csC,
+		SenderKeys:      csC,
 		InlineRecoverer: csC,
-		Log:           waLog.Noop,
-		ID:            &jidCParsed,
-		ParsedSKCache: parsedC,
+		Log:             waLog.Noop,
+		ID:              &jidCParsed,
 	}
 
 	// Step 4: Call TryInlineRecovery on C.
@@ -613,7 +601,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	t.Logf("TryInlineRecovery succeeded: donorJID=%s", donorJID)
 
 	// Step 5: Direct-cipher retry — construct cipher under labeled, Decrypt skmsg.
-	// This validates the warm parsedReplace hit (D-04 safe: no DB round-trip).
+	// This validates the warm flat c.cache hit (D-04 safe: no DB round-trip).
 	sep := strings.LastIndex(labeled, ":")
 	devIDStr := labeled[sep+1:]
 	devIDVal, err := strconv.ParseUint(devIDStr, 10, 32)

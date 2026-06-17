@@ -266,9 +266,6 @@ type Device struct {
 	Sessions    SessionStore
 	PreKeys     PreKeyStore
 	SenderKeys  SenderKeyStore
-	// Phase 17.8: decode-once struct-LRU cache for sender keys. Wired by attachCachedStores.
-	// Phase 17.13: parsedSessionCache removed (D-04a); sessions cached as flat []byte only.
-	ParsedSKCache *parsedSKCache
 	// Phase 17.12: inline synchronous cross-account sender-key recovery.
 	// Nil before attachCachedStores wires it. message.go gates on nil before
 	// calling TryInlineRecovery — no-op when not wired (test environments, pre-init).

@@ -6,13 +6,12 @@
 
 // no_parsed_cache_grep_test.go — TestNoParsedCacheOnSenderKeyPath
 //
-// WAVE-0 GATE — Phase 38.4: Collapse sender-key double-cache to single flat-bytes cache.
+// CORRECTNESS GATE — Phase 38.4: Collapse sender-key double-cache to single flat-bytes cache.
 //
-// This test is EXPECTED RED until Plan 03 deletes the parsed-struct cache (SKParsed).
-// DO NOT silence, skip, or mark t.Skip() on this test — the RED state is the proof
-// that the grep-gate correctly identifies the tokens that Plan 03 must eliminate.
-// After Plan 03 removes all parsed-cache wiring, this test must turn GREEN and
-// stay GREEN as a permanent correctness gate.
+// Plan 03 deleted the parsed-struct cache (SKParsed). This gate is now GREEN and
+// must stay GREEN: reintroducing any parsed-struct-cache token on the sender-key
+// path re-opens double-caching and the GC storm. DO NOT silence, skip, or
+// t.Skip() this test.
 //
 // What this gate enforces:
 // After Phase 38.4 Plan 03, zero parsed-struct-cache references must remain on the
@@ -79,11 +78,8 @@ var forbiddenParsedTokens = []string{
 }
 
 // TestNoParsedCacheOnSenderKeyPath asserts zero parsed-struct-cache tokens on the
-// covered sender-key source files.
-//
-// THIS TEST IS EXPECTED RED until Plan 03 deletes the parsed-struct cache.
-// VIOLATION lines are the proof that the gate is correctly identifying live tokens.
-// After Plan 03 the test must be GREEN with no violations.
+// covered sender-key source files. The parsed cache was deleted in Plan 03; any
+// VIOLATION line is a regression (double-caching reintroduced).
 func TestNoParsedCacheOnSenderKeyPath(t *testing.T) {
 	moduleRoot := findModuleRoot(t)
 	t.Logf("module root: %s", moduleRoot)

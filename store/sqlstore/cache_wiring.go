@@ -23,7 +23,6 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
@@ -49,50 +48,45 @@ import (
 // host-only drop-in (KAVTOV_CACHE_SENDERKEY_DECODED_CAP=500000). This phase
 // lands the validated 500k default and removes the drop-in.
 //
-// Per-entry heap bytes measured by TestCacheMemoryBudget (Phase 35.1-01) using
-// ReadMemStats-delta at N=10,000 entries. Values are ground-truth from the test,
-// not pprof estimates. Blob sizes from ~1-2% TABLESAMPLE on prod (avg / p95 / max):
+// Per-entry heap bytes measured by TestCacheMemoryBudget (Phase 38.4-01) using
+// ReadMemStats-delta at N=10,000 entries (pprof-calibrated fill values).
+// Blob sizes from pprof live heap 2026-06-17 (driver 2026.06.57):
 //
-//	sender_key: avg=720 B, p95=1301 B, max=282966 B (rare fat tail)
-//	session:    avg=2620 B, p95=5185 B, max=653645 B (rare fat tail)
+//	sender_key: pprof real ~3.6 KB/entry (1537 MB / 432k entries)
+//	session:    pprof real ~3.3 KB/entry  (270 MB  /  81k entries)
 //
 //	Cache            | Measured B/entry | Cap     | Budget MB
 //	-----------------|------------------|---------|----------
-//	SKParsed         |   903 B          | 500,000 |   430 MB
-//	SenderKey bytes  |   992 B          | 500,000 |   473 MB
-//	Session bytes    |  2874 B          | 100,000 |   274 MB
-//	Identity         |   179 B          | 150,000 |    26 MB
-//	SKDevices        |   215 B          | 300,000 |    62 MB
-//	MsgSecret        |   294 B          | 300,000 |    84 MB
-//	Total caches                                  | 1,349 MB
-//	Base RSS (non-cache)                          |   228 MB
-//	Grand total                                   | 1,577 MB
-//	GOMEMLIMIT                                    | 3,200 MB
-//	GC headroom                                   |  50.7%  (>= 30% threshold)
+//	SenderKey bytes  |  3,253 B         | 400,000 |  1,241 MB   (Phase 38.4-03: cap lowered; SKParsed deleted)
+//	Session bytes    |  3,677 B         | 100,000 |    351 MB
+//	Identity         |    179 B         | 150,000 |     25 MB
+//	SKDevices        |    215 B         | 300,000 |     62 MB
+//	MsgSecret        |    297 B         | 300,000 |     85 MB
+//	Total caches                                  |  1,764 MB
+//	Base RSS (non-cache)                          |    228 MB
+//	Grand total                                   |  1,992 MB
+//	GOMEMLIMIT                                    |  3,200 MB
+//	GC headroom                                   |   37.8%  (>= 30% threshold)
 //
 //	30% GC headroom constraint: available for caches <= GOMEMLIMIT*0.70 - baseRSS
-//	= 3200*0.70 - 228 = 2012 MB. Total caches 1349 MB << 2012 MB. Validated by
+//	= 3200*0.70 - 228 = 2012 MB. Total caches 1764 MB < 2012 MB. Validated by
 //	TestCacheMemoryBudget in cache_sizing_test.go.
 //	Override env vars to reduce caps without a fork rebuild.
 var (
 	signalSessionCacheCap   = envIntOrDefault("KAVTOV_CACHE_SESSION_CAP", 100_000)
 	signalIdentityCacheCap  = envIntOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 150_000)
-	signalSenderKeyCacheCap = envIntOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 500_000)
+	// Phase 38.4-03: cap lowered from 500_000 to 400_000 (D-4: re-budget after
+	// deleting the parsed struct cache; pprof real ~3.6 KB/entry × 400k = 1440 MB,
+	// fitting the 30%-headroom budget — see TestCacheMemoryBudget).
+	signalSenderKeyCacheCap = envIntOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 400_000)
 	// kavtov-fork: Phase 27 — device-set index (one small []string per
 	// jid|group|userBare).
 	signalSenderKeyDevicesCacheCap = envIntOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 300_000)
 	// perf 260601-uuy: message-secret pair cache (secret + realSender).
 	signalMsgSecretCacheCap = envIntOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 300_000)
-	// Phase 17.8: decoded struct-LRU for flat sender-key values.
-	//
-	// 2026-06-10 GC-storm: caee645 raised this from 500k to 1.5M; the resulting
-	// warmed heap (2.85 GB) left only 11% GC headroom against GOMEMLIMIT=3200 MiB
-	// and drove 40 GC cycles/min. Fixed by TestCacheMemoryBudget (Phase 35.1-01):
-	// measured 903 B/entry; 500k * 903 B = 430 MB, preserving >= 30% headroom.
-	// Host-only drop-in (KAVTOV_CACHE_SENDERKEY_DECODED_CAP=500000) removed in
-	// Phase 35.1-02 after this default is deployed. This is the AUTHORITATIVE prod
-	// cap (wireSignalCaches builds the prod LRU from it); env-overridable.
-	signalSKParsedCacheCap = envIntOrDefault("KAVTOV_CACHE_SENDERKEY_DECODED_CAP", 500_000)
+	// Phase 38.4-03: KAVTOV_CACHE_SENDERKEY_DECODED_CAP (signalSKParsedCacheCap)
+	// REMOVED — the parsed struct-cache (SKParsed) is deleted. Remove this env var
+	// from the systemd unit if present.
 )
 
 // ---------------------------------------------------------------------------
@@ -359,19 +353,6 @@ type signalCaches struct {
 	// queries warm) instead of the DB passthrough; invalidated by PutSenderKey
 	// when a sender's device set may have changed (a new SKDM).
 	SenderKeyDevices *lru.Cache[string, []string]
-	// Phase 17.8: decoded struct-LRU caches. LoadSenderKey / LoadSession hits
-	// call NewSenderKeyFromStruct / NewSessionFromStructure instead of JSON
-	// Deserialize + graph-rebuild. Keyed with the same jid-prefix as the []byte
-	// LRU (device scoping on the shared process-level LRU). Eviction is a silent
-	// no-op — next Load re-populates from the []byte LRU.
-	//
-	// Phase 17.9 GC redesign: SKParsed now stores the flat value-struct
-	// (store.flatSenderKey, via the store.SKParsedLRU alias) rather than
-	// *SenderKeyStructure, to remove the per-entry GC pointer-scan cost. The
-	// value type is unexported in package store; sqlstore only constructs and
-	// forwards the LRU (never Get/Add), so the exported alias suffices.
-	SKParsed *store.SKParsedLRU
-
 	// perf 260601-uuy: message-secret pair cache. Keyed
 	// jid|chat.ToNonAD()|sender.ToNonAD()|message_id → (secret, realSender).
 	// Avoids a PG read + JSON-less Scan on the 22 GB whatsmeow_message_secrets
@@ -534,13 +515,6 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 		panic(err)
 	}
 
-	// Phase 17.8: decoded struct-LRU caches. lru.New (no eviction callback) —
-	// struct LRU eviction is a silent no-op; no flusher interaction needed.
-	c.caches.SKParsed, err = store.NewSKParsedLRU(signalSKParsedCacheCap)
-	if err != nil {
-		log.Errorf("Failed to construct SKParsedCache (cap=%d): %v", signalSKParsedCacheCap, err)
-		panic(err)
-	}
 	// Phase 17.5.1 WR-01: cancelled by Container.Close (via
 	// closeSignalCaches) so emitMetricsLoop exits before logger/db
 	// teardown.
@@ -620,39 +594,6 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	// Phase 17.12: wire inline synchronous recovery. No goroutine, no map, no mutex —
 	// CachedSenderKeyStore satisfies SenderKeyInlineRecoverer directly.
 	device.InlineRecoverer = senderKeyStore
-
-	// Phase 17.8: wire decoded struct-LRU caches to the device. Both parsed
-	// caches use the same shared LRU (constructed in wireSignalCaches) but are
-	// accessed via thin wrappers that enforce the Store-time mutex discipline.
-	device.ParsedSKCache = store.NewParsedSKCache(c.caches.SKParsed)
-
-	// Inject the wasFailed invalidation callback into the senderKeyStore so
-	// that PutSenderKeyWithMeta(wasFailed=true) recovery paths invalidate the
-	// struct cache (Pitfall 4 guard, T-17.8-05 mitigation).
-	senderKeyStore.SetParsedInvalidate(func(key string) {
-		device.ParsedSKCache.Invalidate(key)
-	})
-
-	// Phase 17.9 Task 3: REPLACE-on-write coherence for the columnar read path.
-	// GetSenderKeyStructure reads DB columns that the async flusher has NOT yet
-	// drained after a PutSenderKeyStructure write. REPLACE with the in-hand
-	// structure at the write chokepoint so an immediate LoadSenderKey (including
-	// the recovery path's direct PutSenderKeyStructure) returns the freshly-written
-	// key without waiting for the async drain. MUST be a REPLACE, not invalidate
-	// (T-17.9-16; see CachedSenderKeyStore.parsedReplace field comment).
-	senderKeyStore.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
-		return device.ParsedSKCache.StoreStruct(key, s, donorKeyID)
-	})
-
-	// Phase 35.2 (CR-01): READ access into the parsed cache for
-	// TryInlineRecovery's union merge. The recovery guard read
-	// (GetSenderKeyStructure) is DB-only, and under write-back the parsed
-	// cache + flusher dirty-set can be AHEAD of the DB by up to a flush
-	// interval — the D-12 merge must be built from the union of both views or
-	// a cache-only fresh generation is silently dropped from cache AND DB.
-	senderKeyStore.SetParsedLoad(func(key string) (*groupRecord.SenderKeyStructure, bool) {
-		return device.ParsedSKCache.LoadStruct(key)
-	})
 
 	// perf 260601-uuy: message-secret pair cache.
 	device.MsgSecrets = NewCachedMessageSecretStore(innerStore, jid, c.caches.MsgSecret, &c.caches.MsgSecretExplicitRemoves)
@@ -811,7 +752,6 @@ func (c *Container) CacheLens() map[string]int {
 		"identity":   -1,
 		"sk_devices": -1,
 		"msg_secret": -1,
-		"sk_parsed":  -1,
 	}
 	if c.caches.SenderKey != nil {
 		lens["sk_bytes"] = c.caches.SenderKey.Len()
@@ -827,9 +767,6 @@ func (c *Container) CacheLens() map[string]int {
 	}
 	if c.caches.MsgSecret != nil {
 		lens["msg_secret"] = c.caches.MsgSecret.Len()
-	}
-	if c.caches.SKParsed != nil {
-		lens["sk_parsed"] = c.caches.SKParsed.Len()
 	}
 	return lens
 }

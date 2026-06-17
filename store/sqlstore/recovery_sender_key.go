@@ -488,24 +488,15 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	// and PutSenderKeyStructure. If the existing row already has the same KeyID at
 	// Iteration >= donor.Iteration, the donor is stale — skip the write to avoid
 	// clobbering the naturally-advanced key.
+	// Phase 38.4-03: GetSenderKeyStructure is now cache-aware (Plan 02) — it
+	// checks the flat c.cache BEFORE the DB read. The parsedLoad union (CR-01)
+	// that previously merged the parsed-cache view with the DB read is no longer
+	// needed: the freshest visible state is already in c.cache (written by
+	// PutSenderKeyStructure's write-through at every cipher/recovery write).
+	// The flat cache IS the freshest view; no union is required.
 	existing, err := c.GetSenderKeyStructure(ctx, group, targetSenderID)
 	if err != nil {
 		return "", false, err
-	}
-	// CR-01 (2026-06-10): GetSenderKeyStructure reads the DB ONLY; under
-	// write-back the DB lags the parsed cache + flusher dirty-set by up to a
-	// flush interval. Building the guard + D-12 merge from the DB snapshot
-	// alone can silently drop a cache-only fresh generation from BOTH the
-	// cache (the recovery install replaces the whole cached entry) and the DB
-	// (the enqueued merged blob replaces the dirty blob that carried it).
-	// Union the cache-resident structure with the DB read, preferring the
-	// higher iteration per KeyID, so the merge base is the freshest visible
-	// state. StoreStruct additionally rejects any recovery install whose
-	// state-set is missing a cached KeyID (defense in depth).
-	if c.parsedLoad != nil {
-		if cached, hit := c.parsedLoad(c.key(group, targetSenderID)); hit && cached != nil {
-			existing = unionSenderKeyStructures(cached, existing)
-		}
 	}
 	if existing != nil {
 		for _, st := range existing.SenderKeyStates {

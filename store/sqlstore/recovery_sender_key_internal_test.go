@@ -576,3 +576,119 @@ func TestInlineRecoveryMergeCapsStatesAndDonorKeys(t *testing.T) {
 		}
 	}
 }
+
+// mkStructState builds a *SenderKeyStateStructure with valid field sizes so
+// PackFlat accepts it. chainKey=32B, signingPub=33B (prefix 0x05), no skipped keys.
+func mkStructState(keyID, iter uint32) *groupRecord.SenderKeyStateStructure {
+	pub := make([]byte, 33)
+	pub[0] = 0x05
+	return &groupRecord.SenderKeyStateStructure{
+		KeyID: keyID,
+		SenderChainKey: &ratchet.SenderChainKeyStructure{
+			Iteration: iter,
+			ChainKey:  make([]byte, 32),
+		},
+		SigningKeyPublic: pub,
+	}
+}
+
+// TestPutSenderKeyStructureRecoveryBackwardOnlyGate is the TDD RED/GREEN gate
+// for Risk-b (Phase 38.4-03 Task 2). It asserts three behaviors of
+// PutSenderKeyStructureRecovery's flat-path ordering gate:
+//
+//  1. STALE DONOR REJECTED: a donor whose iteration does NOT strictly advance the
+//     cached position for that KeyID is rejected (installed=false, no write).
+//  2. FORWARD DONOR ACCEPTED: a donor that strictly advances the KeyID iteration
+//     is installed (installed=true).
+//  3. FOREIGN KEYIDS PRESERVED: a recovery write does not reject on equal-
+//     iteration matches for non-donor KeyIDs (D-12 preserved-foreign rule).
+//
+// RED proof: removing the ported gate from PutSenderKeyStructureRecovery causes
+// Case 1 to return installed=true (wrong — stale donor lands in the cache/flusher).
+// The GREEN state is gated on the real gate ported in Task 2.
+func TestPutSenderKeyStructureRecoveryBackwardOnlyGate(t *testing.T) {
+	const (
+		group    = "riskbgroup@g.us"
+		user     = "555_1:0"
+		donorKID = uint32(7)
+	)
+
+	// --- Case 1: STALE DONOR REJECTED ---
+	// Existing cached state: keyID=7, iter=50.
+	existingBlob, packOK := store.PackFlat(&groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{mkStructState(donorKID, 50)},
+	})
+	if !packOK {
+		t.Fatal("PackFlat(existing) rejected the seed structure")
+	}
+	stub := &stubRecoveryInner{existing: existingBlob}
+	cs := newStubCachedStore(t, stub, nil)
+	// Seed the cache with the existing blob (mirrors what GetSenderKeyStructure
+	// returns from cache after a previous write).
+	cs.cache.Add(cs.key(group, user), existingBlob)
+
+	// Donor: keyID=7, iter=40 — does NOT strictly advance (40 < 50).
+	staleDonorStruct := &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{mkStructState(donorKID, 40)},
+	}
+	installed, err := cs.PutSenderKeyStructureRecovery(context.Background(), group, user, staleDonorStruct, donorKID)
+	if err != nil {
+		t.Fatalf("PutSenderKeyStructureRecovery (stale): %v", err)
+	}
+	if installed {
+		t.Error("STALE DONOR: want installed=false (donor iter=40 does not advance cached iter=50), got true (gate missing or broken)")
+	}
+	if stub.putCalls.Load() != 0 {
+		t.Error("STALE DONOR: want 0 writes to inner store, got non-zero (gate missing or broken)")
+	}
+
+	// --- Case 2: FORWARD DONOR ACCEPTED ---
+	// Fresh donor: keyID=7, iter=60 — strictly advances.
+	stub2 := &stubRecoveryInner{existing: existingBlob}
+	cs2 := newStubCachedStore(t, stub2, nil)
+	cs2.cache.Add(cs2.key(group, user), existingBlob)
+
+	freshDonorStruct := &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{mkStructState(donorKID, 60)},
+	}
+	installed2, err := cs2.PutSenderKeyStructureRecovery(context.Background(), group, user, freshDonorStruct, donorKID)
+	if err != nil {
+		t.Fatalf("PutSenderKeyStructureRecovery (fresh): %v", err)
+	}
+	if !installed2 {
+		t.Error("FORWARD DONOR: want installed=true (donor iter=60 strictly advances cached iter=50), got false")
+	}
+
+	// --- Case 3: FOREIGN KEYIDS PRESERVED ---
+	// Cached state has TWO keyIDs: donor keyID=7 at iter=50, and a foreign keyID=8
+	// at iter=30. The incoming structure has keyID=7 at iter=60 (donor) and
+	// keyID=8 at iter=30 (equal iteration — preserved foreign state). Must ACCEPT.
+	existingMultiBlob, packOK := store.PackFlat(&groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+			mkStructState(donorKID, 50),
+			mkStructState(8, 30), // foreign KeyID
+		},
+	})
+	if !packOK {
+		t.Fatal("PackFlat(existingMulti) rejected the seed structure")
+	}
+	stub3 := &stubRecoveryInner{existing: existingMultiBlob}
+	cs3 := newStubCachedStore(t, stub3, nil)
+	cs3.cache.Add(cs3.key(group, user), existingMultiBlob)
+
+	// Incoming: donor keyID=7 iter=60 (strictly advances) + foreign keyID=8
+	// iter=30 (equal — preserved foreign state, must not reject).
+	foreignPreservedStruct := &groupRecord.SenderKeyStructure{
+		SenderKeyStates: []*groupRecord.SenderKeyStateStructure{
+			mkStructState(donorKID, 60), // donor: advances
+			mkStructState(8, 30),        // foreign: equal — accept (D-12 preserved-foreign rule)
+		},
+	}
+	installed3, err := cs3.PutSenderKeyStructureRecovery(context.Background(), group, user, foreignPreservedStruct, donorKID)
+	if err != nil {
+		t.Fatalf("PutSenderKeyStructureRecovery (foreign): %v", err)
+	}
+	if !installed3 {
+		t.Error("FOREIGN PRESERVED: want installed=true (donor advances, foreign equal), got false (D-12 violated)")
+	}
+}

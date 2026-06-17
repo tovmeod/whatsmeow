@@ -6,19 +6,23 @@
 
 // senderkey_cache_test.go — TestSenderKeyCacheCoherence
 //
-// Verifies the ParsedSKCache REPLACE-on-write coherence design (T-17.9-16) using
-// a real store.Device with a real ParsedSKCache and a real CachedSenderKeyStore.
+// Verifies the flat []byte cache REPLACE-on-write coherence design (T-17.9-16)
+// using a real store.Device and a real CachedSenderKeyStore.
+//
+// Phase 38.4-03: the parsed struct cache (ParsedSKCache) is deleted; the single
+// flat c.cache write-through inside PutSenderKeyStructure is what provides the
+// REPLACE coherence asserted below.
 //
 // The critical test harness invariant: the flusher IS ATTACHED but NOT STARTED
 // (no goroutine, no auto-drain). Enqueue adds to dirty-set only. PutManySenderKeys
 // is NEVER called automatically. This is the attached-not-drained condition that
 // discriminates between REPLACE and invalidate:
 //
-//   - Under REPLACE: after PutSenderKeyStructure → LoadSenderKey returns N+1 from cache,
-//     while a raw DB read still returns N. Cache leads; DB lags. Proven.
-//   - Under invalidate: PutSenderKeyStructure would clear the cache → LoadSenderKey misses
-//     → reads DB (still N) → returns N. Silent stale key. Not tested here because
-//     REPLACE is what's implemented.
+//   - Under REPLACE: after PutSenderKeyStructure → LoadSenderKey returns N+1 from
+//     the flat cache, while a raw DB read still returns N. Cache leads; DB lags.
+//   - Under invalidate: PutSenderKeyStructure would clear the cache → LoadSenderKey
+//     misses → reads DB (still N) → returns N. Silent stale key. The flat
+//     write-through is REPLACE, not invalidate.
 //
 // Test arms:
 //  1. ratchet-advance: device.StoreSenderKey (iter=N+1) → device.LoadSenderKey returns N+1
@@ -154,10 +158,13 @@ func newBatchTestStoreWithJID(t *testing.T, jidStr string) (*sqlstore.SQLStore, 
 }
 
 // newCohTestDevice creates a *store.Device with:
-//   - SenderKeys = *CachedSenderKeyStore wrapping inner
-//   - ParsedSKCache = real *parsedSKCache (via store.NewParsedSKCache)
-//   - parsedReplace wired: cs.SetParsedReplace(device.ParsedSKCache.StoreStruct)
+//   - SenderKeys = *CachedSenderKeyStore wrapping inner (the single flat []byte cache)
 //   - Flusher attached via cs.SetFlusher but NOT started (no goroutine)
+//
+// Phase 38.4-03: the parsed struct cache is deleted. The CachedSenderKeyStore's
+// flat c.cache write-through (PutSenderKeyStructure) is the only sender-key cache;
+// it provides the REPLACE-on-write coherence the arms below assert via
+// device.LoadSenderKey (cache leads, DB lags while the flusher is undrained).
 //
 // Returns the device, the CachedSenderKeyStore (for direct PutSenderKeyStructure),
 // the flusher (for DirtyCount assertion), and the raw *sql.DB (for raw DB reads).
@@ -178,17 +185,6 @@ func newCohTestDevice(t *testing.T) (device *store.Device, cs *sqlstore.CachedSe
 		SenderKeys: cs,
 	}
 	device.ID = &jid
-
-	// Wire ParsedSKCache (mirrors attachCachedStores). Phase 17.9: flat
-	// value-struct LRU via store.NewSKParsedLRU.
-	skLRU, _ := store.NewSKParsedLRU(1024)
-	device.ParsedSKCache = store.NewParsedSKCache(skLRU)
-
-	// Wire parsedReplace → device.ParsedSKCache.StoreStruct
-	// (mirrors cache_wiring.go attachCachedStores).
-	cs.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
-		return device.ParsedSKCache.StoreStruct(key, s, donorKeyID)
-	})
 
 	// Wire a flusher that is NOT started. Enqueue adds to dirty-set only.
 	flusher = sqlstore.NewSenderKeyFlusher(inner, nil, 0)
@@ -222,7 +218,7 @@ func makeSenderKeyName(group, user string) *libprotocol.SenderKeyName {
 func TestSenderKeyCacheCoherence(t *testing.T) {
 	// --- Arm 1: ratchet-advance via device.StoreSenderKey ---
 	// Seed DB at iter=5 (write-through). Advance to iter=6 via device.StoreSenderKey
-	// (which calls PutSenderKeyStructure → parsedReplace → cache REPLACE).
+	// (which calls PutSenderKeyStructure → flat c.cache write-through REPLACE).
 	// With flusher attached-not-drained: DB stays at 5; LoadSenderKey returns 6.
 	t.Run("ratchet-advance", func(t *testing.T) {
 		device, cs, flusher, inner, db := newCohTestDevice(t)
@@ -252,9 +248,9 @@ func TestSenderKeyCacheCoherence(t *testing.T) {
 				got5.Structure().SenderKeyStates[0].SenderChainKey.Iteration)
 		}
 
-		// Advance to iter=6 via device.StoreSenderKey (columnar path).
+		// Advance to iter=6 via device.StoreSenderKey.
 		// This calls PutSenderKeyStructure → flusher.Enqueue (dirty-set only, no drain)
-		// → parsedReplace → cache REPLACE with iter=6.
+		// → flat c.cache write-through REPLACE with iter=6.
 		s6 := buildAdvancedStructure(10, 6)
 		sk6, err := groupRecord.NewSenderKeyFromStruct(s6, store.SignalProtobufSerializer.SenderKeyRecord, store.SignalProtobufSerializer.SenderKeyState)
 		if err != nil {
@@ -347,7 +343,7 @@ func TestSenderKeyCacheCoherence(t *testing.T) {
 		}
 		t.Logf("recovery-shaped: DB iter=%d (expect 5 — flusher not drained)", dbIter)
 
-		// LoadSenderKey after recovery: cache HIT (REPLACED with iter=9 by parsedReplace).
+		// LoadSenderKey after recovery: cache HIT (flat c.cache REPLACED with iter=9).
 		// Under invalidate: miss → reads DB (still 5) → returns iter=5 (WRONG).
 		got9, err := device.LoadSenderKey(ctx, skn)
 		if err != nil {

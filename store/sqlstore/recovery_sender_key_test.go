@@ -803,20 +803,23 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 	})
 }
 
-// TestInlineRecoveryCacheResidentRace is the D-13 failing-first test (CR-01).
+// TestInlineRecoveryCacheResidentRace is the D-13 cache-resident downgrade test
+// (CR-01), reconciled to the flat single-cache (Phase 38.4-03).
 //
 // It reproduces the cache-resident ratchet-downgrade race: account B has an
 // ADVANCED sender-key state (KeyID K, Iteration 50) that is cache-resident in the
-// parsed cache AND in the flusher dirty-set, but the DB row for B is ABSENT (the
-// ~1s flusher window held open deterministically by attaching a flusher that is
-// never started). Account A has a STALE donor row (KeyID K, Iteration 10) in the
-// DB. TryInlineRecovery calls GetSenderKeyStructure (DB-only — it does NOT read
-// the parsed cache), finds no matching guard entry (B's row is absent from DB),
-// then installs the donor via PutSenderKeyStructure → parsedReplace which blindly
-// overwrites the cache with Iteration 10, downgrading the live ratchet position.
+// flat []byte cache AND in the flusher dirty-set, but the DB row for B is ABSENT
+// (the ~1s flusher window held open deterministically by attaching a flusher that
+// is never started). Account A has a STALE donor row (KeyID K, Iteration 10) in
+// the DB.
 //
-// Against current code (no iteration gate) the assertion MUST fail.
-// After Task 2 lands the iteration gate the assertion passes (green).
+// Phase 38.4-03: the parsed struct cache is deleted. GetSenderKeyStructure is now
+// cache-aware (Plan 02) — it reads the flat c.cache BEFORE the DB. So the
+// recovery guard + the ported flat-path backward-only gate (Task 2) see the
+// cache-resident advanced state at Iteration=50 and REJECT the stale donor. The
+// DB-backed assertion below reads through the cache-aware GetSenderKeyStructure
+// and confirms the advanced state survives — the end-to-end twin of the in-package
+// TestPutSenderKeyStructureRecoveryBackwardOnlyGate Case 1.
 func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 	db, err := sql.Open("pgx", batchTestDSN())
 	if err != nil {
@@ -866,33 +869,27 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 	devCache, _ := lru.New[string, []string](256)
 	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 
-	// Wire a real parsed cache (mirrors attachCachedStores).
-	skLRU, _ := store.NewSKParsedLRU(256)
-	parsedCache := store.NewParsedSKCache(skLRU)
-
-	// Wire parsedReplace -> parsedCache.StoreStruct.
-	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
-		return parsedCache.StoreStruct(key, s, donorKeyID)
-	})
-
 	// Wire a flusher that is NOT started (attached-not-drained = stale DB window).
 	flusher := sqlstore.NewSenderKeyFlusher(innerB, nil, 0)
 	csB.SetFlusher(flusher)
 	// flusher.Start() intentionally NOT called — no goroutine, DB stays absent.
 
-	// Step 1: Warm the parsed cache with the ADVANCED state via PutSenderKeyStructure.
-	// This lands in the parsed cache + flusher dirty-set; the DB row for B stays absent.
+	// Step 1: Warm the flat cache with the ADVANCED state via PutSenderKeyStructure.
+	// This lands (write-through) in the flat c.cache + flusher dirty-set; the DB
+	// row for B stays absent (flusher never drained).
 	advancedStruct := buildDonorStructure(targetKeyID, advancedIter, 0x11)
 	if err := csB.PutSenderKeyStructure(ctx, group, targetSenderID, advancedStruct); err != nil {
 		t.Fatalf("PutSenderKeyStructure (advanced seed): %v", err)
 	}
 
-	// Verify the cache is warm at Iteration=50 before the recovery attempt.
-	// Compute the cache key the same way CachedSenderKeyStore does: jid|group|user.
-	cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
-	warmStruct, warmOK := parsedCache.LoadStruct(cacheKey)
-	if !warmOK || warmStruct == nil || len(warmStruct.SenderKeyStates) == 0 {
-		t.Fatalf("pre-condition: parsed cache is not warm for %s (LoadStruct miss)", cacheKey)
+	// Verify the cache-aware read serves Iteration=50 before the recovery attempt
+	// (flat c.cache is consulted before the DB, which is still absent for B).
+	warmStruct, err := csB.GetSenderKeyStructure(ctx, group, targetSenderID)
+	if err != nil {
+		t.Fatalf("pre-condition: GetSenderKeyStructure: %v", err)
+	}
+	if warmStruct == nil || len(warmStruct.SenderKeyStates) == 0 {
+		t.Fatalf("pre-condition: cache-aware read miss for advanced state")
 	}
 	if warmStruct.SenderKeyStates[0].SenderChainKey.Iteration != advancedIter {
 		t.Fatalf("pre-condition: cache iteration = %d, want %d",
@@ -904,10 +901,9 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 	insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, staleStruct)
 
 	// Step 3: Call TryInlineRecovery for B's (group, targetSenderID).
-	// GetSenderKeyStructure inside TryInlineRecovery reads from DB only (the guard
-	// read) — it does NOT consult the parsed cache. B's DB row is absent (flusher
-	// not drained), so the guard passes, and the stale donor installs via
-	// PutSenderKeyStructure → parsedReplace.
+	// GetSenderKeyStructure is now cache-aware (Plan 02): it reads the flat c.cache
+	// FIRST, sees the advanced state at Iteration=50, and the downgrade guard +
+	// the ported flat-path backward-only gate (Task 2) REJECT the stale donor.
 	_, recovered, recErr := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, targetKeyID, advancedIter+5)
 	if recErr != nil {
 		t.Fatalf("TryInlineRecovery: %v", recErr)
@@ -919,22 +915,22 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 		t.Error("CR-03: TryInlineRecovery returned ok=true for a gate-rejected stale donor install")
 	}
 
-	// Step 4: Assert the parsed cache still serves Iteration=50.
-	// Against current code (no gate) the stale donor clobbers the cache with
-	// Iteration=10 and this assertion FAILS — proving the race is exercised.
-	afterStruct, afterOK := parsedCache.LoadStruct(cacheKey)
-	if !afterOK || afterStruct == nil || len(afterStruct.SenderKeyStates) == 0 {
-		t.Fatalf("D-13 FAIL: parsed cache evicted after recovery install (want Iter=%d, got miss)", advancedIter)
+	// Step 4: Assert the cache-aware read still serves Iteration=50 — the stale
+	// donor must NOT have downgraded the cache-resident advanced state.
+	afterStruct, err := csB.GetSenderKeyStructure(ctx, group, targetSenderID)
+	if err != nil {
+		t.Fatalf("D-13: GetSenderKeyStructure after recovery: %v", err)
+	}
+	if afterStruct == nil || len(afterStruct.SenderKeyStates) == 0 {
+		t.Fatalf("D-13 FAIL: flat cache evicted after recovery install (want Iter=%d, got miss)", advancedIter)
 	}
 	gotIter := afterStruct.SenderKeyStates[0].SenderChainKey.Iteration
 	if gotIter != advancedIter {
-		// This is the expected failure against pre-fix code: stale donor clobbered
-		// the cache with Iteration=10 instead of preserving Iteration=50.
-		t.Errorf("D-13 FAIL (CR-01): parsed cache degraded — got Iter=%d, want Iter=%d "+
+		t.Errorf("D-13 FAIL (CR-01): flat cache degraded — got Iter=%d, want Iter=%d "+
 			"(stale donor Iter=%d overwrote cache-resident advanced state — ratchet downgraded)",
 			gotIter, advancedIter, staleIter)
 	}
-	t.Logf("D-13: parsed cache after recovery = Iter=%d (want %d)", gotIter, advancedIter)
+	t.Logf("D-13: flat cache after recovery = Iter=%d (want %d)", gotIter, advancedIter)
 }
 
 // TestInlineRecoveryIterationGuard asserts the iteration-downgrade protection
@@ -993,13 +989,9 @@ func TestInlineRecoveryIterationGuard(t *testing.T) {
 	// fires before the write, so async vs sync doesn't affect this test).
 	csB := newRecoveryTestStoreB(t, db)
 
-	// Wire parsedReplace so PutSenderKeyStructure's callback fires.
-	// Needed because TryInlineRecovery calls c.GetSenderKeyStructure (which reads
-	// the struct cache if warm) and must correctly see the existing B row.
-	// The parsedReplace callback here is a no-op (just wires the field).
-	csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
-		return store.StoreAccepted
-	})
+	// Phase 38.4-03: the parsed struct cache is gone. TryInlineRecovery's
+	// downgrade guard reads the cache-aware GetSenderKeyStructure (flat c.cache,
+	// then DB) and correctly sees the existing B row written to the DB above.
 
 	// Attempt inline recovery with donor at iter=50, existing at iter=100.
 	// targetIter=60 (donor=50 <= 60 so donor qualifies by forward-only filter),
@@ -1205,7 +1197,8 @@ func findStateByKeyID(s *groupRecord.SenderKeyStructure, keyID uint32) *groupRec
 //  4. nil-existing arm: no existing structure for B → donor installs as single-state.
 //  5. warm-cache arm (checker-required D-12 interaction): K1@20 consistent in
 //     cache AND DB (write-through, no flusher); donor K2@9; TryInlineRecovery;
-//     LoadStruct serves K1@20 AND K2@9 (gate must NOT reject on equal K1 in cache).
+//     the cache-aware GetSenderKeyStructure serves K1@20 AND K2@9 (gate must NOT
+//     reject on equal K1 in cache).
 func TestInlineRecoveryDonorMerge(t *testing.T) {
 	db, err := sql.Open("pgx", batchTestDSN())
 	if err != nil {
@@ -1256,9 +1249,6 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
-			return store.StoreAccepted
-		})
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 15)
 		if err != nil {
@@ -1331,9 +1321,6 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
-			return store.StoreAccepted
-		})
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k3, 10)
 		if err != nil {
@@ -1381,9 +1368,6 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
-			return store.StoreAccepted
-		})
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 10)
 		if err != nil {
@@ -1408,9 +1392,6 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		csB := newRecoveryTestStoreB(t, db)
-		csB.SetParsedReplace(func(_ string, _ *groupRecord.SenderKeyStructure, _ *uint32) store.StoreVerdict {
-			return store.StoreAccepted
-		})
 
 		_, ok, err := csB.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k1, 20)
 		if err != nil {
@@ -1439,16 +1420,16 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 	// Arm 5: warm-cache (checker-required D-11/D-12 interaction).
 	//
 	// Seed K1@20 consistently in cache AND DB using the WRITE-THROUGH path
-	// (no flusher attached on seeding store — parsedReplace fires synchronously,
-	// DB row also written). Then seed K2@9 for account A. Call TryInlineRecovery.
-	// Assert LoadStruct serves BOTH K1@20 AND K2@9.
+	// (no flusher attached on seeding store — the flat c.cache write-through fires
+	// synchronously, DB row also written). Then seed K2@9 for account A. Call
+	// TryInlineRecovery. Assert the cache-aware read serves BOTH K1@20 AND K2@9.
 	//
 	// The critical gate test: the merged union carries K1 at EQUAL iteration to
 	// its cache-resident counterpart. The iteration gate must accept this as a
 	// preserved foreign state (non-donor KeyID). If the gate incorrectly applies
 	// the cipher rule (reject on ANY equal iter) or the naive recovery rule
 	// (reject if ANY matching state cached >= new), the merged install is rejected
-	// and LoadStruct returns only K2@9 or a miss — proving the gate is wrong.
+	// and the cache-aware read returns only K2@9 or a miss — proving the gate is wrong.
 	// -----------------------------------------------------------------------
 	t.Run("warm_cache_merge_accepted", func(t *testing.T) {
 		_, _ = db.ExecContext(ctx,
@@ -1456,7 +1437,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 			recoveryTestJIDA, recoveryTestJIDB, group)
 
 		// Build a write-through store (NO flusher) for seeding K1@20 into B.
-		// This ensures the parsed cache AND DB are both warm at K1@20.
+		// This ensures the flat cache AND DB are both warm at K1@20.
 		jidB, err := types.ParseJID(recoveryTestJIDB)
 		if err != nil {
 			t.Fatalf("ParseJID B: %v", err)
@@ -1466,13 +1447,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		byteCache, _ := lru.New[string, []byte](256)
 		devCache, _ := lru.New[string, []string](256)
 		csBSeed := sqlstore.NewCachedSenderKeyStore(innerBSeed, recoveryTestJIDB, byteCache, devCache, nil)
-		// No flusher → write-through mode.
-
-		skLRU, _ := store.NewSKParsedLRU(256)
-		parsedCache := store.NewParsedSKCache(skLRU)
-		csBSeed.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
-			return parsedCache.StoreStruct(key, s, donorKeyID)
-		})
+		// No flusher → write-through mode (warms the flat c.cache + writes DB).
 
 		// Seed K1@20 via PutSenderKeyStructure (write-through: writes DB + warms cache).
 		seedStruct := buildDonorStructure(k1, 20, 0x31)
@@ -1480,10 +1455,12 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 			t.Fatalf("seed K1@20 write-through: %v", err)
 		}
 
-		// Verify cache is warm at K1@20.
-		cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
-		warmSt, warmOK := parsedCache.LoadStruct(cacheKey)
-		if !warmOK || findStateByKeyID(warmSt, k1) == nil ||
+		// Verify the cache-aware read is warm at K1@20.
+		warmSt, err := csBSeed.GetSenderKeyStructure(ctx, group, targetSenderID)
+		if err != nil {
+			t.Fatalf("pre-condition: GetSenderKeyStructure: %v", err)
+		}
+		if warmSt == nil || findStateByKeyID(warmSt, k1) == nil ||
 			findStateByKeyID(warmSt, k1).SenderChainKey.Iteration != 20 {
 			t.Fatalf("pre-condition: cache not warm at K1@20")
 		}
@@ -1503,10 +1480,10 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
 		// Now call TryInlineRecovery using the SAME store (csBSeed) that holds the warm cache.
-		// TryInlineRecovery's GetSenderKeyStructure reads from DB (DB is consistent),
+		// TryInlineRecovery's GetSenderKeyStructure is cache-aware (flat c.cache, then DB),
 		// finds K1@20 in existing, checks guard: K2 (donor) not in existing → proceeds.
 		// The merged install carries K1@20 (foreign, preserved) + K2@9 (donor).
-		// The iteration gate sees K1 at EQUAL iter in cache (cached=20, new=20) —
+		// The flat-path gate sees K1 at EQUAL iter in cache (cached=20, new=20) —
 		// this must be ACCEPTED as a preserved foreign state (D-12 interaction rule).
 		_, ok, err := csBSeed.TryInlineRecovery(ctx, group, targetSenderID, bareUser, k2, 15)
 		if err != nil {
@@ -1516,10 +1493,13 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 			t.Fatal("warm-cache arm: expected true (donor found), got false")
 		}
 
-		// Assert LoadStruct serves BOTH K1@20 AND K2@9.
-		afterSt, afterOK := parsedCache.LoadStruct(cacheKey)
-		if !afterOK || afterSt == nil {
-			t.Fatal("warm-cache arm: LoadStruct miss after TryInlineRecovery")
+		// Assert the cache-aware read serves BOTH K1@20 AND K2@9.
+		afterSt, err := csBSeed.GetSenderKeyStructure(ctx, group, targetSenderID)
+		if err != nil {
+			t.Fatalf("warm-cache arm: GetSenderKeyStructure after recovery: %v", err)
+		}
+		if afterSt == nil {
+			t.Fatal("warm-cache arm: cache-aware read miss after TryInlineRecovery")
 		}
 		k1AfterState := findStateByKeyID(afterSt, k1)
 		k2AfterState := findStateByKeyID(afterSt, k2)
@@ -1624,12 +1604,6 @@ func TestInlineRecoveryDonorPrependedAndFlushed(t *testing.T) {
 	devCache, _ := lru.New[string, []string](256)
 	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 
-	skLRU, _ := store.NewSKParsedLRU(256)
-	parsedCache := store.NewParsedSKCache(skLRU)
-	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, donorKeyID *uint32) store.StoreVerdict {
-		return parsedCache.StoreStruct(key, s, donorKeyID)
-	})
-
 	flusher := sqlstore.NewSenderKeyFlusher(innerB, waLog.Noop, 0)
 	csB.SetFlusher(flusher)
 	// flusher.Start() intentionally NOT called — dirty-set drains only via Drain().
@@ -1653,10 +1627,14 @@ func TestInlineRecoveryDonorPrependedAndFlushed(t *testing.T) {
 	}
 
 	// Assert 1 (cache): the merged cached structure has the DONOR at state[0].
-	cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
-	cachedSt, cacheOK := parsedCache.LoadStruct(cacheKey)
-	if !cacheOK || cachedSt == nil || len(cachedSt.SenderKeyStates) == 0 {
-		t.Fatal("CR-04: parsed cache miss after recovery install")
+	// Read through the cache-aware GetSenderKeyStructure (flat c.cache leads the
+	// undrained DB) BEFORE Drain().
+	cachedSt, err := csB.GetSenderKeyStructure(ctx, group, targetSenderID)
+	if err != nil {
+		t.Fatalf("CR-04: GetSenderKeyStructure after recovery: %v", err)
+	}
+	if cachedSt == nil || len(cachedSt.SenderKeyStates) == 0 {
+		t.Fatal("CR-04: flat cache miss after recovery install")
 	}
 	if got := cachedSt.SenderKeyStates[0].KeyID; got != k2 {
 		t.Errorf("CR-04: cached state[0].KeyID = %d, want %d (donor must be most-recent)", got, k2)
@@ -1792,8 +1770,8 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	donorStruct := buildDonorStructure(donorKeyID, donorIter, 0x71)
 	insertFlatBlobRow(t, db, recoveryTestJIDA, group, donorSenderID, donorStruct)
 
-	// Build B's store: real parsed cache, parsedReplace AND parsedInvalidate
-	// wired, NO flusher (write-through — the DB write is synchronous).
+	// Build B's store: flat single cache, NO flusher (write-through — the DB
+	// write is synchronous and warms the flat c.cache).
 	jidB, err := types.ParseJID(recoveryTestJIDB)
 	if err != nil {
 		t.Fatalf("ParseJID B: %v", err)
@@ -1804,20 +1782,10 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	devCache, _ := lru.New[string, []string](256)
 	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 
-	skLRU, _ := store.NewSKParsedLRU(256)
-	parsedCache := store.NewParsedSKCache(skLRU)
-	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, dk *uint32) store.StoreVerdict {
-		return parsedCache.StoreStruct(key, s, dk)
-	})
-	csB.SetParsedInvalidate(func(key string) {
-		parsedCache.Invalidate(key)
-	})
-
-	// Warm the parsed cache with the (cacheable) 6-state existing structure so
-	// the post-recovery invalidation is observable.
-	cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
-	if v := parsedCache.StoreStruct(cacheKey, existingStruct, nil); v != store.StoreAccepted {
-		t.Fatalf("pre-condition: warming 6-state entry: verdict=%v, want StoreAccepted", v)
+	// Warm the flat cache with the (cacheable) 6-state existing structure via the
+	// write-through path so the post-recovery cache replacement is observable.
+	if err := csB.PutSenderKeyStructure(ctx, group, targetSenderID, existingStruct); err != nil {
+		t.Fatalf("pre-condition: warming 6-state entry: %v", err)
 	}
 
 	// Recover donor KeyID 90 (targetIter=15: donor 9 <= 15 qualifies). The merge
@@ -1864,11 +1832,14 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	}
 
 	// Assert 2: the capped 5-state merge is flat-cacheable and the relaxed
-	// CR-01 guard accepted it — the cache is REPLACED with the merged entry
-	// (donor at state[0]), not invalidated.
-	cachedStruct, hit := parsedCache.LoadStruct(cacheKey)
-	if !hit {
-		t.Error("QUICK-SKCAP-01: parsed cache empty after capped recovery install (want replaced entry)")
+	// CR-01 guard accepted it — the flat cache is REPLACED with the merged entry
+	// (donor at state[0]). Read through the cache-aware GetSenderKeyStructure.
+	cachedStruct, err := csB.GetSenderKeyStructure(ctx, group, targetSenderID)
+	if err != nil {
+		t.Fatalf("QUICK-SKCAP-01: GetSenderKeyStructure after recovery: %v", err)
+	}
+	if cachedStruct == nil || len(cachedStruct.SenderKeyStates) == 0 {
+		t.Error("QUICK-SKCAP-01: flat cache empty after capped recovery install (want replaced entry)")
 	} else if got := cachedStruct.SenderKeyStates[0].KeyID; got != donorKeyID {
 		t.Errorf("QUICK-SKCAP-01: cached state[0].KeyID = %d, want donor %d", got, donorKeyID)
 	}
@@ -1890,10 +1861,12 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 // B gone from the DB on drain. All subsequent messages on B became permanently
 // undecryptable.
 //
-// Post-fix: TryInlineRecovery unions the cache-resident structure with the DB
-// read before merging (parsedLoad), so B is carried into the merge; the
-// StoreStruct missing-KeyID guard (defense in depth) rejects any recovery
-// install that would drop a cached generation.
+// Phase 38.4-03: the parsed cache + the parsedLoad union are gone. The merge
+// base is now the cache-aware GetSenderKeyStructure (Plan 02), which reads the
+// flat c.cache BEFORE the DB — so the cache-resident generation B is carried
+// into the merge directly, and the ported flat-path backward-only gate rejects
+// any recovery install that would drop a cached generation. The behavioral
+// contract is unchanged; only the cache form (flat []byte) differs.
 func TestInlineRecoveryCacheOnlyGenerationSurvives(t *testing.T) {
 	db, err := sql.Open("pgx", batchTestDSN())
 	if err != nil {
@@ -1931,8 +1904,8 @@ func TestInlineRecoveryCacheOnlyGenerationSurvives(t *testing.T) {
 		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
 		recoveryTestJIDA, recoveryTestJIDB, group)
 
-	// Build B's store: real parsed cache, parsedReplace + parsedLoad wired,
-	// flusher attached but never started (write-back window held open).
+	// Build B's store: flat single cache, flusher attached but never started
+	// (write-back window held open).
 	jidB, err := types.ParseJID(recoveryTestJIDB)
 	if err != nil {
 		t.Fatalf("ParseJID B: %v", err)
@@ -1943,20 +1916,11 @@ func TestInlineRecoveryCacheOnlyGenerationSurvives(t *testing.T) {
 	devCache, _ := lru.New[string, []string](256)
 	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 
-	skLRU, _ := store.NewSKParsedLRU(256)
-	parsedCache := store.NewParsedSKCache(skLRU)
-	csB.SetParsedReplace(func(key string, s *groupRecord.SenderKeyStructure, dk *uint32) store.StoreVerdict {
-		return parsedCache.StoreStruct(key, s, dk)
-	})
-	csB.SetParsedLoad(func(key string) (*groupRecord.SenderKeyStructure, bool) {
-		return parsedCache.LoadStruct(key)
-	})
-
 	flusher := sqlstore.NewSenderKeyFlusher(innerB, waLog.Noop, 0)
 	csB.SetFlusher(flusher)
 	// flusher.Start() intentionally NOT called — DB row stays absent.
 
-	// Step 1: generation B arrives via the cipher path — parsed cache + flusher
+	// Step 1: generation B arrives via the cipher path — flat c.cache + flusher
 	// dirty-set only; the DB row for B remains absent.
 	structB := buildDonorStructure(keyB, iterB, 0x81)
 	if err := csB.PutSenderKeyStructure(ctx, group, targetSenderID, structB); err != nil {
@@ -1984,11 +1948,15 @@ func TestInlineRecoveryCacheOnlyGenerationSurvives(t *testing.T) {
 		t.Fatal("TryInlineRecovery: expected true (donor found, merge valid), got false")
 	}
 
-	// Assert 1: generation B survives in the parsed cache alongside the donor.
-	cacheKey := recoveryTestJIDB + "|" + group + "|" + targetSenderID
-	cachedSt, cacheOK := parsedCache.LoadStruct(cacheKey)
-	if !cacheOK || cachedSt == nil {
-		t.Fatal("CR-01: parsed cache miss after recovery install")
+	// Assert 1: generation B survives in the flat cache alongside the donor.
+	// Read through the cache-aware GetSenderKeyStructure (flat c.cache leads the
+	// undrained DB) BEFORE Drain().
+	cachedSt, err := csB.GetSenderKeyStructure(ctx, group, targetSenderID)
+	if err != nil {
+		t.Fatalf("CR-01: GetSenderKeyStructure after recovery: %v", err)
+	}
+	if cachedSt == nil {
+		t.Fatal("CR-01: flat cache miss after recovery install")
 	}
 	if bCached := findStateByKeyID(cachedSt, keyB); bCached == nil {
 		t.Error("CR-01: cache-only generation B dropped from parsed cache by recovery install")

@@ -451,14 +451,58 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 		}
 	}
 
-	// TODO-RISK-B: port the backward-only / strictly-advancing iteration gate from
-	// parsedcache.go StoreStruct onto this flat write path. Task 2 replaces this stub
-	// with the real gate (reads GetSenderKeyStructure cache-aware and rejects a stale
-	// donor install). The write path below remains functional in the meantime.
+	// Flat-path backward-only / strictly-advancing iteration gate (Risk-b).
 	//
-	// NOTE: the recovery_sender_key.go downgrade guard (L510-519) still runs BEFORE
-	// this site (via TryInlineRecovery), providing first-line protection. The ported
-	// gate here adds defense-in-depth for direct callers of PutSenderKeyStructureRecovery.
+	// This gate is ported from parsedcache.go StoreStruct (deleted in Phase 38.4-03).
+	// It checks the cache-aware GetSenderKeyStructure (Plan 02) and rejects a stale
+	// or backward-moving install:
+	//   - Donor KeyID: must strictly advance (cached.Iteration >= donor.Iteration → reject).
+	//   - Non-donor KeyIDs: reject only on backward move (cached.Iteration > incoming).
+	//   - Equal iteration on non-donor KeyIDs: preserved foreign state → accept (D-12).
+	// No cached entry (absent or cache-miss) → write proceeds unconditionally.
+	//
+	// ORDERING: checked BEFORE flusher.Enqueue. A rejected stale install must not enter
+	// the dirty-set or the cache (prevents last-wins DB drain of a stale blob — T-384-06).
+	//
+	// This is defense-in-depth for direct callers of PutSenderKeyStructureRecovery.
+	// The first-line guard in recovery_sender_key.go (downgrade guard) still runs
+	// BEFORE this site via TryInlineRecovery.
+	existing, gErr := c.GetSenderKeyStructure(ctx, group, user)
+	if gErr != nil {
+		return false, gErr
+	}
+	if existing != nil {
+		for _, inSt := range s.SenderKeyStates {
+			if inSt == nil || inSt.SenderChainKey == nil {
+				continue
+			}
+			// Find the matching cached state for this KeyID.
+			var cachedIter uint32
+			var found bool
+			for _, exSt := range existing.SenderKeyStates {
+				if exSt != nil && exSt.SenderChainKey != nil && exSt.KeyID == inSt.KeyID {
+					cachedIter = exSt.SenderChainKey.Iteration
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue // no cached counterpart — new state, accept
+			}
+			if inSt.KeyID == donorKeyID {
+				// Donor KeyID: must strictly advance.
+				if cachedIter >= inSt.SenderChainKey.Iteration {
+					return false, nil // stale donor — reject
+				}
+			} else {
+				// Non-donor (preserved foreign) KeyID: reject only on backward move.
+				if cachedIter > inSt.SenderChainKey.Iteration {
+					return false, nil // backward move — reject
+				}
+				// Equal iteration: preserved foreign state — accept (D-12 interaction rule).
+			}
+		}
+	}
 
 	// Persist: enqueue to the write-back flusher when wired, else write through.
 	if c.flusher != nil {

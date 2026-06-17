@@ -10,9 +10,8 @@
 //
 // Each test drives the integration through device.LoadSenderKey /
 // device.StoreSenderKey / device.LoadSession / device.StoreSession (public API).
-// Parsed-cache types live in package store; tests access them only via
-// device.ParsedSKCache exported methods. No direct field reads into package
-// store internals. Phase 17.13: ParsedSessionCache removed (D-04a).
+// Phase 38.4-03: the parsed struct cache is deleted; the single flat []byte
+// cache (skLRU) is the only sender-key cache exercised here.
 //
 // Run: go test ./store/sqlstore/ -run TestDecodeOnce_CR -race -count=5
 
@@ -43,26 +42,26 @@ import (
 
 // testDeviceHandles holds the wired test device plus the handles callers need
 // to set up preconditions and make assertions.
+//
+// Phase 38.4-03: ParsedSKCache / skParsedLRU removed. The single flat []byte
+// cache (skLRU) is now the only sender-key cache — no struct cache exists.
 type testDeviceHandles struct {
-	device      *store.Device
-	fakeSK      *fakeSenderKeyStore
-	fakeSess    *fakeSessionStore
-	skStore     *CachedSenderKeyStore
-	skLRU       *lru.Cache[string, []byte]
-	skParsedLRU *store.SKParsedLRU // Phase 17.9: flat value-struct LRU
-	testJID     string             // the JID string (== device.ID.String())
+	device   *store.Device
+	fakeSK   *fakeSenderKeyStore
+	fakeSess *fakeSessionStore
+	skStore  *CachedSenderKeyStore
+	skLRU    *lru.Cache[string, []byte]
+	testJID  string // the JID string (== device.ID.String())
 }
 
-// buildTestDeviceWithParsedCache constructs a *store.Device fully wired with
-// parsedSKCache and a CachedSenderKeyStore. Phase 17.13: parsedSessionCache
-// removed (D-04a); only sender-key struct cache is wired. The device
-// JID and the CachedSenderKeyStore JID are identical (required by TR-08
-// key-matching invariant). A flusher is attached (required by TR-08 wasFailed
-// path) but not Started so no goroutine races the test.
+// buildTestDevice constructs a *store.Device with a CachedSenderKeyStore
+// backed by the flat []byte LRU only (no parsed struct cache — deleted in
+// Phase 38.4-03). A non-started flusher is attached so write-back paths
+// don't spawn goroutines.
 //
-// lruCap controls the capacity of the LRUs; pass a small value (e.g. 2)
-// to exercise eviction in TR-05.
-func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles {
+// lruCap controls the capacity of the flat byte LRU; pass a small value (e.g. 2)
+// to exercise LRU eviction in TR-05.
+func buildTestDevice(t *testing.T, lruCap int) *testDeviceHandles {
 	t.Helper()
 
 	const testJIDStr = "15550001234"
@@ -79,17 +78,12 @@ func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles
 	if err != nil {
 		t.Fatalf("lru.New devCache: %v", err)
 	}
-	skParsedLRU, err := store.NewSKParsedLRU(lruCap)
-	if err != nil {
-		t.Fatalf("NewSKParsedLRU: %v", err)
-	}
 	// Build the CachedSenderKeyStore. jid string must match device.ID.String()
-	// so that c.key(group,user) == the device struct-cache cacheKey (TR-08).
+	// so that c.key(group,user) == the cache key used inside the store.
 	jidStr := jid.String()
 	skStore := NewCachedSenderKeyStore(fakeSK, jidStr, skCache, devCache, nil)
 
-	// Attach a non-Started flusher so the wasFailed path executes the
-	// parsedInvalidate callback (TR-08) without spawning a background goroutine.
+	// Attach a non-Started flusher so write-back enqueues don't spawn goroutines.
 	flushStore := &mockFlushStore{}
 	f := NewSenderKeyFlusher(flushStore, waLog.Noop, 1000)
 	skStore.SetFlusher(f)
@@ -101,21 +95,13 @@ func buildTestDeviceWithParsedCache(t *testing.T, lruCap int) *testDeviceHandles
 		Sessions:   fakeSess,
 	}
 
-	d.ParsedSKCache = store.NewParsedSKCache(skParsedLRU)
-
-	// Wire wasFailed invalidation callback (mirrors attachCachedStores exactly).
-	skStore.SetParsedInvalidate(func(key string) {
-		d.ParsedSKCache.Invalidate(key)
-	})
-
 	return &testDeviceHandles{
-		device:      d,
-		fakeSK:      fakeSK,
-		fakeSess:    fakeSess,
-		skStore:     skStore,
-		skLRU:       skCache,
-		skParsedLRU: skParsedLRU,
-		testJID:     jidStr,
+		device:   d,
+		fakeSK:   fakeSK,
+		fakeSess: fakeSess,
+		skStore:  skStore,
+		skLRU:    skCache,
+		testJID:  jidStr,
 	}
 }
 
@@ -168,15 +154,17 @@ func buildSenderKeyBlobKeyID(keyID uint32) []byte {
 	return blob
 }
 
-// seedSKStructCache calls LoadSenderKey to populate the struct cache via the
-// cold (byte-cache miss → decode → StoreStruct) path. Returns the first Load
-// result for further assertion.
+// seedSKFlatCache seeds both the inner fake store and the flat []byte LRU for
+// (group, senderName), then calls LoadSenderKey once to warm the cache.
+// Returns the first Load result for further assertion.
+//
+// Phase 38.4-03: renamed from seedSKStructCache; no struct cache exists.
+// The flat byte LRU (c.cache) is the only sender-key cache.
 //
 // senderName is the bare SignalAddress name (e.g. "15550001001"). The helper
-// internally uses senderName+":0" as the full SignalAddress string (deviceID=0)
-// for seeding the byte-level stores, matching what signal.go passes to
-// CachedSenderKeyStore.GetSenderKey (senderKeyName.Sender().String()).
-func seedSKStructCache(t *testing.T, h *testDeviceHandles, group, senderName string, blob []byte) *groupRecord.SenderKey {
+// internally uses senderName+":0" as the full SignalAddress string (deviceID=0),
+// matching what signal.go passes to CachedSenderKeyStore.GetSenderKey.
+func seedSKFlatCache(t *testing.T, h *testDeviceHandles, group, senderName string, blob []byte) *groupRecord.SenderKey {
 	t.Helper()
 	ctx := context.Background()
 
@@ -185,15 +173,15 @@ func seedSKStructCache(t *testing.T, h *testDeviceHandles, group, senderName str
 
 	// Seed the inner fake so the byte-cache-miss path finds data.
 	if err := h.fakeSK.PutSenderKey(ctx, group, senderFull, blob); err != nil {
-		t.Fatalf("seedSKStructCache fakeSK.PutSenderKey: %v", err)
+		t.Fatalf("seedSKFlatCache fakeSK.PutSenderKey: %v", err)
 	}
-	// Warm the byte LRU so CachedSenderKeyStore.GetSenderKey is a LRU hit.
+	// Warm the flat byte LRU so CachedSenderKeyStore.GetSenderKey is a LRU hit.
 	h.skLRU.Add(h.testJID+"|"+group+"|"+senderFull, copyBytes(blob))
 
 	skName := makeSenderKeyName(group, senderName)
 	key, err := h.device.LoadSenderKey(ctx, skName)
 	if err != nil {
-		t.Fatalf("seedSKStructCache LoadSenderKey: %v", err)
+		t.Fatalf("seedSKFlatCache LoadSenderKey: %v", err)
 	}
 	return key
 }
@@ -392,20 +380,20 @@ func seedSessStore(t *testing.T, h *testDeviceHandles, addrName string, blob []b
 // ---------------------------------------------------------------------------
 // TR-01: Concurrent LoadSenderKey while StoreSenderKey for same (group,sender)
 //
-// SC-2 coverage: concurrent decrypt / write-back / struct-cache access is
+// SC-2 coverage: concurrent decrypt / write-back / flat-cache access is
 // race-free; each Load returns an independent *SenderKey object.
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR01(t *testing.T) {
 	const N = 10
-	h := buildTestDeviceWithParsedCache(t, 64)
+	h := buildTestDevice(t, 64)
 	ctx := context.Background()
 
 	group, sender := "group-TR01", "15550001001"
 	blob := buildFlatSenderKeyBlob(0)
 
-	// Pre-populate struct cache so subsequent hot Loads exercise the hit path.
-	seedSKStructCache(t, h, group, sender, blob)
+	// Pre-populate flat cache so subsequent hot Loads exercise the hit path.
+	seedSKFlatCache(t, h, group, sender, blob)
 
 	skName := makeSenderKeyName(group, sender)
 
@@ -470,12 +458,11 @@ func TestDecodeOnce_CR_TR01(t *testing.T) {
 // ---------------------------------------------------------------------------
 // TR-02: Two concurrent StoreSenderKey calls for the same (group,sender).
 //
-// After both complete: LoadSenderKey returns non-nil; no panic; struct cache
-// holds exactly one entry; -race clean.
+// After both complete: LoadSenderKey returns non-nil; no panic; -race clean.
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR02(t *testing.T) {
-	h := buildTestDeviceWithParsedCache(t, 64)
+	h := buildTestDevice(t, 64)
 	ctx := context.Background()
 
 	group, sender := "group-TR02", "15550001002"
@@ -521,22 +508,17 @@ func TestDecodeOnce_CR_TR02(t *testing.T) {
 	if got == nil {
 		t.Fatal("TR-02: LoadSenderKey returned nil after concurrent stores")
 	}
-
-	// Struct cache must hold exactly one entry for the key (no torn state).
-	if n := h.skParsedLRU.Len(); n != 1 {
-		t.Errorf("TR-02: skParsedLRU.Len() = %d, want 1 (last writer wins, no torn state)", n)
-	}
 }
 
 // ---------------------------------------------------------------------------
 // TR-03: LoadSenderKey after StoreSenderKey returns post-ratchet structure.
 //
 // Sequential correctness: Store a key with keyID=42, Load it back, verify
-// keyID=42 survives the struct-cache round-trip.
+// keyID=42 survives the flat-cache round-trip.
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR03(t *testing.T) {
-	h := buildTestDeviceWithParsedCache(t, 64)
+	h := buildTestDevice(t, 64)
 	ctx := context.Background()
 
 	group, sender := "group-TR03", "15550001003"
@@ -550,17 +532,13 @@ func TestDecodeOnce_CR_TR03(t *testing.T) {
 		t.Fatalf("TR-03: fullParseSenderKey blob42: %v", err)
 	}
 
-	// StoreSenderKey: serializes once; struct cache updated.
+	// StoreSenderKey: encodes to flat bytes; flat cache updated.
 	if err := h.device.StoreSenderKey(ctx, skName, k); err != nil {
 		t.Fatalf("TR-03: StoreSenderKey: %v", err)
 	}
 
-	// Clear the byte LRU so LoadSenderKey cannot bypass the struct cache via
-	// the byte path — it must serve from the struct cache, then fall to the
-	// inner fake if struct cache is empty.
-	h.skLRU.Purge()
-
-	// LoadSenderKey must return the post-ratchet structure from struct cache.
+	// LoadSenderKey must return the post-ratchet structure via the flat cache.
+	// (The flat cache is warmed by PutSenderKeyStructure's write-through.)
 	got, err := h.device.LoadSenderKey(ctx, skName)
 	if err != nil {
 		t.Fatalf("TR-03: LoadSenderKey: %v", err)
@@ -569,35 +547,34 @@ func TestDecodeOnce_CR_TR03(t *testing.T) {
 		t.Fatal("TR-03: LoadSenderKey returned nil after StoreSenderKey")
 	}
 
-	// Verify keyID survives the struct-cache round-trip.
-	// Phase 17.9: extractSenderKeyMeta now takes *senderKeyColumns; decompose the structure.
+	// Verify keyID survives the flat-cache round-trip.
 	gotKeyID, _ := extractStructMeta(got.Structure())
 	if gotKeyID != wantKeyID {
 		t.Errorf("TR-03: gotKeyID = %d, want %d "+
-			"(post-ratchet structure not preserved by struct cache)", gotKeyID, wantKeyID)
+			"(post-ratchet structure not preserved by flat cache)", gotKeyID, wantKeyID)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TR-04: Invalidate concurrent with LoadSenderKey — no panic; Load falls through.
+// TR-04: Concurrent LoadSenderKey while the flat LRU is being Purged.
 //
-// 5 Load goroutines + 2 Invalidate goroutines run concurrently.
-// Assertion: no panic; Loads either hit (return non-nil) or miss (return nil
-// for missing raw data, or non-nil from byte-cache after struct-cache miss).
+// Phase 38.4-03: no parsed struct cache exists. The test verifies concurrent
+// Load + Purge (flat LRU eviction) is race-free.
+// 5 Load goroutines + 2 Purge goroutines run concurrently.
+// Assertion: no panic; Loads return non-error results.
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR04(t *testing.T) {
-	h := buildTestDeviceWithParsedCache(t, 64)
+	h := buildTestDevice(t, 64)
 	ctx := context.Background()
 
 	group, sender := "group-TR04", "15550001004"
 	blob := buildFlatSenderKeyBlob(0)
 
-	// Pre-populate struct cache.
-	seedSKStructCache(t, h, group, sender, blob)
+	// Pre-populate flat cache.
+	seedSKFlatCache(t, h, group, sender, blob)
 
 	skName := makeSenderKeyName(group, sender)
-	cacheKey := h.testJID + "|" + group + "|" + skName.Sender().String()
 
 	var wg sync.WaitGroup
 	errs := make([]error, 5)
@@ -613,12 +590,12 @@ func TestDecodeOnce_CR_TR04(t *testing.T) {
 		}()
 	}
 
-	// 2 invalidators
+	// 2 flat-cache purgers (evict everything; Loads then fall to inner fake).
 	for j := 0; j < 2; j++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			h.device.ParsedSKCache.Invalidate(cacheKey)
+			h.skStore.Purge()
 		}()
 	}
 
@@ -633,36 +610,35 @@ func TestDecodeOnce_CR_TR04(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TR-05: LRU struct-cache capacity eviction concurrent with LoadSenderKey.
+// TR-05: Flat LRU capacity eviction — a third key forces eviction.
 //
-// Build parsedSKCache with cap=2; fill it with 2 entries; concurrently Load a
-// third key (forcing eviction of one). The third key must fall through to the
-// fakeSenderKeyStore (byte-cache miss path).
+// Phase 38.4-03: tests the flat []byte LRU directly. Build with cap=2; fill
+// with 2 entries; Load a third key (forces eviction of one entry). The third
+// key must be served via the inner fake (byte-cache miss path).
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR05(t *testing.T) {
 	// Use cap=2 so the third entry forces an eviction.
-	h := buildTestDeviceWithParsedCache(t, 2)
+	h := buildTestDevice(t, 2)
 	ctx := context.Background()
 
 	group := "group-TR05"
 	blob := buildFlatSenderKeyBlob(0)
 
-	// Fill both slots in the struct-LRU.
-	seedSKStructCache(t, h, group, "sender-A", blob)
-	seedSKStructCache(t, h, group, "sender-B", blob)
-	if n := h.skParsedLRU.Len(); n != 2 {
-		t.Fatalf("TR-05: expected 2 struct-cache entries, got %d", n)
+	// Fill both slots in the flat byte LRU.
+	seedSKFlatCache(t, h, group, "sender-A", blob)
+	seedSKFlatCache(t, h, group, "sender-B", blob)
+	if n := h.skLRU.Len(); n != 2 {
+		t.Fatalf("TR-05: expected 2 flat-cache entries, got %d", n)
 	}
 
-	// Seed the inner fake with blob for sender-C (so the byte miss path can serve it).
+	// Seed the inner fake with blob for sender-C (so the DB-miss path can serve it).
 	if err := h.fakeSK.PutSenderKey(ctx, group, "sender-C:0", blob); err != nil {
 		t.Fatalf("TR-05: seed fakeSK for sender-C: %v", err)
 	}
-	h.skLRU.Add(h.testJID+"|"+group+"|sender-C:0", copyBytes(blob))
 
-	// Concurrently Load sender-C — forces eviction of sender-A or sender-B from
-	// the struct-LRU (cap=2).
+	// Load sender-C — forces eviction of sender-A or sender-B from the flat LRU
+	// (cap=2), then adds sender-C.
 	skNameC := makeSenderKeyName(group, "sender-C")
 
 	var wg sync.WaitGroup
@@ -679,11 +655,11 @@ func TestDecodeOnce_CR_TR05(t *testing.T) {
 		t.Fatalf("TR-05: LoadSenderKey sender-C: %v", loadErr)
 	}
 	if got == nil {
-		t.Fatal("TR-05: LoadSenderKey sender-C returned nil (byte fallthrough should have served it)")
+		t.Fatal("TR-05: LoadSenderKey sender-C returned nil (inner fake should have served it)")
 	}
-	// After the load, struct-LRU is still at cap=2 (evicted one, added one).
-	if n := h.skParsedLRU.Len(); n != 2 {
-		t.Errorf("TR-05: skParsedLRU.Len() = %d after load, want 2 (cap eviction preserves cap invariant)", n)
+	// After the load, flat LRU is still at cap=2 (evicted one, added one).
+	if n := h.skLRU.Len(); n != 2 {
+		t.Errorf("TR-05: skLRU.Len() = %d after load, want 2 (cap eviction preserves cap invariant)", n)
 	}
 }
 
@@ -699,7 +675,7 @@ func TestDecodeOnce_CR_TR05(t *testing.T) {
 
 func TestDecodeOnce_CR_TR06(t *testing.T) {
 	const N = 10
-	h := buildTestDeviceWithParsedCache(t, 64)
+	h := buildTestDevice(t, 64)
 	ctx := context.Background()
 
 	addrName := "15550002001"
@@ -775,7 +751,7 @@ func TestDecodeOnce_CR_TR06(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR07(t *testing.T) {
-	h := buildTestDeviceWithParsedCache(t, 64)
+	h := buildTestDevice(t, 64)
 	ctx := context.Background()
 
 	addrName := "15550002002"
@@ -824,15 +800,19 @@ func TestDecodeOnce_CR_TR07(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // TR-08: failedSenderKeyTuples bypass: PutSenderKeyWithMeta wasFailed=true
-// concurrent with normal Load → struct cache is invalidated; next Load
-// re-fetches from the byte-level cache (new recovered blob).
+// writes the new blob to the flat byte cache; next Load returns the new key.
+//
+// Phase 38.4-03: the struct-cache Invalidate path is gone (no struct cache).
+// The test verifies the essential correctness invariant that survives deletion:
+// a wasFailed=true write lands in the flat byte cache, and the next
+// LoadSenderKey returns the new recovered key (not the old stale key).
 //
 // SC-3 (sole flusher writer via wasFailed path) and
 // SC-5 (failedSenderKeyTuples bypass) coverage.
 // ---------------------------------------------------------------------------
 
 func TestDecodeOnce_CR_TR08(t *testing.T) {
-	h := buildTestDeviceWithParsedCache(t, 64)
+	h := buildTestDevice(t, 64)
 	ctx := context.Background()
 
 	group, sender := "group-TR08", "15550001008"
@@ -844,32 +824,22 @@ func TestDecodeOnce_CR_TR08(t *testing.T) {
 
 	skName := makeSenderKeyName(group, sender)
 
-	// Pre-populate struct cache with the OLD key (keyID=1).
-	// Use bare sender name (not skName.Sender().String() which has ":0" suffix);
-	// seedSKStructCache appends ":0" internally.
-	seedSKStructCache(t, h, group, sender, blobOld)
+	// Pre-populate flat cache with the OLD key (keyID=1).
+	seedSKFlatCache(t, h, group, sender, blobOld)
 
-	// Sanity: struct cache is warm.
-	if n := h.skParsedLRU.Len(); n != 1 {
-		t.Fatalf("TR-08: expected struct cache len=1 before PutSenderKeyWithMeta, got %d", n)
+	// Sanity: flat cache is warm with the old key.
+	if n := h.skLRU.Len(); n != 1 {
+		t.Fatalf("TR-08: expected flat cache len=1 before PutSenderKeyWithMeta, got %d", n)
 	}
 
 	// PutSenderKeyWithMeta(wasFailed=true) simulates a failed-tuple recovery
-	// writing a fresh blob. This must:
-	//   1. Update the byte LRU with blobNew.
-	//   2. Call parsedInvalidate → device.ParsedSKCache.Invalidate.
+	// writing a fresh blob. This must update the flat byte LRU with blobNew.
 	senderStr := skName.Sender().String()
 	if err := h.skStore.PutSenderKeyWithMeta(ctx, group, senderStr, blobNew, true); err != nil {
 		t.Fatalf("TR-08: PutSenderKeyWithMeta wasFailed=true: %v", err)
 	}
 
-	// Struct cache must now be empty — Invalidate fired.
-	if n := h.skParsedLRU.Len(); n != 0 {
-		t.Errorf("TR-08: skParsedLRU.Len() = %d after PutSenderKeyWithMeta(wasFailed=true), want 0 "+
-			"(Invalidate must fire on wasFailed=true — Pitfall 4 guard broken)", n)
-	}
-
-	// Next LoadSenderKey must re-parse from the byte cache (blobNew → keyID=99).
+	// Next LoadSenderKey must decode from blobNew → keyID=99.
 	got, err := h.device.LoadSenderKey(ctx, skName)
 	if err != nil {
 		t.Fatalf("TR-08: LoadSenderKey after recovery: %v", err)
@@ -878,17 +848,10 @@ func TestDecodeOnce_CR_TR08(t *testing.T) {
 		t.Fatal("TR-08: LoadSenderKey returned nil after recovery write")
 	}
 
-	// Verify the re-parsed result uses the new key (keyID=99).
-	// Phase 17.9: extractSenderKeyMeta now takes *senderKeyColumns; decompose the structure.
+	// Verify the loaded result uses the new key (keyID=99).
 	gotKeyID, _ := extractStructMeta(got.Structure())
 	if gotKeyID != newKeyID {
 		t.Errorf("TR-08: gotKeyID = %d, want %d "+
-			"(next Load must re-parse from blobNew after invalidation)", gotKeyID, newKeyID)
-	}
-
-	// Struct cache is re-warmed after the Load.
-	if n := h.skParsedLRU.Len(); n != 1 {
-		t.Errorf("TR-08: skParsedLRU.Len() = %d after Load, want 1 "+
-			"(struct cache should be re-populated after byte-cache re-parse)", n)
+			"(next Load must decode from blobNew after wasFailed=true write)", gotKeyID, newKeyID)
 	}
 }
