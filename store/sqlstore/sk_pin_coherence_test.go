@@ -188,60 +188,108 @@ func TestSKPinConcurrentWrites(t *testing.T) {
 }
 
 // TestSKPinStructureReadBeforeDrain verifies that after a write via PutSenderKeyStructure
-// (which write-through pins it in c.cache), a read via GetSenderKeyStructure BEFORE any
-// flusher drain returns the just-written structure — not nil.
+// (which write-through pins it in c.cache AND in pinnedBlobs), a read via
+// GetSenderKeyStructure BEFORE any flusher drain returns the just-written structure.
 //
-// This is the STRUCTURE/decrypt read path coherence case (risk c surface in 38.4-CONTEXT.md):
+// This is the STRUCTURE/decrypt read path coherence case (risk c in 38.4-CONTEXT.md):
 // after Plan 03 removes the parsed cache, the decrypt read path goes exclusively through
 // GetSenderKeyStructure. A write-before-drain miss on that path = silent decrypt failure.
 //
-// SKIP GATE: GetSenderKeyStructure is NOT YET cache-aware (Plan 02 extends it to consult
-// c.cache before the DB). The assertion below is gated behind t.Skip so the suite stays
-// GREEN now. Plan 02 removes the t.Skip and the assertion must pass.
+// Sub-cases:
+//
+//  1. Cache-hit path: structure served from c.cache (the write-through LRU).
+//  2. Eviction-before-drain path: after the LRU entry is forcibly evicted, the
+//     pinnedBlobs overlay must still serve the structure via GetSenderKeyStructure
+//     (risk c: T-384-03/T-384-04 mitigated by the pinnedBlobs overlay + pinnedMu).
+//
+// Phase 38.4-02: skip removed, assertions must pass.
 func TestSKPinStructureReadBeforeDrain(t *testing.T) {
-	// Plan 02 makes GetSenderKeyStructure cache-aware (consults c.cache before DB).
-	// Remove this t.Skip and flip the assertion to "want non-nil structure" when Plan 02 lands.
-	t.Skip("Plan 02 makes GetSenderKeyStructure cache-aware — flip assertion then")
-
 	ctx := context.Background()
-	c, _ := newTestCachedSenderKeyStore(t, 16)
 
-	// Wire a flusher but do NOT Start it — write is pending, no drain yet.
-	ms := &mockFlushStore{}
-	flusher := NewSenderKeyFlusher(ms, waLog.Noop, 0)
-	c.SetFlusher(flusher)
+	// Sub-case 1: LRU cache hit path.
+	t.Run("CacheHit", func(t *testing.T) {
+		c, _ := newTestCachedSenderKeyStore(t, 16)
 
-	// Build a realistic sender-key structure to write.
-	structure := recompose(skCols0)
-	if structure == nil {
-		t.Fatal("recompose returned nil")
-	}
+		// Wire a flusher but do NOT Start it — write is pending, no drain yet.
+		ms := &mockFlushStore{}
+		flusher := NewSenderKeyFlusher(ms, waLog.Noop, 0)
+		c.SetFlusher(flusher)
 
-	// Write via PutSenderKeyStructure — this should write-through into c.cache
-	// (D-03 invariant) AND enqueue in the flusher dirty-set. The inner (fake) DB
-	// has NOT been written yet (flusher not drained).
-	if err := c.PutSenderKeyStructure(ctx, "group-E", "user_5:0", structure); err != nil {
-		t.Fatalf("PutSenderKeyStructure: %v", err)
-	}
+		// Build a realistic sender-key structure to write.
+		structure := recompose(skCols0)
+		if structure == nil {
+			t.Fatal("recompose returned nil")
+		}
 
-	// Confirm the flusher has NOT been drained (inner still empty).
-	if got := ms.calls.Load(); got != 0 {
-		t.Errorf("mockFlushStore.calls = %d, want 0 (flusher not drained)", got)
-	}
+		// Write via PutSenderKeyStructure — write-through into c.cache (D-03)
+		// AND enqueue in the flusher dirty-set. The inner (fake) DB has NOT been
+		// written yet (flusher not drained).
+		if err := c.PutSenderKeyStructure(ctx, "group-E", "user_5:0", structure); err != nil {
+			t.Fatalf("PutSenderKeyStructure: %v", err)
+		}
 
-	// GetSenderKeyStructure reads via the columnar path (GetSenderKeyFlat or GetSenderKey
-	// fallback). After Plan 02, it will consult c.cache first and return the cached blob
-	// without hitting the inner store.
-	// ASSERTION: the just-written structure is returned (not nil).
-	got, err := c.GetSenderKeyStructure(ctx, "group-E", "user_5:0")
-	if err != nil {
-		t.Fatalf("GetSenderKeyStructure: %v", err)
-	}
-	// After Plan 02 this must be non-nil (cache hit). Before Plan 02 this returns nil
-	// because GetSenderKeyStructure is DB-only and the flusher has not drained.
-	if got == nil {
-		t.Error("GetSenderKeyStructure returned nil before drain — expected non-nil after Plan 02 makes it cache-aware")
-	}
+		// Confirm the flusher has NOT been drained (inner still empty).
+		if got := ms.calls.Load(); got != 0 {
+			t.Errorf("mockFlushStore.calls = %d, want 0 (flusher not drained)", got)
+		}
+
+		// GetSenderKeyStructure must now return the just-written structure from
+		// c.cache (cache-aware read, Plan 02) without hitting the inner store.
+		got, err := c.GetSenderKeyStructure(ctx, "group-E", "user_5:0")
+		if err != nil {
+			t.Fatalf("GetSenderKeyStructure: %v", err)
+		}
+		if got == nil {
+			t.Error("GetSenderKeyStructure returned nil before drain — expected non-nil (c.cache hit)")
+		}
+	})
+
+	// Sub-case 2: eviction-before-drain path (risk c / T-384-03/T-384-04).
+	// Force-evict the LRU entry after the write; the pinnedBlobs overlay must
+	// still serve the structure before the flusher drains.
+	t.Run("EvictionBeforeDrain", func(t *testing.T) {
+		c, _ := newTestCachedSenderKeyStore(t, 16)
+
+		// Wire a flusher but do NOT Start it.
+		ms := &mockFlushStore{}
+		flusher := NewSenderKeyFlusher(ms, waLog.Noop, 0)
+		c.SetFlusher(flusher)
+
+		structure := recompose(skCols0)
+		if structure == nil {
+			t.Fatal("recompose returned nil")
+		}
+
+		if err := c.PutSenderKeyStructure(ctx, "group-F", "user_6:0", structure); err != nil {
+			t.Fatalf("PutSenderKeyStructure: %v", err)
+		}
+
+		// Force-evict the LRU entry to simulate cache pressure.
+		k := c.key("group-F", "user_6:0")
+		c.cache.Remove(k)
+
+		// LRU is now empty; pinnedBlobs should still hold the blob.
+		c.pinnedMu.Lock()
+		pinned := c.pinnedBlobs[k]
+		c.pinnedMu.Unlock()
+		if pinned == nil {
+			t.Fatal("pinnedBlobs entry missing after LRU eviction — overlay not set on write")
+		}
+
+		// GetSenderKeyStructure must serve the structure from pinnedBlobs (not the DB).
+		got, err := c.GetSenderKeyStructure(ctx, "group-F", "user_6:0")
+		if err != nil {
+			t.Fatalf("GetSenderKeyStructure after eviction: %v", err)
+		}
+		if got == nil {
+			t.Error("GetSenderKeyStructure returned nil after LRU eviction — pinnedBlobs overlay did not serve the structure")
+		}
+
+		// Confirm the flusher still has NOT drained (inner DB still empty).
+		if got2 := ms.calls.Load(); got2 != 0 {
+			t.Errorf("mockFlushStore.calls = %d, want 0 (flusher not drained)", got2)
+		}
+	})
 }
 
 // TestSKPinEmptyNotCached verifies that when inner returns 0 devices, the
