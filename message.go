@@ -784,9 +784,12 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d have=[%s]",
 		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration(), have)
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
-	// kavtov-fork (38.5): increment per-account blacklist counter for (group, bare-sender).
-	// Emit exactly one log line when the threshold is first crossed.
-	cli.incrementBotResendBlacklist(chat.String(), from.SignalAddressUser())
+	// kavtov-fork (38.5): increment per-account blacklist counter for (group, sender).
+	// MUST key on from.User (bare, no agent suffix) to match the check site in
+	// sendRetryReceipt (info.Sender.User). For these @lid bots from == info.Sender, so
+	// using SignalAddressUser() here would add a "_1" suffix the check never sees and the
+	// blacklist would never trip. Emit one log line when the threshold is first crossed.
+	cli.incrementBotResendBlacklist(chat.String(), from.User)
 	return nil, signalerror.ErrNoSenderKeyForUser
 }
 
