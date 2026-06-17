@@ -566,6 +566,56 @@ func gcTrend(deltaFromPrev int64, newEntries int) string {
 }
 
 // ---------------------------------------------------------------------------
+// Arm G — DecodePerDecrypt: per-decrypt flat-blob decode cost (Phase 38.4)
+//
+// Measures UnpackFlat + NewSenderKeyFromStruct for the two fixture variants.
+// This is the decode cost that replaces the deleted LoadStruct cache hit after
+// Plan 03 removes SKParsed. The baseline is recorded in 38.4-01-SUMMARY.md for
+// the Plan 03 no-regression comparison.
+//
+// The flat blob is built ONCE before b.ResetTimer() (pack cost excluded).
+// Only the decode path (UnpackFlat → graphRebuildSenderKey) is timed.
+// ---------------------------------------------------------------------------
+
+// BenchmarkSenderKeyDecodePerDecrypt_0Keys measures UnpackFlat + graphRebuildSenderKey
+// for the 0-skipped-key common case (Phase 38.4 baseline).
+func BenchmarkSenderKeyDecodePerDecrypt_0Keys(b *testing.B) {
+	blob, ok := store.PackFlat(recompose(skCols0))
+	if !ok {
+		b.Fatal("PackFlat failed for skCols0")
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := store.UnpackFlat(blob)
+		if err != nil {
+			b.Fatalf("UnpackFlat: %v", err)
+		}
+		if _, err := graphRebuildSenderKey(s); err != nil {
+			b.Fatalf("rebuild: %v", err)
+		}
+	}
+}
+
+// BenchmarkSenderKeyDecodePerDecrypt_MaxSkipped measures UnpackFlat + graphRebuildSenderKey
+// for the 32-skipped-key fat-tail case (Phase 38.4 baseline).
+func BenchmarkSenderKeyDecodePerDecrypt_MaxSkipped(b *testing.B) {
+	blob, ok := store.PackFlat(recompose(skCols32))
+	if !ok {
+		b.Fatal("PackFlat failed for skCols32")
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := store.UnpackFlat(blob)
+		if err != nil {
+			b.Fatalf("UnpackFlat: %v", err)
+		}
+		if _, err := graphRebuildSenderKey(s); err != nil {
+			b.Fatalf("rebuild: %v", err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Recovery latency benchmark (dimension d)
 //
 // Times RecoverSenderKey on a live test DB against a realistic donor
