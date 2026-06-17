@@ -784,6 +784,9 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d have=[%s]",
 		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration(), have)
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
+	// kavtov-fork (38.5): increment per-account blacklist counter for (group, bare-sender).
+	// Emit exactly one log line when the threshold is first crossed.
+	cli.incrementBotResendBlacklist(chat.String(), from.SignalAddressUser())
 	return nil, signalerror.ErrNoSenderKeyForUser
 }
 

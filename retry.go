@@ -17,6 +17,7 @@ import (
 	"os"
 	"runtime/debug"
 	"strconv"
+	"sync"
 	"time"
 
 	"go.mau.fi/libsignal/ecc"
@@ -244,6 +245,85 @@ func (cli *Client) shouldRecreateSession(ctx context.Context, retryCount int, ji
 type incomingRetryKey struct {
 	jid       types.JID
 	messageID types.MessageID
+}
+
+// kavtov-fork (38.5): key for the per-account bot-resend blacklist.
+// Group is the group JID string; Sender is the bare user (SignalAddressUser),
+// so a device-rotating bot accumulates under one key.
+type botResendKey struct {
+	Group  string
+	Sender string
+}
+
+// botResendBlacklistThreshold is the number of cumulative skmsg decrypts failures
+// for a (group, sender) before the resend-request stanza to that bot is suppressed.
+// The ack, phone request, and donor scan are NOT suppressed.
+const botResendBlacklistThreshold = 10
+
+// claimKey is the key for the process-wide PhoneRequestClaims map.
+type claimKey struct {
+	Group string
+	MsgID string
+}
+
+// phoneRequestClaimTTL is the expiry for a PhoneRequestClaims entry. If the
+// claiming account's phone never delivers within this window, the next miss
+// re-claims and fires a fresh phone request (no loss).
+const phoneRequestClaimTTL = 5 * time.Second
+
+// PhoneRequestClaims is a process-wide, concurrency-safe claim map used to ensure
+// that only one managed account sends the phone-fetch request for a given group
+// message. Shared across all per-account Clients; injected by the driver.
+type PhoneRequestClaims struct {
+	mu     sync.Mutex
+	claims map[claimKey]time.Time
+}
+
+// NewPhoneRequestClaims creates a new PhoneRequestClaims instance.
+func NewPhoneRequestClaims() *PhoneRequestClaims {
+	return &PhoneRequestClaims{claims: make(map[claimKey]time.Time)}
+}
+
+// TryClaim claims the (group, msgID) pair for the calling account.
+// Returns true if this caller should proceed with the phone request:
+// - no existing claim, or the existing claim is older than phoneRequestClaimTTL.
+// Returns false if another account already holds a live claim (skip the request).
+func (p *PhoneRequestClaims) TryClaim(group, msgID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	k := claimKey{Group: group, MsgID: msgID}
+	if t, ok := p.claims[k]; ok && time.Since(t) < phoneRequestClaimTTL {
+		return false
+	}
+	p.claims[k] = time.Now()
+	return true
+}
+
+// incrementBotResendBlacklist increments the failure counter for (group, sender)
+// and logs BOT_RESEND_BLACKLISTED exactly once when the counter first reaches
+// botResendBlacklistThreshold. Guarded by botResendBlacklistLock; lazy-inits
+// the map on a bare &Client{}.
+func (cli *Client) incrementBotResendBlacklist(group, sender string) {
+	k := botResendKey{Group: group, Sender: sender}
+	cli.botResendBlacklistLock.Lock()
+	defer cli.botResendBlacklistLock.Unlock()
+	if cli.botResendBlacklist == nil {
+		cli.botResendBlacklist = make(map[botResendKey]int)
+	}
+	cli.botResendBlacklist[k]++
+	if cli.botResendBlacklist[k] == botResendBlacklistThreshold && cli.Log != nil {
+		cli.Log.Warnf("BOT_RESEND_BLACKLISTED group=%s sender=%s", group, sender)
+	}
+}
+
+// isBotResendBlacklisted reports whether the (group, sender) pair has accumulated
+// >= botResendBlacklistThreshold failures. Called in sendRetryReceipt to suppress
+// the futile resend-request stanza to the bot.
+func (cli *Client) isBotResendBlacklisted(group, sender string) bool {
+	k := botResendKey{Group: group, Sender: sender}
+	cli.botResendBlacklistLock.Lock()
+	defer cli.botResendBlacklistLock.Unlock()
+	return cli.botResendBlacklist[k] >= botResendBlacklistThreshold
 }
 
 func (cli *Client) tryHandleRetryReceipt(ctx context.Context, receipt *events.Receipt, node *waBinary.Node) {
@@ -910,11 +990,28 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 		// arrives on its own, so the RequestFromPhoneDelay (5s) is pure latency before the phone
 		// request fires anyway — fetch immediately to cut ride-alert latency. Same request count,
 		// just sooner. Transient cases (negligible volume) also fetch immediately, which is fine.
-		if cli.SynchronousAck || forceIncludeIdentity {
-			cli.immediateRequestMessageFromPhone(ctx, info)
-		} else {
-			go cli.delayedRequestMessageFromPhone(info)
+		//
+		// kavtov-fork (38.5): ask-once gate — for group decrypt-fails, only one managed
+		// account sends the phone-fetch request per (group, message). The first account
+		// to TryClaim wins; others skip. If nil (gate disabled), fires unconditionally.
+		doPhoneRequest := true
+		if info.IsGroup && cli.PhoneRequestClaims != nil {
+			doPhoneRequest = cli.PhoneRequestClaims.TryClaim(info.Chat.String(), info.ID)
 		}
+		if doPhoneRequest {
+			if cli.SynchronousAck || forceIncludeIdentity {
+				cli.immediateRequestMessageFromPhone(ctx, info)
+			} else {
+				go cli.delayedRequestMessageFromPhone(info)
+			}
+		}
+	}
+	// kavtov-fork (38.5): blacklist gate — for group messages from a bot that has
+	// accumulated >= botResendBlacklistThreshold cumulative decrypt fails, skip the
+	// resend-request stanza (GenOnePreKey + sendNode). The ack (caller) and the
+	// phone request (above) are unaffected.
+	if info.IsGroup && cli.isBotResendBlacklisted(info.Chat.String(), info.Sender.User) {
+		return
 	}
 
 	var registrationIDBytes [4]byte
