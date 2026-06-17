@@ -187,6 +187,63 @@ func TestSKPinConcurrentWrites(t *testing.T) {
 	}
 }
 
+// TestSKPinStructureReadBeforeDrain verifies that after a write via PutSenderKeyStructure
+// (which write-through pins it in c.cache), a read via GetSenderKeyStructure BEFORE any
+// flusher drain returns the just-written structure — not nil.
+//
+// This is the STRUCTURE/decrypt read path coherence case (risk c surface in 38.4-CONTEXT.md):
+// after Plan 03 removes the parsed cache, the decrypt read path goes exclusively through
+// GetSenderKeyStructure. A write-before-drain miss on that path = silent decrypt failure.
+//
+// SKIP GATE: GetSenderKeyStructure is NOT YET cache-aware (Plan 02 extends it to consult
+// c.cache before the DB). The assertion below is gated behind t.Skip so the suite stays
+// GREEN now. Plan 02 removes the t.Skip and the assertion must pass.
+func TestSKPinStructureReadBeforeDrain(t *testing.T) {
+	// Plan 02 makes GetSenderKeyStructure cache-aware (consults c.cache before DB).
+	// Remove this t.Skip and flip the assertion to "want non-nil structure" when Plan 02 lands.
+	t.Skip("Plan 02 makes GetSenderKeyStructure cache-aware — flip assertion then")
+
+	ctx := context.Background()
+	c, _ := newTestCachedSenderKeyStore(t, 16)
+
+	// Wire a flusher but do NOT Start it — write is pending, no drain yet.
+	ms := &mockFlushStore{}
+	flusher := NewSenderKeyFlusher(ms, waLog.Noop, 0)
+	c.SetFlusher(flusher)
+
+	// Build a realistic sender-key structure to write.
+	structure := recompose(skCols0)
+	if structure == nil {
+		t.Fatal("recompose returned nil")
+	}
+
+	// Write via PutSenderKeyStructure — this should write-through into c.cache
+	// (D-03 invariant) AND enqueue in the flusher dirty-set. The inner (fake) DB
+	// has NOT been written yet (flusher not drained).
+	if err := c.PutSenderKeyStructure(ctx, "group-E", "user_5:0", structure); err != nil {
+		t.Fatalf("PutSenderKeyStructure: %v", err)
+	}
+
+	// Confirm the flusher has NOT been drained (inner still empty).
+	if got := ms.calls.Load(); got != 0 {
+		t.Errorf("mockFlushStore.calls = %d, want 0 (flusher not drained)", got)
+	}
+
+	// GetSenderKeyStructure reads via the columnar path (GetSenderKeyFlat or GetSenderKey
+	// fallback). After Plan 02, it will consult c.cache first and return the cached blob
+	// without hitting the inner store.
+	// ASSERTION: the just-written structure is returned (not nil).
+	got, err := c.GetSenderKeyStructure(ctx, "group-E", "user_5:0")
+	if err != nil {
+		t.Fatalf("GetSenderKeyStructure: %v", err)
+	}
+	// After Plan 02 this must be non-nil (cache hit). Before Plan 02 this returns nil
+	// because GetSenderKeyStructure is DB-only and the flusher has not drained.
+	if got == nil {
+		t.Error("GetSenderKeyStructure returned nil before drain — expected non-nil after Plan 02 makes it cache-aware")
+	}
+}
+
 // TestSKPinEmptyNotCached verifies that when inner returns 0 devices, the
 // result is NOT cached in the deviceCache LRU, forcing a re-query on the next call.
 func TestSKPinEmptyNotCached(t *testing.T) {

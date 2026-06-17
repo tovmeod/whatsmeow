@@ -13,31 +13,59 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 
-	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
 
 // TestCacheMemoryBudget measures ground-truth per-entry object count and heap
-// bytes for all six signal caches, then asserts the total warmed budget at
+// bytes for all five signal caches, then asserts the total warmed budget at
 // proposed caps stays under GOMEMLIMIT with >= 30% headroom.
 //
-// Proposed caps (to be hard-coded in Wave 2):
+// Phase 38.4 update: SKParsed cache removed (parsed-struct cache deleted);
+// fill sizes updated to pprof-measured per-entry values (2026-06-17 pprof):
+//   - SenderKey []byte: ~3686 bytes/entry (1537 MB / 432k entries)
+//   - Session   []byte: ~3380 bytes/entry (270 MB / 81k entries)
 //
-//	SKParsed    = 500,000 entries
-//	SenderKey[] = 500,000 entries
+// Proposed caps (hard-coded in cache_wiring.go):
+//
+//	SenderKey[] = 400,000 entries  (down from 500k; no parsed cache → headroom recovers)
 //	Session[]   = 100,000 entries
 //	Identity    = 150,000 entries
 //	SKDevices   = 300,000 entries
 //	MsgSecret   = 300,000 entries
 //
 // Budget assertion: headroom = 1 - (totalBudgetMB + baseRSSMB) / goMemLimitMB >= 0.30
+// Expected post-change arithmetic (CONTEXT D-4):
+//
+//	flat 400k×3.6KB=1440 + session 100k×3.3KB=330 + identity 26 + SKDevices 62 + MsgSecret 84 = ~1942 MB
+//	headroom = 1 - (1942+228)/3200 = 0.322 (32.2% >= 30% OK)
 func TestCacheMemoryBudget(t *testing.T) {
 	const N = 10_000
 
-	// Proposed cap constants — Wave 2 will hard-code these into cache_wiring.go.
+	// Per-entry fill sizes calibrated to reproduce the pprof-measured per-entry heap
+	// cost when the LRU measureHeapDelta function runs.
+	//
+	// pprof heap profile (2026-06-17 13:09, driver 2026.06.57):
+	//   - PutSenderKeyStructure: 1537 MB across ~432k cached entries → ~3558 B/entry (raw pprof)
+	//   - Session cache: 270 MB across ~81k cached entries → ~3501 B/entry (raw pprof)
+	//
+	// The measureHeapDelta function adds LRU node overhead (~582 B/entry for sender-key,
+	// ~296 B/entry for session) on top of the payload fill bytes. To reproduce the pprof
+	// per-entry total, the fill size = pprof_measured - overhead:
+	//   - sender-key: 3558 - 582 ≈ 2976 B fill → measures ~3558 B total (matches pprof)
+	//   - session:    3501 - 296 ≈ 3205 B fill → measures ~3501 B total (matches pprof)
+	//
+	// These are used only by this test for budget accounting; the wiring cap (400_000)
+	// is set in cache_wiring.go.
 	const (
-		capSKParsed  = 500_000
-		capSKBytes   = 500_000
+		// skBytesPerEntry is the fill size producing pprof-equivalent measured overhead.
+		skBytesPerEntry = 2_976
+		// sessionBytesPerEntry is the fill size producing pprof-equivalent measured overhead.
+		sessionBytesPerEntry = 3_205
+	)
+
+	// Proposed cap constants — hard-coded in cache_wiring.go.
+	const (
+		capSKBytes   = 400_000 // Phase 38.4: reduced from 500k (parsed cache removed)
 		capSession   = 100_000
 		capIdentity  = 150_000
 		capSKDevices = 300_000
@@ -47,7 +75,6 @@ func TestCacheMemoryBudget(t *testing.T) {
 	)
 
 	var (
-		perBytesSKParsed  float64
 		perBytesSKBytes   float64
 		perBytesSession   float64
 		perBytesIdentity  float64
@@ -75,34 +102,14 @@ func TestCacheMemoryBudget(t *testing.T) {
 		return perObj, perBytes
 	}
 
-	// ---- 1. SKParsed -----------------------------------------------------------
-	skParsedLRU, err := store.NewSKParsedLRU(N + 100)
-	if err != nil {
-		t.Fatalf("NewSKParsedLRU: %v", err)
-	}
-	// Pre-compute one representative structure (reuse across all N fills to
-	// keep allocation pressure on the LRU bookkeeping, not on fixture construction).
-	skStructure := recompose(makeSKColumns(1, 0))
-	if skStructure == nil {
-		t.Fatal("recompose returned nil")
-	}
-	perObjSKParsed, perBytesSKParsed := measureHeapDelta(func(i int) {
-		key := fmt.Sprintf("jid%d|grp%d|usr:0", i, i)
-		store.AddFlatToLRU(skParsedLRU, key, skStructure)
-	})
-	t.Logf("SKParsed     : per-entry %.2f objects, %.0f bytes (cap=%d → %.0f MB)",
-		perObjSKParsed, perBytesSKParsed, capSKParsed,
-		float64(capSKParsed)*perBytesSKParsed/(1024*1024))
-	runtime.KeepAlive(skParsedLRU)
-
-	// ---- 2. SenderKey []byte ---------------------------------------------------
+	// ---- 1. SenderKey []byte ---------------------------------------------------
 	skBytesLRU, err := lru.New[string, []byte](N + 100)
 	if err != nil {
 		t.Fatalf("lru.New skBytes: %v", err)
 	}
 	perObjSKBytes, perBytesSKBytes := measureHeapDelta(func(i int) {
 		key := fmt.Sprintf("sk%d|grp%d|usr:0", i, i)
-		skBytesLRU.Add(key, make([]byte, 720))
+		skBytesLRU.Add(key, make([]byte, skBytesPerEntry))
 	})
 	t.Logf("SenderKeyBytes: per-entry %.2f objects, %.0f bytes (cap=%d → %.0f MB)",
 		perObjSKBytes, perBytesSKBytes, capSKBytes,
@@ -115,7 +122,7 @@ func TestCacheMemoryBudget(t *testing.T) {
 		t.Fatalf("lru.New session: %v", err)
 	}
 	perObjSession, perBytesSession := measureHeapDelta(func(i int) {
-		sessLRU.Add(fmt.Sprintf("sess%d", i), make([]byte, 2620))
+		sessLRU.Add(fmt.Sprintf("sess%d", i), make([]byte, sessionBytesPerEntry))
 	})
 	t.Logf("Session      : per-entry %.2f objects, %.0f bytes (cap=%d → %.0f MB)",
 		perObjSession, perBytesSession, capSession,
@@ -170,9 +177,11 @@ func TestCacheMemoryBudget(t *testing.T) {
 	runtime.KeepAlive(msLRU)
 
 	// ---- Budget assertion ------------------------------------------------------
+	// SKParsed term removed (Phase 38.4: parsed-struct cache deleted).
+	// Expected: flat 400k×3.6KB=1440 + session 100k×3.3KB=330 + identity 26 +
+	//           SKDevices 62 + MsgSecret 84 = ~1942 MB < 2012 MB (≥30% headroom).
 	totalBudgetMB :=
-		float64(capSKParsed)*perBytesSKParsed/(1024*1024) +
-			float64(capSKBytes)*perBytesSKBytes/(1024*1024) +
+		float64(capSKBytes)*perBytesSKBytes/(1024*1024) +
 			float64(capSession)*perBytesSession/(1024*1024) +
 			float64(capIdentity)*perBytesIdentity/(1024*1024) +
 			float64(capSKDevices)*perBytesSKDevices/(1024*1024) +
@@ -190,7 +199,6 @@ func TestCacheMemoryBudget(t *testing.T) {
 
 	// Keep all caches alive so GC does not collect them before the final
 	// ReadMemStats observations above complete.
-	runtime.KeepAlive(skParsedLRU)
 	runtime.KeepAlive(skBytesLRU)
 	runtime.KeepAlive(sessLRU)
 	runtime.KeepAlive(idLRU)
