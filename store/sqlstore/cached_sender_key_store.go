@@ -77,6 +77,16 @@ type CachedSenderKeyStore struct {
 	// map deleted when empty. GetSenderKeyDevices returns pinned UNION DB-result.
 	pinned map[string]map[string]struct{}
 
+	// pinnedBlobs holds the flat blob for writes that have not yet drained to DB
+	// AND whose c.cache entry may have been evicted (risk c: eviction-before-drain).
+	// Phase 38.4-02: extends the 260617-0k0 coherence mechanism to the KEY blob
+	// so GetSenderKeyStructure can still serve the structure after LRU eviction.
+	// Key: c.key(group, user) — same key as c.cache (device-qualified, not bare).
+	// Value: copyBytes of the PackFlat blob at write time.
+	// Guarded by pinnedMu (same lock as pinned — single lock, no new contention).
+	// Unpinned inside the EXISTING SetFlusher onDrained closure (no second hook).
+	pinnedBlobs map[string][]byte
+
 	// Phase 17.8: optional callback to invalidate the decoded struct cache on
 	// wasFailed=true recovery writes (Pitfall 4 / T-17.8-05 mitigation). Nil
 	// when no struct cache is wired (test scenarios, pre-attachCachedStores).
@@ -136,6 +146,7 @@ func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.
 		deviceCache: deviceCache,
 		sf:          sf,
 		pinned:      make(map[string]map[string]struct{}),
+		pinnedBlobs: make(map[string][]byte),
 	}
 }
 
@@ -154,6 +165,7 @@ func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 	}
 	f.SetOnDrained(func(group, user string) {
 		dk := c.key(group, senderKeyUserBare(user))
+		bk := c.key(group, user)
 		c.pinnedMu.Lock()
 		if ps := c.pinned[dk]; ps != nil {
 			delete(ps, user)
@@ -161,6 +173,9 @@ func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 				delete(c.pinned, dk)
 			}
 		}
+		// Phase 38.4-02: also unpin the blob overlay. The DB commit is now
+		// authoritative for this key; the pinnedBlob safety net is no longer needed.
+		delete(c.pinnedBlobs, bk)
 		c.pinnedMu.Unlock()
 	})
 }
@@ -263,9 +278,44 @@ func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user str
 // all rows carry a PackFlat blob; absent rows return (nil, nil) so LoadSenderKey
 // builds an empty record.
 //
+// Phase 38.4-02: cache-aware read. Checks the write-through flat c.cache BEFORE
+// the inner DB read (Pitfall 1 fix). A just-written key whose flusher entry has
+// not yet drained to DB is served from the cache, mirroring GetSenderKey.
+// On a c.cache miss, also checks pinnedBlobs (risk c: eviction-before-drain
+// coherence). On miss, the DB blob is added to c.cache before returning.
+// UnpackFlat error on a cached blob falls through to the DB (corrupt cache entry
+// is not fatal — T-384-05 mitigated).
+//
 // The returned *SenderKeyStructure is READ-ONLY. The caller calls
 // NewSenderKeyFromStruct to obtain a live *SenderKey record.
 func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group, user string) (*groupRecord.SenderKeyStructure, error) {
+	k := c.key(group, user)
+
+	// Cache-aware read: check the write-through flat c.cache first.
+	if v, ok := c.cache.Get(k); ok {
+		atomic.AddUint64(&c.hits, 1)
+		if s, err := store.UnpackFlat(v); err == nil {
+			return s, nil
+		}
+		// UnpackFlat error on a cached blob: treat as miss, fall through to DB.
+		// (T-384-05: a corrupt cache entry must not return a bad structure.)
+	}
+
+	// Cache miss: also check the pinnedBlobs overlay (risk c: eviction-before-drain).
+	// A just-written-but-undrained blob whose c.cache entry was evicted is still
+	// pinned here until onDrained fires (same pinnedMu as the device-set overlay).
+	c.pinnedMu.Lock()
+	pinned := c.pinnedBlobs[k]
+	c.pinnedMu.Unlock()
+	if pinned != nil {
+		if s, err := store.UnpackFlat(pinned); err == nil {
+			return s, nil
+		}
+		// Corrupt pinned blob: fall through to DB.
+	}
+
+	atomic.AddUint64(&c.misses, 1)
+
 	r, ok := c.inner.(senderKeyFlatReader)
 	if !ok {
 		// inner does not implement the flat reader (test stub / pre-wiring).
@@ -274,6 +324,8 @@ func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group,
 		if err != nil || blob == nil {
 			return nil, err
 		}
+		// Cache the DB result for subsequent reads.
+		c.cache.Add(k, copyBytes(blob))
 		return store.UnpackFlat(blob)
 	}
 
@@ -285,6 +337,8 @@ func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group,
 		// Absent row: no error, caller builds an empty record.
 		return nil, nil
 	}
+	// Cache the DB result (mirror GetSenderKey L254-255: Add before decode, never cache nil).
+	c.cache.Add(k, copyBytes(blob))
 	return store.UnpackFlat(blob)
 }
 
@@ -376,7 +430,14 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 		// Write-through []byte cache so GetSenderKey returns the fresh blob before
 		// the flusher drains (D-03: blob is PackFlat output = byte-identical to DB
 		// sender_key column value; safe to cache directly).
-		c.cache.Add(c.key(group, user), copyBytes(blob))
+		blobCopy := copyBytes(blob)
+		c.cache.Add(c.key(group, user), blobCopy)
+
+		// Phase 38.4-02: also pin in pinnedBlobs so GetSenderKeyStructure can
+		// serve the structure after LRU eviction (risk c: eviction-before-drain).
+		c.pinnedMu.Lock()
+		c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
+		c.pinnedMu.Unlock()
 
 		// REPLACE-on-write coherence (T-17.9-16): replace the parsed cache entry
 		// with the in-hand structure so LoadSenderKey returns the fresh key before
@@ -409,6 +470,13 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 
 	// Write-through []byte cache (D-03) on the synchronous fallback path.
 	c.cache.Add(c.key(group, user), copyBytes(blob))
+
+	// Phase 38.4-02: pin the blob on the synchronous fallback path too (no flusher,
+	// but the pin is harmless — onDrained will never fire so it stays until Purge/restart,
+	// which is the correct semantics for a synchronous write: DB is authoritative immediately).
+	c.pinnedMu.Lock()
+	c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
+	c.pinnedMu.Unlock()
 
 	// Write-through path: also replace the parsed cache for coherence.
 	// donorKeyID=nil => cipher write (backward-only gate, equal-iter accepted).
@@ -506,6 +574,11 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 		// both paths reach this block (StoreRejectedStale returned early above).
 		c.cache.Add(c.key(group, user), copyBytes(blob))
 
+		// Phase 38.4-02: pin the blob for eviction-before-drain coherence on recovery path.
+		c.pinnedMu.Lock()
+		c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
+		c.pinnedMu.Unlock()
+
 		c.updateDeviceCache(group, user)
 		return true, nil
 	}
@@ -524,6 +597,11 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 
 	// Write-through []byte cache (D-03) on the synchronous fallback path.
 	c.cache.Add(c.key(group, user), copyBytes(blob))
+
+	// Phase 38.4-02: pin the blob on recovery synchronous fallback path.
+	c.pinnedMu.Lock()
+	c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
+	c.pinnedMu.Unlock()
 
 	c.updateDeviceCache(group, user)
 	return true, nil
