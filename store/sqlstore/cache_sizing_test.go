@@ -25,9 +25,12 @@ import (
 //   - SenderKey []byte: ~3686 bytes/entry (1537 MB / 432k entries)
 //   - Session   []byte: ~3380 bytes/entry (270 MB / 81k entries)
 //
-// Proposed caps (hard-coded in cache_wiring.go):
+// Caps. NOTE: the deployed wiring cap (cache_wiring.go) is 500,000 — the 400k
+// reduction below is a VALIDATED PROPOSAL (D-4) pending explicit approval, not
+// the live default. This test asserts the *proposed* 400k cap meets the 30%
+// headroom target; it does not gate the deployed 500k config.
 //
-//	SenderKey[] = 400,000 entries  (down from 500k; no parsed cache → headroom recovers)
+//	SenderKey[] = 400,000 entries  (proposed; down from the deployed 500k — recovers headroom once approved)
 //	Session[]   = 100,000 entries
 //	Identity    = 150,000 entries
 //	SKDevices   = 300,000 entries
@@ -54,8 +57,9 @@ func TestCacheMemoryBudget(t *testing.T) {
 	//   - sender-key: 3558 - 582 ≈ 2976 B fill → measures ~3558 B total (matches pprof)
 	//   - session:    3501 - 296 ≈ 3205 B fill → measures ~3501 B total (matches pprof)
 	//
-	// These are used only by this test for budget accounting; the wiring cap (400_000)
-	// is set in cache_wiring.go.
+	// These are used only by this test for budget accounting. The deployed wiring
+	// cap in cache_wiring.go is 500_000; the 400_000 below is the proposed cap
+	// this test validates against the 30% headroom target (pending approval).
 	const (
 		// skBytesPerEntry is the fill size producing pprof-equivalent measured overhead.
 		skBytesPerEntry = 2_976
@@ -65,7 +69,7 @@ func TestCacheMemoryBudget(t *testing.T) {
 
 	// Proposed cap constants — hard-coded in cache_wiring.go.
 	const (
-		capSKBytes   = 400_000 // Phase 38.4: reduced from 500k (parsed cache removed)
+		capSKBytes   = 400_000 // PROPOSED cap (D-4, pending approval); deployed wiring is 500k
 		capSession   = 100_000
 		capIdentity  = 150_000
 		capSKDevices = 300_000

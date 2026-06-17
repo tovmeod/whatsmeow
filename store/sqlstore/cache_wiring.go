@@ -57,28 +57,34 @@ import (
 //
 //	Cache            | Measured B/entry | Cap     | Budget MB
 //	-----------------|------------------|---------|----------
-//	SenderKey bytes  |  3,253 B         | 400,000 |  1,241 MB   (Phase 38.4-03: cap lowered; SKParsed deleted)
+//	SenderKey bytes  |  3,253 B         | 500,000 |  1,551 MB   (Phase 38.4-03: SKParsed deleted; cap retained at 500k — 400k re-budget proposed, not approved)
 //	Session bytes    |  3,677 B         | 100,000 |    351 MB
 //	Identity         |    179 B         | 150,000 |     25 MB
 //	SKDevices        |    215 B         | 300,000 |     62 MB
 //	MsgSecret        |    297 B         | 300,000 |     85 MB
-//	Total caches                                  |  1,764 MB
+//	Total caches (deployed 500k)                  |  2,074 MB
 //	Base RSS (non-cache)                          |    228 MB
-//	Grand total                                   |  1,992 MB
+//	Grand total                                   |  2,302 MB
 //	GOMEMLIMIT                                    |  3,200 MB
-//	GC headroom                                   |   37.8%  (>= 30% threshold)
+//	GC headroom (deployed 500k)                   |   28.1%  (under the 30% target)
 //
-//	30% GC headroom constraint: available for caches <= GOMEMLIMIT*0.70 - baseRSS
-//	= 3200*0.70 - 228 = 2012 MB. Total caches 1764 MB < 2012 MB. Validated by
-//	TestCacheMemoryBudget in cache_sizing_test.go.
+//	NOTE: with the parsed cache deleted, 500k stays under GOMEMLIMIT and is lower
+//	memory than prod-today (parsed cache ~350 MB removed), but lands at ~28%
+//	headroom — just under the 30% target. Lowering the cap to 400_000 recovers
+//	37.8% headroom (total caches 1,764 MB < 2,012 MB budget) and is validated by
+//	TestCacheMemoryBudget, but that cap reduction is a PROPOSAL pending approval.
 //	Override env vars to reduce caps without a fork rebuild.
 var (
 	signalSessionCacheCap   = envIntOrDefault("KAVTOV_CACHE_SESSION_CAP", 100_000)
 	signalIdentityCacheCap  = envIntOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 150_000)
-	// Phase 38.4-03: cap lowered from 500_000 to 400_000 (D-4: re-budget after
-	// deleting the parsed struct cache; pprof real ~3.6 KB/entry × 400k = 1440 MB,
-	// fitting the 30%-headroom budget — see TestCacheMemoryBudget).
-	signalSenderKeyCacheCap = envIntOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 400_000)
+	// Phase 38.4-03: cap RETAINED at 500_000 (deployed default). The plan's D-4
+	// proposed lowering to 400_000 to recover 30%-headroom after deleting the
+	// parsed struct cache, but the cap reduction was NOT approved — only the
+	// parsed-cache deletion ships. 500k post-deletion is already lower memory
+	// than prod (parsed cache ~350 MB gone) and stays under GOMEMLIMIT. The
+	// 400_000 re-budget remains a validated PROPOSAL (see TestCacheMemoryBudget)
+	// pending explicit approval.
+	signalSenderKeyCacheCap = envIntOrDefault("KAVTOV_CACHE_SENDERKEY_CAP", 500_000)
 	// kavtov-fork: Phase 27 — device-set index (one small []string per
 	// jid|group|userBare).
 	signalSenderKeyDevicesCacheCap = envIntOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 300_000)
