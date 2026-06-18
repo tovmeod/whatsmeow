@@ -75,8 +75,14 @@ import (
 //	TestCacheMemoryBudget, but that cap reduction is a PROPOSAL pending approval.
 //	Override env vars to reduce caps without a fork rebuild.
 var (
-	signalSessionCacheCap   = envIntOrDefault("KAVTOV_CACHE_SESSION_CAP", 100_000)
-	signalIdentityCacheCap  = envIntOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 150_000)
+	signalSessionCacheCap = envIntOrDefault("KAVTOV_CACHE_SESSION_CAP", 100_000)
+	// quick 260619-10v: 150k -> 100k. GC mark cost is proportional to LRU entry
+	// count (per-entry string key + list node + map slot are the scanned
+	// pointers). Identity cache is stable/low-churn (~61 evict/min on 150k = full
+	// turnover ~41h), so the working set sits below cap; a modest trim drops
+	// pointer count for less GC mark work. DB is idle so the few extra misses are
+	// cheap DB reads. Env-overridable to retune without a rebuild.
+	signalIdentityCacheCap = envIntOrDefault("KAVTOV_CACHE_IDENTITY_CAP", 100_000)
 	// Phase 38.4-03: cap RETAINED at 500_000 (deployed default). The plan's D-4
 	// proposed lowering to 400_000 to recover 30%-headroom after deleting the
 	// parsed struct cache, but the cap reduction was NOT approved — only the
@@ -89,7 +95,13 @@ var (
 	// jid|group|userBare).
 	signalSenderKeyDevicesCacheCap = envIntOrDefault("KAVTOV_CACHE_SKDEVICES_CAP", 300_000)
 	// perf 260601-uuy: message-secret pair cache (secret + realSender).
-	signalMsgSecretCacheCap = envIntOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 300_000)
+	// quick 260619-10v: 300k -> 30k. This cache recycles its entire 300k every
+	// ~2.3h (~2192 evict/min) = mostly dead weight aged out before reuse, so it is
+	// the biggest safe entry-count cut for the GC mark-storm (88% of driver CPU
+	// was runtime.gcDrain). ~30k holds ~14 min of hot recent secrets; older
+	// lookups fall to the idle DB (cheap read). Removes ~270k of ~1.05M total
+	// cache entries. Env-overridable to retune without a rebuild.
+	signalMsgSecretCacheCap = envIntOrDefault("KAVTOV_CACHE_MSGSECRET_CAP", 30_000)
 	// Phase 38.4-03: KAVTOV_CACHE_SENDERKEY_DECODED_CAP (signalSKParsedCacheCap)
 	// REMOVED — the parsed struct-cache (SKParsed) is deleted. Remove this env var
 	// from the systemd unit if present.

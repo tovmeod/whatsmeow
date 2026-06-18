@@ -71,9 +71,9 @@ func TestCacheMemoryBudget(t *testing.T) {
 	const (
 		capSKBytes   = 400_000 // PROPOSED cap (D-4, pending approval); deployed wiring is 500k
 		capSession   = 100_000
-		capIdentity  = 150_000
+		capIdentity  = 100_000 // quick 260619-10v: lowered 150k -> 100k (GC entry-count cut)
 		capSKDevices = 300_000
-		capMsgSecret = 300_000
+		capMsgSecret = 30_000 // quick 260619-10v: lowered 300k -> 30k (mostly-dead-weight cache)
 		baseRSSMB    = 228.0 // base RSS (non-cache) from incident pprof + pgtype strings
 		goMemLimitMB = 3200.0
 	)
@@ -182,8 +182,9 @@ func TestCacheMemoryBudget(t *testing.T) {
 
 	// ---- Budget assertion ------------------------------------------------------
 	// SKParsed term removed (Phase 38.4: parsed-struct cache deleted).
-	// Expected: flat 400k×3.6KB=1440 + session 100k×3.3KB=330 + identity 26 +
-	//           SKDevices 62 + MsgSecret 84 = ~1942 MB < 2012 MB (≥30% headroom).
+	// Expected: flat 400k×3.6KB=1440 + session 100k×3.3KB=330 + identity 17 +
+	//           SKDevices 62 + MsgSecret 8 = ~1857 MB (≥30% headroom). quick
+	//           260619-10v cut identity 150k->100k and MsgSecret 300k->30k.
 	totalBudgetMB :=
 		float64(capSKBytes)*perBytesSKBytes/(1024*1024) +
 			float64(capSession)*perBytesSession/(1024*1024) +
