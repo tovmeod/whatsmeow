@@ -805,14 +805,35 @@ func extractSenderKeyHave(ctx context.Context, senderKeyStore store.SenderKeySto
 		return "none"
 	}
 	parts := make([]string, 0, len(devices))
+	// Prod sender-key rows are flat (PackFlat, fmt_ver=2); the legacy
+	// GetSenderKey + NewSenderKeyFromBytes path JSON-deserializes and fails on
+	// flat blobs ("invalid character" ERROR spam + have= unreadable since the flat
+	// migration). When the store is columnar, decode via the fmt_ver-aware
+	// GetSenderKeyStructure + NewSenderKeyFromStruct, mirroring LoadSenderKey
+	// (signal.go). Fall back to the JSON []byte path only for legacy/test stores.
+	csk, columnar := senderKeyStore.(store.SenderKeyColumnarStore)
 	for _, sid := range devices {
-		kb, kerr := senderKeyStore.GetSenderKey(ctx, chat, sid)
-		if kerr != nil || len(kb) == 0 {
-			continue
-		}
-		rec, rerr := record.NewSenderKeyFromBytes(kb, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
-		if rerr != nil {
-			continue
+		var rec *record.SenderKey
+		if columnar {
+			structure, serr := csk.GetSenderKeyStructure(ctx, chat, sid)
+			if serr != nil || structure == nil {
+				continue
+			}
+			r, rerr := record.NewSenderKeyFromStruct(structure, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
+			if rerr != nil {
+				continue
+			}
+			rec = r
+		} else {
+			kb, kerr := senderKeyStore.GetSenderKey(ctx, chat, sid)
+			if kerr != nil || len(kb) == 0 {
+				continue
+			}
+			r, rerr := record.NewSenderKeyFromBytes(kb, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
+			if rerr != nil {
+				continue
+			}
+			rec = r
 		}
 		if st, serr := rec.GetSenderKeyStateByID(targetKeyID); serr == nil {
 			parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d,match)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
