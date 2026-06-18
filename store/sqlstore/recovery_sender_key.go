@@ -45,7 +45,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
@@ -82,6 +84,29 @@ var (
 // donorSFLogEvery is the sampling period for the DONOR_SF_COALESCED log line.
 // 100 yields observable lines within minutes given the ~10/min donor-attempt rate.
 const donorSFLogEvery = 100
+
+// noDonorCache memoizes the negative result of the donor scan (Phase 38.6-01).
+// Key: sfKey string (group|senderBare|keyID); Value: time.Time when the entry
+// was stored. A stored entry means the scan returned donor==nil. Only negatives
+// are cached; a found donor is never stored. Entries expire after noDonorCacheTTL
+// — stale entries are re-scanned and refreshed when found.
+//
+// Process-wide: the cache stores a global, deterministic fact ("no donor exists
+// for this tuple across all accounts") which makes process-wide memoization
+// correct. A new keyID (e.g. bot rotation) is a different sfKey → fresh scan.
+var noDonorCache sync.Map
+
+// noDonorCacheTTL is the time-to-live for negative-donor cache entries.
+// A no-donor tuple is re-scanned at most once per this period instead of on
+// every miss. 5 minutes cuts the scan rate from ~per-miss (~111k/3.25h at 1am)
+// to once-per-tuple-per-5-min. Raise for more reduction (no message loss: phone
+// recovery covers the window; a bot that remains donorless never recovers anyway).
+const noDonorCacheTTL = 5 * time.Minute
+
+// noDonorCacheSkips counts how often a miss was served from the negative cache
+// (the donor scan was skipped because a non-expired entry existed). Logged every
+// donorSFLogEvery skips for observability (same cadence as DONOR_SF_COALESCED).
+var noDonorCacheSkips atomic.Uint64
 
 // senderKeyRecoveryReader is the local interface that *SQLStore satisfies to
 // expose the cross-account donor scan. Using a local interface avoids exposing
@@ -412,6 +437,28 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	// share a prefix (T-29-01-01 mitigation).
 	sfKey := group + "|" + senderBare + "|" + strconv.FormatUint(uint64(targetKeyID), 10)
 
+	// Phase 38.6-01: negative-donor cache check. If a non-expired entry exists
+	// for sfKey it means a previous scan returned no donor for this tuple; skip
+	// the scan and return early. Only negatives are cached (found donors are never
+	// stored), so this never suppresses a recovery that would succeed.
+	// Expired entries fall through to the full scan path, which refreshes the entry.
+	if v, ok := noDonorCache.Load(sfKey); ok {
+		if stored, valid := v.(time.Time); valid && time.Since(stored) < noDonorCacheTTL {
+			n := noDonorCacheSkips.Add(1)
+			if n%donorSFLogEvery == 0 {
+				var skipLog waLog.Logger
+				if sq, sqOk := c.inner.(*SQLStore); sqOk {
+					skipLog = sq.log
+				}
+				if skipLog != nil {
+					skipLog.Infof("NO_DONOR_CACHE_SKIP skips=%d group=%s sender=%s keyID=%s",
+						n, group, senderBare, strconv.FormatUint(uint64(targetKeyID), 10))
+				}
+			}
+			return "", false, nil
+		}
+	}
+
 	var donor *donorSenderKeyState
 	if c.sf != nil {
 		v, sfErr, shared := c.sf.Do(sfKey, func() (any, error) {
@@ -464,6 +511,15 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	if donor != nil && donor.Iteration > targetIter {
 		return "", false, nil // not recovered: shared donor is past this caller's target
 	}
+
+	// Phase 38.6-01: populate the negative-donor cache. Store ONLY when the scan
+	// found no donor. A found donor (donor != nil) is never stored so positive
+	// results keep working and are always re-scanned. The TTL is the sole
+	// invalidation; a new keyID (bot rotation) uses a different sfKey.
+	if donor == nil {
+		noDonorCache.Store(sfKey, time.Now())
+	}
+
 	if donor == nil {
 		// D-03 / 999.19: sampled SENDERKEY_SUBCLASS classifier.
 		// Runs only when the sampler fires (default 1-in-10); reads whatsmeow_lid_map

@@ -10,7 +10,10 @@
 
 package sqlstore
 
-import "context"
+import (
+	"context"
+	"strconv"
+)
 
 // NoDonorFields is the exported alias for noDonorFields used by external tests.
 type NoDonorFields = noDonorFields
@@ -23,4 +26,14 @@ func ClassifyNoDonor(ctx context.Context, s *SQLStore, ourJID, group, senderBare
 // SetSenderKeySubclassRate sets the sampler rate for tests (save/restore around the test).
 func SetSenderKeySubclassRate(rate int) {
 	senderKeySubclassRate = rate
+}
+
+// DeleteNoDonorCacheEntry removes a single entry from the negative-donor cache.
+// Test-only: allows DB-backed integration tests (package sqlstore_test) to
+// evict a specific sfKey so the cache does not bleed across subtests that share
+// the same (group, senderBare, keyID) tuple but use different donor/targetIter
+// scenarios.
+func DeleteNoDonorCacheEntry(group, senderBare string, keyID uint32) {
+	sfKey := group + "|" + senderBare + "|" + strconv.FormatUint(uint64(keyID), 10)
+	noDonorCache.Delete(sfKey)
 }

@@ -233,6 +233,9 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		_, _ = db.ExecContext(ctx,
 			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
 			recoveryTestJIDA, recoveryTestJIDB, group)
+		// Clear the negative-donor cache for this tuple so prior subtests' scan
+		// results (which may differ in targetIter) do not bleed into this subtest.
+		sqlstore.DeleteNoDonorCacheEntry(group, bareUser, targetKeyID)
 
 		storeA := newSeedStoreA(t, db)
 		csB := newRecoveryTestStoreB(t, db)
@@ -300,6 +303,7 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		_, _ = db.ExecContext(ctx,
 			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
 			recoveryTestJIDA, recoveryTestJIDB, group)
+		sqlstore.DeleteNoDonorCacheEntry(group, bareUser, targetKeyID)
 
 		csB := newRecoveryTestStoreB(t, db)
 
@@ -346,6 +350,7 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		_, _ = db.ExecContext(ctx,
 			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
 			recoveryTestJIDA, recoveryTestJIDB, group)
+		sqlstore.DeleteNoDonorCacheEntry(group, bareUser, targetKeyID)
 
 		storeA := newSeedStoreA(t, db)
 		csB := newRecoveryTestStoreB(t, db)
@@ -389,6 +394,7 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		_, _ = db.ExecContext(ctx,
 			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
 			recoveryTestJIDA, recoveryTestJIDB, group)
+		sqlstore.DeleteNoDonorCacheEntry(group, bareUser, targetKeyID)
 
 		storeA := newSeedStoreA(t, db)
 		csB := newRecoveryTestStoreB(t, db)
@@ -455,6 +461,7 @@ func TestRecoverSenderKeyCrossAccount(t *testing.T) {
 		_, _ = db.ExecContext(ctx,
 			`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
 			recoveryTestJIDA, recoveryTestJIDB, group)
+		sqlstore.DeleteNoDonorCacheEntry(group, bareUser, targetKeyID)
 
 		storeA := newSeedStoreA(t, db)
 		csB := newRecoveryTestStoreB(t, db)
