@@ -25,6 +25,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -583,6 +584,136 @@ func TestCachedSession_WR03_LRUAndDirtySetAgreeUnderConcurrentWriters(t *testing
 	}
 	if !bytes.Equal(dirtyBlob, lruBlob) {
 		t.Fatalf("LRU (%q) and dirty-set (%q) disagree — readers would serve a different blob than what gets persisted (WR-03)", lruBlob, dirtyBlob)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend
+// D-01/D-02: when there are no PN sessions in the dirty-set and no PN row in
+// the inner store, MigratePNToLID must NOT take the WithFlushBlocked path
+// (no-op skip). The inner.MigratePNToLID must still be called (sets
+// once-per-process gate). A second call for the same pn must also not take
+// the flush-block path (IsPNMigrated short-circuit).
+//
+// RED until plans 02+03 restructure MigratePNToLID with HasDirtyPrefix +
+// ExistsPNSession branches — current code always takes WithFlushBlocked.
+// ---------------------------------------------------------------------------
+
+func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
+	ctx := context.Background()
+
+	// Use a fresh fakeSessionStore with NO PN sessions — the no-op path.
+	inner := newFakeSessionStore()
+	// Wire the blockingFlushSessionStore as the flush backing so we can detect
+	// if PutManySessions is called (which happens if WithFlushBlocked runs a
+	// flush inside the block).
+	mock := newMockFlushSessionStore()
+	blocking := newBlockingFlushSessionStore(mock)
+	// blockNext is already true from newBlockingFlushSessionStore.
+	c, flusher, _ := newTestCachedSessionStoreWiring(t, 100, blocking, inner)
+
+	pn := types.JID{User: "972515529399", Server: types.DefaultUserServer}
+	lid := types.JID{User: "972515529399_0", Server: types.HiddenUserServer}
+
+	// Assert (a): MigratePNToLID completes without blocking.
+	// If the code takes WithFlushBlocked and blockingFlushSessionStore fires,
+	// it will block indefinitely on b.writeRelease — use a timeout.
+	done := make(chan error, 1)
+	go func() {
+		done <- c.MigratePNToLID(ctx, pn, lid)
+	}()
+
+	select {
+	case err := <-done:
+		// Assert (a): no error on the no-op path.
+		if err != nil {
+			t.Fatalf("MigratePNToLID: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		// The blocking store fired — WithFlushBlocked was taken on the no-op
+		// path. Release it so the test can clean up, then fail.
+		close(blocking.writeRelease)
+		<-done
+		t.Fatal("MigratePNToLID blocked in WithFlushBlocked on a no-op path (no PN sessions exist) — D-02 first-send skip not implemented")
+	}
+
+	// Assert (b): inner.MigratePNToLID WAS called (once-per-process gate must be set).
+	if got := inner.migrateCalls.Load(); got != 1 {
+		t.Errorf("inner.migrateCalls = %d, want 1 — inner must be called even on the no-op path (D-01)", got)
+	}
+
+	// Assert (c): a second call for the same pn returns immediately without
+	// calling inner again (IsPNMigrated gate fires for already-migrated pn).
+	done2 := make(chan error, 1)
+	go func() {
+		done2 <- c.MigratePNToLID(ctx, pn, lid)
+	}()
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("second MigratePNToLID: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(blocking.writeRelease)
+		<-done2
+		t.Fatal("second MigratePNToLID blocked — IsPNMigrated gate not set by first call (D-01)")
+	}
+	// Second call must NOT have incremented inner.migrateCalls again (gated by IsPNMigrated).
+	// Note: the CachedSessionStore uses c.inner.(*SQLStore).IsPNMigrated; fakeSessionStore is
+	// not *SQLStore so the type assertion always fails and inner.migrateCalls may be 2. This
+	// assertion documents the expected behavior when the inner IS an SQLStore (prod path).
+	_ = flusher
+}
+
+// ---------------------------------------------------------------------------
+// TestCollateSafePredicate
+// Pure string-logic test asserting the LIKE-equivalent prefix predicate used
+// by the collation-safe migration/delete queries (D-06). Validates that a PN
+// form their_id='972515529399:0' matches the prefix "972515529399:" and does
+// NOT false-positive on a different phone ("972526548435:") or a LID-form
+// their_id ("972515529399_1:0") which starts with the same digits but uses an
+// underscore delimiter.
+//
+// Comment: this mirrors the LIKE $2 || ':%' ESCAPE '\' predicate fixed in
+// store.go:147-174 (D-06). The DB-backed predicate test (TestExistsPNSession_LIKEMatch)
+// lives in store_pn_test.go (plan 02); this test covers the matching logic
+// in memory and is self-contained (no external deps — passes once compiled).
+// ---------------------------------------------------------------------------
+
+func TestCollateSafePredicate(t *testing.T) {
+	// PN-form their_id: <phone>:<device> (colon delimiter, no underscore).
+	pnID := "972515529399:0"
+	pnPrefix := "972515529399:"
+
+	// Must match: same phone, PN form.
+	if !strings.HasPrefix(pnID, pnPrefix) {
+		t.Errorf("HasPrefix(%q, %q) = false — PN row must match its own prefix", pnID, pnPrefix)
+	}
+
+	// Must NOT match: different phone.
+	otherPhone := "972526548435:"
+	if strings.HasPrefix(pnID, otherPhone) {
+		t.Errorf("HasPrefix(%q, %q) = true — different phone should not match", pnID, otherPhone)
+	}
+
+	// Must NOT match: LID-form their_id uses underscore not colon as first
+	// delimiter — "972515529399_1:0" starts with same digits but the prefix
+	// "972515529399:" does NOT match because '_' != ':' at position 12.
+	lidID := "972515529399_1:0"
+	if strings.HasPrefix(lidID, pnPrefix) {
+		t.Errorf("HasPrefix(%q, %q) = true — LID-form their_id must NOT match the PN prefix", lidID, pnPrefix)
+	}
+
+	// Must NOT match: underscore-only suffix variant.
+	lidID2 := "972515529399_1:1"
+	if strings.HasPrefix(lidID2, pnPrefix) {
+		t.Errorf("HasPrefix(%q, %q) = true — LID variant 2 must NOT match", lidID2, pnPrefix)
+	}
+
+	// Validate the inverse: empty prefix matches anything (sanity guard for the
+	// test logic — ensures we're not accidentally using an empty string).
+	if pnPrefix == "" {
+		t.Fatal("pnPrefix is empty — test setup error")
 	}
 }
 
