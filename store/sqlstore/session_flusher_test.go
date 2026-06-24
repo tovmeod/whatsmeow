@@ -442,6 +442,77 @@ func TestSessionFlusher_RemoveDropsDirtyEntry(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestHasDirtyPrefix_LockDiscipline
+// HasDirtyPrefix reports whether any dirty-set entry starts with a given
+// prefix — single-thread correctness + concurrent enqueue safety under -race.
+// D-03: takes only f.mu (never flushMu), mirrors RemovePrefix lock discipline.
+// ---------------------------------------------------------------------------
+
+func TestHasDirtyPrefix_LockDiscipline(t *testing.T) {
+	f, _ := newTestSessionFlusher(t, 1000)
+
+	// Not present yet.
+	if got := f.HasDirtyPrefix("972515529399:"); got {
+		t.Fatal("HasDirtyPrefix returned true before any Enqueue")
+	}
+
+	// Enqueue a PN-addressed entry and assert the prefix matches.
+	f.Enqueue("972515529399:0", []byte("signal-session"))
+	if got := f.HasDirtyPrefix("972515529399:"); !got {
+		t.Fatal("HasDirtyPrefix returned false after Enqueue of 972515529399:0 — expected true")
+	}
+	// A different prefix must not match.
+	if got := f.HasDirtyPrefix("972526548435:"); got {
+		t.Fatal("HasDirtyPrefix returned true for a prefix that was never enqueued")
+	}
+
+	// Remove the entry and assert the prefix is gone.
+	f.Remove("972515529399:0")
+	if got := f.HasDirtyPrefix("972515529399:"); got {
+		t.Fatal("HasDirtyPrefix returned true after Remove — dirty entry not dropped")
+	}
+}
+
+func TestHasDirtyPrefix_LockDiscipline_Concurrent(t *testing.T) {
+	f, _ := newTestSessionFlusher(t, 1000)
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+
+	// 10 writers enqueue concurrent:0 .. concurrent:9.
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			addr := fmt.Sprintf("concurrent:%d", i)
+			f.Enqueue(addr, []byte("session"))
+		}()
+	}
+
+	// 10 readers call HasDirtyPrefix concurrently; at least one must return true
+	// by the time all goroutines finish (we capture results after joining).
+	results := make([]bool, goroutines)
+	var rwg sync.WaitGroup
+	rwg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer rwg.Done()
+			results[i] = f.HasDirtyPrefix("concurrent:")
+		}()
+	}
+
+	wg.Wait()
+	rwg.Wait()
+
+	// After all writers finished, the prefix MUST now be true.
+	if got := f.HasDirtyPrefix("concurrent:"); !got {
+		t.Fatal("HasDirtyPrefix returned false after all goroutines completed — expected at least one entry")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TestSessionFlusher_DrainRetries
 // Drain retries on a transient failure (failOnce) and eventually writes all
 // entries. The dirty-set is empty after Drain.
