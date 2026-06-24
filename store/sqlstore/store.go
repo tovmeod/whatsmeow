@@ -77,8 +77,7 @@ const (
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllIdentitiesQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
-	deleteIdentityQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	deleteIdentityQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
 	getIdentityQuery         = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
 )
 
@@ -88,7 +87,15 @@ func (s *SQLStore) PutIdentity(ctx context.Context, address string, key [32]byte
 }
 
 func (s *SQLStore) DeleteAllIdentities(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentitiesQuery, s.JID, phone)
+	// kavtov-fork Phase 47.3 amendment 2026-06-25: repointed to deleteAllIdentityKeysQuery
+	// (the canonical, collation-safe LIKE form fixed in D-06). The former
+	// deleteAllIdentitiesQuery used the broken range idiom
+	// (their_id >= $2||':' AND their_id < $2||';') which silently deleted 0 rows
+	// on en_US.utf8 — making the identity-change handler (notification.go:55) a no-op
+	// for ~1 month (ef91440, 2026-05-25). phone is bound raw (pure digits from
+	// from.User); no escaper needed here — the LIKE metacharacter risk only applies
+	// to LID-form prefixes, which ExistsPNSession handles separately.
+	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, phone)
 	return err
 }
 
@@ -164,6 +171,14 @@ const (
 	`
 	// deleteAllIdentityKeysQuery removes all PN-form identity key rows.
 	// kavtov-fork Phase 47.3 D-06: LIKE replaces broken range idiom.
+	// This is the CANONICAL delete predicate for whatsmeow_identity_keys prefix deletes.
+	// It backs two callers:
+	//   1. deleteAllIdentityKeys() — called by MigratePNToLID's PN→LID migration path.
+	//   2. DeleteAllIdentities() — called by the identity-change handler (notification.go:55)
+	//      when WhatsApp signals a contact's identity key has rotated. The former
+	//      deleteAllIdentitiesQuery (removed Phase 47.3 amendment 2026-06-25) was a duplicate
+	//      of this query using the broken range idiom that silently deleted 0 rows on
+	//      en_US.utf8 (ef91440 regression, 2026-05-25).
 	deleteAllIdentityKeysQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'`
 	migratePNToLIDIdentityKeysQuery = `
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity)
