@@ -595,8 +595,15 @@ func TestCachedSession_WR03_LRUAndDirtySetAgreeUnderConcurrentWriters(t *testing
 // once-per-process gate). A second call for the same pn must also not take
 // the flush-block path (IsPNMigrated short-circuit).
 //
-// RED until plans 02+03 restructure MigratePNToLID with HasDirtyPrefix +
-// ExistsPNSession branches — current code always takes WithFlushBlocked.
+// Strengthened probe (plan 03): this test previously passed vacuously because
+// the blockingFlushSessionStore only fires at PutManySessions, and with an
+// empty dirty-set flushPrefixBlocked exits before calling PutManySessions even
+// when WithFlushBlocked IS taken. The real distinguishing probe is
+// flusher.WithFlushBlockedCalls() — an atomic counter that increments on every
+// entry into WithFlushBlocked regardless of whether any flush work is done.
+// If the no-op-skip is NOT implemented (i.e. WithFlushBlocked is always taken)
+// this counter will be non-zero; with the skip it stays at 0.
+// This test FAILS without the plan-03 MigratePNToLID restructure.
 // ---------------------------------------------------------------------------
 
 func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
@@ -604,9 +611,10 @@ func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
 
 	// Use a fresh fakeSessionStore with NO PN sessions — the no-op path.
 	inner := newFakeSessionStore()
-	// Wire the blockingFlushSessionStore as the flush backing so we can detect
-	// if PutManySessions is called (which happens if WithFlushBlocked runs a
-	// flush inside the block).
+	// Wire the blockingFlushSessionStore as the flush backing. The blocking
+	// store remains armed (blockNext=true) so that if WithFlushBlocked IS taken
+	// it will deadlock — the timeout below catches that case. The real
+	// detection, however, is flusher.WithFlushBlockedCalls().
 	mock := newMockFlushSessionStore()
 	blocking := newBlockingFlushSessionStore(mock)
 	// blockNext is already true from newBlockingFlushSessionStore.
@@ -615,9 +623,15 @@ func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
 	pn := types.JID{User: "972515529399", Server: types.DefaultUserServer}
 	lid := types.JID{User: "972515529399_0", Server: types.HiddenUserServer}
 
+	// Snapshot WithFlushBlockedCalls BEFORE the call so we can assert the delta.
+	callsBefore := flusher.WithFlushBlockedCalls()
+
 	// Assert (a): MigratePNToLID completes without blocking.
-	// If the code takes WithFlushBlocked and blockingFlushSessionStore fires,
-	// it will block indefinitely on b.writeRelease — use a timeout.
+	// If the code takes WithFlushBlocked and the dirty-set is non-empty,
+	// blockingFlushSessionStore will deadlock — the timeout catches that case.
+	// If the code takes WithFlushBlocked on an empty dirty-set it won't
+	// deadlock but WithFlushBlockedCalls will be non-zero (the assertion below
+	// catches THAT case — this is the vacuous-pass fix).
 	done := make(chan error, 1)
 	go func() {
 		done <- c.MigratePNToLID(ctx, pn, lid)
@@ -630,20 +644,30 @@ func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
 			t.Fatalf("MigratePNToLID: %v", err)
 		}
 	case <-time.After(500 * time.Millisecond):
-		// The blocking store fired — WithFlushBlocked was taken on the no-op
-		// path. Release it so the test can clean up, then fail.
+		// The blocking store fired — WithFlushBlocked was taken AND the
+		// dirty-set was non-empty (PutManySessions was called). Release it
+		// so the test can clean up, then fail.
 		close(blocking.writeRelease)
 		<-done
 		t.Fatal("MigratePNToLID blocked in WithFlushBlocked on a no-op path (no PN sessions exist) — D-02 first-send skip not implemented")
 	}
 
-	// Assert (b): inner.MigratePNToLID WAS called (once-per-process gate must be set).
+	// Assert (b-real): WithFlushBlocked must NOT have been entered on the
+	// no-op path. This is the primary probe — it FAILS if the no-op-skip is
+	// absent even when the dirty-set is empty (closing the vacuous-pass gap).
+	callsAfter := flusher.WithFlushBlockedCalls()
+	if delta := callsAfter - callsBefore; delta != 0 {
+		t.Errorf("WithFlushBlockedCalls delta = %d, want 0 — MigratePNToLID took WithFlushBlocked on a no-op path (no PN sessions exist, D-02 skip required)", delta)
+	}
+
+	// Assert (c): inner.MigratePNToLID WAS called (once-per-process gate must be set).
 	if got := inner.migrateCalls.Load(); got != 1 {
 		t.Errorf("inner.migrateCalls = %d, want 1 — inner must be called even on the no-op path (D-01)", got)
 	}
 
-	// Assert (c): a second call for the same pn returns immediately without
+	// Assert (d): a second call for the same pn returns immediately without
 	// calling inner again (IsPNMigrated gate fires for already-migrated pn).
+	callsBefore2 := flusher.WithFlushBlockedCalls()
 	done2 := make(chan error, 1)
 	go func() {
 		done2 <- c.MigratePNToLID(ctx, pn, lid)
@@ -658,11 +682,14 @@ func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
 		<-done2
 		t.Fatal("second MigratePNToLID blocked — IsPNMigrated gate not set by first call (D-01)")
 	}
-	// Second call must NOT have incremented inner.migrateCalls again (gated by IsPNMigrated).
-	// Note: the CachedSessionStore uses c.inner.(*SQLStore).IsPNMigrated; fakeSessionStore is
-	// not *SQLStore so the type assertion always fails and inner.migrateCalls may be 2. This
-	// assertion documents the expected behavior when the inner IS an SQLStore (prod path).
-	_ = flusher
+	// Second call must NOT have entered WithFlushBlocked (IsPNMigrated fires first
+	// for already-migrated pn — but note: fakeSessionStore is not *SQLStore so the
+	// type assertion in CachedSessionStore for IsPNMigrated always fails; inner.migrateCalls
+	// may be 2 on the fake. The WithFlushBlockedCalls assertion still holds regardless).
+	callsAfter2 := flusher.WithFlushBlockedCalls()
+	if delta := callsAfter2 - callsBefore2; delta != 0 {
+		t.Errorf("second MigratePNToLID WithFlushBlockedCalls delta = %d, want 0 — second call should not take flush-block", delta)
+	}
 }
 
 // ---------------------------------------------------------------------------

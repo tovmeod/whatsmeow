@@ -512,26 +512,76 @@ func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.J
 		alreadyMigrated = sql.IsPNMigrated(pn.SignalAddressUser())
 	}
 	if !alreadyMigrated {
-		// Phase 35.2-09 CR-04: force PN-prefixed dirty entries down to the DB and
-		// remove them BEFORE the inner migration, inside the flush-blocked
-		// section, so (a) the migration's SELECT copies the freshest ratchet
-		// state to the LID key (a dirty-but-unflushed PN session would otherwise
-		// miss the migration — stale LID row) and (b) neither an in-flight flush
-		// snapshot nor a later drain can re-insert a zombie pn row after the
-		// migration deletes the pn rows. On sweep failure the migration is
-		// aborted (fail closed); the inner once-per-process gate is not consumed,
-		// so a retry can still heal.
-		if c.flusher != nil {
+		// D-01/D-02 (Phase 47.3): three-branch gate for the first-send no-op-skip.
+		//
+		// The flush-block (WithFlushBlocked) is only needed when there is actual PN
+		// migration work to order against the flusher. Skip it when BOTH checks
+		// are negative — "no-op path" (cheap: one dirty-set scan + one index-narrowed
+		// LIKE query on the first send per recipient, then IsPNMigrated takes over).
+		//
+		//   Branch 1 (full ordered path): hasDirty || hasDB is true — there are PN
+		//     sessions in the dirty-set or the DB. Take WithFlushBlocked exactly as
+		//     before (CR-04: flush dirty prefix first, then migrate inside the block).
+		//
+		//   Branch 2 (no-op path): both checks are false — nothing to migrate.
+		//     Call inner.MigratePNToLID UNCONDITIONALLY (D-01: sets the
+		//     migratedPNSessionsCache gate so every subsequent send for this pn
+		//     short-circuits at IsPNMigrated before reaching this block).
+		//     Skip WithFlushBlocked — safe-by-construction for CR-01 (nothing to
+		//     delete means no delete-resurrection risk).
+		//
+		//   Branch 3 (nil-flusher fallback): no SessionFlusher wired — the inner
+		//     store is used directly with no write-back buffering; call inner directly
+		//     with no flush coordination.
+		//
+		// D-05: check-to-send race accepted as benign. A PN row could be Enqueued
+		// between HasDirtyPrefix returning false and inner.MigratePNToLID running,
+		// but the no-op path neither deletes nor changes reads, so CR-01 and
+		// read-gap/479 cannot be violated. D2's single-writer eliminates this class.
+		pnPrefix := pn.SignalAddressUser() + ":"
+
+		hasDirty := c.flusher != nil && c.flusher.HasDirtyPrefix(pnPrefix)
+
+		var hasDB bool
+		if sql, ok := c.inner.(*SQLStore); ok {
+			var err error
+			hasDB, err = sql.ExistsPNSession(ctx, pnPrefix)
+			if err != nil {
+				return fmt.Errorf("MigratePNToLID existence check: %w", err)
+			}
+		}
+
+		if c.flusher != nil && (hasDirty || hasDB) {
+			// Branch 1: full ordered path — flush dirty PN entries before migration.
+			// Phase 35.2-09 CR-04: force PN-prefixed dirty entries down to the DB and
+			// remove them BEFORE the inner migration, inside the flush-blocked
+			// section, so (a) the migration's SELECT copies the freshest ratchet
+			// state to the LID key (a dirty-but-unflushed PN session would otherwise
+			// miss the migration — stale LID row) and (b) neither an in-flight flush
+			// snapshot nor a later drain can re-insert a zombie pn row after the
+			// migration deletes the pn rows. On sweep failure the migration is
+			// aborted (fail closed); the inner once-per-process gate is not consumed,
+			// so a retry can still heal.
 			if err := c.flusher.WithFlushBlocked(func() error {
-				if err := c.flusher.flushPrefixBlocked(ctx, pn.SignalAddressUser()+":"); err != nil {
+				if err := c.flusher.flushPrefixBlocked(ctx, pnPrefix); err != nil {
 					return fmt.Errorf("failed to flush pending sessions before PN->LID migration: %w", err)
 				}
 				return c.inner.MigratePNToLID(ctx, pn, lid)
 			}); err != nil {
 				return err
 			}
-		} else if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
-			return err
+		} else if c.flusher != nil {
+			// Branch 2: no-op path — both hasDirty and hasDB are false.
+			// Call inner directly (sets once-per-process gate); skip WithFlushBlocked.
+			if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
+				return err
+			}
+		} else {
+			// Branch 3: nil-flusher fallback — inner is used write-through; no
+			// flush coordination needed.
+			if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
+				return err
+			}
 		}
 	}
 	// Phase 24: single O(K) lookup instead of the former O(N) two-pass

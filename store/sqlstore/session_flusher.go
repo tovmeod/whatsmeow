@@ -44,6 +44,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -98,6 +99,12 @@ type SessionFlusher struct {
 	wg      sync.WaitGroup
 
 	flushInterval time.Duration // injectable for tests; default 5s
+
+	// withFlushBlockedCalls counts every entry into WithFlushBlocked. Used in
+	// tests to assert that the no-op-skip path does NOT take the flush-block.
+	// Increment is on every call, so callers that should NOT enter WithFlushBlocked
+	// can assert this counter stays at 0 before their operation.
+	withFlushBlockedCalls atomic.Uint64
 }
 
 // NewSessionFlusher constructs a SessionFlusher with prod defaults. cap=0 uses
@@ -342,9 +349,17 @@ func (f *SessionFlusher) flushPrefixBlocked(ctx context.Context, prefix string) 
 // backpressure path re-takes flushMu); Remove and RemovePrefix are safe
 // (they only take f.mu).
 func (f *SessionFlusher) WithFlushBlocked(fn func() error) error {
+	f.withFlushBlockedCalls.Add(1)
 	f.flushMu.Lock()
 	defer f.flushMu.Unlock()
 	return fn()
+}
+
+// WithFlushBlockedCalls returns the total number of times WithFlushBlocked has
+// been entered. Used by tests to assert that the no-op-skip path in
+// MigratePNToLID does NOT take the flush-block (D-01/D-02).
+func (f *SessionFlusher) WithFlushBlockedCalls() uint64 {
+	return f.withFlushBlockedCalls.Load()
 }
 
 // flushOneSynchronous performs a single-address synchronous write on the
