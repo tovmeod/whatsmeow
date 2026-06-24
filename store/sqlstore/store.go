@@ -144,37 +144,63 @@ const (
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
-	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
+	// deleteAllSessionsQuery removes all PN-form session rows for a (our_jid, pnSignal)
+	// pair. kavtov-fork Phase 47.3 D-06: LIKE $2 || ':%' ESCAPE '\' replaces the
+	// previous range idiom (their_id >= $2||':' AND their_id < $2||';') which
+	// silently returned 0 rows on the prod DB's en_US.utf8 collation — ';' does
+	// not order after ':' there. LIKE matches by character, not collation ordering.
+	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'`
 	deleteSessionQuery     = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
 
+	// migratePNToLIDSessionsQuery copies session rows from PN-format their_id to
+	// LID-format their_id. kavtov-fork Phase 47.3 D-06: LIKE replaces broken range
+	// (see deleteAllSessionsQuery comment above).
 	migratePNToLIDSessionsQuery = `
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session)
 		SELECT our_jid, replace(their_id, $2, $3), session
 		FROM whatsmeow_sessions
-		WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
+		WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
-	deleteAllIdentityKeysQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
+	// deleteAllIdentityKeysQuery removes all PN-form identity key rows.
+	// kavtov-fork Phase 47.3 D-06: LIKE replaces broken range idiom.
+	deleteAllIdentityKeysQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'`
 	migratePNToLIDIdentityKeysQuery = `
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity)
 		SELECT our_jid, replace(their_id, $2, $3), identity
 		FROM whatsmeow_identity_keys
-		WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
+		WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllSenderKeysQuery = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'`
+	// deleteAllSenderKeysQuery removes all PN-form sender-key rows. Uses sender_id
+	// (not their_id). kavtov-fork Phase 47.3 D-06: LIKE replaces broken range idiom.
+	// whatsmeow_sender_keys has a text_pattern_ops unique index (v18) so this LIKE
+	// on sender_id IS index-seekable (byte-ordered range seek on the text_pattern_ops index).
+	deleteAllSenderKeysQuery = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id LIKE $2 || ':%' ESCAPE '\'`
 	// migratePNToLIDSenderKeysQuery copies sender-key rows from PN-format sender_id
 	// to LID-format sender_id. Post-upgrade-19 the table has only (our_jid, chat_id,
 	// sender_id, sender_key) — the flat bytea is copied as-is. The LID row's sender_key
 	// is the donor row's flat blob; the next write will replace it on ratchet advance.
+	// kavtov-fork Phase 47.3 D-06: LIKE replaces broken range idiom (sender_id column).
 	migratePNToLIDSenderKeysQuery = `
 		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
 		SELECT our_jid, chat_id, replace(sender_id, $2, $3), sender_key
 		FROM whatsmeow_sender_keys
-		WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'
+		WHERE our_jid=$1 AND sender_id LIKE $2 || ':%' ESCAPE '\'
 		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
 			sender_key=excluded.sender_key
 	`
+
+	// existsPNSessionQuery checks whether this account has any session row whose
+	// their_id starts with pnPrefix (e.g. "972515529399:"). Used by
+	// CachedSessionStore.MigratePNToLID to determine whether to take the full
+	// WithFlushBlocked path on the first send (D-02 cheap no-op detection).
+	// pnPrefix is caller-escaped via senderKeyLikeEscaper before binding — required
+	// to treat any LIKE metacharacters in the prefix literally (defensive; PN
+	// prefixes are pure-digit phone strings with no metacharacters, but future
+	// callers may pass other forms).
+	// LIKE + ESCAPE instead of the broken >= ':' AND < ';' range (D-04/D-06).
+	existsPNSessionQuery = `SELECT true FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2 || '%' ESCAPE '\' LIMIT 1`
 )
 
 func (s *SQLStore) GetSession(ctx context.Context, address string) (session []byte, err error) {
@@ -191,6 +217,24 @@ func (s *SQLStore) HasSession(ctx context.Context, address string) (has bool, er
 		err = nil
 	}
 	return
+}
+
+// ExistsPNSession reports whether this account has any session row whose
+// their_id starts with pnPrefix. pnPrefix must be the colon-suffixed PN
+// signal prefix, e.g. "972515529399:" (caller passes pn.SignalAddressUser()+":").
+// The prefix is escaped via senderKeyLikeEscaper before binding to guard against
+// LIKE metacharacters (defensive; PN prefixes are pure digits, but LID-form
+// prefixes contain '_' which is a LIKE wildcard).
+// Returns (false, nil) on sql.ErrNoRows (no rows = prefix not present).
+// Used by CachedSessionStore.MigratePNToLID for D-02 cheap no-op detection.
+func (s *SQLStore) ExistsPNSession(ctx context.Context, pnPrefix string) (bool, error) {
+	escaped := senderKeyLikeEscaper.Replace(pnPrefix)
+	var exists bool
+	err := s.db.QueryRow(ctx, existsPNSessionQuery, s.JID, escaped).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return exists, err
 }
 
 type addressSessionTuple struct {

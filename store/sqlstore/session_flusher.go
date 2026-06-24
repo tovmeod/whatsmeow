@@ -280,6 +280,23 @@ func (f *SessionFlusher) RemovePrefix(prefix string) {
 	f.mu.Unlock()
 }
 
+// HasDirtyPrefix reports whether any address in the dirty-set starts with prefix.
+// Takes only f.mu — never flushMu. Safe to call outside any WithFlushBlocked.
+// Lock order: f.mu only (not flushMu), consistent with Remove/RemovePrefix.
+// A false result has a brief false-negative window (D-05): a PN row could be
+// Enqueued after HasDirtyPrefix returns false; callers accept this (benign for
+// the no-op-skip path which neither deletes nor changes reads).
+func (f *SessionFlusher) HasDirtyPrefix(prefix string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for addr := range f.dirty {
+		if strings.HasPrefix(addr, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // flushPrefixBlocked synchronously writes every dirty entry whose address
 // starts with prefix to the DB, then removes ALL prefix-matching entries from
 // the dirty-set. Caller MUST hold flushMu (i.e. call this from inside
