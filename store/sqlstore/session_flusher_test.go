@@ -737,3 +737,59 @@ func TestSessionFlusher_DirtyCount(t *testing.T) {
 		t.Fatalf("after 2 distinct Enqueues: DirtyCount = %d, want 2", n)
 	}
 }
+
+// ===========================================================================
+// D2 single-writer invariant tests (Phase 47.3-06). RED stubs in Task 1;
+// bodies filled in Task 3 once the single-writer redesign lands.
+//
+// D2 is a correctness/elegance redesign (NOT a perf win — D-09): the writer
+// goroutine owns ALL DB mutation (flush + delete + migrate + backpressure
+// relief), serialized by channel FIFO, with no lock held across DB I/O. These
+// three tests attack the hardest invariants the channel-FIFO + rwmu design
+// must preserve: CR-01 delete ordering, D-11 evicted-dirty read, and INV-8
+// backpressure with no off-writer DB write.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestSingleWriter_DeleteOrdering (CR-01 via D2 channel-FIFO)
+// A delete work item processed after a flush batch must NOT be resurrected by
+// the flush's in-flight PutManySessions UPSERT. The blockingFlushSessionStore
+// holds the writer's PutManySessions open between snapshot and DB apply; a
+// delete work item is sent to workCh during that window. With the single
+// writer, the delete is dequeued only AFTER runFlush completes (channel FIFO),
+// so the net DB effect is UPSERT then DELETE -> row deleted. Replaces flushMu
+// mutual exclusion with single-goroutine FIFO serialization.
+// ---------------------------------------------------------------------------
+
+func TestSingleWriter_DeleteOrdering(t *testing.T) {
+	t.Skip("D2 implementation pending — body filled in Task 3")
+}
+
+// ---------------------------------------------------------------------------
+// TestSingleWriter_EvictedDirtyRead (WR-03 / D-11)
+// A PeekAndMirror after LRU eviction must reach the dirty-but-unflushed blob
+// via rwmu.RLock() WITHOUT a channel round-trip to the writer goroutine (a
+// round-trip would block on the writer mid-DB-write — the 17.13 -> 479 read
+// gap). The read must complete even while the writer holds rwmu.Lock() for a
+// brief snapshot, with no deadlock.
+// ---------------------------------------------------------------------------
+
+func TestSingleWriter_EvictedDirtyRead(t *testing.T) {
+	t.Skip("D2 implementation pending — body filled in Task 3")
+}
+
+// ---------------------------------------------------------------------------
+// TestSingleWriter_BackpressureNoInlineWrite (INV-8 / design §7 §9)
+// Backpressure relief must NOT perform any DB write on the producer goroutine.
+// On dirty-set > backpressureCap, EnqueueAndMirror sends a synchronous
+// workFlushSync item to workCh and blocks on its done channel (that blocking
+// IS the backpressure); the relief flush runs inside the single writer,
+// FIFO-ordered with deletes/migrates. This test asserts (a) the only
+// PutManySessions calls happen on the writer goroutine, and (b) a full workCh
+// blocks the producer (the send itself is the backpressure, not a lock-free
+// inline DB write).
+// ---------------------------------------------------------------------------
+
+func TestSingleWriter_BackpressureNoInlineWrite(t *testing.T) {
+	t.Skip("D2 implementation pending — body filled in Task 3")
+}
