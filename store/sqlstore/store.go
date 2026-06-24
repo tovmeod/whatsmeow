@@ -277,6 +277,13 @@ func (s *SQLStore) DeleteSession(ctx context.Context, address string) error {
 	return err
 }
 
+// IsPNMigrated reports whether MigratePNToLID has already migrated this PN this
+// process, WITHOUT mutating the once-per-process gate. Lets the cached wrapper skip
+// the expensive flush-block on the common already-migrated repeat-send path.
+func (s *SQLStore) IsPNMigrated(pnSignal string) bool {
+	return s.migratedPNSessionsCache.Has(pnSignal)
+}
+
 func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
 	pnSignal := pn.SignalAddressUser()
 	if !s.migratedPNSessionsCache.Add(pnSignal) {

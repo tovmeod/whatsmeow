@@ -499,26 +499,40 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 // steady-state PN→LID migration rate" was contradicted by that profile;
 // the O(K) implementation makes it genuinely negligible.
 func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
-	// Phase 35.2-09 CR-04: force PN-prefixed dirty entries down to the DB and
-	// remove them BEFORE the inner migration, inside the flush-blocked
-	// section, so (a) the migration's SELECT copies the freshest ratchet
-	// state to the LID key (a dirty-but-unflushed PN session would otherwise
-	// miss the migration — stale LID row) and (b) neither an in-flight flush
-	// snapshot nor a later drain can re-insert a zombie pn row after the
-	// migration deletes the pn rows. On sweep failure the migration is
-	// aborted (fail closed); the inner once-per-process gate is not consumed,
-	// so a retry can still heal.
-	if c.flusher != nil {
-		if err := c.flusher.WithFlushBlocked(func() error {
-			if err := c.flusher.flushPrefixBlocked(ctx, pn.SignalAddressUser()+":"); err != nil {
-				return fmt.Errorf("failed to flush pending sessions before PN->LID migration: %w", err)
+	// ride-button-slow-send fix: MigratePNToLID is called per recipient device on
+	// EVERY send, but the inner DB migration is gated once-per-process
+	// (migratedPNSessionsCache). The WithFlushBlocked (flushMu) wait below was thus
+	// paid on every repeat call for a NO-OP migration, serializing the send behind the
+	// session flusher's Postgres write (~1s/device, confirmed by block profile +
+	// SLOW_SEND setup_migrate_ms). Once migrated there are no deletes to order against
+	// the flusher, so skip the flush-block. The cache sweep below still runs
+	// unconditionally (cheap, idempotent), so cache-coherence behavior is unchanged.
+	alreadyMigrated := false
+	if sql, ok := c.inner.(*SQLStore); ok {
+		alreadyMigrated = sql.IsPNMigrated(pn.SignalAddressUser())
+	}
+	if !alreadyMigrated {
+		// Phase 35.2-09 CR-04: force PN-prefixed dirty entries down to the DB and
+		// remove them BEFORE the inner migration, inside the flush-blocked
+		// section, so (a) the migration's SELECT copies the freshest ratchet
+		// state to the LID key (a dirty-but-unflushed PN session would otherwise
+		// miss the migration — stale LID row) and (b) neither an in-flight flush
+		// snapshot nor a later drain can re-insert a zombie pn row after the
+		// migration deletes the pn rows. On sweep failure the migration is
+		// aborted (fail closed); the inner once-per-process gate is not consumed,
+		// so a retry can still heal.
+		if c.flusher != nil {
+			if err := c.flusher.WithFlushBlocked(func() error {
+				if err := c.flusher.flushPrefixBlocked(ctx, pn.SignalAddressUser()+":"); err != nil {
+					return fmt.Errorf("failed to flush pending sessions before PN->LID migration: %w", err)
+				}
+				return c.inner.MigratePNToLID(ctx, pn, lid)
+			}); err != nil {
+				return err
 			}
-			return c.inner.MigratePNToLID(ctx, pn, lid)
-		}); err != nil {
+		} else if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
 			return err
 		}
-	} else if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
-		return err
 	}
 	// Phase 24: single O(K) lookup instead of the former O(N) two-pass
 	// cache.Keys() walk (13.43% driver CPU per 2026-05-28 60s pprof).
