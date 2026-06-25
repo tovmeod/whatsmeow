@@ -19,6 +19,8 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -177,6 +179,68 @@ func (b *blockingFlushSessionStore) DeleteAllSessions(ctx context.Context, phone
 
 func (b *blockingFlushSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
 	return b.inner.MigratePNToLID(ctx, pn, lid)
+}
+
+// ---------------------------------------------------------------------------
+// gidRecordingStore wraps a sessionWriterStore and records the goroutine id of
+// every PutManySessions call. Used by TestSingleWriter_BackpressureNoInlineWrite
+// to assert ALL DB writes happen on the single writer goroutine (design §9 —
+// no inline DB write off the writer).
+// ---------------------------------------------------------------------------
+
+type gidRecordingStore struct {
+	inner sessionWriterStore
+	mu    sync.Mutex
+	gids  map[uint64]int // goroutine id -> call count
+}
+
+func (g *gidRecordingStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
+	gid := goroutineID()
+	g.mu.Lock()
+	if g.gids == nil {
+		g.gids = make(map[uint64]int)
+	}
+	g.gids[gid]++
+	g.mu.Unlock()
+	return g.inner.PutManySessions(ctx, sessions)
+}
+
+func (g *gidRecordingStore) DeleteSession(ctx context.Context, address string) error {
+	return g.inner.DeleteSession(ctx, address)
+}
+
+func (g *gidRecordingStore) DeleteAllSessions(ctx context.Context, phone string) error {
+	return g.inner.DeleteAllSessions(ctx, phone)
+}
+
+func (g *gidRecordingStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
+	return g.inner.MigratePNToLID(ctx, pn, lid)
+}
+
+// callerGIDs returns the distinct goroutine ids observed across all
+// PutManySessions calls.
+func (g *gidRecordingStore) callerGIDs() []uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]uint64, 0, len(g.gids))
+	for gid := range g.gids {
+		out = append(out, gid)
+	}
+	return out
+}
+
+// goroutineID returns the current goroutine's id by parsing the runtime stack
+// header. Test-only diagnostic (the standard library deliberately hides this).
+func goroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// "goroutine <id> [...".
+	fields := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))
+	if len(fields) == 0 {
+		return 0
+	}
+	id, _ := strconv.ParseUint(fields[0], 10, 64)
+	return id
 }
 
 // ---------------------------------------------------------------------------
@@ -808,7 +872,56 @@ func TestSessionFlusher_DirtyCount(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSingleWriter_DeleteOrdering(t *testing.T) {
-	t.Skip("D2 implementation pending — body filled in Task 3")
+	mock := newMockFlushSessionStore()
+	b := newBlockingFlushSessionStore(mock)
+	// boundaryN high so the Enqueue below does not spontaneously flush; the test
+	// drives the flush explicitly via flushCh through the running writer.
+	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+	defer f.Stop()
+
+	ctx := context.Background()
+	f.Enqueue("target:0", []byte("doomed"))
+
+	// Trigger a flush through the writer; the blockingStore pauses it mid-write
+	// (snapshot of {target:0} taken, PutManySessions blocked).
+	f.flushCh <- struct{}{}
+	<-b.writeStarted
+
+	// Dispatch a delete for the same address. It sends a workDeleteSingle item to
+	// workCh and blocks on done. The writer is busy with the paused flush, so the
+	// delete is queued BEHIND the flush (channel FIFO).
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- f.DeleteSession(ctx, "target:0")
+	}()
+
+	// The delete MUST NOT complete while the flush is paused (FIFO: it is queued
+	// behind the in-flight flush).
+	select {
+	case err := <-deleteDone:
+		t.Fatalf("DeleteSession completed while the flush was paused — channel-FIFO ordering broken (CR-01); err=%v", err)
+	case <-time.After(150 * time.Millisecond):
+		// Correct: delete queued behind the paused flush.
+	}
+
+	// Release the flush. The writer finishes runFlush (UPSERT target:0), then
+	// dequeues the delete (DELETE target:0). Net DB effect: UPSERT then DELETE.
+	close(b.writeRelease)
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+
+	// CR-01: target:0 must NOT be present in the DB — the delete won over the
+	// in-flight flush's upsert because the writer processed them in FIFO order.
+	if _, ok := mock.getSession("target:0"); ok {
+		t.Fatal("target:0 resurrected in the store by the in-flight flush upsert — CR-01 violated (the delete must win, processed FIFO after the flush)")
+	}
+	// The dirty entry must also be gone.
+	if _, ok := f.Peek("target:0"); ok {
+		t.Fatal("dirty entry survived DeleteSession (CR-01)")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +934,66 @@ func TestSingleWriter_DeleteOrdering(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSingleWriter_EvictedDirtyRead(t *testing.T) {
-	t.Skip("D2 implementation pending — body filled in Task 3")
+	mock := newMockFlushSessionStore()
+	b := newBlockingFlushSessionStore(mock)
+	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+	// released guards the single close(b.writeRelease): the test body closes it
+	// on the happy path; the defer closes it if an assertion failed early (so a
+	// paused writer cannot hang Stop()'s Drain).
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(b.writeRelease) }) }
+	defer func() {
+		release()
+		f.Stop()
+	}()
+
+	blob := []byte("evicted-but-dirty")
+	f.Enqueue("evict:0", blob)
+
+	// Part 1: a plain read reaches the dirty blob synchronously (no channel
+	// round-trip — PeekAndMirror only takes rwmu.RLock()). The mirror callback
+	// stands in for the LRU repopulate (WR-03).
+	var mirrored []byte
+	got, ok := f.PeekAndMirror("evict:0", func(bl []byte) { mirrored = append([]byte(nil), bl...) })
+	if !ok {
+		t.Fatal("PeekAndMirror returned not-found for a dirty (LRU-evicted) address — read-gap (D-11)")
+	}
+	if string(got) != string(blob) {
+		t.Fatalf("PeekAndMirror blob = %q, want %q", got, blob)
+	}
+	if string(mirrored) != string(blob) {
+		t.Fatalf("mirror callback blob = %q, want %q (WR-03 coherence)", mirrored, blob)
+	}
+
+	// Part 2: while the writer is mid-flush (it released rwmu.Lock() after the
+	// snapshot and is now blocked in PutManySessions — entry still dirty until
+	// the clear pass), PeekAndMirror must still complete via rwmu.RLock() with no
+	// deadlock and no channel round-trip. Use a 500ms guard.
+	f.flushCh <- struct{}{}
+	<-b.writeStarted // writer snapshotted (rwmu.Lock released) and is paused in the DB write
+
+	readDone := make(chan []byte, 1)
+	go func() {
+		out, found := f.PeekAndMirror("evict:0", nil)
+		if !found {
+			readDone <- nil
+			return
+		}
+		readDone <- out
+	}()
+	select {
+	case out := <-readDone:
+		if string(out) != string(blob) {
+			t.Fatalf("mid-flush PeekAndMirror = %q, want %q (entry still dirty until the clear pass)", out, blob)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("PeekAndMirror deadlocked while the writer was mid-flush — rwmu.RLock() must not block on DB I/O (D-11)")
+	}
+
+	// Release the writer; after the clear pass the entry is in the DB.
+	release()
 }
 
 // ---------------------------------------------------------------------------
@@ -837,5 +1009,101 @@ func TestSingleWriter_EvictedDirtyRead(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSingleWriter_BackpressureNoInlineWrite(t *testing.T) {
-	t.Skip("D2 implementation pending — body filled in Task 3")
+	// gidRecordingStore records the goroutine id of every PutManySessions call so
+	// the test can assert ALL DB writes happen on ONE goroutine (the writer) and
+	// never on a producer goroutine (no inline off-writer DB write — design §9).
+	rec := &gidRecordingStore{inner: newMockFlushSessionStore()}
+	// cap=5 -> backpressureCap=1: a second distinct dirty address triggers relief.
+	f := newSessionFlusherForTest(rec, 5, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+	defer f.Stop()
+
+	// Drive many backpressure-triggering writes from several producer goroutines.
+	producerGIDs := &sync.Map{}
+	var wg sync.WaitGroup
+	const producers = 6
+	const writesPer = 40
+	for i := 0; i < producers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			producerGIDs.Store(goroutineID(), true)
+			for j := 0; j < writesPer; j++ {
+				// Distinct addresses keep the dirty-set above backpressureCap so
+				// EnqueueAndMirror takes the relief path (workFlushSync via the writer).
+				f.Enqueue(fmt.Sprintf("bp-%d-%d:0", i, j), []byte("v"))
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Final synchronous flush through the writer to settle.
+	if err := f.flushSyncForTest(); err != nil {
+		t.Fatalf("flushSyncForTest: %v", err)
+	}
+
+	// (a) Every PutManySessions call must have happened on a SINGLE goroutine
+	// (the writer), and NEVER on any producer goroutine. This proves the
+	// backpressure relief did NOT perform an inline DB write off the writer.
+	writerGIDs := rec.callerGIDs()
+	if len(writerGIDs) != 1 {
+		t.Fatalf("PutManySessions ran on %d distinct goroutines %v, want exactly 1 (the single writer); a >1 count means a DB write happened off the writer goroutine (INV-8 / design §9)", len(writerGIDs), writerGIDs)
+	}
+	for _, gid := range writerGIDs {
+		if _, isProducer := producerGIDs.Load(gid); isProducer {
+			t.Fatalf("PutManySessions ran on producer goroutine %d — inline off-writer DB write (CR-01 hole the amendment closed, design §9)", gid)
+		}
+	}
+
+	// (b) A full workCh blocks the producer (the send is the backpressure, not a
+	// lock-free escape hatch). Build a flusher whose writer is paused, fill workCh
+	// to capacity, and assert the next send blocks rather than returning.
+	assertFullWorkChBlocksProducer(t)
+}
+
+// assertFullWorkChBlocksProducer verifies that when workCh is full the producer
+// blocks on the send (design §9: a full workCh blocks the producer; the send IS
+// the backpressure). It pauses the writer mid-flush, fills the buffered workCh,
+// then confirms one more send blocks until the writer drains.
+func assertFullWorkChBlocksProducer(t *testing.T) {
+	t.Helper()
+	mock := newMockFlushSessionStore()
+	b := newBlockingFlushSessionStore(mock)
+	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+	defer f.Stop()
+
+	// Pause the writer mid-flush so it cannot drain workCh.
+	f.Enqueue("seed:0", []byte("v"))
+	f.flushCh <- struct{}{}
+	<-b.writeStarted // writer is now blocked in PutManySessions; it will not read workCh
+
+	// Fill workCh to capacity with fire-and-forget delete work items (done=nil).
+	for i := 0; i < workChBuffer; i++ {
+		f.workCh <- writeWork{kind: workDeleteSingle, address: fmt.Sprintf("x%d:0", i)}
+	}
+
+	// The next send must BLOCK (workCh is full and the writer is paused).
+	sendReturned := make(chan struct{})
+	go func() {
+		f.workCh <- writeWork{kind: workDeleteSingle, address: "overflow:0"}
+		close(sendReturned)
+	}()
+	select {
+	case <-sendReturned:
+		t.Fatal("send on a full workCh returned immediately — backpressure is not bounded by the channel send (design §9)")
+	case <-time.After(150 * time.Millisecond):
+		// Correct: the producer is blocked on the full-channel send.
+	}
+
+	// Release the writer; it drains workCh and the blocked send eventually lands.
+	close(b.writeRelease)
+	select {
+	case <-sendReturned:
+		// Correct: once the writer drains, the blocked send completes.
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked send never completed after the writer drained workCh")
+	}
 }
