@@ -69,6 +69,10 @@ func (c *countingFlushStore) MigratePNToLID(ctx context.Context, pn, lid types.J
 	return c.backing.MigratePNToLID(ctx, pn, lid)
 }
 
+func (c *countingFlushStore) IsPNMigrated(pn string) bool {
+	return c.backing.IsPNMigrated(pn)
+}
+
 func newTestCachedSessionStoreWithFlusher(t *testing.T, capSize int) (
 	*CachedSessionStore,
 	*fakeSessionStore,
@@ -607,13 +611,15 @@ func TestCachedSession_WR03_LRUAndDirtySetAgreeUnderConcurrentWriters(t *testing
 // migrate work item to the single writer goroutine. A second call for the same
 // pn must also short-circuit at IsPNMigrated.
 //
-// Probe (carried from D1 plan 03): flusher.WithFlushBlockedCalls() — in D2
-// nothing increments this counter (the V1 WithFlushBlocked is gone; the no-op
-// migrate path dispatches no work item), so it stays at 0. A delta of 0 across
-// the call confirms the no-op path took no flush coordination — exactly the
-// behavior D-02's first-send skip requires. (Under D1 a non-zero delta would
-// have meant the flush-blocked path was wrongly taken; under D2 the same
-// assertion confirms no migrate work item was dispatched.)
+// Probe (Phase 47.3 F12): flusher.MigrateDispatches() — a REAL counter of
+// workMigratePNPrefix work items dispatched to the writer. The no-op path
+// (Branch-2 / Branch-3) dispatches ZERO; the full ordered path (Branch-1)
+// dispatches exactly one. A delta of 0 across the no-op call confirms the
+// first-send skip took NO flush coordination. This replaces the V1
+// WithFlushBlockedCalls probe, which D2 left permanently at 0 (vacuous: a D-02
+// regression wrongly dispatching a work item would still have passed). The
+// companion full-path assertion (TestCachedSession_MigrateFullPath_DispatchesOne)
+// asserts the delta is exactly 1 when there IS PN dirty state.
 // ---------------------------------------------------------------------------
 
 func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
@@ -622,26 +628,22 @@ func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
 	// Use a fresh fakeSessionStore with NO PN sessions — the no-op path.
 	inner := newFakeSessionStore()
 	// Wire the blockingFlushSessionStore as the flush backing. The blocking
-	// store remains armed (blockNext=true) so that if WithFlushBlocked IS taken
-	// it will deadlock — the timeout below catches that case. The real
-	// detection, however, is flusher.WithFlushBlockedCalls().
+	// store remains armed (blockNext=true) so that if a migrate work item IS
+	// dispatched (it would run a pre-migrate flush) it deadlocks — the timeout
+	// below catches that case. The real detection is flusher.MigrateDispatches().
 	mock := newMockFlushSessionStore()
 	blocking := newBlockingFlushSessionStore(mock)
-	// blockNext is already true from newBlockingFlushSessionStore.
 	c, flusher, _ := newTestCachedSessionStoreWiring(t, 100, blocking, inner)
 
 	pn := types.JID{User: "972515529399", Server: types.DefaultUserServer}
 	lid := types.JID{User: "972515529399_0", Server: types.HiddenUserServer}
 
-	// Snapshot WithFlushBlockedCalls BEFORE the call so we can assert the delta.
-	callsBefore := flusher.WithFlushBlockedCalls()
+	// Snapshot the dispatch counter BEFORE the call so we can assert the delta.
+	dispatchBefore := flusher.MigrateDispatches()
 
-	// Assert (a): MigratePNToLID completes without blocking.
-	// If the code takes WithFlushBlocked and the dirty-set is non-empty,
-	// blockingFlushSessionStore will deadlock — the timeout catches that case.
-	// If the code takes WithFlushBlocked on an empty dirty-set it won't
-	// deadlock but WithFlushBlockedCalls will be non-zero (the assertion below
-	// catches THAT case — this is the vacuous-pass fix).
+	// Assert (a): MigratePNToLID completes without blocking. If a migrate work
+	// item were wrongly dispatched on the no-op path, its pre-migrate flush would
+	// hit the still-armed blocking store and deadlock — the timeout catches that.
 	done := make(chan error, 1)
 	go func() {
 		done <- c.MigratePNToLID(ctx, pn, lid)
@@ -649,25 +651,20 @@ func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
 
 	select {
 	case err := <-done:
-		// Assert (a): no error on the no-op path.
 		if err != nil {
 			t.Fatalf("MigratePNToLID: %v", err)
 		}
 	case <-time.After(500 * time.Millisecond):
-		// The blocking store fired — WithFlushBlocked was taken AND the
-		// dirty-set was non-empty (PutManySessions was called). Release it
-		// so the test can clean up, then fail.
 		close(blocking.writeRelease)
 		<-done
-		t.Fatal("MigratePNToLID blocked in WithFlushBlocked on a no-op path (no PN sessions exist) — D-02 first-send skip not implemented")
+		t.Fatal("MigratePNToLID dispatched a migrate work item on a no-op path (no PN sessions exist) — D-02 first-send skip not implemented")
 	}
 
-	// Assert (b-real): WithFlushBlocked must NOT have been entered on the
-	// no-op path. This is the primary probe — it FAILS if the no-op-skip is
-	// absent even when the dirty-set is empty (closing the vacuous-pass gap).
-	callsAfter := flusher.WithFlushBlockedCalls()
-	if delta := callsAfter - callsBefore; delta != 0 {
-		t.Errorf("WithFlushBlockedCalls delta = %d, want 0 — MigratePNToLID took WithFlushBlocked on a no-op path (no PN sessions exist, D-02 skip required)", delta)
+	// Assert (b-real): ZERO migrate work items dispatched on the no-op path. This
+	// is the primary probe — it FAILS if the no-op-skip is absent even when the
+	// dirty-set is empty (closing the vacuous-pass gap that F12 flagged).
+	if delta := flusher.MigrateDispatches() - dispatchBefore; delta != 0 {
+		t.Errorf("MigrateDispatches delta = %d, want 0 — MigratePNToLID dispatched a migrate work item on a no-op path (D-02 skip required, F12)", delta)
 	}
 
 	// Assert (c): inner.MigratePNToLID WAS called (once-per-process gate must be set).
@@ -675,9 +672,9 @@ func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
 		t.Errorf("inner.migrateCalls = %d, want 1 — inner must be called even on the no-op path (D-01)", got)
 	}
 
-	// Assert (d): a second call for the same pn returns immediately without
-	// calling inner again (IsPNMigrated gate fires for already-migrated pn).
-	callsBefore2 := flusher.WithFlushBlockedCalls()
+	// Assert (d): a second call for the same pn returns immediately and dispatches
+	// no migrate work item.
+	dispatchBefore2 := flusher.MigrateDispatches()
 	done2 := make(chan error, 1)
 	go func() {
 		done2 <- c.MigratePNToLID(ctx, pn, lid)
@@ -692,13 +689,41 @@ func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {
 		<-done2
 		t.Fatal("second MigratePNToLID blocked — IsPNMigrated gate not set by first call (D-01)")
 	}
-	// Second call must NOT have entered WithFlushBlocked (IsPNMigrated fires first
-	// for already-migrated pn — but note: fakeSessionStore is not *SQLStore so the
-	// type assertion in CachedSessionStore for IsPNMigrated always fails; inner.migrateCalls
-	// may be 2 on the fake. The WithFlushBlockedCalls assertion still holds regardless).
-	callsAfter2 := flusher.WithFlushBlockedCalls()
-	if delta := callsAfter2 - callsBefore2; delta != 0 {
-		t.Errorf("second MigratePNToLID WithFlushBlockedCalls delta = %d, want 0 — second call should not take flush-block", delta)
+	if delta := flusher.MigrateDispatches() - dispatchBefore2; delta != 0 {
+		t.Errorf("second MigratePNToLID MigrateDispatches delta = %d, want 0 — second call should dispatch no migrate work item (F12)", delta)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestCachedSession_MigrateFullPath_DispatchesOne (Phase 47.3 F12 companion)
+// When there IS PN dirty state (Branch-1, the full ordered path), MigratePNToLID
+// must dispatch EXACTLY ONE workMigratePNPrefix work item to the writer. This is
+// the positive half of the F12 probe — together with the no-op test's delta-0
+// assertion it makes the dispatch counter a real, non-vacuous regression guard.
+// ---------------------------------------------------------------------------
+
+func TestCachedSession_MigrateFullPath_DispatchesOne(t *testing.T) {
+	ctx := context.Background()
+	c, inner, _, flusher, _ := newTestCachedSessionStoreWithFlusher(t, 100)
+
+	pn := types.JID{User: "13579", Server: types.DefaultUserServer}
+	lid := types.JID{User: "888", Server: types.HiddenUserServer}
+	pnAddr := pn.SignalAddressUser() + ":0"
+
+	// Create PN dirty state so Branch-1 (full ordered path) is taken.
+	if err := c.PutSession(ctx, pnAddr, []byte("ratchet")); err != nil {
+		t.Fatalf("PutSession: %v", err)
+	}
+	if has, _ := inner.HasSession(ctx, pnAddr); has {
+		t.Fatal("setup: pn session already flushed — test needs it dirty (Branch-1 via hasDirty)")
+	}
+
+	dispatchBefore := flusher.MigrateDispatches()
+	if err := c.MigratePNToLID(ctx, pn, lid); err != nil {
+		t.Fatalf("MigratePNToLID (full path): %v", err)
+	}
+	if delta := flusher.MigrateDispatches() - dispatchBefore; delta != 1 {
+		t.Errorf("MigrateDispatches delta = %d, want 1 — the full ordered path (Branch-1, PN dirty state present) must dispatch exactly one migrate work item (F12)", delta)
 	}
 }
 
@@ -751,6 +776,44 @@ func TestCollateSafePredicate(t *testing.T) {
 	// test logic — ensures we're not accidentally using an empty string).
 	if pnPrefix == "" {
 		t.Fatal("pnPrefix is empty — test setup error")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestLikeEscapeConsistency (Phase 47.3 F11)
+// The bound LIKE prefix MUST be escaped via senderKeyLikeEscaper everywhere a
+// value is bound to a `LIKE $N || ... ESCAPE '\'` predicate — ExistsPNSession,
+// the three deleteAll* helpers, AND the three migratePNToLID* queries — so any
+// LIKE metacharacter in the prefix is treated literally. Pure-digit PN prefixes
+// have no metacharacters (the escaper is a no-op for them), but LID-form
+// prefixes contain '_' (a single-char LIKE wildcard) which raw binding would
+// over-match. This test asserts the escaper behaviour the queries now rely on:
+//   - pure digits pass through unchanged (PN prefixes — no regression),
+//   - '_' is escaped to '\_' so it matches a literal underscore only,
+//   - '%' and '\' are escaped to '\%' and '\\'.
+// It is the in-memory predicate test the review asked for; the DB-backed
+// predicate test (TestExistsPNSession_LIKEMatch) lives in store_pn_test.go.
+// ---------------------------------------------------------------------------
+
+func TestLikeEscapeConsistency(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"pure-digit-PN", "972515529399:", "972515529399:"}, // no metacharacters — escaper is a no-op
+		{"LID-underscore", "972515529399_1:", `972515529399\_1:`},
+		{"percent", "12%34:", `12\%34:`},
+		{"backslash", `12\34:`, `12\\34:`},
+		{"all-three", `a_b%c\d:`, `a\_b\%c\\d:`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := senderKeyLikeEscaper.Replace(tc.in)
+			if got != tc.want {
+				t.Errorf("senderKeyLikeEscaper.Replace(%q) = %q, want %q — LIKE bind would over/under-match (F11)", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 

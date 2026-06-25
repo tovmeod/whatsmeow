@@ -134,6 +134,10 @@ func (m *mockFlushSessionStore) MigratePNToLID(_ context.Context, pn, lid types.
 	return nil
 }
 
+// IsPNMigrated: the mock has no once-per-process gate, so every migration is a
+// real one (never an already-migrated no-op). Phase 47.3 F4 interface widening.
+func (m *mockFlushSessionStore) IsPNMigrated(string) bool { return false }
+
 // ---------------------------------------------------------------------------
 // blockingFlushSessionStore wraps any sessionWriterStore and blocks the FIRST
 // PutManySessions call between "write started" and "write released". This is
@@ -181,6 +185,10 @@ func (b *blockingFlushSessionStore) MigratePNToLID(ctx context.Context, pn, lid 
 	return b.inner.MigratePNToLID(ctx, pn, lid)
 }
 
+func (b *blockingFlushSessionStore) IsPNMigrated(pn string) bool {
+	return b.inner.IsPNMigrated(pn)
+}
+
 // ---------------------------------------------------------------------------
 // gidRecordingStore wraps a sessionWriterStore and records the goroutine id of
 // every PutManySessions call. Used by TestSingleWriter_BackpressureNoInlineWrite
@@ -215,6 +223,10 @@ func (g *gidRecordingStore) DeleteAllSessions(ctx context.Context, phone string)
 
 func (g *gidRecordingStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
 	return g.inner.MigratePNToLID(ctx, pn, lid)
+}
+
+func (g *gidRecordingStore) IsPNMigrated(pn string) bool {
+	return g.inner.IsPNMigrated(pn)
 }
 
 // callerGIDs returns the distinct goroutine ids observed across all
@@ -576,7 +588,7 @@ func TestSessionFlusher_RemoveDropsDirtyEntry(t *testing.T) {
 // TestHasDirtyPrefix_LockDiscipline
 // HasDirtyPrefix reports whether any dirty-set entry starts with a given
 // prefix — single-thread correctness + concurrent enqueue safety under -race.
-// D-03: takes only f.mu (never flushMu), mirrors RemovePrefix lock discipline.
+// D2: takes only rwmu.RLock() (no flush mutex), mirrors Remove's lock discipline.
 // ---------------------------------------------------------------------------
 
 func TestHasDirtyPrefix_LockDiscipline(t *testing.T) {
@@ -1105,5 +1117,462 @@ func assertFullWorkChBlocksProducer(t *testing.T) {
 		// Correct: once the writer drains, the blocked send completes.
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocked send never completed after the writer drained workCh")
+	}
+}
+
+// ===========================================================================
+// FAILURE-PATH tests (Phase 47.3 code-review fix-forward). The D2 happy-path
+// suite above never reached the error/shutdown/cancel branches that the xhigh
+// review flagged (F1-F6). These five tests are deterministic (no scheduling
+// reliance) and were RED against the pre-fix code:
+//   1. Shutdown-with-pending-delete (F1): a delete dispatched as the writer
+//      stops completes or returns a definitive error — never hangs, never lost.
+//   2. DB-delete-failure (F3): a failing inner delete RETAINS the dirty entry
+//      and returns the error (no torn state, no lost ratchet blob).
+//   3. Cancelled caller-ctx (F5): a delete with an already-cancelled caller ctx
+//      STILL lands the durable DB delete (writer runs a detached ctx).
+//   4. Backpressure-under-DB-failure (F6/F9): relief does NOT report relieved
+//      while still over backpressureCap; the dirty-set is brought below cap by
+//      the drop path; no unbounded re-dispatch.
+//   5. Gate-race (F4): a migration that no-ops at the gate does NOT strand PN
+//      dirty rows — they are re-validated, not destructively removed.
+// ===========================================================================
+
+// failableSessionStore is a deterministic failure-injection mock implementing
+// sessionWriterStore. Each operation kind can be made to fail (returning a
+// fixed error WITHOUT mutating the backing map) by toggling the *Fail flags.
+// Toggles are guarded by mu so a test goroutine can flip them safely while the
+// writer goroutine is running.
+type failableSessionStore struct {
+	mu           sync.Mutex
+	sessions     map[string][]byte
+	putFail      bool
+	deleteFail   bool
+	migrateFail  bool
+	migrateNoop  bool // succeed but migrate nothing (stand-in for the once-per-process gate already fired)
+	failErr      error
+	putCalls     atomic.Int64
+	deleteCalls  atomic.Int64
+	migrateCalls atomic.Int64
+}
+
+func newFailableSessionStore() *failableSessionStore {
+	return &failableSessionStore{
+		sessions: make(map[string][]byte),
+		failErr:  fmt.Errorf("injected DB failure"),
+	}
+}
+
+func (s *failableSessionStore) setPutFail(v bool)     { s.mu.Lock(); s.putFail = v; s.mu.Unlock() }
+func (s *failableSessionStore) setDeleteFail(v bool)  { s.mu.Lock(); s.deleteFail = v; s.mu.Unlock() }
+func (s *failableSessionStore) setMigrateFail(v bool) { s.mu.Lock(); s.migrateFail = v; s.mu.Unlock() }
+func (s *failableSessionStore) setMigrateNoop(v bool) { s.mu.Lock(); s.migrateNoop = v; s.mu.Unlock() }
+
+func (s *failableSessionStore) PutManySessions(_ context.Context, sessions map[string][]byte) error {
+	s.putCalls.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.putFail {
+		return s.failErr
+	}
+	for addr, blob := range sessions {
+		stored := make([]byte, len(blob))
+		copy(stored, blob)
+		s.sessions[addr] = stored
+	}
+	return nil
+}
+
+func (s *failableSessionStore) DeleteSession(ctx context.Context, address string) error {
+	s.deleteCalls.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleteFail {
+		return s.failErr
+	}
+	// F5: a delete dispatched with an already-cancelled CALLER ctx must still
+	// land. The writer runs on a detached ctx — assert the ctx the writer
+	// passed is NOT already cancelled.
+	if ctx != nil && ctx.Err() != nil {
+		return fmt.Errorf("writer ran delete on a cancelled ctx: %w", ctx.Err())
+	}
+	delete(s.sessions, address)
+	return nil
+}
+
+func (s *failableSessionStore) DeleteAllSessions(_ context.Context, phone string) error {
+	s.deleteCalls.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleteFail {
+		return s.failErr
+	}
+	pfx := phone + ":"
+	for addr := range s.sessions {
+		if strings.HasPrefix(addr, pfx) {
+			delete(s.sessions, addr)
+		}
+	}
+	return nil
+}
+
+func (s *failableSessionStore) MigratePNToLID(_ context.Context, pn, lid types.JID) error {
+	s.migrateCalls.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.migrateFail {
+		return s.failErr
+	}
+	if s.migrateNoop {
+		// Stand-in for the once-per-process gate already firing in a concurrent
+		// Branch-2 path: the inner migration returns nil but migrates NOTHING.
+		return nil
+	}
+	pnPfx := pn.SignalAddressUser() + ":"
+	lidUser := lid.SignalAddressUser()
+	var victims []string
+	for addr := range s.sessions {
+		if strings.HasPrefix(addr, pnPfx) {
+			victims = append(victims, addr)
+		}
+	}
+	for _, addr := range victims {
+		newAddr := lidUser + addr[len(pn.SignalAddressUser()):]
+		s.sessions[newAddr] = s.sessions[addr]
+		delete(s.sessions, addr)
+	}
+	return nil
+}
+
+// IsPNMigrated models the once-per-process gate for the F4 gate-race test: when
+// migrateNoop is set, the gate has "already fired" in a concurrent Branch-2
+// path, so the writer's re-validation (consumed = !IsPNMigrated) sees the
+// migration did NOT consume the PN rows and must retain them.
+func (s *failableSessionStore) IsPNMigrated(string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.migrateNoop
+}
+
+func (s *failableSessionStore) has(addr string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.sessions[addr]
+	return ok
+}
+
+// ---------------------------------------------------------------------------
+// TestFailurePath_ShutdownWithPendingDelete (F1)
+// A DeleteSession dispatched while the writer is stopping must complete or
+// return a definitive error — it must NEVER hang on <-done and NEVER be
+// silently lost. The pre-fix Drain() did ONE non-blocking workCh pass, so a
+// delete sent after that pass (but before/while Stop ran) was never processed
+// and the caller (Background ctx) blocked forever on <-done.
+// ---------------------------------------------------------------------------
+
+func TestFailurePath_ShutdownWithPendingDelete(t *testing.T) {
+	store := newFailableSessionStore()
+	store.sessions["shut:0"] = []byte("doomed")
+	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+
+	// Stop the writer FIRST: close stopCh, wait for the writer to exit, run
+	// Drain (which does its workCh-drain pass and the dirty-set flush). After
+	// Stop returns, NOTHING is reading workCh anymore.
+	f.Stop()
+
+	// Now dispatch a delete with a Background ctx (no deadline). The send lands
+	// in the buffered workCh, then DeleteSession blocks on <-done. With the
+	// pre-fix code there is no longer any consumer for workCh, so <-done hangs
+	// FOREVER — a dispatched delete silently vanishes and the caller wedges.
+	// The fix must guarantee a dispatched op ALWAYS completes or returns a
+	// definitive error (producer sends select on a stop/abort channel; or Stop
+	// is sequenced so no producer can send into an orphaned workCh).
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- f.DeleteSession(context.Background(), "shut:0")
+	}()
+
+	select {
+	case err := <-deleteDone:
+		// Acceptable: completed (err==nil, row deleted) OR a definitive error.
+		if err == nil && store.has("shut:0") {
+			t.Fatal("shut:0 still present after a no-error shutdown delete — delete silently lost (F1)")
+		}
+		if err != nil {
+			t.Logf("post-Stop delete returned a definitive error (acceptable, not a hang): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DeleteSession dispatched after Stop() hung on <-done — orphaned work-item, caller wedged forever (F1)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestFailurePath_DeleteDBFailureRetainsDirty (F3)
+// When the inner DB delete fails, the writer must RETAIN the dirty entry and
+// RETURN the error. The pre-fix code removed the dirty entry BEFORE the DB
+// delete, unconditionally — so a DB failure left torn state (dirty gone, DB row
+// still present, caller believes deleted). V1 removed dirty ONLY on success.
+// ---------------------------------------------------------------------------
+
+func TestFailurePath_DeleteDBFailureRetainsDirty(t *testing.T) {
+	store := newFailableSessionStore()
+	store.sessions["delfail:0"] = []byte("present-in-db")
+	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+	defer f.Stop()
+
+	// Seed a dirty entry for the same address.
+	f.Enqueue("delfail:0", []byte("dirty-blob"))
+	if _, ok := f.Peek("delfail:0"); !ok {
+		t.Fatal("setup: dirty entry missing")
+	}
+
+	// Make the inner delete fail.
+	store.setDeleteFail(true)
+
+	err := f.DeleteSession(context.Background(), "delfail:0")
+	if err == nil {
+		t.Fatal("DeleteSession returned nil despite an injected DB delete failure — error swallowed (F3)")
+	}
+
+	// The dirty entry must be RETAINED (not removed before a failed DB delete).
+	if _, ok := f.Peek("delfail:0"); !ok {
+		t.Fatal("dirty entry was removed despite the DB delete failing — torn state, lost ratchet blob (F3)")
+	}
+	// The DB row must still be present (the delete did not land).
+	if !store.has("delfail:0") {
+		t.Fatal("DB row gone despite injected failure — test mock inconsistency")
+	}
+
+	// Recovery: a retry after the DB heals must succeed and clear both.
+	store.setDeleteFail(false)
+	if err := f.DeleteSession(context.Background(), "delfail:0"); err != nil {
+		t.Fatalf("retry DeleteSession after DB heal: %v", err)
+	}
+	if _, ok := f.Peek("delfail:0"); ok {
+		t.Fatal("dirty entry survived a successful retry delete (F3)")
+	}
+	if store.has("delfail:0") {
+		t.Fatal("DB row survived a successful retry delete (F3)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestFailurePath_CancelledCallerCtxStillDeletes (F5)
+// A DeleteSession whose CALLER ctx is already cancelled when the writer dequeues
+// it must STILL land the durable DB delete — the writer runs the mutation on a
+// fresh background-derived ctx, detached from the caller's cancellable ctx. The
+// pre-fix writer derived its DB ctx from work.ctx, so a cancelled caller ctx
+// dropped the security delete with context.Canceled.
+// ---------------------------------------------------------------------------
+
+func TestFailurePath_CancelledCallerCtxStillDeletes(t *testing.T) {
+	store := newFailableSessionStore()
+	store.sessions["cancel:0"] = []byte("must-be-deleted")
+	b := newBlockingFlushSessionStore(store)
+	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+	defer f.Stop()
+
+	// Pause the writer mid-flush so the delete sits in workCh while we cancel.
+	f.Enqueue("filler:0", []byte("v"))
+	f.flushCh <- struct{}{}
+	<-b.writeStarted
+
+	// Dispatch the delete with a cancellable ctx, then cancel it while the item
+	// is queued behind the paused flush.
+	ctx, cancel := context.WithCancel(context.Background())
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- f.DeleteSession(ctx, "cancel:0")
+	}()
+	time.Sleep(50 * time.Millisecond) // ensure the send landed in the buffer
+	cancel()                          // caller ctx now cancelled while item is queued
+
+	// Release the flush; the writer dequeues the delete next (FIFO) and must run
+	// the DB delete on a DETACHED ctx — the failableSessionStore.DeleteSession
+	// asserts the ctx it received is not already cancelled.
+	close(b.writeRelease)
+
+	// The caller may observe ctx.Err() (it returned on ctx.Done) OR nil — either
+	// is acceptable for the CALLER. The DURABLE requirement is the DB delete
+	// landed regardless. Wait for the delete to be processed by the writer.
+	select {
+	case <-deleteDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delete caller did not return within 2s (F5)")
+	}
+	// Poll for the durable effect (the writer may complete slightly after the
+	// caller returns on ctx.Done).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !store.has("cancel:0") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if store.has("cancel:0") {
+		t.Fatal("cancel:0 still in DB — the cancelled caller ctx dropped the durable delete (F5)")
+	}
+	if store.deleteCalls.Load() == 0 {
+		t.Fatal("inner DeleteSession was never called — writer skipped the DB mutation on a cancelled ctx (F5)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestFailurePath_BackpressureUnderDBFailure (F6/F9)
+// Under sustained DB-write failure, backpressure relief must NOT report
+// "relieved" while the dirty-set is still over backpressureCap, and must bound
+// the dirty-set below backpressureCap via the drop path (no unbounded
+// re-dispatch / amplification against a failing DB). The pre-fix relief flush
+// dropped only to dropCap (40%, still above the 20% backpressureCap) yet
+// signalled done<-nil, so every later Enqueue re-dispatched a full-batch flush.
+// ---------------------------------------------------------------------------
+
+func TestFailurePath_BackpressureUnderDBFailure(t *testing.T) {
+	store := newFailableSessionStore()
+	// cap=10 -> backpressureCap=2, dropCap=4. The relief drop path must bring the
+	// dirty-set to <= backpressureCap (2) under DB failure, not merely <= dropCap.
+	f := newSessionFlusherForTest(store, 10, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+	defer f.Stop()
+
+	store.setPutFail(true) // every flush fails
+
+	// Drive enough distinct writes to repeatedly cross backpressureCap. Each
+	// over-cap Enqueue dispatches a workFlushSync; the relief flush fails (DB
+	// down) and must drop the dirty-set below backpressureCap rather than
+	// signalling relieved while still over cap.
+	for i := 0; i < 60; i++ {
+		f.Enqueue(fmt.Sprintf("bpf-%d:0", i), []byte("v"))
+	}
+
+	// After the failing-DB backpressure storm, the dirty-set must be bounded at
+	// or below backpressureCap (relief actually relieved). The pre-fix code
+	// latched at dropCap (4) > backpressureCap (2).
+	if dc := f.DirtyCount(); dc > f.backpressureCap {
+		t.Fatalf("dirty-set = %d after backpressure relief under DB failure, want <= backpressureCap (%d) — relief signalled relieved while still over cap (F6/F9)", dc, f.backpressureCap)
+	}
+
+	// The DB stayed down the whole time, so nothing should have persisted.
+	if store.putCalls.Load() == 0 {
+		t.Fatal("no relief flush was ever attempted — backpressure path not exercised (test setup)")
+	}
+
+	// Heal the DB so the deferred Stop()'s Drain does not have to burn the full
+	// F2 deadline retrying a down DB (keeps the test fast; the F2 bound itself is
+	// covered by TestFailurePath_ShutdownWithPendingDelete's Drain path and the
+	// drainTotalDeadline logic).
+	store.setPutFail(false)
+}
+
+// ---------------------------------------------------------------------------
+// TestFailurePath_MigrateGateRaceDoesNotStrandPN (F4)
+// processMigratePNPrefix must NOT destructively remove PN dirty rows when the
+// inner migration does not actually consume them (e.g. the once-per-process
+// gate already fired in a concurrent Branch-2 path → inner.MigratePNToLID
+// no-ops). The pre-fix code flushed + unconditionally removed PN dirty rows
+// before calling inner; if inner no-op'd, those rows were orphaned (never
+// migrated, never re-migrated). The fix re-validates: on a no-op migration the
+// PN dirty rows are NOT lost (they remain available for a real migration).
+// ---------------------------------------------------------------------------
+
+func TestFailurePath_MigrateGateRaceDoesNotStrandPN(t *testing.T) {
+	store := newFailableSessionStore()
+	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.Start()
+	defer f.Stop()
+
+	pn := types.JID{User: "12345", Server: types.DefaultUserServer}
+	lid := types.JID{User: "777", Server: types.HiddenUserServer}
+	pnAddr := pn.SignalAddressUser() + ":0"
+	lidAddr := lid.SignalAddressUser() + ":0"
+
+	// Seed a dirty PN entry. It is NOT yet in the DB.
+	f.Enqueue(pnAddr, []byte("ratchet"))
+
+	// Gate-race stand-in: the inner migration succeeds (nil) but migrates
+	// NOTHING — exactly what happens when a concurrent Branch-2 path already
+	// fired the once-per-process gate (s.migratedPNSessionsCache.Add returns
+	// false → MigratePNToLID returns nil early without touching the rows). The
+	// pre-fix processMigratePNPrefix flushed + UNCONDITIONALLY removed the PN
+	// dirty rows BEFORE this no-op inner call, so the PN state is orphaned:
+	// removed from the dirty-set, and (because the once-per-process gate stays
+	// set this process) never migrated to LID and never re-migrated.
+	store.setMigrateNoop(true)
+
+	if err := f.MigratePNToLID(context.Background(), pn, lid); err != nil {
+		t.Fatalf("MigratePNToLID (no-op gate-race): %v", err)
+	}
+
+	// FIX PRINCIPLE (F4): PN dirty state must NOT be destructively removed unless
+	// the migration actually consumed it. The inner migration migrated nothing
+	// (no-op), so the PN dirty entry must be RETAINED — its ratchet blob is the
+	// only fresh copy not yet migrated to LID. The pre-fix code removed it
+	// unconditionally, stranding it.
+	if _, ok := f.Peek(pnAddr); !ok {
+		t.Fatal("PN dirty entry was destructively removed after a no-op migration that consumed nothing — stranded PN state, never migrated, never re-migratable this process (F4)")
+	}
+	// The blob must be intact (unchanged generation).
+	if got, _ := f.Peek(pnAddr); string(got) != "ratchet" {
+		t.Fatalf("retained PN dirty blob = %q, want \"ratchet\" (F4)", got)
+	}
+
+	// Recovery: when a REAL migration runs (gate clears), the retained PN dirty
+	// state migrates correctly to LID.
+	store.setMigrateNoop(false)
+	if err := f.MigratePNToLID(context.Background(), pn, lid); err != nil {
+		t.Fatalf("retry MigratePNToLID after gate clears: %v", err)
+	}
+	if !store.has(lidAddr) {
+		t.Fatal("LID row missing after a real retry migration — retained PN dirty state did not migrate (F4)")
+	}
+	if _, ok := f.Peek(pnAddr); ok {
+		t.Fatal("PN dirty entry survived a real migration that consumed it (F4)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestFailurePath_DrainBoundedUnderDBDown (F2)
+// Drain's PutManySessions retry loop must be bounded by a total deadline so a
+// DB-down-at-shutdown does NOT wedge Stop()/Container.Close() until SIGKILL.
+// The pre-fix Drain retried forever (100ms sleep, no cap). This test injects a
+// short drain deadline and a permanently-failing DB, then asserts Stop()
+// returns within the deadline + a margin instead of hanging.
+// ---------------------------------------------------------------------------
+
+func TestFailurePath_DrainBoundedUnderDBDown(t *testing.T) {
+	store := newFailableSessionStore()
+	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
+	f.boundaryN = 1 << 30
+	f.drainDeadline = 300 * time.Millisecond // short bound for the test
+	f.Start()
+
+	f.Enqueue("drainbound:0", []byte("never-persists"))
+	store.setPutFail(true) // DB permanently down
+
+	stopDone := make(chan struct{})
+	go func() {
+		f.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+		// Correct: Drain abandoned the retry after the deadline; Stop completed.
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not complete — Drain retried a down DB forever (F2)")
+	}
+
+	// The dirty entry was never persisted (DB down) — bounded crash-loss INV-7
+	// accepts this. The point is that shutdown COMPLETED rather than wedging.
+	if store.has("drainbound:0") {
+		t.Fatal("entry persisted despite a down DB — test mock inconsistency")
 	}
 }

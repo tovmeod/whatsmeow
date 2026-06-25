@@ -198,6 +198,11 @@ func (f *fakeSessionStore) MigratePNToLID(_ context.Context, pn, lid types.JID) 
 	return nil
 }
 
+// IsPNMigrated: the fake has no once-per-process gate, so every migration is a
+// real one (consumed). Phase 47.3 F4 interface widening — fakeSessionStore is
+// used as the writer-store backing in cached-store flusher tests.
+func (f *fakeSessionStore) IsPNMigrated(string) bool { return false }
+
 // ---------------------------------------------------------------------------
 // fakeIdentityStore implements store.IdentityStore (store/store.go:23-28).
 // ---------------------------------------------------------------------------

@@ -78,7 +78,7 @@ const (
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
 	deleteIdentityQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
-	getIdentityQuery         = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	getIdentityQuery    = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
 )
 
 func (s *SQLStore) PutIdentity(ctx context.Context, address string, key [32]byte) error {
@@ -92,10 +92,12 @@ func (s *SQLStore) DeleteAllIdentities(ctx context.Context, phone string) error 
 	// deleteAllIdentitiesQuery used the broken range idiom
 	// (their_id >= $2||':' AND their_id < $2||';') which silently deleted 0 rows
 	// on en_US.utf8 — making the identity-change handler (notification.go:55) a no-op
-	// for ~1 month (ef91440, 2026-05-25). phone is bound raw (pure digits from
-	// from.User); no escaper needed here — the LIKE metacharacter risk only applies
-	// to LID-form prefixes, which ExistsPNSession handles separately.
-	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, phone)
+	// for ~1 month (ef91440, 2026-05-25).
+	// F11 (Phase 47.3): escape the bound LIKE prefix consistently with
+	// ExistsPNSession and the other delete/migrate queries. phone is pure digits
+	// today (from from.User) — the escaper is a no-op for digits and a
+	// correctness guard for any future LID-form prefix ('_' is a LIKE wildcard).
+	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
 	return err
 }
 
@@ -162,11 +164,16 @@ const (
 	// migratePNToLIDSessionsQuery copies session rows from PN-format their_id to
 	// LID-format their_id. kavtov-fork Phase 47.3 D-06: LIKE replaces broken range
 	// (see deleteAllSessionsQuery comment above).
+	// F11 (Phase 47.3 fix-forward): the LIKE predicate binds $4 (the
+	// senderKeyLikeEscaper-escaped prefix) so any LIKE metacharacter in the
+	// prefix is treated literally — CONSISTENT with ExistsPNSession and the
+	// delete queries. $2 stays RAW for replace() (a literal substring replace,
+	// not a pattern) — escaping it would replace the escaped form, not the data.
 	migratePNToLIDSessionsQuery = `
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session)
 		SELECT our_jid, replace(their_id, $2, $3), session
 		FROM whatsmeow_sessions
-		WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'
+		WHERE our_jid=$1 AND their_id LIKE $4 || ':%' ESCAPE '\'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
 	// deleteAllIdentityKeysQuery removes all PN-form identity key rows.
@@ -179,12 +186,13 @@ const (
 	//      deleteAllIdentitiesQuery (removed Phase 47.3 amendment 2026-06-25) was a duplicate
 	//      of this query using the broken range idiom that silently deleted 0 rows on
 	//      en_US.utf8 (ef91440 regression, 2026-05-25).
-	deleteAllIdentityKeysQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'`
+	deleteAllIdentityKeysQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'`
+	// F11: LIKE binds the escaped $4; replace() keeps raw $2 (see sessions query).
 	migratePNToLIDIdentityKeysQuery = `
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity)
 		SELECT our_jid, replace(their_id, $2, $3), identity
 		FROM whatsmeow_identity_keys
-		WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'
+		WHERE our_jid=$1 AND their_id LIKE $4 || ':%' ESCAPE '\'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
 	// deleteAllSenderKeysQuery removes all PN-form sender-key rows. Uses sender_id
@@ -197,11 +205,12 @@ const (
 	// sender_id, sender_key) — the flat bytea is copied as-is. The LID row's sender_key
 	// is the donor row's flat blob; the next write will replace it on ratchet advance.
 	// kavtov-fork Phase 47.3 D-06: LIKE replaces broken range idiom (sender_id column).
+	// F11: LIKE binds the escaped $4; replace() keeps raw $2 (see sessions query).
 	migratePNToLIDSenderKeysQuery = `
 		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
 		SELECT our_jid, chat_id, replace(sender_id, $2, $3), sender_key
 		FROM whatsmeow_sender_keys
-		WHERE our_jid=$1 AND sender_id LIKE $2 || ':%' ESCAPE '\'
+		WHERE our_jid=$1 AND sender_id LIKE $4 || ':%' ESCAPE '\'
 		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
 			sender_key=excluded.sender_key
 	`
@@ -317,17 +326,21 @@ func (s *SQLStore) DeleteAllSessions(ctx context.Context, phone string) error {
 }
 
 func (s *SQLStore) deleteAllSessions(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllSessionsQuery, s.JID, phone)
+	// F11 (Phase 47.3): escape the bound LIKE prefix CONSISTENTLY with
+	// ExistsPNSession. Defensive — PN prefixes are pure digits today, but a
+	// LID-form prefix contains '_' (a LIKE wildcard); raw binding would
+	// over-match. Escaping every LIKE query removes the asymmetric footgun.
+	_, err := s.db.Exec(ctx, deleteAllSessionsQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
 	return err
 }
 
 func (s *SQLStore) deleteAllSenderKeys(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllSenderKeysQuery, s.JID, phone)
+	_, err := s.db.Exec(ctx, deleteAllSenderKeysQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
 	return err
 }
 
 func (s *SQLStore) deleteAllIdentityKeys(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, phone)
+	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
 	return err
 }
 
@@ -350,8 +363,13 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 	}
 	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
 	lidSignal := lid.SignalAddressUser()
+	// F11 (Phase 47.3): $4 is the senderKeyLikeEscaper-escaped prefix bound to the
+	// LIKE predicate in each migrate query; $2 stays RAW (pnSignal) for replace(),
+	// which is a literal substring replace, not a pattern. Escaping the LIKE bind
+	// makes these queries CONSISTENT with ExistsPNSession / the delete queries.
+	escapedPN := senderKeyLikeEscaper.Replace(pnSignal)
 	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		res, err := s.db.Exec(ctx, migratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal)
+		res, err := s.db.Exec(ctx, migratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal, escapedPN)
 		if err != nil {
 			return fmt.Errorf("failed to migrate sessions: %w", err)
 		}
@@ -364,7 +382,7 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 			return fmt.Errorf("failed to delete extra sessions: %w", err)
 		}
 
-		res, err = s.db.Exec(ctx, migratePNToLIDIdentityKeysQuery, s.JID, pnSignal, lidSignal)
+		res, err = s.db.Exec(ctx, migratePNToLIDIdentityKeysQuery, s.JID, pnSignal, lidSignal, escapedPN)
 		if err != nil {
 			return fmt.Errorf("failed to migrate identity keys: %w", err)
 		}
@@ -377,7 +395,7 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 			return fmt.Errorf("failed to delete extra identity keys: %w", err)
 		}
 
-		res, err = s.db.Exec(ctx, migratePNToLIDSenderKeysQuery, s.JID, pnSignal, lidSignal)
+		res, err = s.db.Exec(ctx, migratePNToLIDSenderKeysQuery, s.JID, pnSignal, lidSignal, escapedPN)
 		if err != nil {
 			return fmt.Errorf("failed to migrate sender keys: %w", err)
 		}

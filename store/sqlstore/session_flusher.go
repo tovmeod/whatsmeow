@@ -104,6 +104,13 @@ type sessionWriterStore interface {
 	DeleteSession(ctx context.Context, address string) error
 	DeleteAllSessions(ctx context.Context, phone string) error
 	MigratePNToLID(ctx context.Context, pn, lid types.JID) error
+	// IsPNMigrated reports whether the once-per-process PN→LID gate has already
+	// fired for pnSignal WITHOUT mutating it. The writer re-checks it inside
+	// processMigratePNPrefix before destructively removing PN dirty rows: if a
+	// concurrent Branch-2 path fired the gate after this work item was dispatched,
+	// inner.MigratePNToLID would no-op, so the writer must NOT drop the PN dirty
+	// rows (they are the only fresh copy not yet migrated). Phase 47.3 F4 fix.
+	IsPNMigrated(pnSignal string) bool
 }
 
 // workKind identifies the type of write work the single writer goroutine must
@@ -186,22 +193,86 @@ type SessionFlusher struct {
 	// separate from workCh so coalescing flush signals never starve work items.
 	flushCh chan struct{}
 
+	// abortCh is closed once the writer has permanently stopped consuming workCh
+	// AND Stop()'s Drain has finished its final workCh drain. A producer that is
+	// blocked on a workCh send or on <-done selects on abortCh so a work item
+	// dispatched during/after shutdown returns a definitive error instead of
+	// hanging forever (Phase 47.3 F1 — no orphaned, never-drained work item).
+	abortCh chan struct{}
+
 	stopCh   chan struct{}
 	stopOnce sync.Once // makes Stop idempotent (double-Stop must not double-close stopCh)
 	wg       sync.WaitGroup
 
 	flushInterval time.Duration // injectable for tests; default 5s
 
-	// withFlushBlockedCalls is retained from V1 as a test probe. In D2 nothing
-	// increments it (WithFlushBlocked is removed; the no-op-skip path in
-	// MigratePNToLID never dispatches a work item), so it stays at 0 — exactly
-	// what TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend asserts (the
-	// no-op path must not take any flush coordination).
-	withFlushBlockedCalls atomic.Uint64
+	// drainDeadline bounds Drain's PutManySessions retry loop on shutdown (F2).
+	// Default drainTotalDeadline (30s); injectable shorter for tests.
+	drainDeadline time.Duration
+
+	// migrateDispatches counts how many workMigratePNPrefix work items have been
+	// dispatched to the writer (Phase 47.3 F12 — replaces the permanently-zero
+	// withFlushBlockedCalls probe). The no-op MigratePNToLID path (Branch-2 /
+	// Branch-3) dispatches ZERO; the full ordered path (Branch-1) dispatches
+	// exactly one. TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend asserts
+	// a delta of 0 across the no-op call — a REAL probe (a D-02 regression that
+	// wrongly dispatched a work item would now be caught, where the old vacuous
+	// zero counter could not).
+	migrateDispatches atomic.Uint64
 }
 
 // workChBuffer is the workCh buffer size (design §11/§12.1 discretion item).
 const workChBuffer = 256
+
+// drainTotalDeadline bounds Drain()'s PutManySessions retry loop on shutdown so
+// a DB-down-at-shutdown cannot wedge Stop()/Container.Close() until systemd
+// SIGKILL (Phase 47.3 F2). On exhaustion Drain logs and returns so shutdown
+// completes (the unflushed dirty-set is the bounded crash-loss INV-7 already
+// accepts).
+const drainTotalDeadline = 30 * time.Second
+
+// errFlusherStopped is returned to a producer whose synchronous work item could
+// not be dispatched to (or completed by) the writer because the flusher is
+// shutting down. A definitive error — never a hang (Phase 47.3 F1).
+var errFlusherStopped = fmt.Errorf("session flusher stopped")
+
+// dispatchSync sends a synchronous work item to the writer and blocks on its
+// done channel. Every send/receive selects on abortCh so a work item dispatched
+// during or after shutdown returns errFlusherStopped (or the caller's ctx error)
+// instead of hanging forever on an orphaned workCh (Phase 47.3 F1). The done
+// channel is buffered (1) by the caller, so a writer that completes the item
+// after the caller already returned on abortCh/ctx never blocks.
+func (f *SessionFlusher) dispatchSync(work writeWork) error {
+	if work.done == nil {
+		// Programmer error: synchronous dispatch requires a done channel.
+		return fmt.Errorf("dispatchSync called with nil done channel")
+	}
+	select {
+	case f.workCh <- work:
+	case <-f.abortCh:
+		return errFlusherStopped
+	case <-work.ctx.Done():
+		return work.ctx.Err()
+	}
+	select {
+	case err := <-work.done:
+		return err
+	case <-f.abortCh:
+		// The writer is gone, but the item may already be buffered in workCh.
+		// Stop()'s Drain processes the buffered workCh before closing abortCh,
+		// so a still-buffered item completes and lands on done first (selected
+		// above). Reaching here means the item will not be processed — return a
+		// definitive error rather than hang.
+		select {
+		case err := <-work.done:
+			return err
+		default:
+			return errFlusherStopped
+		}
+	case <-work.ctx.Done():
+		return work.ctx.Err()
+	}
+}
 
 // NewSessionFlusher constructs a SessionFlusher with prod defaults. cap=0 uses
 // the env var / compiled default. log is used for error / info logging.
@@ -225,8 +296,10 @@ func NewSessionFlusher(db sessionWriterStore, log waLog.Logger, cap int) *Sessio
 		dirty:           make(map[string]*sessionDirtyEntry, 1024),
 		workCh:          make(chan writeWork, workChBuffer),
 		flushCh:         make(chan struct{}, 1),
+		abortCh:         make(chan struct{}),
 		stopCh:          make(chan struct{}),
 		flushInterval:   time.Duration(tms) * time.Millisecond,
+		drainDeadline:   drainTotalDeadline,
 	}
 }
 
@@ -252,18 +325,9 @@ func (f *SessionFlusher) DirtyCount() int {
 // runFlush/Drain directly, which would race the writer). Returns an error if
 // the writer does not complete within 5s.
 func (f *SessionFlusher) flushSyncForTest() error {
-	done := make(chan error, 1)
-	select {
-	case f.workCh <- writeWork{kind: workFlushSync, done: done}:
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("flushSyncForTest: workCh send timed out")
-	}
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("flushSyncForTest: writer did not complete within 5s")
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return f.dispatchSync(writeWork{kind: workFlushSync, ctx: ctx, done: make(chan error, 1)})
 }
 
 // crossesBoundary returns true when the advance count crosses an N-boundary
@@ -343,20 +407,22 @@ func (f *SessionFlusher) EnqueueAndMirror(address string, blob []byte, mirror fu
 	// backpressure — it slows this producer until the writer relieves the
 	// dirty-set. rwmu is NOT held here, so no deadlock with the writer's
 	// snapshot/clear. NO DB write happens on this goroutine (design §9).
+	//
+	// Phase 47.3 F6/F9: the relief work item runs reliefFlush in the writer,
+	// which guarantees the dirty-set ends at or below backpressureCap even under
+	// DB-write failure (it drops coldest down to backpressureCap, not merely
+	// dropCap). The writer signals the relief error on done; we log and return —
+	// we do NOT loop re-dispatching a full-batch flush against a failing DB
+	// (that was the throughput-collapse amplification). A single relief per
+	// over-cap Enqueue is sufficient because reliefFlush already brings the
+	// dirty-set below the threshold.
 	if needsRelief {
-		done := make(chan error, 1)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		select {
-		case f.workCh <- writeWork{kind: workFlushSync, ctx: ctx, done: done}:
-			// workCh full -> the send above blocks (bounded by ctx) = backpressure.
-			select {
-			case <-done:
-			case <-ctx.Done():
-				f.log.Errorf("SessionFlusher backpressure relief timed out addr=%s", address)
-			}
-		case <-ctx.Done():
-			f.log.Errorf("SessionFlusher backpressure enqueue timed out addr=%s", address)
+		if err := f.dispatchSync(writeWork{kind: workFlushSync, ctx: ctx, done: make(chan error, 1)}); err != nil {
+			// Relief failed (DB down or shutting down). reliefFlush has already
+			// bounded the dirty-set via the drop path; do NOT re-dispatch.
+			f.log.Errorf("SessionFlusher backpressure relief failed addr=%s: %v", address, err)
 		}
 	}
 }
@@ -411,18 +477,6 @@ func (f *SessionFlusher) Remove(address string) {
 	f.rwmu.Unlock()
 }
 
-// RemovePrefix drops every dirty entry whose address starts with prefix.
-// Brief rwmu.Lock() only. Retained for direct callers / tests.
-func (f *SessionFlusher) RemovePrefix(prefix string) {
-	f.rwmu.Lock()
-	for addr := range f.dirty {
-		if strings.HasPrefix(addr, prefix) {
-			delete(f.dirty, addr)
-		}
-	}
-	f.rwmu.Unlock()
-}
-
 // HasDirtyPrefix reports whether any address in the dirty-set starts with prefix.
 // Concurrent-read via rwmu.RLock() (D2: updated from V1's f.mu, design §6).
 // A false result has a brief false-negative window (D-05): a PN row could be
@@ -448,18 +502,15 @@ func (f *SessionFlusher) HasDirtyPrefix(prefix string) bool {
 // completed both the DB delete and the dirty-set removal, so no read can find
 // the dirty entry after the LRU is cleared.
 func (f *SessionFlusher) DeleteSession(ctx context.Context, address string) error {
-	done := make(chan error, 1)
-	select {
-	case f.workCh <- writeWork{kind: workDeleteSingle, ctx: ctx, address: address, done: done}:
-	case <-ctx.Done():
-		return ctx.Err()
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return f.dispatchSync(writeWork{
+		kind:    workDeleteSingle,
+		ctx:     ctx,
+		address: address,
+		done:    make(chan error, 1),
+	})
 }
 
 // DeleteAllSessions dispatches a workDeletePrefix work item and blocks on done.
@@ -469,25 +520,16 @@ func (f *SessionFlusher) DeleteSession(ctx context.Context, address string) erro
 // expects (it appends ':%' itself); the dirty-set sweep matches "<phone>:" so
 // the in-memory and DB removals cover the same address set (design §5 note).
 func (f *SessionFlusher) DeleteAllSessions(ctx context.Context, phone string) error {
-	done := make(chan error, 1)
-	work := writeWork{
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return f.dispatchSync(writeWork{
 		kind:   workDeletePrefix,
 		ctx:    ctx,
 		prefix: phone + ":",
 		phone:  phone,
-		done:   done,
-	}
-	select {
-	case f.workCh <- work:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+		done:   make(chan error, 1),
+	})
 }
 
 // MigratePNToLID dispatches a workMigratePNPrefix work item and blocks on done.
@@ -497,35 +539,51 @@ func (f *SessionFlusher) DeleteAllSessions(ctx context.Context, phone string) er
 // with flushes inside the single writer. pnSignal is the bare PN signal user;
 // pnPrefix is "<pnSignal>:" for the dirty-set sweep.
 func (f *SessionFlusher) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
-	done := make(chan error, 1)
-	work := writeWork{
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// F12 probe: count the migrate work-item dispatch. Only Branch-1 (the full
+	// ordered path) calls this method; the no-op/nil-flusher branches call
+	// inner.MigratePNToLID directly, so this counter stays at 0 for them.
+	f.migrateDispatches.Add(1)
+	return f.dispatchSync(writeWork{
 		kind:   workMigratePNPrefix,
 		ctx:    ctx,
 		prefix: pn.SignalAddressUser() + ":",
 		pn:     pn,
 		lid:    lid,
-		done:   done,
-	}
-	select {
-	case f.workCh <- work:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+		done:   make(chan error, 1),
+	})
 }
 
-// WithFlushBlockedCalls returns the V1 test-probe counter. In D2 nothing
-// increments it (WithFlushBlocked is removed; the no-op-skip path dispatches no
-// work item), so it stays at 0 — which is what
-// TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend asserts (the no-op
-// migrate path takes no flush coordination).
-func (f *SessionFlusher) WithFlushBlockedCalls() uint64 {
-	return f.withFlushBlockedCalls.Load()
+// MigrateDispatches returns the number of workMigratePNPrefix work items
+// dispatched to the writer (Phase 47.3 F12 — a REAL probe replacing the
+// permanently-zero V1 withFlushBlockedCalls counter). The no-op MigratePNToLID
+// path dispatches ZERO; the full ordered path dispatches exactly one. A test can
+// assert the delta across a call to verify the no-op-skip took no flush
+// coordination (delta 0) and the full path did (delta 1).
+func (f *SessionFlusher) MigrateDispatches() uint64 {
+	return f.migrateDispatches.Load()
+}
+
+// clearStaleLocked applies the CR-02 staleness guard for a completed batch:
+// for each address that was in the snapshot, record the drained generation and
+// delete the dirty entry ONLY if no newer Enqueue arrived during the in-flight
+// DB write (e.advCount == snapAdv). If a newer blob arrived mid-write the entry
+// stays dirty (the newer generation flushes next cycle) — clearing it
+// unconditionally would drop the newer blob from the durable path forever.
+// Must be called with rwmu.Lock() held. Phase 47.3 F14: this clear pass was
+// copy-pasted in runFlush, reliefFlush, and Drain; extracting it ensures a
+// future guard fix applies to every flush path, not silently to one copy.
+func (f *SessionFlusher) clearStaleLocked(advAt map[string]uint32) {
+	for addr, snapAdv := range advAt {
+		if e, ok := f.dirty[addr]; ok {
+			e.lastDrain = snapAdv
+			if e.advCount == snapAdv {
+				delete(f.dirty, addr)
+			}
+		}
+	}
 }
 
 // dropColdestLocked removes one entry from the dirty-set (pseudo-random map
@@ -572,24 +630,12 @@ func (f *SessionFlusher) runFlush() {
 		return
 	}
 
-	// Step 3: CR-02 staleness guard under a brief write lock. Only clear an
-	// entry if no newer Enqueue arrived during the in-flight DB write — deleting
-	// unconditionally would drop the newer blob from the durable path forever
-	// (DB holds the snapshot generation; the only copy of the newer blob would
-	// be the evictable LRU mirror). The writer holds NO lock during step 2, so a
-	// concurrent EnqueueAndMirror can increment advCount; the e.advCount ==
-	// snapAdv check fires and the entry stays dirty.
+	// Step 3: CR-02 staleness guard under a brief write lock (F14 helper). Only
+	// clear an entry if no newer Enqueue arrived during the in-flight DB write.
+	// The writer holds NO lock during step 2, so a concurrent EnqueueAndMirror
+	// can increment advCount; clearStaleLocked keeps such entries dirty.
 	f.rwmu.Lock()
-	for addr, snapAdv := range advAt {
-		if e, ok := f.dirty[addr]; ok {
-			e.lastDrain = snapAdv
-			if e.advCount == snapAdv {
-				delete(f.dirty, addr)
-			}
-			// else: a newer blob arrived mid-write — the entry stays dirty
-			// (with the newer blob) and flushes on the next cycle.
-		}
-	}
+	f.clearStaleLocked(advAt)
 	f.rwmu.Unlock()
 }
 
@@ -600,41 +646,52 @@ func (f *SessionFlusher) runFlush() {
 func (f *SessionFlusher) processWork(work writeWork) {
 	switch work.kind {
 	case workFlushSync:
-		// Backpressure relief: a full dirty-set flush, FIFO-ordered with deletes
-		// and migrates. The producer (EnqueueAndMirror) blocks on done.
-		f.runFlush()
+		// Backpressure relief: bound the dirty-set to <= backpressureCap even
+		// under DB-write failure (Phase 47.3 F6/F9). The producer
+		// (EnqueueAndMirror) blocks on done and gets the relief error.
+		err := f.reliefFlush()
 		if work.done != nil {
-			work.done <- nil
+			work.done <- err
 		}
 
 	case workDeleteSingle:
-		// Step 1: remove from dirty-set under a brief write lock.
-		f.rwmu.Lock()
-		delete(f.dirty, work.address)
-		f.rwmu.Unlock()
-		// Step 2: DB delete — NO lock held. Runs AFTER any in-flight flush's
-		// UPSERT (FIFO), so the row ends up deleted, never resurrected (CR-01).
+		// Phase 47.3 F3: DB delete FIRST; remove the dirty entry ONLY on success.
+		// On DB error keep the dirty entry and return the error — no torn state
+		// (V1 ordering: the dirty entry was the only fresh copy; dropping it
+		// before a failed DB delete would lose the ratchet blob AND leave the DB
+		// row, with the caller believing the session deleted).
+		//
+		// CR-01 ordering is preserved: this runs AFTER any in-flight flush's
+		// UPSERT (single-writer FIFO), so the DELETE lands after the UPSERT and
+		// the row ends up deleted, never resurrected.
 		ctx, cancel := f.workCtx(work.ctx)
 		err := f.db.DeleteSession(ctx, work.address)
 		cancel()
+		if err == nil {
+			f.rwmu.Lock()
+			delete(f.dirty, work.address)
+			f.rwmu.Unlock()
+		}
 		if work.done != nil {
 			work.done <- err
 		}
 
 	case workDeletePrefix:
-		// Step 1: sweep prefix-matching dirty entries under a brief write lock.
-		f.rwmu.Lock()
-		for addr := range f.dirty {
-			if strings.HasPrefix(addr, work.prefix) {
-				delete(f.dirty, addr)
-			}
-		}
-		f.rwmu.Unlock()
-		// Step 2: DB delete — NO lock held. work.phone is the bare phone the
-		// helper expects (it appends ':%' itself via deleteAllSessionsQuery).
+		// Phase 47.3 F3: DB prefix-delete FIRST; sweep the dirty-set ONLY on
+		// success. work.phone is the bare phone the helper expects (it appends
+		// ':%' itself via deleteAllSessionsQuery).
 		ctx, cancel := f.workCtx(work.ctx)
 		err := f.db.DeleteAllSessions(ctx, work.phone)
 		cancel()
+		if err == nil {
+			f.rwmu.Lock()
+			for addr := range f.dirty {
+				if strings.HasPrefix(addr, work.prefix) {
+					delete(f.dirty, addr)
+				}
+			}
+			f.rwmu.Unlock()
+		}
 		if work.done != nil {
 			work.done <- err
 		}
@@ -650,18 +707,75 @@ func (f *SessionFlusher) processWork(work writeWork) {
 	}
 }
 
-// processMigratePNPrefix flushes PN-prefix dirty entries, removes them, then
-// runs the inner migration (CR-04). Writer goroutine only; no lock across I/O.
+// reliefFlush is the backpressure-relief flush (Phase 47.3 F6/F9). Unlike
+// runFlush (the periodic/N-boundary flush, which on DB failure drops only to
+// dropCap), reliefFlush GUARANTEES the dirty-set ends at or below
+// backpressureCap on return — that is what makes the relief actually relieve.
+// On a successful DB write it clears the snapshot generation (CR-02 guard) and
+// returns nil. On DB-write failure it drops coldest entries down to
+// backpressureCap (bounding memory AND guaranteeing the producer's needsRelief
+// condition is false next time) and returns the DB error so the producer can
+// log it — without the producer re-dispatching a full-batch flush against the
+// failing DB (the throughput-collapse amplification the review flagged).
+// Writer goroutine only; no lock held across the DB write.
+func (f *SessionFlusher) reliefFlush() error {
+	// Step 1: snapshot under a brief write lock.
+	f.rwmu.Lock()
+	if len(f.dirty) == 0 {
+		f.rwmu.Unlock()
+		return nil
+	}
+	batch := make(map[string][]byte, len(f.dirty))
+	advAt := make(map[string]uint32, len(f.dirty))
+	for addr, e := range f.dirty {
+		batch[addr] = copyBytes(e.blob)
+		advAt[addr] = e.advCount
+	}
+	f.rwmu.Unlock()
+
+	// Step 2: DB write — NO lock held.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := f.db.PutManySessions(ctx, batch)
+	cancel()
+
+	if err != nil {
+		f.log.Errorf("SessionFlusher relief flush failed (%d rows): %v", len(batch), err)
+		// Drop coldest down to backpressureCap so the relief actually relieves
+		// (NOT merely to dropCap, which stays above backpressureCap and re-arms
+		// the producer's needsRelief on the very next Enqueue — F6/F9).
+		f.rwmu.Lock()
+		for len(f.dirty) > f.backpressureCap {
+			f.dropColdestLocked()
+		}
+		f.rwmu.Unlock()
+		return err
+	}
+
+	// Step 3: CR-02 staleness guard (same rationale as runFlush).
+	f.rwmu.Lock()
+	f.clearStaleLocked(advAt)
+	f.rwmu.Unlock()
+	return nil
+}
+
+// processMigratePNPrefix flushes PN-prefix dirty entries, runs the inner
+// migration, then removes the PN dirty entries ONLY IF the migration actually
+// consumed them (CR-04 + Phase 47.3 F4). Writer goroutine only; no lock across
+// I/O.
 func (f *SessionFlusher) processMigratePNPrefix(work writeWork) {
 	ctx, cancel := f.workCtx(work.ctx)
 	defer cancel()
 
-	// Step 1: snapshot PN-prefix dirty entries under a brief write lock.
+	// Step 1: single-pass collection of PN-prefix dirty keys + their blobs under
+	// a brief write lock (F13: was a double map scan — collect once here, reuse
+	// pnKeys for the conditional remove in step 4).
 	f.rwmu.Lock()
 	pnBatch := make(map[string][]byte)
+	pnKeys := make([]string, 0)
 	for addr, e := range f.dirty {
 		if strings.HasPrefix(addr, work.prefix) {
 			pnBatch[addr] = copyBytes(e.blob)
+			pnKeys = append(pnKeys, addr)
 		}
 	}
 	f.rwmu.Unlock()
@@ -675,44 +789,76 @@ func (f *SessionFlusher) processMigratePNPrefix(work writeWork) {
 		}
 	}
 
-	// Step 3: remove PN-prefix entries from the dirty-set so a later flush
-	// cannot re-insert a zombie pn row after the migration deletes the pn rows.
-	// Unconditional removal (NOT the CR-02 generation guard): a retained newer
-	// pn entry would flush back as a zombie. A writer mutating a pn address
-	// concurrently with its own migration races the migration itself.
-	f.rwmu.Lock()
-	for addr := range f.dirty {
-		if strings.HasPrefix(addr, work.prefix) {
-			delete(f.dirty, addr)
-		}
-	}
-	f.rwmu.Unlock()
+	// Step 3: F4 gate re-validation. If a concurrent Branch-2 path fired the
+	// once-per-process gate after this work item was dispatched, the inner
+	// MigratePNToLID below will NO-OP (migrate nothing) — and removing the PN
+	// dirty rows would orphan them (never migrated, never re-migratable this
+	// process). Re-check the gate INSIDE the writer (serialized with all other
+	// mutations): only run the destructive remove if the gate has NOT already
+	// fired, i.e. THIS migration is the one that will consume the rows.
+	consumed := !f.db.IsPNMigrated(work.pn.SignalAddressUser())
 
 	// Step 4: inner migration — NO lock held.
-	work.done <- f.db.MigratePNToLID(ctx, work.pn, work.lid)
-}
-
-// workCtx derives a 30s-bounded context for a writer DB call from the caller's
-// context (or a fresh background context if the caller supplied none). The
-// returned cancel MUST be called by the writer after the DB call. Bounding even
-// a caller-supplied context guarantees the writer goroutine cannot block
-// indefinitely on a single DB statement.
-func (f *SessionFlusher) workCtx(parent context.Context) (context.Context, context.CancelFunc) {
-	if parent == nil {
-		parent = context.Background()
+	migErr := f.db.MigratePNToLID(ctx, work.pn, work.lid)
+	if migErr != nil {
+		// Migration failed: keep the dirty rows for a retry (they were flushed to
+		// the DB in step 2, but retaining the dirty copy lets a retry re-flush the
+		// freshest generation). Do NOT remove. Return the error.
+		work.done <- migErr
+		return
 	}
-	return context.WithTimeout(parent, 30*time.Second)
+
+	// Step 5: remove PN-prefix entries from the dirty-set ONLY if this migration
+	// actually consumed them (gate was not already fired). Conditional remove
+	// (NOT the CR-02 generation guard): a consumed prefix must be swept so a
+	// later flush cannot re-insert a zombie pn row after the migration deleted
+	// the pn rows. If the migration no-op'd (consumed == false), the PN dirty
+	// rows are retained for a real migration (F4 — no strand).
+	if consumed {
+		f.rwmu.Lock()
+		for _, addr := range pnKeys {
+			delete(f.dirty, addr)
+		}
+		f.rwmu.Unlock()
+	}
+
+	work.done <- nil
 }
 
-// Drain flushes the entire dirty-set synchronously, retrying on transient
-// failure. Drains pending work items FIRST so no delete/migrate is lost, then
-// blocks until the dirty-set is empty. Called during Stop() (after the writer
-// goroutine has exited, so there is no concurrent writer — Drain runs the
-// flush passes directly).
+// workCtx returns a FRESH 30s-bounded background context for a writer DB
+// mutation, DETACHED from the caller's cancellable request context (Phase 47.3
+// F5). A delete/migrate is a durability action: once it is dispatched to the
+// writer and the caller has (logically) committed to it, cancelling the
+// caller's request ctx must NOT drop the DB mutation. The pre-fix code derived
+// the writer's ctx from the caller's ctx, so a caller ctx that cancelled while
+// the item sat in workCh failed the mutation with context.Canceled and the
+// already-returned caller never retried — a silently-dropped security delete.
+// The unused parent arg is retained for call-site symmetry / future deadline
+// propagation; the 30s bound also guarantees the writer cannot block
+// indefinitely on a single DB statement.
+func (f *SessionFlusher) workCtx(_ context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 30*time.Second)
+}
+
+// Drain processes pending work items, then flushes the entire dirty-set
+// synchronously, retrying PutManySessions on transient failure UP TO a total
+// deadline (Phase 47.3 F2). Called during Stop() AFTER the writer goroutine has
+// exited (no concurrent writer — Drain runs the passes directly).
+//
+// F1: it drains pending work items in a loop until workCh is empty — and each
+// such item is processed to completion (its done channel is signalled) so a
+// dispatched delete/migrate that was still buffered when the writer exited is
+// NEVER silently lost. After this Drain returns, Stop closes abortCh so any
+// producer that races a send into the now-orphaned workCh returns
+// errFlusherStopped instead of hanging.
+//
+// F2: the dirty-set flush retry is bounded by drainTotalDeadline — on a
+// DB-down-at-shutdown it logs the un-drained count and returns so
+// Stop()/Container.Close() completes instead of wedging until SIGKILL.
 func (f *SessionFlusher) Drain() {
-	// Drain any pending work items the writer goroutine did not process before
-	// stopCh fired (design §12.5). The writer is gone by the time Stop() calls
-	// Drain, so process them here in FIFO order.
+	// Drain ALL pending work items the writer did not process before stopCh
+	// fired (design §12.5, F1). Loop until workCh is empty — processWork
+	// signals each item's done channel, so no buffered delete/migrate is lost.
 	for {
 		select {
 		case work := <-f.workCh:
@@ -723,6 +869,7 @@ func (f *SessionFlusher) Drain() {
 	}
 
 flushLoop:
+	deadline := time.Now().Add(f.drainDeadline)
 	for {
 		f.rwmu.Lock()
 		if len(f.dirty) == 0 {
@@ -743,21 +890,23 @@ flushLoop:
 		cancel()
 
 		if err != nil {
+			if time.Now().After(deadline) {
+				// F2: bound the retry. Give up so shutdown completes; the
+				// un-drained dirty-set is the bounded crash-loss INV-7 accepts.
+				f.rwmu.Lock()
+				lost := len(f.dirty)
+				f.rwmu.Unlock()
+				f.log.Errorf("SessionFlusher Drain abandoned after %s: DB still failing, %d dirty entries unflushed at shutdown: %v", f.drainDeadline, lost, err)
+				return
+			}
 			f.log.Errorf("SessionFlusher Drain batch failed (%d rows): %v — retrying", len(batch), err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		// CR-02 staleness guard — see runFlush for the rationale.
+		// CR-02 staleness guard (F14 helper) — see runFlush for the rationale.
 		f.rwmu.Lock()
-		for addr, snapAdv := range advAt {
-			if e, ok := f.dirty[addr]; ok {
-				e.lastDrain = snapAdv
-				if e.advCount == snapAdv {
-					delete(f.dirty, addr)
-				}
-			}
-		}
+		f.clearStaleLocked(advAt)
 		drained := len(batch)
 		f.rwmu.Unlock()
 
@@ -797,13 +946,19 @@ func (f *SessionFlusher) Start() {
 
 // Stop signals the writer goroutine to exit, waits for it, then calls Drain()
 // synchronously to flush any remaining dirty entries (and process any pending
-// work items) before the DB closes. Idempotent: a second Stop is a no-op (it
-// must not double-close stopCh — tests may call Stop explicitly AND via
-// t.Cleanup).
+// work items) before the DB closes. After Drain, abortCh is closed so any
+// producer that races a synchronous work-item dispatch into the now-orphaned
+// workCh returns errFlusherStopped instead of hanging forever (Phase 47.3 F1).
+// Idempotent: a second Stop is a no-op (it must not double-close stopCh — tests
+// may call Stop explicitly AND via t.Cleanup).
 func (f *SessionFlusher) Stop() {
 	f.stopOnce.Do(func() {
 		close(f.stopCh)
 		f.wg.Wait()
 		f.Drain()
+		// Close abortCh AFTER Drain has emptied workCh: a producer blocked in
+		// dispatchSync now observes abortCh and returns a definitive error
+		// rather than waiting on a done channel no writer will ever signal.
+		close(f.abortCh)
 	})
 }
