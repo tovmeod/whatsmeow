@@ -1370,16 +1370,10 @@ func (cli *Client) encryptMessageForDevices(
 			pnDevices = append(pnDevices, jid)
 		}
 	}
-	lidStart := time.Now()
 	lidMappings, err := cli.Store.LIDs.GetManyLIDsForPNs(ctx, pnDevices)
-	lidmapDur := time.Since(lidStart)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to fetch LID mappings: %w", err)
 	}
-	// Debug (ride-button-slow-send): split setup_ms into the LID lookup vs the
-	// per-device migrateSessionStore (which takes flushMu). Measurement only.
-	var migrateDur time.Duration
-	var migrateN int
 
 	encryptionIdentities := make(map[types.JID]types.JID, len(allDevices))
 	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
@@ -1389,10 +1383,7 @@ func (cli *Client) encryptMessageForDevices(
 		if jid.Server == types.DefaultUserServer {
 			// TODO query LID from server for missing entries
 			if lidForPN, ok := lidMappings[jid]; ok && !lidForPN.IsEmpty() {
-				mStart := time.Now()
 				cli.migrateSessionStore(ctx, jid, lidForPN)
-				migrateDur += time.Since(mStart)
-				migrateN++
 				encryptionIdentity = lidForPN
 			}
 		}
@@ -1454,9 +1445,9 @@ func (cli *Client) encryptMessageForDevices(
 		if total > 500*time.Millisecond {
 			// Breakdown of a SLOW send, so we know which phase actually costs the
 			// time (decode prefetch vs prekey-fetch network vs the encrypt loop).
-			cli.Log.Warnf("SLOW_SEND total_ms=%d setup_ms=%d setup_lidmap_ms=%d setup_migrate_ms=%d setup_migrate_n=%d prefetch_ms=%d prekey_fetch_ms=%d encrypt_loop_ms=%d devices=%d retry_devices=%d max_session_bytes=%d",
-				total.Milliseconds(), setupDur.Milliseconds(), lidmapDur.Milliseconds(), migrateDur.Milliseconds(), migrateN,
-				prefetchDur.Milliseconds(), prekeyDur.Milliseconds(), time.Since(loopStart).Milliseconds(),
+			cli.Log.Warnf("SLOW_SEND total_ms=%d setup_ms=%d prefetch_ms=%d prekey_fetch_ms=%d encrypt_loop_ms=%d devices=%d retry_devices=%d max_session_bytes=%d",
+				total.Milliseconds(), setupDur.Milliseconds(), prefetchDur.Milliseconds(),
+				prekeyDur.Milliseconds(), time.Since(loopStart).Milliseconds(),
 				len(allDevices), len(retryDevices), store.MaxCachedSessionBytes(ctx))
 		}
 	}
