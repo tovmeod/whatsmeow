@@ -19,23 +19,31 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 // ---------------------------------------------------------------------------
-// mockFlushSessionStore is a thread-safe fake that implements flushSessionBatch.
-// Records calls and stored sessions so tests can assert on them.
+// mockFlushSessionStore is a thread-safe fake that implements the widened
+// sessionWriterStore interface (Phase 47.3-06 D2): the single writer goroutine
+// performs deletes and migrates itself, so the test double exposes
+// PutManySessions, DeleteSession, DeleteAllSessions, and MigratePNToLID over an
+// in-memory map. Records calls and stored sessions so tests can assert on them.
 // ---------------------------------------------------------------------------
 
 type mockFlushSessionStore struct {
-	mu        sync.Mutex
-	sessions  map[string][]byte
-	callCount atomic.Int64
-	failOnce  bool
-	failErr   error
+	mu           sync.Mutex
+	sessions     map[string][]byte
+	callCount    atomic.Int64
+	deleteCalls  atomic.Int64
+	migrateCalls atomic.Int64
+	failOnce     bool
+	failErr      error
 }
 
 func newMockFlushSessionStore() *mockFlushSessionStore {
@@ -79,22 +87,69 @@ func (m *mockFlushSessionStore) getSession(addr string) ([]byte, bool) {
 	return out, true
 }
 
+// DeleteSession / DeleteAllSessions / MigratePNToLID implement the widened
+// sessionWriterStore interface (D2). They mirror the SQLStore semantics on the
+// in-memory map (DeleteAllSessions matches the "<phone>:" prefix; MigratePNToLID
+// rekeys the PN-prefix entries to the LID user).
+func (m *mockFlushSessionStore) DeleteSession(_ context.Context, address string) error {
+	m.deleteCalls.Add(1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, address)
+	return nil
+}
+
+func (m *mockFlushSessionStore) DeleteAllSessions(_ context.Context, phone string) error {
+	m.deleteCalls.Add(1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pfx := phone + ":"
+	for addr := range m.sessions {
+		if strings.HasPrefix(addr, pfx) {
+			delete(m.sessions, addr)
+		}
+	}
+	return nil
+}
+
+func (m *mockFlushSessionStore) MigratePNToLID(_ context.Context, pn, lid types.JID) error {
+	m.migrateCalls.Add(1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pnPfx := pn.SignalAddressUser() + ":"
+	lidUser := lid.SignalAddressUser()
+	var victims []string
+	for addr := range m.sessions {
+		if strings.HasPrefix(addr, pnPfx) {
+			victims = append(victims, addr)
+		}
+	}
+	for _, addr := range victims {
+		newAddr := lidUser + addr[len(pn.SignalAddressUser()):]
+		m.sessions[newAddr] = m.sessions[addr]
+		delete(m.sessions, addr)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
-// blockingFlushSessionStore wraps any flushSessionBatch and blocks the FIRST
+// blockingFlushSessionStore wraps any sessionWriterStore and blocks the FIRST
 // PutManySessions call between "write started" and "write released". This is
 // the deterministic interleaving hook the CR-01/CR-02/CR-03/WR-01 regression
 // tests use to hold a flush cycle open between its dirty-set snapshot and the
-// DB-write apply, without sleeps.
+// DB-write apply, without sleeps. The delete/migrate methods delegate straight
+// to inner (only PutManySessions is gated) so the D2 single-writer delete
+// ordering tests can hold a flush open and then dispatch a delete.
 // ---------------------------------------------------------------------------
 
 type blockingFlushSessionStore struct {
-	inner        flushSessionBatch
+	inner        sessionWriterStore
 	blockNext    atomic.Bool
 	writeStarted chan struct{}
 	writeRelease chan struct{}
 }
 
-func newBlockingFlushSessionStore(inner flushSessionBatch) *blockingFlushSessionStore {
+func newBlockingFlushSessionStore(inner sessionWriterStore) *blockingFlushSessionStore {
 	b := &blockingFlushSessionStore{
 		inner:        inner,
 		writeStarted: make(chan struct{}),
@@ -110,6 +165,18 @@ func (b *blockingFlushSessionStore) PutManySessions(ctx context.Context, session
 		<-b.writeRelease
 	}
 	return b.inner.PutManySessions(ctx, sessions)
+}
+
+func (b *blockingFlushSessionStore) DeleteSession(ctx context.Context, address string) error {
+	return b.inner.DeleteSession(ctx, address)
+}
+
+func (b *blockingFlushSessionStore) DeleteAllSessions(ctx context.Context, phone string) error {
+	return b.inner.DeleteAllSessions(ctx, phone)
+}
+
+func (b *blockingFlushSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
+	return b.inner.MigratePNToLID(ctx, pn, lid)
 }
 
 // ---------------------------------------------------------------------------
@@ -618,61 +685,40 @@ func TestSessionFlusher_CR02_EnqueueDuringInflightBatchRetained(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestSessionFlusher_CR03_InlineFlushDoesNotClobberNewerWrite
-// CR-03 regression: under backpressure, two Enqueues for the same address take
-// the inline path with differently-aged blobs. Without serialization + the
-// advSnap staleness guard, the older write can land after the newer one
-// (leaving the DB at v1) and/or the older flush clears the dirty entry that
-// already holds v2 — dropping v2 from the durable path.
+// TestSessionFlusher_CR03_BackpressureReliefLastWins (Phase 47.3-06 D2)
+// CR-03 in D2: backpressure relief is a workFlushSync work item processed by
+// the single writer goroutine, FIFO-ordered with every other DB write — there
+// is NO inline write on the producer goroutine that could clobber a newer one
+// (design §9). This is structurally stronger than the V1 advSnap staleness
+// guard: a single writer cannot reorder its own writes. This test drives the
+// backpressure relief path through the writer (cap=5 -> backpressureCap=1) and
+// asserts the durable end-state is the last-written blob (last-wins, no clobber).
 // ---------------------------------------------------------------------------
 
-func TestSessionFlusher_CR03_InlineFlushDoesNotClobberNewerWrite(t *testing.T) {
+func TestSessionFlusher_CR03_BackpressureReliefLastWins(t *testing.T) {
 	mock := newMockFlushSessionStore()
-	b := newBlockingFlushSessionStore(mock)
-	// cap=5 → backpressureCap=1: the second distinct address triggers the
-	// inline synchronous path.
-	f := newSessionFlusherForTest(b, 5, 5000*time.Second)
+	// cap=5 -> backpressureCap=1: a second distinct dirty address triggers the
+	// synchronous workFlushSync relief through the writer.
+	f := newSessionFlusherForTest(mock, 5, 5000*time.Second)
+	f.Start()
+	defer f.Stop()
 
-	f.Enqueue("filler:0", []byte("filler")) // dirty=1, below backpressureCap
+	f.Enqueue("filler:0", []byte("filler")) // dirty=1, at/below backpressureCap
 
-	enq1Done := make(chan struct{})
-	go func() {
-		f.Enqueue("cr03-addr:0", []byte("v1")) // dirty=2 > 1 → inline write, blocked in mock
-		close(enq1Done)
-	}()
-	<-b.writeStarted // inline v1 write is in flight (post-snapshot, pre-apply)
+	// This second distinct address pushes dirty>backpressureCap. EnqueueAndMirror
+	// sends a workFlushSync to the writer and blocks on done — the relief flush
+	// runs inside the single writer (no inline producer-goroutine DB write).
+	f.Enqueue("cr03-addr:0", []byte("v1"))
+	// A newer write for the same address: last-wins.
+	f.Enqueue("cr03-addr:0", []byte("v2"))
 
-	enq2Done := make(chan struct{})
-	go func() {
-		f.Enqueue("cr03-addr:0", []byte("v2")) // updates entry to v2; its inline write must serialize after v1's
-		close(enq2Done)
-	}()
-
-	// With the fix, enq2's inline write blocks behind flushMu (timeout
-	// branch); without it, enq2's write lands while v1 is paused (enq2Done
-	// branch) and the released v1 write then clobbers it. The final-state
-	// assertions below detect the bug deterministically either way.
-	select {
-	case <-enq2Done:
-	case <-time.After(200 * time.Millisecond):
+	// Force a final synchronous flush through the writer and assert the durable
+	// end-state is v2 (newer generation never lost; no older write clobbered it).
+	if err := f.flushSyncForTest(); err != nil {
+		t.Fatalf("flushSyncForTest: %v", err)
 	}
-
-	close(b.writeRelease)
-	<-enq1Done
-	<-enq2Done
-
-	got, ok := mock.getSession("cr03-addr:0")
-	if !ok {
-		t.Fatal("cr03-addr:0 never reached the store")
-	}
-	if string(got) != "v2" {
-		t.Fatalf("store = %q, want v2 — older inline write clobbered the newer one (CR-03)", got)
-	}
-	// Whatever is (or is not) left dirty, the durable end-state after a full
-	// drain must be v2.
-	f.Drain()
-	if v, _ := mock.getSession("cr03-addr:0"); string(v) != "v2" {
-		t.Fatalf("store = %q after Drain, want v2 (CR-03 lost update on inline path)", v)
+	if v, ok := mock.getSession("cr03-addr:0"); !ok || string(v) != "v2" {
+		t.Fatalf("store = %q (found=%v) after backpressure relief, want v2 (last-wins; no clobber, CR-03/D2)", v, ok)
 	}
 }
 

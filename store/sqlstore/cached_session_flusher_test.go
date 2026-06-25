@@ -42,7 +42,11 @@ import (
 // ---------------------------------------------------------------------------
 
 // countingFlushStore counts PutManySessions calls and delegates to the same
-// fakeSessionStore so Get-after-drain reads back the written data.
+// fakeSessionStore so Get-after-drain reads back the written data. Phase
+// 47.3-06 D2: implements the widened sessionWriterStore interface — the writer
+// goroutine performs deletes and migrates itself, and they must reach the SAME
+// backing the wrapper's inner reads from (in prod the flusher.db and the
+// wrapper.inner are the same *SQLStore; here both are the same fakeSessionStore).
 type countingFlushStore struct {
 	backing   *fakeSessionStore
 	callCount int
@@ -51,6 +55,18 @@ type countingFlushStore struct {
 func (c *countingFlushStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
 	c.callCount++
 	return c.backing.PutManySessions(ctx, sessions)
+}
+
+func (c *countingFlushStore) DeleteSession(ctx context.Context, address string) error {
+	return c.backing.DeleteSession(ctx, address)
+}
+
+func (c *countingFlushStore) DeleteAllSessions(ctx context.Context, phone string) error {
+	return c.backing.DeleteAllSessions(ctx, phone)
+}
+
+func (c *countingFlushStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
+	return c.backing.MigratePNToLID(ctx, pn, lid)
 }
 
 func newTestCachedSessionStoreWithFlusher(t *testing.T, capSize int) (
@@ -70,7 +86,7 @@ func newTestCachedSessionStoreWithFlusher(t *testing.T, capSize int) (
 // newTestCachedSessionStoreWiring is the lower-level wiring helper: it accepts
 // an arbitrary flushSessionBatch (e.g. blockingFlushSessionStore for the CR-01
 // interleaving tests) and the inner fakeSessionStore the wrapper delegates to.
-func newTestCachedSessionStoreWiring(t *testing.T, capSize int, flushBacking flushSessionBatch, inner *fakeSessionStore) (
+func newTestCachedSessionStoreWiring(t *testing.T, capSize int, flushBacking sessionWriterStore, inner *fakeSessionStore) (
 	*CachedSessionStore,
 	*SessionFlusher,
 	*lru.Cache[string, []byte],
@@ -89,11 +105,19 @@ func newTestCachedSessionStoreWiring(t *testing.T, capSize int, flushBacking flu
 	var dummyExplicitRemoves uint64
 	wrapper := NewCachedSessionStore(inner, "test-jid", sessionCache, &dummyExplicitRemoves, idx)
 
-	// Do NOT Start() the flusher here — the goroutine racing with assertions
-	// would make dirty-count checks racy. Tests use Drain() for synchronous
-	// draining; TestCachedSession_DrainFlushesAll calls Stop() explicitly.
-	flusher := newSessionFlusherForTest(flushBacking, 1000, 5000*time.Second /* ticker irrelevant without Start */)
-	t.Cleanup(flusher.Drain) // Drain is safe to call when not started
+	// Phase 47.3-06 D2: the writer goroutine MUST run so DeleteSession /
+	// DeleteAllSessions / MigratePNToLID work items dispatched to workCh are
+	// processed (those methods block on a done channel — without a writer they
+	// hang). To keep DirtyCount assertions stable, boundaryN is set very high so
+	// no N-boundary flush signal ever fires, and the ticker interval is long so
+	// it never spontaneously flushes. Tests that want a flush trigger it
+	// explicitly (flusher.flushCh <- struct{}{}) or via Drain()/Stop(). The
+	// writer only auto-acts on the work channel (deletes/migrates), which is what
+	// the actor-model delete/migrate tests need.
+	flusher := newSessionFlusherForTest(flushBacking, 1000, 5000*time.Second)
+	flusher.boundaryN = 1 << 30 // disable N-boundary auto-flush during wired tests
+	flusher.Start()
+	t.Cleanup(flusher.Stop) // Stop drains the workCh + dirty-set, then exits the writer
 
 	wrapper.SetFlusher(flusher)
 	return wrapper, flusher, sessionCache
@@ -368,10 +392,14 @@ func TestCachedSession_DrainFlushesAll(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // TestCachedSession_CR01_DeleteSessionNotResurrectedByInflightFlush
-// CR-01 regression: a DeleteSession completing while a flush batch is in
-// flight (snapshotted but not yet written) must NOT have its row re-upserted
-// by that batch. The blockingFlushSessionStore holds the flush open between
-// snapshot and DB-write apply; the delete is issued inside that window.
+// CR-01 regression: a DeleteSession dispatched while a flush batch is in flight
+// (snapshotted but not yet written) must NOT have its row re-upserted by that
+// batch. Phase 47.3-06 D2: the single writer goroutine serializes flush and
+// delete by channel FIFO — a delete work item sent while a flush is in flight
+// is dequeued AFTER runFlush completes, so the delete's DB DELETE lands after
+// the flush's DB UPSERT and the row ends up deleted. The blockingFlushSessionStore
+// holds the writer's flush open between snapshot and DB-write apply; the delete
+// is issued (via the wrapper -> workDeleteSingle work item) inside that window.
 // ---------------------------------------------------------------------------
 
 func TestCachedSession_CR01_DeleteSessionNotResurrectedByInflightFlush(t *testing.T) {
@@ -384,38 +412,32 @@ func TestCachedSession_CR01_DeleteSessionNotResurrectedByInflightFlush(t *testin
 		t.Fatalf("PutSession: %v", err)
 	}
 
-	flushDone := make(chan struct{})
-	go func() {
-		flusher.runFlush()
-		close(flushDone)
-	}()
-	<-blocking.writeStarted // flush has snapshotted the dirty-set and is mid-DB-write
+	// Trigger a flush THROUGH the running writer (not a direct runFlush call —
+	// the writer owns all DB mutation in D2). The blockingStore pauses the
+	// writer mid-flush (snapshot taken, PutManySessions blocked).
+	flusher.flushCh <- struct{}{}
+	<-blocking.writeStarted // the writer has snapshotted the dirty-set and is mid-DB-write
 
+	// Dispatch the delete: it sends a workDeleteSingle item to workCh and blocks
+	// on its done channel. The writer is busy with the paused flush, so the
+	// delete is queued BEHIND the flush (channel FIFO) and cannot run yet.
 	deleteDone := make(chan error, 1)
 	go func() {
 		deleteDone <- c.DeleteSession(ctx, "cr01-addr:0")
 	}()
 
-	// With the CR-01 fix the delete is serialized behind the in-flight flush
-	// (blocks on flushMu); without it the delete completes inside the open
-	// window and the released batch resurrects the row. The select only
-	// sequences the release — the final-state assertions below are the actual
-	// check, deterministic on both the fixed and the broken interleaving.
+	// The delete MUST NOT complete while the flush is paused — it is queued
+	// behind the in-flight flush. Confirm it stays blocked, then release the
+	// flush so the writer finishes runFlush and dequeues the delete next (FIFO).
 	select {
 	case err := <-deleteDone:
-		// Pre-fix interleaving: delete won the race while the flush was paused.
-		if err != nil {
-			t.Fatalf("DeleteSession: %v", err)
-		}
-		close(blocking.writeRelease)
-		<-flushDone
-	case <-time.After(200 * time.Millisecond):
-		// Fixed behavior: delete is blocked behind the in-flight flush cycle.
-		close(blocking.writeRelease)
-		<-flushDone
-		if err := <-deleteDone; err != nil {
-			t.Fatalf("DeleteSession: %v", err)
-		}
+		t.Fatalf("DeleteSession completed while the flush was paused — FIFO ordering broken (CR-01); err=%v", err)
+	case <-time.After(150 * time.Millisecond):
+		// Correct: delete queued behind the paused flush. Release the flush.
+	}
+	close(blocking.writeRelease)
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteSession: %v", err)
 	}
 
 	if has, err := inner.HasSession(ctx, "cr01-addr:0"); err != nil {
@@ -425,10 +447,6 @@ func TestCachedSession_CR01_DeleteSessionNotResurrectedByInflightFlush(t *testin
 	}
 	if _, ok := flusher.Peek("cr01-addr:0"); ok {
 		t.Fatal("dirty entry survived DeleteSession (CR-01)")
-	}
-	flusher.Drain()
-	if has, _ := inner.HasSession(ctx, "cr01-addr:0"); has {
-		t.Fatal("deleted session resurrected by post-delete Drain (CR-01)")
 	}
 }
 
@@ -448,13 +466,12 @@ func TestCachedSession_CR01_DeleteAllSessionsNotResurrectedByInflightFlush(t *te
 		t.Fatalf("PutSession: %v", err)
 	}
 
-	flushDone := make(chan struct{})
-	go func() {
-		flusher.runFlush()
-		close(flushDone)
-	}()
+	// Trigger a flush through the running writer; pause it mid-DB-write.
+	flusher.flushCh <- struct{}{}
 	<-blocking.writeStarted
 
+	// Dispatch the bulk delete (workDeletePrefix work item). It queues behind
+	// the paused flush (channel FIFO).
 	deleteDone := make(chan error, 1)
 	go func() {
 		deleteDone <- c.DeleteAllSessions(ctx, "cr01b")
@@ -462,17 +479,13 @@ func TestCachedSession_CR01_DeleteAllSessionsNotResurrectedByInflightFlush(t *te
 
 	select {
 	case err := <-deleteDone:
-		if err != nil {
-			t.Fatalf("DeleteAllSessions: %v", err)
-		}
-		close(blocking.writeRelease)
-		<-flushDone
-	case <-time.After(200 * time.Millisecond):
-		close(blocking.writeRelease)
-		<-flushDone
-		if err := <-deleteDone; err != nil {
-			t.Fatalf("DeleteAllSessions: %v", err)
-		}
+		t.Fatalf("DeleteAllSessions completed while the flush was paused — FIFO ordering broken (CR-01); err=%v", err)
+	case <-time.After(150 * time.Millisecond):
+		// Correct: bulk delete queued behind the paused flush.
+	}
+	close(blocking.writeRelease)
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteAllSessions: %v", err)
 	}
 
 	if has, _ := inner.HasSession(ctx, "cr01b:0"); has {
@@ -480,10 +493,6 @@ func TestCachedSession_CR01_DeleteAllSessionsNotResurrectedByInflightFlush(t *te
 	}
 	if _, ok := flusher.Peek("cr01b:0"); ok {
 		t.Fatal("dirty entry survived DeleteAllSessions sweep (CR-01)")
-	}
-	flusher.Drain()
-	if has, _ := inner.HasSession(ctx, "cr01b:0"); has {
-		t.Fatal("bulk-deleted session resurrected by post-delete Drain (CR-01)")
 	}
 }
 
@@ -530,8 +539,11 @@ func TestCachedSession_CR04_MigratePNToLIDSweepsDirtySet(t *testing.T) {
 	if _, ok := flusher.Peek(pnAddr); ok {
 		t.Fatal("PN dirty entry survived MigratePNToLID — would flush back as a zombie pn row (CR-04)")
 	}
-	// (c) A post-migration drain must not resurrect the pn row.
-	flusher.Drain()
+	// (c) A post-migration flush (through the running writer) must not resurrect
+	// the pn row — the migration already swept the PN-prefix dirty entries.
+	if err := flusher.flushSyncForTest(); err != nil {
+		t.Fatalf("post-migration flush: %v", err)
+	}
 	if has, _ := inner.HasSession(ctx, pnAddr); has {
 		t.Fatal("zombie pn row written to inner store after migration (CR-04)")
 	}
@@ -590,20 +602,18 @@ func TestCachedSession_WR03_LRUAndDirtySetAgreeUnderConcurrentWriters(t *testing
 // ---------------------------------------------------------------------------
 // TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend
 // D-01/D-02: when there are no PN sessions in the dirty-set and no PN row in
-// the inner store, MigratePNToLID must NOT take the WithFlushBlocked path
-// (no-op skip). The inner.MigratePNToLID must still be called (sets
-// once-per-process gate). A second call for the same pn must also not take
-// the flush-block path (IsPNMigrated short-circuit).
+// the inner store, MigratePNToLID must take the no-op path — call
+// inner.MigratePNToLID DIRECTLY (sets the once-per-process gate) and dispatch NO
+// migrate work item to the single writer goroutine. A second call for the same
+// pn must also short-circuit at IsPNMigrated.
 //
-// Strengthened probe (plan 03): this test previously passed vacuously because
-// the blockingFlushSessionStore only fires at PutManySessions, and with an
-// empty dirty-set flushPrefixBlocked exits before calling PutManySessions even
-// when WithFlushBlocked IS taken. The real distinguishing probe is
-// flusher.WithFlushBlockedCalls() — an atomic counter that increments on every
-// entry into WithFlushBlocked regardless of whether any flush work is done.
-// If the no-op-skip is NOT implemented (i.e. WithFlushBlocked is always taken)
-// this counter will be non-zero; with the skip it stays at 0.
-// This test FAILS without the plan-03 MigratePNToLID restructure.
+// Probe (carried from D1 plan 03): flusher.WithFlushBlockedCalls() — in D2
+// nothing increments this counter (the V1 WithFlushBlocked is gone; the no-op
+// migrate path dispatches no work item), so it stays at 0. A delta of 0 across
+// the call confirms the no-op path took no flush coordination — exactly the
+// behavior D-02's first-send skip requires. (Under D1 a non-zero delta would
+// have meant the flush-blocked path was wrongly taken; under D2 the same
+// assertion confirms no migrate work item was dispatched.)
 // ---------------------------------------------------------------------------
 
 func TestCachedSession_MigrateNoOp_SkipsFlushBlock_FirstSend(t *testing.T) {

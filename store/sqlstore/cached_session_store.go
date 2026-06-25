@@ -44,10 +44,12 @@ import (
 //
 // # Delete coherence (17.5 data-loss path T-35.2-09-04 re-audit + CR-01)
 //
-// DeleteSession and DeleteAllSessions run the synchronous inner delete AND
-// the matching dirty-entry removal inside flusher.WithFlushBlocked, which
-// serializes them against every in-flight flush cycle (async batch, shutdown
-// drain, inline backpressure write). Deletes are NOT deferred. This prevents
+// Phase 47.3-06 D2: DeleteSession and DeleteAllSessions dispatch the inner DB
+// delete AND the matching dirty-entry removal as a work item to the single
+// writer goroutine (via flusher.DeleteSession / DeleteAllSessions), which
+// serializes them by channel FIFO against every flush cycle (periodic batch,
+// N-boundary flush, shutdown drain, backpressure-relief flush). Deletes are NOT
+// deferred — the caller blocks on the work item's done channel. This prevents
 // both the Phase-17.5 timer-vs-Delete race (a deferred delete racing a
 // buffered re-add) and the CR-01 snapshot race (a flush batch snapshotted
 // BEFORE the delete re-upserting the row AFTER the delete completes).
@@ -56,9 +58,9 @@ import (
 //
 // The six BLOCKER-class paths from the 17.5 review are addressed as follows:
 //
-//  1. Timer-vs-Delete race: deletes stay synchronous-through-inner-plus-Remove
-//     AND run inside WithFlushBlocked (CR-01), so no buffered write — including
-//     an already-snapshotted in-flight batch — can persist after a delete
+//  1. Timer-vs-Delete race: deletes dispatch a delete work item to the single
+//     writer (CR-01 FIFO ordering), so no buffered write — including an
+//     already-snapshotted in-flight batch — can persist after a delete
 //     completes.
 //  2. "Clear state before inner write" inversion: the flusher snapshots-then-writes
 //     and only clears the dirty entry on a confirmed drain — never clears state
@@ -370,26 +372,28 @@ func (c *CachedSessionStore) PutManySessions(ctx context.Context, sessions map[s
 	return nil
 }
 
-// DeleteSession writes through to inner and (on success) removes the cache
-// entry for this address. Also drops any dirty flusher entry so a buffered
-// blob cannot resurrect a deleted session (Phase 35.2-09 T-35.2-09-04,
-// re-audit of the 17.5 timer-vs-Delete race; deletes stay synchronous).
+// DeleteSession removes the session for this address from the inner DB and the
+// flusher dirty-set, then removes the cache entry. A buffered blob cannot
+// resurrect a deleted session (Phase 35.2-09 T-35.2-09-04, re-audit of the 17.5
+// timer-vs-Delete race; deletes stay synchronous).
 func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) error {
-	// Phase 35.2-09 CR-01: the inner DB delete AND the dirty-entry removal
-	// must both run while flushes are blocked. An in-flight flush snapshots
-	// the dirty-set, releases the flusher mutex, and then writes the batch —
-	// without the flush-blocked section a delete completing inside that
-	// window would have its row re-upserted (resurrected) by the in-flight
-	// batch. Deletes are a security/correctness action (identity change,
-	// corrupt session); resurrection is a crypto-store integrity violation.
+	// Phase 47.3-06 D2 CR-01: the inner DB delete AND the dirty-entry removal
+	// run inside the single writer goroutine via a workDeleteSingle work item.
+	// The writer processes flush, delete, and migrate work in channel-FIFO
+	// order, so a delete sent while a flush is in flight is dequeued AFTER the
+	// flush completes — the delete's DB DELETE lands after the flush's DB UPSERT
+	// and the row ends up deleted, never resurrected (design §8). This replaces
+	// the V1 flush-mutex lock-across-I/O delete-blocking section. Deletes are a
+	// security/correctness action (identity change, corrupt session);
+	// resurrection is a crypto-store integrity violation.
+	//
+	// flusher.DeleteSession blocks on the work item's done channel — so by the
+	// time it returns the writer has completed BOTH the DB delete and the
+	// dirty-set removal. The LRU cache.Remove below therefore runs AFTER the
+	// dirty entry is gone (RESEARCH landmine #4): no concurrent read can fall
+	// through to a still-dirty entry once the LRU is cleared.
 	if c.flusher != nil {
-		if err := c.flusher.WithFlushBlocked(func() error {
-			if err := c.inner.DeleteSession(ctx, address); err != nil {
-				return err
-			}
-			c.flusher.Remove(address)
-			return nil
-		}); err != nil {
+		if err := c.flusher.DeleteSession(ctx, address); err != nil {
 			return err
 		}
 	} else if err := c.inner.DeleteSession(ctx, address); err != nil {
@@ -424,20 +428,17 @@ func (c *CachedSessionStore) DeleteSession(ctx context.Context, address string) 
 // the index is (jid, phone)-scoped, so SnapshotKeys never returns keys
 // belonging to other wrappers.
 func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string) error {
-	// Phase 35.2-09 CR-01: inner DB delete + dirty-set prefix sweep both run
-	// while flushes are blocked, so an in-flight flush snapshot cannot
-	// re-upsert deleted rows after the delete completes (same resurrection
-	// race as DeleteSession above). The flusher dirty-set key is the raw
-	// address (no jid prefix) and the flusher is per-JID, so the phone+":"
-	// prefix sweep has no cross-JID contamination risk.
+	// Phase 47.3-06 D2 CR-01: the inner DB prefix-delete + dirty-set prefix
+	// sweep run inside the single writer goroutine via a workDeletePrefix work
+	// item, FIFO-ordered with flushes — so an in-flight flush snapshot cannot
+	// re-upsert deleted rows after the delete completes (same resurrection race
+	// as DeleteSession above). The flusher dirty-set key is the raw address (no
+	// jid prefix) and the flusher is per-JID, so the phone+":" prefix sweep has
+	// no cross-JID contamination risk. flusher.DeleteAllSessions blocks on the
+	// work item's done channel, so the LRU sweep below runs after the dirty
+	// entries are gone (landmine #4).
 	if c.flusher != nil {
-		if err := c.flusher.WithFlushBlocked(func() error {
-			if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
-				return err
-			}
-			c.flusher.RemovePrefix(phone + ":")
-			return nil
-		}); err != nil {
+		if err := c.flusher.DeleteAllSessions(ctx, phone); err != nil {
 			return err
 		}
 	} else if err := c.inner.DeleteAllSessions(ctx, phone); err != nil {
@@ -499,14 +500,15 @@ func (c *CachedSessionStore) DeleteAllSessions(ctx context.Context, phone string
 // steady-state PN→LID migration rate" was contradicted by that profile;
 // the O(K) implementation makes it genuinely negligible.
 func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
-	// ride-button-slow-send fix: MigratePNToLID is called per recipient device on
-	// EVERY send, but the inner DB migration is gated once-per-process
-	// (migratedPNSessionsCache). The WithFlushBlocked (flushMu) wait below was thus
-	// paid on every repeat call for a NO-OP migration, serializing the send behind the
+	// ride-button-slow-send fix (D1): MigratePNToLID is called per recipient device
+	// on EVERY send, but the inner DB migration is gated once-per-process
+	// (migratedPNSessionsCache). The V1 flush-blocked wait below was thus paid on
+	// every repeat call for a NO-OP migration, serializing the send behind the
 	// session flusher's Postgres write (~1s/device, confirmed by block profile +
-	// SLOW_SEND setup_migrate_ms). Once migrated there are no deletes to order against
-	// the flusher, so skip the flush-block. The cache sweep below still runs
-	// unconditionally (cheap, idempotent), so cache-coherence behavior is unchanged.
+	// SLOW_SEND setup_migrate_ms). Once migrated there are no deletes to order
+	// against the flusher, so skip any flush coordination. The cache sweep below
+	// still runs unconditionally (cheap, idempotent), so cache-coherence behavior
+	// is unchanged.
 	alreadyMigrated := false
 	if sql, ok := c.inner.(*SQLStore); ok {
 		alreadyMigrated = sql.IsPNMigrated(pn.SignalAddressUser())
@@ -514,21 +516,23 @@ func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.J
 	if !alreadyMigrated {
 		// D-01/D-02 (Phase 47.3): three-branch gate for the first-send no-op-skip.
 		//
-		// The flush-block (WithFlushBlocked) is only needed when there is actual PN
-		// migration work to order against the flusher. Skip it when BOTH checks
-		// are negative — "no-op path" (cheap: one dirty-set scan + one index-narrowed
-		// LIKE query on the first send per recipient, then IsPNMigrated takes over).
+		// Flush coordination (a migrate work item dispatched to the single writer)
+		// is only needed when there is actual PN migration work to order against
+		// the flusher. Skip it when BOTH checks are negative — "no-op path" (cheap:
+		// one dirty-set scan + one index-narrowed LIKE query on the first send per
+		// recipient, then IsPNMigrated takes over).
 		//
 		//   Branch 1 (full ordered path): hasDirty || hasDB is true — there are PN
-		//     sessions in the dirty-set or the DB. Take WithFlushBlocked exactly as
-		//     before (CR-04: flush dirty prefix first, then migrate inside the block).
+		//     sessions in the dirty-set or the DB. Dispatch a workMigratePNPrefix
+		//     work item to the single writer (D2 CR-04: flush dirty prefix first,
+		//     then migrate, FIFO-ordered inside the writer).
 		//
 		//   Branch 2 (no-op path): both checks are false — nothing to migrate.
 		//     Call inner.MigratePNToLID UNCONDITIONALLY (D-01: sets the
 		//     migratedPNSessionsCache gate so every subsequent send for this pn
 		//     short-circuits at IsPNMigrated before reaching this block).
-		//     Skip WithFlushBlocked — safe-by-construction for CR-01 (nothing to
-		//     delete means no delete-resurrection risk).
+		//     Skip the work-item dispatch — safe-by-construction for CR-01 (nothing
+		//     to delete means no delete-resurrection risk).
 		//
 		//   Branch 3 (nil-flusher fallback): no SessionFlusher wired — the inner
 		//     store is used directly with no write-back buffering; call inner directly
@@ -553,26 +557,26 @@ func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.J
 
 		if c.flusher != nil && (hasDirty || hasDB) {
 			// Branch 1: full ordered path — flush dirty PN entries before migration.
-			// Phase 35.2-09 CR-04: force PN-prefixed dirty entries down to the DB and
-			// remove them BEFORE the inner migration, inside the flush-blocked
-			// section, so (a) the migration's SELECT copies the freshest ratchet
-			// state to the LID key (a dirty-but-unflushed PN session would otherwise
-			// miss the migration — stale LID row) and (b) neither an in-flight flush
-			// snapshot nor a later drain can re-insert a zombie pn row after the
-			// migration deletes the pn rows. On sweep failure the migration is
-			// aborted (fail closed); the inner once-per-process gate is not consumed,
-			// so a retry can still heal.
-			if err := c.flusher.WithFlushBlocked(func() error {
-				if err := c.flusher.flushPrefixBlocked(ctx, pnPrefix); err != nil {
-					return fmt.Errorf("failed to flush pending sessions before PN->LID migration: %w", err)
-				}
-				return c.inner.MigratePNToLID(ctx, pn, lid)
-			}); err != nil {
+			// Phase 47.3-06 D2 CR-04: dispatch a workMigratePNPrefix work item to
+			// the single writer goroutine, which (inside the writer, FIFO-ordered
+			// with flushes and deletes) (a) flushes PN-prefixed dirty entries to the
+			// DB and removes them BEFORE the inner migration so the migration's
+			// SELECT copies the freshest ratchet state to the LID key (a
+			// dirty-but-unflushed PN session would otherwise miss the migration —
+			// stale LID row), and (b) ensures neither an in-flight flush snapshot
+			// nor a later drain can re-insert a zombie pn row after the migration
+			// deletes the pn rows. On pre-migrate-flush failure the migration is
+			// aborted (fail closed); the inner once-per-process gate is not
+			// consumed, so a retry can still heal. flusher.MigratePNToLID blocks on
+			// the work item's done channel. (The pnPrefix computed above is also the
+			// flusher's work-item prefix — derived identically from
+			// pn.SignalAddressUser()+":".)
+			if err := c.flusher.MigratePNToLID(ctx, pn, lid); err != nil {
 				return err
 			}
 		} else if c.flusher != nil {
 			// Branch 2: no-op path — both hasDirty and hasDB are false.
-			// Call inner directly (sets once-per-process gate); skip WithFlushBlocked.
+			// Call inner directly (sets once-per-process gate); skip the work-item dispatch.
 			if err := c.inner.MigratePNToLID(ctx, pn, lid); err != nil {
 				return err
 			}
