@@ -1127,6 +1127,15 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(axolotlSKDM, pbSerializer.SenderKeyDistributionMessage)
 	if err != nil {
 		cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
+		// 2026-07-01 SKDM debug: capture the raw bytes that fail to parse so we can root-cause the
+		// wire format (they are not otherwise logged). Low volume (~300/day, a couple of @lid senders).
+		// %x = hex; byte0/verNibble expose the libsignal version prefix the parser strips at serialized[0].
+		var skdmByte0 byte
+		if len(axolotlSKDM) > 0 {
+			skdmByte0 = axolotlSKDM[0]
+		}
+		cli.Log.Errorf("SKDM_PARSE_FAIL_BYTES from=%s group=%s len=%d byte0=0x%02x verNibble=%d hex=%x",
+			from, chat, len(axolotlSKDM), skdmByte0, skdmByte0>>4, axolotlSKDM)
 		if traced {
 			cli.Log.Infof("SKDM_TRACE stage=parse-FAIL sender=%s device=%d group=%s err=%v", from.User, from.Device, chat.String(), err)
 		}
