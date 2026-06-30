@@ -49,25 +49,26 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 	info, err := cli.parseMessageInfo(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse message: %v", err)
+		cli.sendAck(ctx, node, NackParsingError)
+		return
+	}
+	if !info.SenderAlt.IsEmpty() {
+		cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
+	} else if !info.RecipientAlt.IsEmpty() {
+		cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
+	}
+	if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
+		go cli.updateBusinessName(ctx, info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
+	}
+	if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
+		go cli.updatePushName(ctx, info.Sender, info.SenderAlt, info, info.PushName)
+	}
+	if info.Sender.Server == types.NewsletterServer {
+		var cancelled bool
+		defer cli.maybeDeferredAck(ctx, node)(&cancelled)
+		cancelled = cli.handlePlaintextMessage(ctx, info, node)
 	} else {
-		if !info.SenderAlt.IsEmpty() {
-			cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
-		} else if !info.RecipientAlt.IsEmpty() {
-			cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
-		}
-		if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
-			go cli.updateBusinessName(ctx, info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
-		}
-		if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
-			go cli.updatePushName(ctx, info.Sender, info.SenderAlt, info, info.PushName)
-		}
-		if info.Sender.Server == types.NewsletterServer {
-			var cancelled bool
-			defer cli.maybeDeferredAck(ctx, node)(&cancelled)
-			cancelled = cli.handlePlaintextMessage(ctx, info, node)
-		} else {
-			cli.decryptMessages(ctx, info, node)
-		}
+		cli.decryptMessages(ctx, info, node)
 	}
 }
 
@@ -313,6 +314,14 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 	// p50/p95/p99 metric meaningless garbage.
 	start := time.Now()
 	defer func() { walltime.DecryptHistogram.Observe(time.Since(start)) }()
+	// upstream merge (2026-06): recover from a decrypt panic and still ack the node so a
+	// panicking message isn't retried forever. Runs before the wall-time defer (LIFO).
+	defer func() {
+		if err := recover(); err != nil {
+			cli.Log.Errorf("Message decryption for %s panicked: %v\n%s", info.ID, err, debug.Stack())
+			cli.sendAck(ctx, node, 0)
+		}
+	}()
 	unavailableNode, ok := node.GetOptionalChildByTag("unavailable")
 	if ok && len(node.GetChildrenByTag("enc")) == 0 {
 		uType := events.UnavailableType(unavailableNode.AttrGetter().String("type"))
@@ -1268,13 +1277,13 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 		if err := cli.storeNCTSalt(ctx, historySync.GetNctSalt()); err != nil {
 			cli.Log.Warnf("Failed to store NCT salt from history sync: %v", err)
 		}
+		if len(historySync.GetPhoneNumberToLidMappings()) > 0 {
+			cli.storeHistoricalPNLIDMappings(ctx, historySync.GetPhoneNumberToLidMappings())
+		}
 		if historySync.GetSyncType() == waHistorySync.HistorySync_PUSH_NAME {
 			cli.handleHistoricalPushNames(ctx, historySync.GetPushnames())
 		} else if len(historySync.GetConversations()) > 0 {
 			cli.storeHistoricalMessageSecrets(ctx, historySync.GetConversations())
-		}
-		if len(historySync.GetPhoneNumberToLidMappings()) > 0 {
-			cli.storeHistoricalPNLIDMappings(ctx, historySync.GetPhoneNumberToLidMappings())
 		}
 		if historySync.GlobalSettings != nil {
 			cli.storeGlobalSettings(ctx, historySync.GlobalSettings)
@@ -1458,9 +1467,15 @@ func (cli *Client) storeHistoricalMessageSecrets(ctx context.Context, conversati
 		if chatJID.IsEmpty() {
 			continue
 		}
-		if chatJID.Server == types.DefaultUserServer && conv.GetTcToken() != nil {
+		var chatPN types.JID
+		if chatJID.Server == types.DefaultUserServer {
+			chatPN = chatJID
+		} else if chatJID.Server == types.HiddenUserServer {
+			chatPN, _ = cli.Store.LIDs.GetPNForLID(ctx, chatJID)
+		}
+		if !chatPN.IsEmpty() && conv.GetTcToken() != nil {
 			privacyTokens = append(privacyTokens, store.PrivacyToken{
-				User:            chatJID,
+				User:            chatPN,
 				Token:           conv.GetTcToken(),
 				Timestamp:       time.Unix(int64(conv.GetTcTokenTimestamp()), 0),
 				SenderTimestamp: time.Unix(int64(conv.GetTcTokenSenderTimestamp()), 0),
@@ -1472,7 +1487,7 @@ func (cli *Client) storeHistoricalMessageSecrets(ctx context.Context, conversati
 				msgKey := msg.GetMessage().GetKey()
 				if msgKey.GetFromMe() {
 					senderJID = ownID
-				} else if chatJID.Server == types.DefaultUserServer {
+				} else if chatJID.Server == types.DefaultUserServer || chatJID.Server == types.HiddenUserServer {
 					senderJID = chatJID
 				} else if msgKey.GetParticipant() != "" {
 					senderJID, _ = types.ParseJID(msgKey.GetParticipant())
