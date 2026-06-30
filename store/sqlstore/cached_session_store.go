@@ -510,8 +510,8 @@ func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.J
 	// still runs unconditionally (cheap, idempotent), so cache-coherence behavior
 	// is unchanged.
 	alreadyMigrated := false
-	if sql, ok := c.inner.(*SQLStore); ok {
-		alreadyMigrated = sql.IsPNMigrated(pn.SignalAddressUser())
+	if gater, ok := c.inner.(pnMigrationGater); ok {
+		alreadyMigrated = gater.IsPNMigrated(pn.SignalAddressUser())
 	}
 	if !alreadyMigrated {
 		// D-01/D-02 (Phase 47.3): three-branch gate for the first-send no-op-skip.
@@ -546,12 +546,23 @@ func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.J
 
 		hasDirty := c.flusher != nil && c.flusher.HasDirtyPrefix(pnPrefix)
 
+		// F10 (Phase 55): skip ExistsPNSession when hasDirty is true. If the
+		// dirty-set already has PN entries for this recipient, Branch 1 is taken
+		// regardless of the DB state — making the round-trip redundant. In a
+		// fan-out of N recipients that all have dirty sessions, this reduces N DB
+		// queries to 0. ExistsPNSession is still called when hasDirty=false (to
+		// distinguish Branch 1 from Branch 2), and only when a flusher is wired
+		// (Branch 3 ignores hasDB entirely).
+		// Uses the pnExistenceChecker interface instead of a *SQLStore type
+		// assertion so test doubles can track call counts.
 		var hasDB bool
-		if sql, ok := c.inner.(*SQLStore); ok {
-			var err error
-			hasDB, err = sql.ExistsPNSession(ctx, pnPrefix)
-			if err != nil {
-				return fmt.Errorf("MigratePNToLID existence check: %w", err)
+		if !hasDirty && c.flusher != nil {
+			if checker, ok := c.inner.(pnExistenceChecker); ok {
+				var err error
+				hasDB, err = checker.ExistsPNSession(ctx, pnPrefix)
+				if err != nil {
+					return fmt.Errorf("MigratePNToLID existence check: %w", err)
+				}
 			}
 		}
 
@@ -605,6 +616,30 @@ func (c *CachedSessionStore) MigratePNToLID(ctx context.Context, pn, lid types.J
 	// eviction removed some keys between SnapshotKeys and the Remove loop.
 	c.secondaryIndex.DropKey(c.jid, pn.SignalAddressUser())
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Narrow interfaces used by MigratePNToLID
+// ---------------------------------------------------------------------------
+
+// pnMigrationGater is satisfied by *SQLStore (and test doubles). Reports
+// whether the once-per-process PN→LID gate has already fired for a given
+// pnSignal WITHOUT mutating it. Checked at the top of MigratePNToLID to
+// short-circuit the expensive flush/migrate path on subsequent sends to the
+// same recipient.
+type pnMigrationGater interface {
+	IsPNMigrated(pnSignal string) bool
+}
+
+// pnExistenceChecker is satisfied by *SQLStore (and test doubles). Checks
+// whether any session row exists for a PN-form prefix. Used by
+// MigratePNToLID to distinguish Branch 1 (sessions exist → flush-then-
+// migrate) from Branch 2 (no sessions → no-op call to set the gate).
+// Only called when hasDirty is false (F10 Phase 55: when the dirty-set
+// already has PN entries, Branch 1 is taken regardless of the DB state,
+// making ExistsPNSession redundant).
+type pnExistenceChecker interface {
+	ExistsPNSession(ctx context.Context, pnPrefix string) (bool, error)
 }
 
 // ---------------------------------------------------------------------------

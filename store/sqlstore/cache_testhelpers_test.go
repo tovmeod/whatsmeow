@@ -43,6 +43,10 @@ type fakeSessionStore struct {
 	deleteAllCalls atomic.Int64
 	deleteCalls    atomic.Int64
 	migrateCalls   atomic.Int64
+	// existsCalls counts ExistsPNSession calls. Used by F10 tests to verify
+	// that the DB existence check is skipped when the dirty-set already has
+	// matching PN entries (hasDirty=true path).
+	existsCalls atomic.Int64
 
 	// lastGetManyBatchBuf retains a copy of the addresses argument from the
 	// most recent GetManySessions call so cache tests can assert the wrapper
@@ -57,6 +61,12 @@ type fakeSessionStore struct {
 	putErr     error
 	putManyErr error
 	migrateErr error
+
+	// migratedPNs tracks which SignalAddressUser pn strings have been
+	// migrated via MigratePNToLID. Satisfies pnMigrationGater so that
+	// CachedSessionStore.MigratePNToLID's IsPNMigrated gate fires in tests
+	// after the first migration per pn (mirroring SQLStore.migratedPNSessionsCache).
+	migratedPNs sync.Map // key: SignalAddressUser string; value: struct{}
 }
 
 // lastGetManyBatch returns a copy of the addresses passed to the most recent
@@ -195,13 +205,40 @@ func (f *fakeSessionStore) MigratePNToLID(_ context.Context, pn, lid types.JID) 
 		f.sessions[newAddr] = session
 		delete(f.sessions, addr)
 	}
+	// Mirror SQLStore.migratedPNSessionsCache: set the once-per-process gate
+	// so CachedSessionStore.MigratePNToLID short-circuits on repeat calls for
+	// the same pn (F10 gate test). Uses the migratedPNs sync.Map which
+	// satisfies the pnMigrationGater interface.
+	f.migratedPNs.Store(pn.SignalAddressUser(), struct{}{})
 	return nil
 }
 
-// IsPNMigrated: the fake has no once-per-process gate, so every migration is a
-// real one (consumed). Phase 47.3 F4 interface widening — fakeSessionStore is
-// used as the writer-store backing in cached-store flusher tests.
-func (f *fakeSessionStore) IsPNMigrated(string) bool { return false }
+// IsPNMigrated satisfies pnMigrationGater. Returns true if MigratePNToLID has
+// been called for this pnSignal in this process (mirroring
+// SQLStore.migratedPNSessionsCache). The old stub always returned false; the
+// stateful version lets F10 gate tests verify that repeat calls short-circuit
+// without hitting ExistsPNSession again.
+func (f *fakeSessionStore) IsPNMigrated(pnSignal string) bool {
+	_, ok := f.migratedPNs.Load(pnSignal)
+	return ok
+}
+
+// ExistsPNSession satisfies pnExistenceChecker. Counts calls via existsCalls so
+// F10 tests can assert that ExistsPNSession is skipped (0 calls) when the
+// dirty-set already has PN entries (hasDirty=true) and is called at most once
+// per pn per process lifetime (IsPNMigrated gate). Mirrors SQLStore semantics:
+// returns true if any session address starts with pnPrefix.
+func (f *fakeSessionStore) ExistsPNSession(_ context.Context, pnPrefix string) (bool, error) {
+	f.existsCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for addr := range f.sessions {
+		if strings.HasPrefix(addr, pnPrefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 
 // ---------------------------------------------------------------------------
 // fakeIdentityStore implements store.IdentityStore (store/store.go:23-28).

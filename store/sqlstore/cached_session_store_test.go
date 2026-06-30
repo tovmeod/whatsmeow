@@ -1086,3 +1086,110 @@ func BenchmarkDeleteAllSessions_LargeShared(b *testing.B) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// F10 (Phase 55): ExistsPNSession batch optimization tests.
+//
+// MigratePNToLID fan-out (47.3 REVIEW F10): the encrypt fan-out calls
+// MigratePNToLID once per recipient. Without the fix, each call would make
+// one ExistsPNSession DB round-trip, producing O(N) DB queries for N
+// recipients. The fix (Phase 55-08) skips ExistsPNSession when the dirty-set
+// already has PN entries for the recipient (hasDirty=true), since Branch 1 is
+// taken regardless of the DB state — making the query redundant.
+//
+// Two assertions:
+//  1. TestMigratePNToLIDBatchQuery: N dirty sessions (one per recipient) →
+//     N MigratePNToLID calls → 0 ExistsPNSession calls (hasDirty=true for all,
+//     each skipped). "At most once per batch" = 0 queries for N devices.
+//
+//  2. TestMigratePNToLID_IsPNMigratedGate: first call (no dirty/DB sessions)
+//     → ExistsPNSession called once. Second call for same pn → IsPNMigrated
+//     gate fires → ExistsPNSession NOT called. Gate proves O(1) per pn per
+//     process lifetime when hasDirty=false.
+// ---------------------------------------------------------------------------
+
+// TestMigratePNToLIDBatchQuery verifies the F10 optimization: when there are N
+// dirty sessions (one per recipient) in the flusher's dirty-set, calling
+// MigratePNToLID for each recipient makes 0 ExistsPNSession DB queries (not N).
+// hasDirty=true → Branch 1 is taken directly, ExistsPNSession is skipped.
+func TestMigratePNToLIDBatchQuery(t *testing.T) {
+	ctx := context.Background()
+	// newTestCachedSessionStoreWithFlusher wires fakeSessionStore as both the
+	// inner store and the write-back target. fakeSessionStore.ExistsPNSession
+	// counts calls via existsCalls so we can assert it was not invoked.
+	c, inner, _, _, _ := newTestCachedSessionStoreWithFlusher(t, 1000)
+
+	// Seed N dirty sessions: one per recipient phone, simulating a fan-out of
+	// N recipients each with one device. PutSession enqueues into the flusher
+	// dirty-set (write-back path) without touching inner immediately.
+	const N = 8
+	for i := 0; i < N; i++ {
+		pnAddr := fmt.Sprintf("phone%d:0", i)
+		if err := c.PutSession(ctx, pnAddr, []byte(fmt.Sprintf("ratchet-%d", i))); err != nil {
+			t.Fatalf("seed PutSession %s: %v", pnAddr, err)
+		}
+	}
+
+	// Verify sessions are in the dirty-set, not yet in inner.
+	for i := 0; i < N; i++ {
+		pnAddr := fmt.Sprintf("phone%d:0", i)
+		if has, _ := inner.HasSession(ctx, pnAddr); has {
+			t.Fatalf("session %s already flushed — test requires dirty-set state", pnAddr)
+		}
+	}
+
+	// Simulate the fan-out: call MigratePNToLID once per recipient.
+	// Each call has hasDirty=true (the dirty-set has "phoneN:0" for each N),
+	// so ExistsPNSession must be skipped for every call.
+	beforeExists := inner.existsCalls.Load()
+	for i := 0; i < N; i++ {
+		pn := types.JID{User: fmt.Sprintf("phone%d", i), Server: types.DefaultUserServer}
+		lid := types.JID{User: fmt.Sprintf("lid%d", i), Server: types.HiddenUserServer}
+		if err := c.MigratePNToLID(ctx, pn, lid); err != nil {
+			t.Fatalf("MigratePNToLID recipient %d: %v", i, err)
+		}
+	}
+	afterExists := inner.existsCalls.Load()
+
+	// Core assertion (F10): hasDirty=true for all N recipients → ExistsPNSession
+	// must not be called at all. Without the fix, N calls would be made.
+	if delta := afterExists - beforeExists; delta != 0 {
+		t.Errorf("ExistsPNSession called %d times for %d dirty-set recipients, want 0 (hasDirty=true → DB existence check is redundant, must be skipped)", delta, N)
+	}
+}
+
+// TestMigratePNToLID_IsPNMigratedGate verifies that:
+//  1. When hasDirty=false and the pn has no DB sessions, ExistsPNSession IS
+//     called once (the normal no-dirty-set path where hasDB must be checked).
+//  2. After the first MigratePNToLID call sets the once-per-process gate, a
+//     second call short-circuits at IsPNMigrated — ExistsPNSession is NOT called
+//     again. This proves O(1) ExistsPNSession per pn per process lifetime.
+func TestMigratePNToLID_IsPNMigratedGate(t *testing.T) {
+	ctx := context.Background()
+	c, inner, _, _, _ := newTestCachedSessionStoreWithFlusher(t, 1000)
+
+	pn := types.JID{User: "999888", Server: types.DefaultUserServer}
+	lid := types.JID{User: "777666", Server: types.HiddenUserServer}
+
+	// First call: no dirty sessions for pn "999888", no DB sessions either.
+	// hasDirty=false → ExistsPNSession IS called (to distinguish Branch 1/2).
+	before1 := inner.existsCalls.Load()
+	if err := c.MigratePNToLID(ctx, pn, lid); err != nil {
+		t.Fatalf("first MigratePNToLID: %v", err)
+	}
+	after1 := inner.existsCalls.Load()
+	if delta := after1 - before1; delta != 1 {
+		t.Errorf("first call: existsCalls delta = %d, want 1 (hasDirty=false, ExistsPNSession must be called to detect Branch 1 vs Branch 2)", delta)
+	}
+
+	// Second call for the same pn: IsPNMigrated gate fires (set by the first
+	// call's inner.MigratePNToLID). ExistsPNSession must NOT be called.
+	before2 := inner.existsCalls.Load()
+	if err := c.MigratePNToLID(ctx, pn, lid); err != nil {
+		t.Fatalf("second MigratePNToLID: %v", err)
+	}
+	after2 := inner.existsCalls.Load()
+	if delta := after2 - before2; delta != 0 {
+		t.Errorf("second call: existsCalls delta = %d, want 0 (IsPNMigrated gate must short-circuit before ExistsPNSession)", delta)
+	}
+}
