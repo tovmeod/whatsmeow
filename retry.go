@@ -994,8 +994,14 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 		// kavtov-fork (38.5): ask-once gate — for group decrypt-fails, only one managed
 		// account sends the phone-fetch request per (group, message). The first account
 		// to TryClaim wins; others skip. If nil (gate disabled), fires unconditionally.
-		doPhoneRequest := true
-		if info.IsGroup && cli.PhoneRequestClaims != nil {
+		//
+		// 2026-06-30 incident: master-gate the phone-fetch behind AutomaticMessageRerequestFromPhone
+		// (previously unconditional for groups). The group phone-fetch storm (~34.7k/day) correlated
+		// with WhatsApp 401 device_removed companion removals + up-to-60s ride-alert latency. With the
+		// flag off (KAVTOV_PHONE_REREQUEST unset) NO phone-fetch fires; the standard retry receipt
+		// (sender resend) below is unaffected.
+		doPhoneRequest := cli.AutomaticMessageRerequestFromPhone
+		if doPhoneRequest && info.IsGroup && cli.PhoneRequestClaims != nil {
 			doPhoneRequest = cli.PhoneRequestClaims.TryClaim(info.Chat.String(), info.ID)
 		}
 		if doPhoneRequest {

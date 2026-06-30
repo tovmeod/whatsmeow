@@ -318,7 +318,11 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		uType := events.UnavailableType(unavailableNode.AttrGetter().String("type"))
 		cli.Log.Warnf("Unavailable message %s from %s (type: %q)", info.ID, info.SourceString(), uType)
 		cli.backgroundIfAsyncAck(func() {
-			cli.immediateRequestMessageFromPhone(ctx, info)
+			// 2026-06-30 incident: gate the unavailable-node phone-fetch behind the same flag as the
+			// decrypt-fail path (see retry.go). Ack still fires unconditionally.
+			if cli.AutomaticMessageRerequestFromPhone {
+				cli.immediateRequestMessageFromPhone(ctx, info)
+			}
 			cli.sendAck(ctx, node, 0)
 		})
 		cli.dispatchEvent(&events.UndecryptableMessage{Info: *info, IsUnavailable: true, UnavailableType: uType})
