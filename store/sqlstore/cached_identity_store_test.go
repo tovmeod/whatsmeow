@@ -15,6 +15,8 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 // Compile-time conformance is asserted inside cached_identity_store.go via
@@ -544,6 +546,60 @@ func TestIdentityAccept_OncePerChange(t *testing.T) {
 	}
 	if got := c.IdentityChangedCount(); got != 1 {
 		t.Errorf("after equal check: IdentityChangedCount = %d, want 1 (no second count)", got)
+	}
+}
+
+// capturingLogger implements waLog.Logger and records how many times each
+// level was called, so tests can assert IDENTITY_CHANGED (class 4, 55.1-03)
+// emits at Debug, not Warn.
+type capturingLogger struct {
+	warnCalls, debugCalls int
+}
+
+func (l *capturingLogger) Warnf(_ string, _ ...any)  { l.warnCalls++ }
+func (l *capturingLogger) Errorf(_ string, _ ...any) {}
+func (l *capturingLogger) Infof(_ string, _ ...any)  {}
+func (l *capturingLogger) Debugf(_ string, _ ...any) { l.debugCalls++ }
+func (l *capturingLogger) Sub(_ string) waLog.Logger { return l }
+
+// TestIdentityAccept_MismatchLogsAtDebugNotWarn verifies class 4 (55.1-03):
+// logIdentityChanged emits the IDENTITY_CHANGED line at Debug, not Warn — the
+// audit signal survives via IdentityChangedCount / identityChangedTotal,
+// which must still increment exactly as before. A bare *SQLStore (no live DB)
+// satisfies the c.inner.(*SQLStore) type assertion logIdentityChanged uses to
+// reach the logger; the cache-hit compare site exercised here never touches
+// sq.db, so no database connection is needed.
+func TestIdentityAccept_MismatchLogsAtDebugNotWarn(t *testing.T) {
+	ctx := context.Background()
+	captured := &capturingLogger{}
+	sqlInner := &SQLStore{Container: &Container{log: captured}, JID: "test-jid"}
+	cache, err := lru.New[string, *[32]byte](16)
+	if err != nil {
+		t.Fatalf("lru.New failed: %v", err)
+	}
+	var dummyExplicitRemoves uint64
+	c := NewCachedIdentityStore(sqlInner, "test-jid", cache, &dummyExplicitRemoves, newIdentitySecondaryIndex())
+
+	k1 := fillKey(0x70)
+	k2 := fillKey(0x80)
+	seed := k1
+	cache.Add(c.key("addr-Debug"), &seed) // seed cache-hit compare site directly
+
+	ok, err := c.IsTrustedIdentity(ctx, "addr-Debug", k2)
+	if err != nil {
+		t.Fatalf("IsTrustedIdentity mismatch: %v", err)
+	}
+	if !ok {
+		t.Errorf("IsTrustedIdentity mismatch = false, want true (D-10 accept)")
+	}
+	if got := c.IdentityChangedCount(); got != 1 {
+		t.Errorf("IdentityChangedCount = %d, want 1", got)
+	}
+	if captured.warnCalls != 0 {
+		t.Errorf("Warnf calls = %d, want 0 (IDENTITY_CHANGED must not warn)", captured.warnCalls)
+	}
+	if captured.debugCalls != 1 {
+		t.Errorf("Debugf calls = %d, want 1 (IDENTITY_CHANGED must emit at Debug)", captured.debugCalls)
 	}
 }
 
