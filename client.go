@@ -708,12 +708,32 @@ func (cli *Client) isExpectedDisconnect() bool {
 	return cli.expectedDisconnect.IsSet()
 }
 
+// maxAutoReconnectDelay caps the auto-reconnect backoff (55.1-02). autoReconnectDelay
+// previously grew linearly (AutoReconnectErrors * 2s) with no maximum, so a long-failing
+// account retried at an ever-growing interval. WA Web's own client caps its Fibonacci
+// backoff at 15 minutes (55.1-INVESTIGATION-websocket.md section 3), but a ride-dispatch
+// driver account that CAN reconnect must not wait minutes; a 60s steady-state retry is
+// used instead — the cap value is an engineering choice, the protocol-grounded
+// requirement is only that a cap exists.
+const maxAutoReconnectDelay = 60 * time.Second
+
+// autoReconnectDelayFor computes the auto-reconnect backoff for a given AutoReconnectErrors
+// count, capped at maxAutoReconnectDelay. Extracted from autoReconnect so tests can assert
+// the cap without running the reconnect loop.
+func autoReconnectDelayFor(autoReconnectErrors int) time.Duration {
+	delay := time.Duration(autoReconnectErrors) * 2 * time.Second
+	if delay > maxAutoReconnectDelay {
+		delay = maxAutoReconnectDelay
+	}
+	return delay
+}
+
 func (cli *Client) autoReconnect(ctx context.Context) {
 	if !cli.EnableAutoReconnect || cli.Store.ID == nil {
 		return
 	}
 	for {
-		autoReconnectDelay := time.Duration(cli.AutoReconnectErrors) * 2 * time.Second
+		autoReconnectDelay := autoReconnectDelayFor(cli.AutoReconnectErrors)
 		cli.Log.Debugf("Automatically reconnecting after %v", autoReconnectDelay)
 		cli.AutoReconnectErrors++
 		if cli.expectedDisconnect.WaitTimeoutCtx(ctx, autoReconnectDelay) == nil {

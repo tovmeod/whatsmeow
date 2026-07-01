@@ -1,6 +1,7 @@
-// kavtov-fork (55.1-02 Task 1): unit tests for the reconnect-durable pending ack/receipt
-// queue.
+// kavtov-fork (55.1-02): unit tests for the reconnect-durable pending ack/receipt queue and
+// the bounded auto-reconnect backoff.
 //
+// Task 1 — pending stanza queue:
 //   - sendAck with no socket (ErrNotConnected) queues instead of warning.
 //   - replayPendingStanzas re-sends queued nodes in FIFO order.
 //   - replayPendingStanzas re-queues the remainder (order preserved) if a replay send hits
@@ -10,6 +11,10 @@
 //     (not one Errorf per discard).
 //   - a non-ErrNotConnected send error (sendAck and sendMessageReceipt) does not enqueue and
 //     still warns, exactly like before this plan.
+//
+// Task 2 — bounded auto-reconnect backoff:
+//   - autoReconnectDelayFor caps at maxAutoReconnectDelay for a large AutoReconnectErrors.
+//   - autoReconnectDelayFor is unchanged (linear) below the cap.
 //
 // Test style: bare &Client{} with a captured waLog.Logger; cli.sendNodeFunc stands in for a
 // real socket (see the sendNodeFunc field doc in client.go) — no socket, no PG.
@@ -22,6 +27,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
@@ -267,5 +273,22 @@ func TestReceiptReplay_DiscardsOnNonDisconnectErrorAndWarns(t *testing.T) {
 	cli.pendingStanzasLock.Unlock()
 	if n != 0 {
 		t.Fatalf("want the entry discarded (not re-queued) on a non-ErrNotConnected replay error, got %d remaining", n)
+	}
+}
+
+// --- Task 2: bounded auto-reconnect backoff --------------------------------------------------
+
+func TestAutoReconnectDelay_CapsAtMax(t *testing.T) {
+	got := autoReconnectDelayFor(10_000)
+	if got != maxAutoReconnectDelay {
+		t.Fatalf("want delay capped at %v for a large AutoReconnectErrors, got %v", maxAutoReconnectDelay, got)
+	}
+}
+
+func TestAutoReconnectDelay_BelowCapIsUnchangedLinear(t *testing.T) {
+	got := autoReconnectDelayFor(5)
+	want := 10 * time.Second
+	if got != want {
+		t.Fatalf("want unchanged linear delay %v below the cap, got %v", want, got)
 	}
 }
