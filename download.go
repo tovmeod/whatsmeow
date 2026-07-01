@@ -383,9 +383,6 @@ func (cli *Client) downloadMedia(ctx context.Context, url string) ([]byte, error
 const mediaHMACLength = 10
 
 func (cli *Client) downloadEncryptedMedia(ctx context.Context, url string, checksum []byte) (file, mac []byte, err error) {
-	if len(checksum) != 32 {
-		return nil, nil, fmt.Errorf("invalid checksum length: expected 32, got %d", len(checksum))
-	}
 	data, err := cli.downloadMedia(ctx, url)
 	if err != nil {
 		return
@@ -394,7 +391,7 @@ func (cli *Client) downloadEncryptedMedia(ctx context.Context, url string, check
 		return
 	}
 	file, mac = data[:len(data)-mediaHMACLength], data[len(data)-mediaHMACLength:]
-	if sha256.Sum256(data) != *(*[32]byte)(checksum) {
+	if len(checksum) == 32 && sha256.Sum256(data) != *(*[32]byte)(checksum) {
 		err = ErrInvalidMediaEncSHA256
 	}
 	return

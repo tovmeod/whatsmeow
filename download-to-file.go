@@ -202,15 +202,12 @@ func (cli *Client) downloadMediaToFile(ctx context.Context, url string, file io.
 }
 
 func (cli *Client) downloadEncryptedMediaToFile(ctx context.Context, url string, checksum []byte, file File) ([]byte, error) {
-	if len(checksum) != 32 {
-		return nil, fmt.Errorf("invalid checksum length: expected 32, got %d", len(checksum))
-	}
 	size, hash, err := cli.downloadMediaToFile(ctx, url, file)
 	if err != nil {
 		return nil, err
 	} else if size <= mediaHMACLength {
 		return nil, ErrTooShortFile
-	} else if checksum != nil && !hmac.Equal(checksum, hash) {
+	} else if len(checksum) == 32 && !hmac.Equal(checksum, hash) {
 		return nil, ErrInvalidMediaEncSHA256
 	}
 	mac := make([]byte, mediaHMACLength)
