@@ -146,11 +146,15 @@ func (c *CachedIdentityStore) IdentityChangedCount() uint64 {
 // store.IdentityStore — read
 // ---------------------------------------------------------------------------
 
-// logIdentityChanged emits one IDENTITY_CHANGED warn line and increments
+// logIdentityChanged emits one IDENTITY_CHANGED debug line and increments
 // identityChangedCount. The logger is borrowed from c.inner when it is a
 // *SQLStore (intra-package type assertion — same idiom as recovery_sender_key.go:311-317).
 // If inner is not *SQLStore (test fakes, future wrappers) the log line is
 // skipped but the counter is still incremented — the counter is the test-visible signal.
+// Class 4 (55.1-03): a peer key rotation is already handled losslessly by the
+// D-10 auto-accept above; the per-event WARN was redundant with the
+// process-global identityChangedTotal aggregate already surfaced every 5
+// minutes by emitMetricsLoop, so this is demoted to Debug.
 func (c *CachedIdentityStore) logIdentityChanged(address string, old, newKey [32]byte) {
 	atomic.AddUint64(&c.identityChangedCount, 1)
 	identityChangedTotal.Add(1) // WR-02: process-global aggregate for emitMetricsLoop/DebugStats
@@ -159,7 +163,7 @@ func (c *CachedIdentityStore) logIdentityChanged(address string, old, newKey [32
 		log = sq.log
 	}
 	if log != nil {
-		log.Warnf("IDENTITY_CHANGED address=%s old=%x new=%x", address, old[:8], newKey[:8])
+		log.Debugf("IDENTITY_CHANGED address=%s old=%x new=%x", address, old[:8], newKey[:8])
 	}
 }
 

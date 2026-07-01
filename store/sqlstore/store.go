@@ -124,7 +124,13 @@ func (s *SQLStore) IsTrustedIdentity(ctx context.Context, address string, key [3
 	// D-10: auto-accept rotated identity key; emit one structured audit log.
 	// Per-(sender,key) once semantics come from libsignal's SaveIdentity-after-trust-check
 	// + PutIdentity value-equal skip (cached_identity_store.go) — do not add a dedup cache.
-	s.log.Warnf("IDENTITY_CHANGED address=%s old=%x new=%x", address, existing[:8], key[:8])
+	// Class 4 (55.1-03): demoted to Debug for consistency with
+	// CachedIdentityStore.logIdentityChanged — same phenomenon (a correctly
+	// trust-on-rotate peer key change). This raw path is unreachable in
+	// production: attachCachedStores (cache_wiring.go) always wraps every
+	// device's Identities via NewCachedIdentityStore, so it never feeds
+	// identityChangedTotal either.
+	s.log.Debugf("IDENTITY_CHANGED address=%s old=%x new=%x", address, existing[:8], key[:8])
 	return true, nil
 }
 
