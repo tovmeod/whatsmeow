@@ -148,7 +148,7 @@ func (cli *Client) downloadAndDecryptToFile(
 		return fmt.Errorf("failed to seek to start of file after decrypting: %w", err)
 	} else if _, err = io.Copy(hasher, file); err != nil {
 		return fmt.Errorf("failed to hash file: %w", err)
-	} else if !hmac.Equal(fileSHA256, hasher.Sum(nil)) {
+	} else if len(fileSHA256) == 32 && !hmac.Equal(fileSHA256, hasher.Sum(nil)) {
 		return ErrInvalidMediaSHA256
 	}
 	return nil

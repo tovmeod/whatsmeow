@@ -301,7 +301,7 @@ func (cli *Client) downloadAndDecrypt(
 
 	} else if data, err = cbcutil.Decrypt(cipherKey, iv, ciphertext); err != nil {
 		err = fmt.Errorf("failed to decrypt file: %w", err)
-	} else if len(fileSHA256) != 32 || sha256.Sum256(data) != *(*[32]byte)(fileSHA256) {
+	} else if len(fileSHA256) == 32 && sha256.Sum256(data) != *(*[32]byte)(fileSHA256) {
 		err = ErrInvalidMediaSHA256
 	}
 	return
