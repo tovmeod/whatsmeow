@@ -242,6 +242,21 @@ type Client struct {
 	skdmInstalledPtr  int
 	skdmInstalledLock sync.Mutex
 
+	// kavtov-fork (55.1-08, D-11 corrected): per-(sender,group) SKDM parse-fail dedup registry. An
+	// SKDM that fails to parse (55.1-INVESTIGATION-skdm.md: two @lid devices emitting a non-conformant
+	// 32-byte payload -- proven external format, not a fixable libsignal-version gap) stays VISIBLE
+	// and FULLY COUNTED, but re-announcing the identical, already-diagnosed failure as a fresh Error
+	// on every single message forever is spam, not vigilance. First sighting per (sender,group) emits
+	// the full Error diagnostic; every repeat only increments the per-pair count and the package-wide
+	// skdmParseFailTotal (message.go, folded into the periodic SKDM_DEDUP line). Bounded at
+	// skdmParseFailPairsSize; unlike skdmInstalled this is NOT a ring -- on overflow a brand-new pair
+	// is counted (skdmParseFailOverflow) but does not get its own first-occurrence Error, since
+	// today's working set is two senders and the bound exists only to guard a future storm of pairs.
+	skdmParseFailSeen     map[skdmParseFailKey]struct{}
+	skdmParseFailCounts   map[skdmParseFailKey]uint64
+	skdmParseFailOverflow uint64
+	skdmParseFailLock     sync.Mutex
+
 	sessionRecreateHistory     map[types.JID]time.Time
 	sessionRecreateHistoryLock sync.Mutex
 	// GetMessageForRetry is used to find the source message for handling retry receipts
@@ -371,6 +386,8 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
 		failedSenderKeyTuples:  make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
 		skdmInstalled:          make(map[skdmInstalledKey]uint32, skdmInstalledSize),
+		skdmParseFailSeen:      make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize),
+		skdmParseFailCounts:    make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize),
 		botResendBlacklist:       make(map[botResendKey]int),
 		appStateSyncFailures:     make(map[appstate.WAPatchName]int),
 		appStateFullSyncFailures: make(map[appstate.WAPatchName]int),

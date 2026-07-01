@@ -1047,6 +1047,56 @@ func (cli *Client) markSKDMProcessed(sender, group string, keyID, iter uint32) {
 	}
 }
 
+// skdmParseFailPairsSize bounds the per-(sender,group) SKDM parse-fail dedup registry (D-11
+// corrected handling, 55.1-08). Two @lid senders are observed today (55.1-INVESTIGATION-skdm.md);
+// the bound guards against a future storm of distinct non-conformant pairs consuming unbounded
+// memory.
+const skdmParseFailPairsSize = 1000
+
+// skdmParseFailKey keys the per-(sender,group) SKDM parse-fail dedup registry by the BARE sender
+// and group ids (not device-qualified, unlike skdmInstalledKey) -- a non-conformant account
+// sending garbage from a different device is still the same already-diagnosed condition.
+type skdmParseFailKey struct {
+	Sender string // from.User
+	Group  string // chat.User
+}
+
+// skdmParseFailTotal is the process-wide count of every SKDM parse failure (first-seen and
+// repeat), folded into the periodic SKDM_DEDUP line below so the total stays visible on the log
+// surface without a per-event Error for every repeat (D-11 corrected: visible + counted, never
+// silently dropped or downgraded).
+var skdmParseFailTotal atomic.Uint64
+
+// skdmParseFailShouldEmit records one SKDM parse failure for (sender, group) and reports whether
+// THIS occurrence should emit the full Error diagnostic. Every call increments skdmParseFailTotal
+// and the per-pair count regardless of the return value. Returns true only on the first-seen pair
+// (which it then records, subject to skdmParseFailPairsSize); every later call for the same pair
+// returns false. On overflow (skdmParseFailPairsSize distinct pairs already recorded) a brand-new
+// pair is counted via skdmParseFailOverflow but does not get its own first-occurrence Error -- the
+// bound is a future-storm guard, not today's shape (two senders).
+func (cli *Client) skdmParseFailShouldEmit(sender, group string) bool {
+	key := skdmParseFailKey{Sender: sender, Group: group}
+	cli.skdmParseFailLock.Lock()
+	defer cli.skdmParseFailLock.Unlock()
+	if cli.skdmParseFailSeen == nil {
+		// Lazy init: a bare &Client{} (tests / direct construction) must not nil-panic.
+		cli.skdmParseFailSeen = make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize)
+		cli.skdmParseFailCounts = make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize)
+	}
+	skdmParseFailTotal.Add(1)
+	if _, seen := cli.skdmParseFailSeen[key]; seen {
+		cli.skdmParseFailCounts[key]++
+		return false
+	}
+	if len(cli.skdmParseFailSeen) >= skdmParseFailPairsSize {
+		cli.skdmParseFailOverflow++
+		return false
+	}
+	cli.skdmParseFailSeen[key] = struct{}{}
+	cli.skdmParseFailCounts[key] = 1
+	return true
+}
+
 const checkPadding = true
 
 func isValidPadding(plaintext []byte) bool {
@@ -1126,16 +1176,29 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	wasFailed := cli.isFailedSenderKeyTuple(from.SignalAddress().String(), chat.String())
 	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(axolotlSKDM, pbSerializer.SenderKeyDistributionMessage)
 	if err != nil {
-		cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
-		// 2026-07-01 SKDM debug: capture the raw bytes that fail to parse so we can root-cause the
-		// wire format (they are not otherwise logged). Low volume (~300/day, a couple of @lid senders).
-		// %x = hex; byte0/verNibble expose the libsignal version prefix the parser strips at serialized[0].
-		var skdmByte0 byte
-		if len(axolotlSKDM) > 0 {
-			skdmByte0 = axolotlSKDM[0]
+		// kavtov-fork (55.1-08, D-11 corrected): visible + fully counted, not re-announced. The
+		// payload is proven-unparseable external format (55.1-INVESTIGATION-skdm.md: two @lid devices
+		// sending a bare 32-byte value where an SKDM belongs), not a version gap our fork could
+		// recover from -- there is no retry here today and this change must not add one. First
+		// sighting per (sender,group) emits the full diagnostic at the existing Error level with the
+		// existing byte0/verNibble/hex capture (that's what proved the root cause); every repeat only
+		// counts (skdmParseFailTotal, folded into the periodic SKDM_DEDUP line below) -- mirrors the
+		// iteration-aware SKDM dedup a few lines below (skdmProcessedIteration).
+		if cli.skdmParseFailShouldEmit(from.User, chat.User) {
+			cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
+			// 2026-07-01 SKDM debug: capture the raw bytes that fail to parse so we can root-cause the
+			// wire format (they are not otherwise logged). Low volume (~300/day, a couple of @lid senders).
+			// %x = hex; byte0/verNibble expose the libsignal version prefix the parser strips at serialized[0].
+			var skdmByte0 byte
+			if len(axolotlSKDM) > 0 {
+				skdmByte0 = axolotlSKDM[0]
+			}
+			cli.Log.Errorf("SKDM_PARSE_FAIL_BYTES from=%s group=%s len=%d byte0=0x%02x verNibble=%d hex=%x",
+				from, chat, len(axolotlSKDM), skdmByte0, skdmByte0>>4, axolotlSKDM)
+		} else {
+			cli.Log.Debugf("SKDM_PARSE_FAIL_BYTES (repeat, known non-conformant pair) from=%s group=%s len=%d total=%d",
+				from, chat, len(axolotlSKDM), skdmParseFailTotal.Load())
 		}
-		cli.Log.Errorf("SKDM_PARSE_FAIL_BYTES from=%s group=%s len=%d byte0=0x%02x verNibble=%d hex=%x",
-			from, chat, len(axolotlSKDM), skdmByte0, skdmByte0>>4, axolotlSKDM)
 		if traced {
 			cli.Log.Infof("SKDM_TRACE stage=parse-FAIL sender=%s device=%d group=%s err=%v", from.User, from.Device, chat.String(), err)
 		}
@@ -1160,7 +1223,7 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 				cli.Log.Infof("SKDM_TRACE stage=dedup-SKIP sender=%s device=%d group=%s keyid=%d iter=%d seen=%d", from.User, from.Device, chat.String(), keyID, skdmIter, seenIter)
 			}
 			if n := skdmDedupSkipped.Add(1); n%skdmDedupLogEvery == 0 {
-				cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d group=%s keyid=%d iter=%d seen=%d", skdmDedupProcessed.Load(), n, chat.String(), keyID, skdmIter, seenIter)
+				cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d parsefail=%d group=%s keyid=%d iter=%d seen=%d", skdmDedupProcessed.Load(), n, skdmParseFailTotal.Load(), chat.String(), keyID, skdmIter, seenIter)
 			}
 			return
 		}
@@ -1186,7 +1249,7 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	// The skip-path line (below wasFailed block) carries group/keyid/iter; this line
 	// records totals only (processed/skipped magnitude without per-event detail).
 	if p := skdmDedupProcessed.Add(1); p%skdmDedupLogEvery == 0 {
-		cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d", p, skdmDedupSkipped.Load())
+		cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d parsefail=%d", p, skdmDedupSkipped.Load(), skdmParseFailTotal.Load())
 	}
 	if wasFailed {
 		cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=y", from.SignalAddressUser(), from.Device, chat.String())

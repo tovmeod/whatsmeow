@@ -1,0 +1,159 @@
+// kavtov-fork (55.1-08): SKDM parse-fail visibility + per-(sender,group) dedup tests (D-11
+// corrected per 55.1-INVESTIGATION-skdm.md). The 32-byte payloads captured in prod are proven
+// external-format garbage (two @lid devices, not a fixable libsignal-version gap) -- there is no
+// valid parse to recover. Correct handling: the FIRST parse failure per (sender,group) pair emits
+// the full Error diagnostic (unchanged level, unchanged byte0/verNibble/hex fields); every repeat
+// from the SAME pair only counts (skdmParseFailTotal) without re-emitting; a second distinct pair
+// still gets its own first-occurrence Error; and no install/recovery write is ever attempted on a
+// parse failure (mirrors the write-count-proof style of skdm_dedup_test.go).
+
+package whatsmeow
+
+import (
+	"context"
+	"encoding/hex"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+
+	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
+)
+
+// errCapture records Errorf calls so tests can assert exact first-occurrence-only emission.
+// Implements waLog.Logger; Sub returns itself. Mirrors warnCapture in bot_resend_blacklist_test.go.
+type errCapture struct {
+	mu     sync.Mutex
+	errors []string
+}
+
+func (l *errCapture) Infof(string, ...interface{})  {}
+func (l *errCapture) Warnf(string, ...interface{})  {}
+func (l *errCapture) Debugf(string, ...interface{}) {}
+func (l *errCapture) Sub(string) waLog.Logger        { return l }
+func (l *errCapture) Errorf(msg string, _ ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.errors = append(l.errors, msg)
+}
+func (l *errCapture) errCount(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, e := range l.errors {
+		if strings.Contains(e, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// nonConformantSKDMBytes is a real captured 32-byte SKDM_PARSE_FAIL_BYTES sample
+// (55.1-INVESTIGATION-skdm.md §3, sample 0) -- proven too short and version-byte-less to be any
+// valid or truncated whatsmeow SenderKeyDistributionMessage (min 35 bytes, fixed 0x33 version
+// byte). Decoding fails immediately in proto.Unmarshal on the 31 bytes after the stripped version
+// nibble.
+func nonConformantSKDMBytes(t *testing.T) []byte {
+	t.Helper()
+	b, err := hex.DecodeString("01d7e68975509f6be5871050e2bc280839ec27a9669bc2c60c2eefe39ac99dd2")
+	if err != nil {
+		t.Fatalf("bad test fixture hex: %v", err)
+	}
+	if len(b) != 32 {
+		t.Fatalf("test fixture is %d bytes, want 32 (matching the documented failing shape)", len(b))
+	}
+	return b
+}
+
+// TestSKDMParseFail_FirstOccurrencePerPairEmitsError verifies the first parse failure for a
+// (sender,group) pair emits both existing Error lines, every repeat from the SAME pair emits
+// neither (only Debugf), every occurrence still advances skdmParseFailTotal, and no
+// install/recovery write is ever attempted.
+func TestSKDMParseFail_FirstOccurrencePerPairEmitsError(t *testing.T) {
+	ctx := context.Background()
+	chat := types.JID{User: "120363000000000090", Server: types.GroupServer}
+	from := types.JID{User: "249439369334987", Server: types.HiddenUserServer, Device: 46}
+	badBytes := nonConformantSKDMBytes(t)
+
+	log := &errCapture{}
+	sk := &countingPutSenderKeyStore{inner: newFakeSenderKeyStore()}
+	cli := newTestClient(sk)
+	cli.Log = log
+
+	startTotal := skdmParseFailTotal.Load()
+
+	for i := 0; i < 5; i++ {
+		cli.handleSenderKeyDistributionMessage(ctx, chat, from, badBytes)
+	}
+
+	if n := log.errCount("Failed to parse sender key distribution message"); n != 1 {
+		t.Errorf("first-line Error emitted %d times across 5 repeats of the SAME pair, want exactly 1", n)
+	}
+	if n := log.errCount("SKDM_PARSE_FAIL_BYTES"); n != 1 {
+		t.Errorf("SKDM_PARSE_FAIL_BYTES emitted %d times across 5 repeats of the SAME pair, want exactly 1", n)
+	}
+	if got := skdmParseFailTotal.Load() - startTotal; got != 5 {
+		t.Errorf("skdmParseFailTotal advanced by %d across 5 calls, want 5 (every occurrence must count)", got)
+	}
+	if sk.putCalls != 0 {
+		t.Errorf("PutSenderKey called %d times on parse failures, want 0 (no install/recovery attempt -- "+
+			"a parse-fail SKDM installs no key and must never retry)", sk.putCalls)
+	}
+}
+
+// TestSKDMParseFail_SecondDistinctPairGetsOwnFirstOccurrence verifies a second (sender,group)
+// pair still gets its own first-occurrence Error even though a different pair already fired.
+func TestSKDMParseFail_SecondDistinctPairGetsOwnFirstOccurrence(t *testing.T) {
+	ctx := context.Background()
+	chatA := types.JID{User: "120363000000000091", Server: types.GroupServer}
+	chatB := types.JID{User: "120363000000000092", Server: types.GroupServer}
+	fromA := types.JID{User: "249439369334987", Server: types.HiddenUserServer, Device: 46}
+	fromB := types.JID{User: "275204576162033", Server: types.HiddenUserServer, Device: 25}
+	badBytes := nonConformantSKDMBytes(t)
+
+	log := &errCapture{}
+	sk := &countingPutSenderKeyStore{inner: newFakeSenderKeyStore()}
+	cli := newTestClient(sk)
+	cli.Log = log
+
+	cli.handleSenderKeyDistributionMessage(ctx, chatA, fromA, badBytes)
+	cli.handleSenderKeyDistributionMessage(ctx, chatA, fromA, badBytes) // repeat of pair A: no new Error
+	cli.handleSenderKeyDistributionMessage(ctx, chatB, fromB, badBytes) // distinct pair B: own first-occurrence
+
+	if n := log.errCount("Failed to parse sender key distribution message"); n != 2 {
+		t.Errorf("two distinct pairs (one repeated) produced %d Error lines, want 2 (one per distinct pair)", n)
+	}
+}
+
+// TestSKDMParseFailShouldEmit_BareClientNoNilPanic verifies a bare &Client{} does not nil-panic
+// on the parse-fail dedup registry (lazy-init, mirroring markSKDMProcessed's bare-Client safety),
+// and that the underlying method itself returns true-then-false for a repeated pair.
+func TestSKDMParseFailShouldEmit_BareClientNoNilPanic(t *testing.T) {
+	bare := &Client{}
+	if !bare.skdmParseFailShouldEmit("249439369334987", "120363000000000093") {
+		t.Fatal("first call on bare &Client{}: want true (first occurrence), got false")
+	}
+	if bare.skdmParseFailShouldEmit("249439369334987", "120363000000000093") {
+		t.Fatal("second call for same pair: want false (repeat), got true")
+	}
+}
+
+// TestSKDMParseFailShouldEmit_BoundedOverflowCountsWithoutOwnFirstEmit verifies the registry is
+// bounded at skdmParseFailPairsSize: once full, a brand-new distinct pair is counted but does not
+// get its own first-occurrence Error (D-11's future-storm guard; today's shape is two senders).
+func TestSKDMParseFailShouldEmit_BoundedOverflowCountsWithoutOwnFirstEmit(t *testing.T) {
+	bare := &Client{}
+	for i := 0; i < skdmParseFailPairsSize; i++ {
+		key := "sender" + strconv.Itoa(i)
+		if !bare.skdmParseFailShouldEmit(key, "group") {
+			t.Fatalf("pair %d: want first-occurrence true (registry not yet full)", i)
+		}
+	}
+	if bare.skdmParseFailShouldEmit("overflow-sender", "group") {
+		t.Fatal("pair beyond skdmParseFailPairsSize: want false (overflow counts only, no own first-occurrence Error)")
+	}
+	if bare.skdmParseFailOverflow != 1 {
+		t.Errorf("skdmParseFailOverflow = %d, want 1", bare.skdmParseFailOverflow)
+	}
+}
