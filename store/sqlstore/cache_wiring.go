@@ -300,20 +300,6 @@ func (idx *identitySecondaryIndex) EvictCleanup(cacheKey, jid, phone string) {
 	}
 }
 
-// TEST-ONLY: totalKeyCount sums the sizes of all inner sets in the identity
-// secondary index. Used by TestSecondaryIndex_BoundedAfter1000CapacityEvictions
-// to assert that the index size does not exceed the LRU cap after evictions.
-// Do not call in production code — acquires RLock, iterates all buckets.
-func (idx *identitySecondaryIndex) totalKeyCount() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	total := 0
-	for _, bucket := range idx.m {
-		total += len(bucket)
-	}
-	return total
-}
-
 // ---------------------------------------------------------------------------
 // Phase 24: address-parsing helpers
 // ---------------------------------------------------------------------------

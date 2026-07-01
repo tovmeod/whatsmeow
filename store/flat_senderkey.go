@@ -236,11 +236,6 @@ func packSkipped(s *groupRecord.SenderKeyStructure) ([]byte, bool) {
 // u32 keyID + u32 chainIter + 32 chainKey + 33 signingPub + u8 hasPriv + 32 signingPriv = 106 bytes.
 const perStateLen = 4 + 4 + flatChainKeyLen + flatSigningPubLen + 1 + flatSigningPrivLen // 106
 
-// flatHeaderOff is the byte offset of state[0].KeyID in a PackFlat buffer.
-// state[0].KeyID is at bytes [1..4] (after the u8 nStates header).
-// Used by the R8 byte-prefilter in the donor scan.
-const flatHeaderOff = 1
-
 // PackFlat serializes a *SenderKeyStructure to a self-complete []byte for storage.
 // Unlike flatFromStructure, PackFlat supports unbounded state count (up to 255 states,
 // limited only by u8 nStates). Exported for use by sqlstore and migration tool

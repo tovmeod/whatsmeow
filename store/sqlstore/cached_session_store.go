@@ -146,11 +146,6 @@ func (c *CachedSessionStore) key(address string) string {
 	return c.jid + "|" + address
 }
 
-// jidPrefix returns the per-wrapper key prefix used to scope cache walks to
-// this device's entries.
-func (c *CachedSessionStore) jidPrefix() string {
-	return c.jid + "|"
-}
 
 // Stats returns the current values of the per-wrapper atomic counters.
 // Phase 17.5 FIX dropped the coalesced / flushed counters along with the
