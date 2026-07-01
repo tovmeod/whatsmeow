@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -24,7 +23,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/libsignal/groups"
-	"go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/protocol"
 	"go.mau.fi/libsignal/session"
 	"go.mau.fi/libsignal/signalerror"
@@ -388,13 +386,6 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		if encType == "pkmsg" || encType == "msg" {
 			decrypted, ciphertextHash, err = cli.decryptDM(ctx, &child, senderEncryptionJID, encType == "pkmsg", info.Timestamp)
 			containsDirectMsg = true
-			if skdmTraceUser(info.Sender.User) {
-				if err != nil {
-					cli.Log.Infof("SKDM_TRACE stage=dm-decrypt-FAIL sender=%s device=%d enc=%s group=%s msgid=%s err=%v", info.Sender.User, info.Sender.Device, encType, info.Chat.String(), info.ID, err)
-				} else {
-					cli.Log.Infof("SKDM_TRACE stage=dm-decrypt-OK sender=%s device=%d enc=%s group=%s msgid=%s", info.Sender.User, info.Sender.Device, encType, info.Chat.String(), info.ID)
-				}
-			}
 		} else if info.IsGroup && encType == "skmsg" {
 			decrypted, ciphertextHash, err = cli.decryptGroupMsg(ctx, &child, senderEncryptionJID, info.Chat, info.Timestamp)
 		} else if encType == "msmsg" && info.Sender.IsBot() {
@@ -750,16 +741,6 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 		}
 		cli.Log.Debugf("Group sender-key candidate %q did not decrypt: %v", sid, decErr)
 	}
-	// kavtov-fork: cross-account recovery diagnostic. Logs the keyID + iteration THIS message needs
-	// ("need_*") and what we currently HOLD per candidate device of this sender ("have"), so a
-	// recovery sweep can pick a source account whose key matches keyid and is within 2000 iterations
-	// behind need_iter. The need_* fields are cheap (read straight off the message); the have= block
-	// costs one GetSenderKey + record deserialize per candidate device, so it is computed only on a
-	// 1-in-N sampled fraction of misses (senderKeyMissShouldSample, perf 260601-uuy).
-	have := "sampled-out"
-	if senderKeyMissShouldSample() {
-		have = extractSenderKeyHave(ctx, cli.Store.SenderKeys, chat.String(), devices, msg.KeyID())
-	}
 	// Phase 17.12: attempt inline synchronous cross-account donor recovery (D-01, D-02).
 	// SENDERKEY_MISS and recordFailedSenderKeyTuple are ONLY emitted on the fail-open
 	// path to avoid false positives when recovery succeeds (Pitfall 2 / D-07).
@@ -794,8 +775,8 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	// D-07: fail-open path (no donor found, query error, or donor-installed-but-failed).
 	// kavtov-fork (P2a): record the failed tuple so a later KEY-path success is
 	// recognizable as convergence (SENDER_KEY_CONVERGED log).
-	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d have=[%s]",
-		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration(), have)
+	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d",
+		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration())
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
 	// kavtov-fork (38.5): increment per-account blacklist counter for (group, sender).
 	// MUST key on from.User (bare, no agent suffix) to match the check site in
@@ -805,87 +786,6 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	cli.incrementBotResendBlacklist(chat.String(), from.User)
 	return nil, signalerror.ErrNoSenderKeyForUser
 }
-
-// extractSenderKeyHave formats the diagnostic "have=" string for a
-// SENDERKEY_MISS event. It calls GetSenderKey per candidate device and
-// deserializes the stored sender-key record to read the current keyID and chain
-// iteration. This is intentionally expensive (one DB read + deserialize per
-// candidate) and MUST NOT run on every failure — call via
-// senderKeyMissShouldSample() (perf 260601-uuy). Returns "none" when there are
-// no candidate devices or none yield a readable record.
-func extractSenderKeyHave(ctx context.Context, senderKeyStore store.SenderKeyStore, chat string, devices []string, targetKeyID uint32) string {
-	if len(devices) == 0 {
-		return "none"
-	}
-	parts := make([]string, 0, len(devices))
-	// Prod sender-key rows are flat (PackFlat, fmt_ver=2); the legacy
-	// GetSenderKey + NewSenderKeyFromBytes path JSON-deserializes and fails on
-	// flat blobs ("invalid character" ERROR spam + have= unreadable since the flat
-	// migration). When the store is columnar, decode via the fmt_ver-aware
-	// GetSenderKeyStructure + NewSenderKeyFromStruct, mirroring LoadSenderKey
-	// (signal.go). Fall back to the JSON []byte path only for legacy/test stores.
-	csk, columnar := senderKeyStore.(store.SenderKeyColumnarStore)
-	for _, sid := range devices {
-		var rec *record.SenderKey
-		if columnar {
-			structure, serr := csk.GetSenderKeyStructure(ctx, chat, sid)
-			if serr != nil || structure == nil {
-				continue
-			}
-			r, rerr := record.NewSenderKeyFromStruct(structure, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
-			if rerr != nil {
-				continue
-			}
-			rec = r
-		} else {
-			kb, kerr := senderKeyStore.GetSenderKey(ctx, chat, sid)
-			if kerr != nil || len(kb) == 0 {
-				continue
-			}
-			r, rerr := record.NewSenderKeyFromBytes(kb, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
-			if rerr != nil {
-				continue
-			}
-			rec = r
-		}
-		if st, serr := rec.GetSenderKeyStateByID(targetKeyID); serr == nil {
-			parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d,match)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
-		} else if st, serr := rec.SenderKeyState(); serr == nil {
-			parts = append(parts, fmt.Sprintf("%s(keyid=%d,iter=%d)", sid, st.KeyID(), st.SenderChainKey().Iteration()))
-		}
-	}
-	if len(parts) == 0 {
-		return "none"
-	}
-	return strings.Join(parts, ",")
-}
-
-// senderKeyMissHaveDefaultRate is the default 1-in-N sampling for the have=
-// diagnostic. At 1-in-100, peak SENDERKEY_MISS volume (a few thousand/min at
-// peak) pays the deserialization cost ~tens of times per minute instead of
-// every time.
-const senderKeyMissHaveDefaultRate = 10
-
-// senderKeyMissHaveRate is the resolved sample rate (read once at init):
-//
-//	0 = disabled entirely (no GetSenderKey calls in the miss diagnostic)
-//	N = 1-in-N misses compute the have= block
-//
-// Configured via env KAVTOV_SENDERKEY_MISS_HAVE. Declared as a var (not const)
-// so internal tests can override it (save/restore around the test).
-var senderKeyMissHaveRate = func() int {
-	s := os.Getenv("KAVTOV_SENDERKEY_MISS_HAVE")
-	if s == "0" {
-		return 0
-	}
-	if n, err := strconv.Atoi(s); err == nil && n > 0 {
-		return n
-	}
-	return senderKeyMissHaveDefaultRate
-}()
-
-// senderKeyMissCounter is the process-wide miss counter driving the sampler.
-var senderKeyMissCounter atomic.Uint64
 
 // D-14: placeholderResend counters track the empty-vs-ok rate for phone re-request responses.
 // placeholderResendEmpty counts items where GetPlaceholderMessageResendResponse() == nil.
@@ -897,18 +797,6 @@ var (
 )
 
 const placeholderLogEvery = 1000
-
-// senderKeyMissShouldSample returns true on 1-in-senderKeyMissHaveRate calls.
-// Always false when senderKeyMissHaveRate == 0 (and never touches the counter
-// in that case, so the disabled path is allocation- and contention-free).
-func senderKeyMissShouldSample() bool {
-	rate := senderKeyMissHaveRate
-	if rate == 0 {
-		return false
-	}
-	n := senderKeyMissCounter.Add(1)
-	return n%uint64(rate) == 0
-}
 
 // kavtov-fork (P2a): bounded recently-failed group sender-key tuple set. See client.go field doc.
 // failedSenderKeyTuplesSize caps the set; the failing working set is a few hundred distinct tuples
@@ -1127,42 +1015,7 @@ func padMessage(plaintext []byte) []byte {
 	return plaintext
 }
 
-// skdmTraceSenders is the watchlist of bare sender users (LID or PN, no agent suffix, no device)
-// whose SKDM receive path is fully traced at INFO. Default = the institutional dispatch-bot LIDs
-// under investigation; override with KAVTOV_SKDM_TRACE_SENDERS (comma-separated). Empty disables.
-// kavtov-fork diagnostic: settles whether these bots ever send us an SKDM and whether we drop it.
-var skdmTraceSenders = func() map[string]struct{} {
-	list := os.Getenv("KAVTOV_SKDM_TRACE_SENDERS")
-	if list == "" {
-		list = "169415706468483,238877608562780,11957960757468,275956749045930,86819156803715,110183409778907,72980755439821,166615454851235,115556699119745,76189129568360,110853827350758,157475730911281"
-	}
-	m := map[string]struct{}{}
-	for _, s := range strings.Split(list, ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			m[s] = struct{}{}
-		}
-	}
-	return m
-}()
-
-// skdmTraceUser reports whether the given sender user (possibly "<id>_<agent>") is watchlisted.
-func skdmTraceUser(user string) bool {
-	if len(skdmTraceSenders) == 0 {
-		return false
-	}
-	base := user
-	if i := strings.IndexByte(base, '_'); i >= 0 {
-		base = base[:i]
-	}
-	_, ok := skdmTraceSenders[base]
-	return ok
-}
-
 func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat, from types.JID, axolotlSKDM []byte) {
-	traced := skdmTraceUser(from.User)
-	if traced {
-		cli.Log.Infof("SKDM_TRACE stage=recv sender=%s device=%d group=%s len=%d", from.User, from.Device, chat.String(), len(axolotlSKDM))
-	}
 	// kavtov-fork: Phase 27 — device-qualified store; the message keyID disambiguates devices; device-tolerant lookup (27-01) finds the record regardless of which device the skmsg is labeled with.
 	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
 	// kavtov-fork (STEP 1 instrument): is this arriving SKDM for a tuple that is CURRENTLY stuck (a
@@ -1199,9 +1052,6 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 			cli.Log.Debugf("SKDM_PARSE_FAIL_BYTES (repeat, known non-conformant pair) from=%s group=%s len=%d total=%d",
 				from, chat, len(axolotlSKDM), skdmParseFailTotal.Load())
 		}
-		if traced {
-			cli.Log.Infof("SKDM_TRACE stage=parse-FAIL sender=%s device=%d group=%s err=%v", from.User, from.Device, chat.String(), err)
-		}
 		if wasFailed {
 			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=parse", from.SignalAddressUser(), from.Device, chat.String())
 		}
@@ -1219,9 +1069,6 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	skdmIter := sdkMsg.Iteration()
 	if !wasFailed {
 		if seenIter, ok := cli.skdmProcessedIteration(senderStr, chat.String(), keyID); ok && skdmIter <= seenIter {
-			if traced {
-				cli.Log.Infof("SKDM_TRACE stage=dedup-SKIP sender=%s device=%d group=%s keyid=%d iter=%d seen=%d", from.User, from.Device, chat.String(), keyID, skdmIter, seenIter)
-			}
 			if n := skdmDedupSkipped.Add(1); n%skdmDedupLogEvery == 0 {
 				cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d parsefail=%d group=%s keyid=%d iter=%d seen=%d", skdmDedupProcessed.Load(), n, skdmParseFailTotal.Load(), chat.String(), keyID, skdmIter, seenIter)
 			}
@@ -1232,16 +1079,10 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	err = builder.Process(ctx, senderKeyName, sdkMsg)
 	if err != nil {
 		cli.Log.Errorf("Failed to process sender key distribution message from %s for %s: %v", from, chat, err)
-		if traced {
-			cli.Log.Infof("SKDM_TRACE stage=process-FAIL sender=%s device=%d group=%s keyid=%d iter=%d err=%v", from.User, from.Device, chat.String(), keyID, skdmIter, err)
-		}
 		if wasFailed {
 			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=process", from.SignalAddressUser(), from.Device, chat.String())
 		}
 		return
-	}
-	if traced {
-		cli.Log.Infof("SKDM_TRACE stage=INSTALLED-OK sender=%s device=%d group=%s keyid=%d iter=%d", from.User, from.Device, chat.String(), keyID, skdmIter)
 	}
 	cli.markSKDMProcessed(senderStr, chat.String(), keyID, skdmIter)
 	// kavtov-fork (29-08 gap-closure): emit SKDM_DEDUP on the processed path every
