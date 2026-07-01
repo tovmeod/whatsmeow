@@ -150,6 +150,27 @@ type Client struct {
 
 	messageSendLock sync.Mutex
 
+	// kavtov-fork (55.1-02): pending ack/receipt queue for reconnect-durable retry.
+	// sendAck/sendMessageReceipt enqueue the built node here instead of dropping it when
+	// sendNode returns ErrNotConnected (socket down mid-reconnect); handleConnectSuccess
+	// drains and replays the queue in FIFO order once the connection is back up. Mirrors
+	// WA Web's own dangling-receipt replay on connect (55.1-INVESTIGATION-websocket.md
+	// section 4). Bounded (pendingStanzaCap) with oldest-discard + a throttled overflow
+	// ERROR so bounded memory never becomes silent loss. Deduplicated by (tag,id,to) so a
+	// re-enqueue of the same ack/receipt does not grow the queue. Lazy-init under
+	// pendingStanzasLock; bare &Client{} is safe.
+	pendingStanzas                []pendingStanzaEntry
+	pendingStanzasSeen            map[pendingStanzaKey]bool
+	pendingStanzasLock            sync.Mutex
+	pendingStanzasOverflowCount   int
+	pendingStanzasLastOverflowLog time.Time
+
+	// sendNodeFunc, when non-nil, replaces cli.sendNode as the transport used by sendAck,
+	// sendMessageReceipt, and replayPendingStanzas. Tests install it to simulate send
+	// outcomes without a real socket; production code leaves it nil (falls back to
+	// cli.sendNode via sendNodeOrHook).
+	sendNodeFunc func(ctx context.Context, node waBinary.Node) error
+
 	tcTokenSenderTS            map[types.JID]time.Time
 	tcTokenSenderTSLock        sync.Mutex
 	lastTCTokenSenderTSCleanup time.Time
@@ -997,6 +1018,98 @@ func (cli *Client) sendNodeAndGetData(ctx context.Context, node waBinary.Node) (
 func (cli *Client) sendNode(ctx context.Context, node waBinary.Node) error {
 	_, err := cli.sendNodeAndGetData(ctx, node)
 	return err
+}
+
+// sendNodeOrHook sends node via cli.sendNodeFunc if a test has installed one, otherwise via
+// the real cli.sendNode. See the sendNodeFunc field doc.
+func (cli *Client) sendNodeOrHook(ctx context.Context, node waBinary.Node) error {
+	if cli.sendNodeFunc != nil {
+		return cli.sendNodeFunc(ctx, node)
+	}
+	return cli.sendNode(ctx, node)
+}
+
+// pendingStanzaCap bounds the reconnect-durable ack/receipt queue (55.1-02) — far above any
+// observed disconnect window's ack volume.
+const pendingStanzaCap = 10000
+
+// pendingStanzaOverflowLogInterval throttles the queue-full ERROR so a sustained overflow
+// logs periodically instead of once per discarded entry.
+const pendingStanzaOverflowLogInterval = time.Minute
+
+type pendingStanzaKey struct {
+	Tag string
+	ID  string
+	To  string
+}
+
+type pendingStanzaEntry struct {
+	key  pendingStanzaKey
+	node waBinary.Node
+}
+
+func pendingStanzaKeyFromNode(node waBinary.Node) pendingStanzaKey {
+	return pendingStanzaKey{
+		Tag: node.Tag,
+		ID:  fmt.Sprintf("%v", node.Attrs["id"]),
+		To:  fmt.Sprintf("%v", node.Attrs["to"]),
+	}
+}
+
+// enqueuePendingStanza queues an ack/receipt node that failed to send because the socket was
+// down (ErrNotConnected), for replay on the next successful connect (replayPendingStanzas).
+// Deduplicated by (tag,id,to); at pendingStanzaCap the oldest entry is discarded and a
+// throttled ERROR reports the overflow count so bounded memory never becomes silent loss.
+func (cli *Client) enqueuePendingStanza(node waBinary.Node) {
+	key := pendingStanzaKeyFromNode(node)
+	cli.pendingStanzasLock.Lock()
+	defer cli.pendingStanzasLock.Unlock()
+	if cli.pendingStanzasSeen == nil {
+		cli.pendingStanzasSeen = make(map[pendingStanzaKey]bool)
+	}
+	if cli.pendingStanzasSeen[key] {
+		return
+	}
+	if len(cli.pendingStanzas) >= pendingStanzaCap {
+		discarded := cli.pendingStanzas[0]
+		cli.pendingStanzas = cli.pendingStanzas[1:]
+		delete(cli.pendingStanzasSeen, discarded.key)
+		cli.pendingStanzasOverflowCount++
+		if time.Since(cli.pendingStanzasLastOverflowLog) >= pendingStanzaOverflowLogInterval {
+			cli.Log.Errorf("Pending ack/receipt queue full (cap %d): discarded %d oldest entries since last report", pendingStanzaCap, cli.pendingStanzasOverflowCount)
+			cli.pendingStanzasOverflowCount = 0
+			cli.pendingStanzasLastOverflowLog = time.Now()
+		}
+	}
+	cli.pendingStanzas = append(cli.pendingStanzas, pendingStanzaEntry{key: key, node: node})
+	cli.pendingStanzasSeen[key] = true
+}
+
+// replayPendingStanzas drains the pending ack/receipt queue and re-sends each node in FIFO
+// order. Called from handleConnectSuccess once the connection is active again. An entry that
+// hits ErrNotConnected again (connect raced another drop) is re-enqueued along with every
+// entry after it, preserving order, and replay stops there; an entry rejected with any other
+// error is logged (Warnf) and discarded.
+func (cli *Client) replayPendingStanzas(ctx context.Context) {
+	cli.pendingStanzasLock.Lock()
+	pending := cli.pendingStanzas
+	cli.pendingStanzas = nil
+	cli.pendingStanzasSeen = nil
+	cli.pendingStanzasLock.Unlock()
+
+	for i, entry := range pending {
+		err := cli.sendNodeOrHook(ctx, entry.node)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, ErrNotConnected) {
+			for _, remaining := range pending[i:] {
+				cli.enqueuePendingStanza(remaining.node)
+			}
+			return
+		}
+		cli.Log.Warnf("Failed to replay pending %s %s: %v", entry.node.Tag, entry.node.Attrs["id"], err)
+	}
 }
 
 func (cli *Client) dispatchEvent(evt any) (handlerFailed bool) {

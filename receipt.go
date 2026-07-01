@@ -8,6 +8,7 @@ package whatsmeow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -167,12 +168,20 @@ func (cli *Client) sendAck(ctx context.Context, node *waBinary.Node, error int) 
 	if error != 0 {
 		attrs["error"] = error
 	}
-	err := cli.sendNode(ctx, waBinary.Node{
+	ackNode := waBinary.Node{
 		Tag:   "ack",
 		Attrs: attrs,
-	})
+	}
+	err := cli.sendNodeOrHook(ctx, ackNode)
 	if err != nil {
-		cli.Log.Warnf("Failed to send acknowledgement for %s %s: %v", node.Tag, node.Attrs["id"], err)
+		if errors.Is(err, ErrNotConnected) {
+			// 55.1-02: the socket is down mid-reconnect — queue for replay on the next
+			// successful connect instead of dropping (see pendingStanzas doc on Client).
+			cli.enqueuePendingStanza(ackNode)
+			cli.Log.Debugf("Deferred acknowledgement for %s %s until reconnect (socket not connected)", node.Tag, node.Attrs["id"])
+		} else {
+			cli.Log.Warnf("Failed to send acknowledgement for %s %s: %v", node.Tag, node.Attrs["id"], err)
+		}
 	}
 }
 
@@ -279,11 +288,19 @@ func (cli *Client) sendMessageReceipt(ctx context.Context, info *types.MessageIn
 	} else if cli.sendActiveReceipts.Load() == 0 {
 		attrs["type"] = string(types.ReceiptTypeInactive)
 	}
-	err := cli.sendNode(ctx, waBinary.Node{
+	receiptNode := waBinary.Node{
 		Tag:   "receipt",
 		Attrs: attrs,
-	})
+	}
+	err := cli.sendNodeOrHook(ctx, receiptNode)
 	if err != nil {
-		cli.Log.Warnf("Failed to send receipt for %s: %v", info.ID, err)
+		if errors.Is(err, ErrNotConnected) {
+			// 55.1-02: the socket is down mid-reconnect — queue for replay on the next
+			// successful connect instead of dropping (see pendingStanzas doc on Client).
+			cli.enqueuePendingStanza(receiptNode)
+			cli.Log.Debugf("Deferred receipt for %s until reconnect (socket not connected)", info.ID)
+		} else {
+			cli.Log.Warnf("Failed to send receipt for %s: %v", info.ID, err)
+		}
 	}
 }

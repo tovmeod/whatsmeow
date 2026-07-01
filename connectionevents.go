@@ -201,6 +201,10 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 		if err != nil {
 			cli.Log.Warnf("Failed to send post-connect passive IQ: %v", err)
 		}
+		// 55.1-02: replay any ack/receipt sends deferred during the disconnected window
+		// (the fork's analog of WA Web's connect-time dangling-receipt passive task) now
+		// that the connection is active again.
+		cli.replayPendingStanzas(ctx)
 		cli.dispatchEvent(&events.Connected{})
 		cli.closeSocketWaitChan()
 	}()
