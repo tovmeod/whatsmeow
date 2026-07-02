@@ -11,6 +11,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,6 +139,93 @@ func TestDownloadEncryptedMediaChecksumRegression(t *testing.T) {
 	_, _, err = cli.downloadEncryptedMedia(context.Background(), srv.URL, []byte{1, 2, 3})
 	if err != nil {
 		t.Errorf("short checksum must be tolerated (not panic), got: %v", err)
+	}
+}
+
+// TestMediaChecksumToFileRegression is the to-file-path counterpart of
+// TestMediaChecksumRegression, covering downloadAndDecryptToFile's plaintext
+// fileSHA256 guard (download-to-file.go:151): absent fileSHA256 succeeds,
+// wrong fileSHA256 fails with ErrInvalidMediaSHA256, correct fileSHA256
+// succeeds (ME-02).
+func TestMediaChecksumToFileRegression(t *testing.T) {
+	plaintext := []byte("hello world this is fake media bytes for the repro test to-file plaintext-guard 1234567890")
+	mediaKey := make([]byte, 32)
+	for i := range mediaKey {
+		mediaKey[i] = byte(i + 1)
+	}
+	iv, cipherKey, macKey, _ := getMediaKeys(mediaKey, MediaImage)
+	ciphertext, err := cbcutil.Encrypt(cipherKey, iv, plaintext)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	h := hmac.New(sha256.New, macKey)
+	h.Write(iv)
+	h.Write(ciphertext)
+	body := append(append([]byte{}, ciphertext...), h.Sum(nil)[:10]...)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	sum := sha256.Sum256(body)
+	fileEncSHA256 := sum[:]
+	sum2 := sha256.Sum256(plaintext)
+	fileSHA256Correct := sum2[:]
+
+	cli := &Client{mediaHTTP: srv.Client(), Log: waLog.Noop}
+
+	newTempFile := func(t *testing.T) *os.File {
+		t.Helper()
+		f, err := os.CreateTemp(t.TempDir(), "media-*")
+		if err != nil {
+			t.Fatalf("create temp file: %v", err)
+		}
+		t.Cleanup(func() { f.Close() })
+		return f
+	}
+	readBack := func(t *testing.T, f *os.File) []byte {
+		t.Helper()
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			t.Fatalf("seek to start: %v", err)
+		}
+		data, err := io.ReadAll(f)
+		if err != nil {
+			t.Fatalf("read file: %v", err)
+		}
+		return data
+	}
+
+	// A media download of encrypted content whose FileSHA256 (plaintext
+	// hash) metadata is absent must succeed, matching pre-merge (ff56bae)
+	// behavior (D-04), for the to-file path too.
+	f1 := newTempFile(t)
+	err = cli.downloadAndDecryptToFile(context.Background(), srv.URL, mediaKey, MediaImage, fileEncSHA256, nil, f1)
+	if err != nil {
+		t.Errorf("missing plaintext hash must succeed after the D-04 fix: %v", err)
+	}
+	if data := readBack(t, f1); string(data) != string(plaintext) {
+		t.Errorf("missing plaintext hash: data mismatch, got %q want %q", data, plaintext)
+	}
+
+	// This must continue to fail after the fix — regression guard in the
+	// other direction.
+	wrongHash := sha256.Sum256([]byte("not the right plaintext"))
+	f2 := newTempFile(t)
+	err = cli.downloadAndDecryptToFile(context.Background(), srv.URL, mediaKey, MediaImage, fileEncSHA256, wrongHash[:], f2)
+	if !errors.Is(err, ErrInvalidMediaSHA256) {
+		t.Errorf("a genuinely wrong hash must still fail after the D-04 fix: err = %v, want ErrInvalidMediaSHA256", err)
+	}
+
+	// Baseline: correct hash must always succeed.
+	f3 := newTempFile(t)
+	err = cli.downloadAndDecryptToFile(context.Background(), srv.URL, mediaKey, MediaImage, fileEncSHA256, fileSHA256Correct, f3)
+	if err != nil {
+		t.Fatalf("correct hash must succeed: %v", err)
+	}
+	if data := readBack(t, f3); string(data) != string(plaintext) {
+		t.Fatalf("correct hash: data mismatch, got %q want %q", data, plaintext)
 	}
 }
 

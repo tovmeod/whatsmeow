@@ -146,7 +146,6 @@ func (c *CachedSessionStore) key(address string) string {
 	return c.jid + "|" + address
 }
 
-
 // Stats returns the current values of the per-wrapper atomic counters.
 // Phase 17.5 FIX dropped the coalesced / flushed counters along with the
 // write-back machinery — only hits / misses / evictions remain.
