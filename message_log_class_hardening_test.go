@@ -26,6 +26,9 @@ import (
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -863,5 +866,117 @@ func TestHistorySyncMediaDelete_PeriodicInfoStillFires(t *testing.T) {
 
 	if n := log.infoCount("HISTORY_SYNC_MEDIA_DELETE"); n != 1 {
 		t.Errorf("HISTORY_SYNC_MEDIA_DELETE Infof fired %d times crossing the threshold, want 1", n)
+	}
+}
+
+// placeholderResendFixtureWebMessageBytes builds a minimal, marshalable WebMessageInfo whose
+// key resolves to a real chat/sender via ParseWebMessage without needing cli.Store (chatJID
+// empty -> parsed from Key.RemoteJID; DefaultUserServer chat -> sender = chat, no participant
+// needed).
+func placeholderResendFixtureWebMessageBytes(t *testing.T, msgID string) []byte {
+	t.Helper()
+	webMsg := &waWeb.WebMessageInfo{
+		Key: &waCommon.MessageKey{
+			RemoteJID: proto.String("15550001111@s.whatsapp.net"),
+			FromMe:    proto.Bool(false),
+			ID:        proto.String(msgID),
+		},
+		MessageTimestamp: proto.Uint64(1700000000),
+	}
+	b, err := proto.Marshal(webMsg)
+	if err != nil {
+		t.Fatalf("marshal fixture WebMessageInfo: %v", err)
+	}
+	return b
+}
+
+// TestPlaceholderResendResponse_EmptyItemNoWarn verifies a mix of nil (phone genuinely lacks
+// the message) and populated placeholder-resend response items: nil items advance
+// placeholderResendEmpty with NO per-item Warnf, while populated items still recover normally
+// (placeholderResendOk advances, recordRecoveredMsgID is called, the batch stays ok).
+func TestPlaceholderResendResponse_EmptyItemNoWarn(t *testing.T) {
+	log := &outcomeCapture{}
+	cli := &Client{Log: log}
+
+	webMsgBytes := placeholderResendFixtureWebMessageBytes(t, "PLACEHOLDER-RECOVERED-1")
+
+	beforeEmpty := placeholderResendEmpty.Load()
+	beforeOk := placeholderResendOk.Load()
+
+	msg := &waE2E.PeerDataOperationRequestResponseMessage{
+		StanzaID: proto.String("REQ-1"),
+		PeerDataOperationResult: []*waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult{
+			{}, // empty item -- phone genuinely lacks the message
+			{
+				PlaceholderMessageResendResponse: &waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult_PlaceholderMessageResendResponse{
+					WebMessageInfoBytes: webMsgBytes,
+				},
+			},
+			{}, // second empty item
+		},
+	}
+
+	ok := cli.handlePlaceholderResendResponse(msg)
+
+	if !ok {
+		t.Error("handlePlaceholderResendResponse returned ok=false, want true")
+	}
+	if n := log.warnCount("Missing response in item"); n != 0 {
+		t.Errorf("Warn-level log fired %d times for empty placeholder-resend items, want 0", n)
+	}
+	if got := placeholderResendEmpty.Load(); got != beforeEmpty+2 {
+		t.Errorf("placeholderResendEmpty = %d, want %d (2 empty items)", got, beforeEmpty+2)
+	}
+	if got := placeholderResendOk.Load(); got != beforeOk+1 {
+		t.Errorf("placeholderResendOk = %d, want %d (1 populated item recovered)", got, beforeOk+1)
+	}
+	if !cli.isRecoveredMsgID("PLACEHOLDER-RECOVERED-1") {
+		t.Error("recordRecoveredMsgID was not called for the populated item")
+	}
+}
+
+// TestPlaceholderResendResponse_PeriodicInfoStillFires verifies the existing PLACEHOLDER_RESEND
+// aggregate Infof line still fires when placeholderResendEmpty crosses the placeholderLogEvery
+// threshold, even though the per-item Warnf is gone.
+func TestPlaceholderResendResponse_PeriodicInfoStillFires(t *testing.T) {
+	log := &outcomeCapture{}
+	cli := &Client{Log: log}
+
+	for placeholderResendEmpty.Load()%placeholderLogEvery != placeholderLogEvery-1 {
+		placeholderResendEmpty.Add(1)
+	}
+
+	msg := &waE2E.PeerDataOperationRequestResponseMessage{
+		StanzaID:                proto.String("REQ-2"),
+		PeerDataOperationResult: []*waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult{{}},
+	}
+	cli.handlePlaceholderResendResponse(msg)
+
+	if n := log.infoCount("PLACEHOLDER_RESEND"); n != 1 {
+		t.Errorf("PLACEHOLDER_RESEND Infof fired %d times crossing the threshold, want 1", n)
+	}
+}
+
+// TestPlaceholderResendResponse_UnmarshalAndParseFailureWarnsUnchanged verifies the two
+// unrelated Warnf branches (a genuinely malformed non-empty item) are untouched by the class-15
+// fix -- only the "resp == nil" per-item WARN was removed.
+func TestPlaceholderResendResponse_UnmarshalAndParseFailureWarnsUnchanged(t *testing.T) {
+	log := &outcomeCapture{}
+	cli := &Client{Log: log}
+
+	msg := &waE2E.PeerDataOperationRequestResponseMessage{
+		StanzaID: proto.String("REQ-3"),
+		PeerDataOperationResult: []*waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult{
+			{
+				PlaceholderMessageResendResponse: &waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult_PlaceholderMessageResendResponse{
+					WebMessageInfoBytes: []byte("not a valid protobuf"),
+				},
+			},
+		},
+	}
+	cli.handlePlaceholderResendResponse(msg)
+
+	if n := log.warnCount("Failed to unmarshal protobuf web message"); n != 1 {
+		t.Errorf("unmarshal-failure Warnf fired %d times, want 1 (unchanged by class 15 fix)", n)
 	}
 }

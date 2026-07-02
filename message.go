@@ -1419,7 +1419,6 @@ func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationR
 	for i, part := range parts {
 		var webMsg waWeb.WebMessageInfo
 		if resp := part.GetPlaceholderMessageResendResponse(); resp == nil {
-			cli.Log.Warnf("Missing response in item #%d of response to %s", i+1, reqID)
 			if n := placeholderResendEmpty.Add(1); n%placeholderLogEvery == 0 {
 				cli.Log.Infof("PLACEHOLDER_RESEND empty=%d ok=%d", n, placeholderResendOk.Load())
 			}
