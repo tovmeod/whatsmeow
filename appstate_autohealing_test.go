@@ -377,6 +377,16 @@ func (s *raceAppStateStore) GetAppStateMutationMAC(_ context.Context, _ string, 
 	return nil, nil
 }
 
+func (s *raceAppStateStore) PutAppStateVersionAndMACs(ctx context.Context, name string, version uint64, hash [128]byte, removedMACs [][]byte, addedMACs []store.AppStateMutationMAC) error {
+	if err := s.PutAppStateVersion(ctx, name, version, hash); err != nil {
+		return err
+	}
+	if err := s.DeleteAppStateMutationMACs(ctx, name, removedMACs); err != nil {
+		return err
+	}
+	return s.PutAppStateMutationMACs(ctx, name, version, addedMACs)
+}
+
 // raceAppStateKeyStore is a fixed single-key fake store.AppStateSyncKeyStore.
 type raceAppStateKeyStore struct {
 	keyID []byte

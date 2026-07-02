@@ -955,7 +955,7 @@ func (s *SQLStore) PutAppStateMutationMACs(ctx context.Context, name string, ver
 	})
 }
 
-func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) (err error) {
+func (s *SQLStore) deleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) (err error) {
 	if len(indexMACs) == 0 {
 		return
 	}
@@ -973,6 +973,35 @@ func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, 
 		_, err = s.db.Exec(ctx, deleteAppStateMutationMACsQueryGeneric+"("+strings.Join(queryParts, ",")+")", args...)
 	}
 	return
+}
+
+func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) error {
+	return s.deleteAppStateMutationMACs(ctx, name, indexMACs)
+}
+
+// PutAppStateVersionAndMACs atomically persists the version cursor, the removed mutation
+// MACs, and the added mutation MACs for one app state collection in a single database
+// transaction (55.1-10, class 14 root cause H1: storeMACs was three independent
+// non-transactional statements, letting a crash/error mid-write leave the version cursor
+// ahead of the mutation-MAC ledger, which produces a silent REMOVE-lookup miss on a later
+// patch and a wrong computed LTHash). db.DoTxn reuses an already-open transaction on the
+// context rather than nesting, so this composes safely with putAppStateMutationMACs' own
+// (now redundant but harmless) transaction wrapping.
+func (s *SQLStore) PutAppStateVersionAndMACs(ctx context.Context, name string, version uint64, hash [128]byte, removedMACs [][]byte, addedMACs []store.AppStateMutationMAC) error {
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		if _, err := s.db.Exec(ctx, putAppStateVersionQuery, s.JID, name, version, hash[:]); err != nil {
+			return fmt.Errorf("failed to update app state version in the database: %w", err)
+		}
+		if err := s.deleteAppStateMutationMACs(ctx, name, removedMACs); err != nil {
+			return fmt.Errorf("failed to remove deleted mutation MACs from the database: %w", err)
+		}
+		for slice := range slices.Chunk(addedMACs, mutationBatchSize) {
+			if err := s.putAppStateMutationMACs(ctx, name, version, slice); err != nil {
+				return fmt.Errorf("failed to insert added mutation MACs to the database: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error) {

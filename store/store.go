@@ -88,6 +88,13 @@ type AppStateStore interface {
 	PutAppStateMutationMACs(ctx context.Context, name string, version uint64, mutations []AppStateMutationMAC) error
 	DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) error
 	GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error)
+
+	// PutAppStateVersionAndMACs atomically persists the version cursor together with the
+	// removed and added mutation MACs for one app state collection (55.1-10, class 14 root
+	// cause H1: storeMACs was three independent non-transactional statements). Implementations
+	// must make this all-or-nothing: on any error, none of the three writes may have taken
+	// effect (no more cursor-ahead-of-ledger states after a crash or error mid-write).
+	PutAppStateVersionAndMACs(ctx context.Context, name string, version uint64, hash [128]byte, removedMACs [][]byte, addedMACs []AppStateMutationMAC) error
 }
 
 type ContactEntry struct {
