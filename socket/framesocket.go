@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,24 @@ import (
 
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+// readPumpRoutineEOF counts routine EOF read-errors classified as handled lifecycle instead
+// of an unrecovered failure (55.1-12) -- periodically visible, mirrors the
+// newsletterControlEmpty/hostFailover* counters elsewhere in this fork.
+var readPumpRoutineEOF atomic.Uint64
+
+const readPumpRoutineEOFLogEvery = 50
+
+// isRoutineEOF reports whether a conn.Read error should be classified as routine,
+// auto-reconnect-handled connection lifecycle (Debug) rather than an unrecovered failure
+// (Error) -- 55.1-12. Legitimate only now that plan 02 makes the disconnect window lossless
+// (queued/replayed acks+receipts) and Tasks 1-3 made dead sockets, xmlstreamend, and 503
+// deterministically recovered; a non-EOF error, or EOF with auto-reconnect disabled/unset, is
+// NOT routine and stays loud. Extracted from readPump so the classification is unit-testable
+// without a live websocket.
+func isRoutineEOF(err error, autoReconnectEnabled func() bool) bool {
+	return errors.Is(err, io.EOF) && autoReconnectEnabled != nil && autoReconnectEnabled()
+}
 
 type FrameSocket struct {
 	parentCtx context.Context
@@ -33,6 +52,12 @@ type FrameSocket struct {
 
 	Frames       chan []byte
 	OnDisconnect func(ctx context.Context, remote bool)
+
+	// AutoReconnectEnabled, when non-nil, reports whether the owning Client currently has
+	// auto-reconnect enabled (55.1-12). readPump uses it to classify a routine EOF read-error
+	// under auto-reconnect as handled lifecycle instead of an unrecovered failure. Set once at
+	// construction (client.go unlockedConnect) with a closure reading cli.EnableAutoReconnect.
+	AutoReconnectEnabled func() bool
 
 	Header []byte
 
@@ -211,7 +236,14 @@ func (fs *FrameSocket) readPump(conn *websocket.Conn, ctx context.Context) {
 		if err != nil {
 			// Ignore the error if the context has been closed
 			if !fs.closed.Load() && !errors.Is(ctx.Err(), context.Canceled) {
-				fs.log.Errorf("Error reading from websocket: %v", err)
+				if isRoutineEOF(err, fs.AutoReconnectEnabled) {
+					if n := readPumpRoutineEOF.Add(1); n%readPumpRoutineEOFLogEvery == 0 {
+						fs.log.Infof("EOF_ROUTINE_RECONNECT count=%d", n)
+					}
+					fs.log.Debugf("Read from websocket ended with EOF (routine, auto-reconnect enabled): %v", err)
+				} else {
+					fs.log.Errorf("Error reading from websocket: %v", err)
+				}
 			}
 			return
 		} else if msgType != websocket.MessageBinary {

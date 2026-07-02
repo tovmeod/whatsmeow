@@ -663,6 +663,9 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 		client = cli.preLoginHTTP
 	}
 	fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), client)
+	// 55.1-12: readPump uses this to classify a routine EOF read-error as handled lifecycle
+	// only when auto-reconnect is actually enabled at the time of the failure.
+	fs.AutoReconnectEnabled = func() bool { return cli.EnableAutoReconnect }
 	if cli.MessengerConfig != nil {
 		fs.URL = cli.MessengerConfig.WebsocketURL
 		fs.HTTPHeaders.Set("Origin", cli.MessengerConfig.BaseURL)
