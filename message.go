@@ -936,6 +936,35 @@ var (
 
 const placeholderLogEvery = 1000
 
+// mediaDeleteOk/mediaDeleteFail count outcomes of the best-effort history-sync media delete
+// (handleHistorySyncNotificationLoop below). This matches WhatsApp Web's own reference client
+// behavior for this exact call (WAWebMmsClientMmsDeleteMdHistorySyncBlob.js): a single
+// fire-and-forget attempt with no retry and no status-code branching -- only the outcome is
+// counted, mirroring the placeholderResend* pattern above.
+var (
+	mediaDeleteOk   atomic.Uint64
+	mediaDeleteFail atomic.Uint64
+)
+
+const mediaDeleteLogEvery = 1000
+
+// recordMediaDeleteOutcome logs and counts the outcome of a single best-effort DeleteMedia
+// call. A failure is a routine, expected outcome of best-effort server-storage housekeeping
+// (e.g. the blob is already gone), so it logs at Debug, not Warn; both outcomes feed a
+// periodic aggregate Infof line so a persistent anomaly stays observable.
+func (cli *Client) recordMediaDeleteOutcome(err error) {
+	if err != nil {
+		cli.Log.Debugf("Failed to delete history sync media from server: %v", err)
+		if n := mediaDeleteFail.Add(1); n%mediaDeleteLogEvery == 0 {
+			cli.Log.Infof("HISTORY_SYNC_MEDIA_DELETE ok=%d fail=%d", mediaDeleteOk.Load(), n)
+		}
+		return
+	}
+	if n := mediaDeleteOk.Add(1); n%mediaDeleteLogEvery == 0 {
+		cli.Log.Infof("HISTORY_SYNC_MEDIA_DELETE ok=%d fail=%d", n, mediaDeleteFail.Load())
+	}
+}
+
 // kavtov-fork (P2a): bounded recently-failed group sender-key tuple set. See client.go field doc.
 // failedSenderKeyTuplesSize caps the set; the failing working set is a few hundred distinct tuples
 // per ~8-min window (~289 sender|group pairs observed, more once device-qualified) against ~0
@@ -1261,9 +1290,7 @@ func (cli *Client) handleHistorySyncNotificationLoop() {
 			} else {
 				cli.dispatchEvent(&events.HistorySync{Data: blob})
 				err = cli.DeleteMedia(ctx, MediaHistory, notif.GetDirectPath(), notif.GetFileEncSHA256(), notif.GetEncHandle())
-				if err != nil {
-					cli.Log.Warnf("Failed to delete history sync media from server: %v", err)
-				}
+				cli.recordMediaDeleteOutcome(err)
 			}
 		case <-time.After(1 * time.Minute):
 			return

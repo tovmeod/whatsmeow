@@ -13,10 +13,12 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.mau.fi/libsignal/serialize"
 	"go.mau.fi/libsignal/signalerror"
@@ -714,5 +716,152 @@ func TestStalePrekey_DifferentSenderGetsOwnWarn(t *testing.T) {
 
 	if n := log.warnCount("STALE_PREKEY"); n != 2 {
 		t.Errorf("two distinct senders (one repeated) produced %d STALE_PREKEY WARNs, want 2 (one per distinct sender)", n)
+	}
+}
+
+// --- 55.1-09 Task 1/2: history-sync media delete (class 10) + placeholder-resend empty item
+// (class 15) -----------------------------------------------------------------------------------
+
+// outcomeCapture records Warnf/Infof/Debugf calls so a test can assert the WA-conformant
+// fire-and-forget media-delete and folded placeholder-resend paths never emit a per-event Warn
+// while still producing the periodic aggregate Infof line.
+type outcomeCapture struct {
+	mu     sync.Mutex
+	warns  []string
+	infos  []string
+	debugs []string
+}
+
+func (l *outcomeCapture) Warnf(msg string, _ ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warns = append(l.warns, msg)
+}
+func (l *outcomeCapture) Infof(msg string, _ ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.infos = append(l.infos, msg)
+}
+func (l *outcomeCapture) Debugf(msg string, _ ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.debugs = append(l.debugs, msg)
+}
+func (l *outcomeCapture) Errorf(string, ...interface{}) {}
+func (l *outcomeCapture) Sub(string) waLog.Logger       { return l }
+
+func outcomeCaptureCount(bucket []string, substr string) int {
+	n := 0
+	for _, s := range bucket {
+		if strings.Contains(s, substr) {
+			n++
+		}
+	}
+	return n
+}
+func (l *outcomeCapture) warnCount(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return outcomeCaptureCount(l.warns, substr)
+}
+func (l *outcomeCapture) infoCount(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return outcomeCaptureCount(l.infos, substr)
+}
+func (l *outcomeCapture) debugCount(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return outcomeCaptureCount(l.debugs, substr)
+}
+
+// newMediaDeleteClient builds a bare Client whose DeleteMedia call is routed to a fake
+// RoundTripper returning the given status code, with a pre-populated mediaConnCache so
+// refreshMediaConn never hits the network (mirrors newHostFailoverClient in
+// download_hostfailover_test.go).
+func newMediaDeleteClient(log waLog.Logger, status int) *Client {
+	cli := &Client{
+		Log: log,
+		mediaHTTP: &http.Client{Transport: &multiHostTransport{byHost: map[string]hostRoundTripFunc{
+			"media.example.test": func(req *http.Request) (*http.Response, error) {
+				return errorResponse(status), nil
+			},
+		}}},
+	}
+	cli.mediaConnCache = &MediaConn{
+		Hosts:     []MediaConnHost{{Hostname: "media.example.test"}},
+		FetchedAt: time.Now(),
+		TTL:       3600,
+	}
+	return cli
+}
+
+// TestHistorySyncMediaDelete_FailureCountedDebugNoWarn verifies a failed DeleteMedia call
+// (400 response) is a single best-effort attempt (no retry, no status-code branching, matching
+// WAWebMmsClientMmsDeleteMdHistorySyncBlob.js) whose outcome is counted and logged at Debug,
+// never Warn.
+func TestHistorySyncMediaDelete_FailureCountedDebugNoWarn(t *testing.T) {
+	log := &outcomeCapture{}
+	cli := newMediaDeleteClient(log, http.StatusBadRequest)
+
+	beforeFail := mediaDeleteFail.Load()
+	beforeOk := mediaDeleteOk.Load()
+
+	err := cli.DeleteMedia(context.Background(), MediaHistory, "/v/t/abc", []byte("hash"), "")
+	if err == nil {
+		t.Fatal("expected DeleteMedia to return an error for a 400 response")
+	}
+	cli.recordMediaDeleteOutcome(err)
+
+	if n := log.warnCount("delete history sync media"); n != 0 {
+		t.Errorf("Warn-level log fired %d times for a media-delete failure, want 0 (WA-conformant fire-and-forget)", n)
+	}
+	if n := log.debugCount("delete history sync media"); n == 0 {
+		t.Error("expected a Debugf call carrying the delete error")
+	}
+	if got := mediaDeleteFail.Load(); got != beforeFail+1 {
+		t.Errorf("mediaDeleteFail = %d, want %d", got, beforeFail+1)
+	}
+	if got := mediaDeleteOk.Load(); got != beforeOk {
+		t.Errorf("mediaDeleteOk = %d, want unchanged %d", got, beforeOk)
+	}
+}
+
+// TestHistorySyncMediaDelete_SuccessCounted verifies a successful DeleteMedia call (200
+// response) increments the success counter with no Warn.
+func TestHistorySyncMediaDelete_SuccessCounted(t *testing.T) {
+	log := &outcomeCapture{}
+	cli := newMediaDeleteClient(log, http.StatusOK)
+
+	beforeOk := mediaDeleteOk.Load()
+
+	err := cli.DeleteMedia(context.Background(), MediaHistory, "/v/t/abc", []byte("hash"), "")
+	if err != nil {
+		t.Fatalf("expected DeleteMedia to succeed for a 200 response, got %v", err)
+	}
+	cli.recordMediaDeleteOutcome(err)
+
+	if n := log.warnCount("delete history sync media"); n != 0 {
+		t.Errorf("Warn-level log fired %d times for a successful media delete, want 0", n)
+	}
+	if got := mediaDeleteOk.Load(); got != beforeOk+1 {
+		t.Errorf("mediaDeleteOk = %d, want %d", got, beforeOk+1)
+	}
+}
+
+// TestHistorySyncMediaDelete_PeriodicInfoStillFires verifies the aggregate
+// HISTORY_SYNC_MEDIA_DELETE Infof line fires when a counter crosses the mediaDeleteLogEvery
+// threshold, so a persistent anomaly stays observable without per-event WARN spam.
+func TestHistorySyncMediaDelete_PeriodicInfoStillFires(t *testing.T) {
+	log := &outcomeCapture{}
+	cli := &Client{Log: log}
+
+	for mediaDeleteFail.Load()%mediaDeleteLogEvery != mediaDeleteLogEvery-1 {
+		mediaDeleteFail.Add(1)
+	}
+	cli.recordMediaDeleteOutcome(fmt.Errorf("simulated delete failure"))
+
+	if n := log.infoCount("HISTORY_SYNC_MEDIA_DELETE"); n != 1 {
+		t.Errorf("HISTORY_SYNC_MEDIA_DELETE Infof fired %d times crossing the threshold, want 1", n)
 	}
 }
