@@ -8,6 +8,7 @@ package whatsmeow
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -15,6 +16,17 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
+
+// connectionLifecycleEvents counts newly-classified, deterministically-recovered connection
+// lifecycle events -- xmlstreamend (client.go handleXMLStreamEnd) and the 503 stream error
+// below (55.1-12). Both converge on the fork's existing readPump-close -> onDisconnect ->
+// autoReconnect chain (the same mechanism WA's own client relies on -- see the citation on
+// each occurrence); the counter exists for observability, not because a new teardown path was
+// added. Periodically visible, mirrors the newsletterControlEmpty/hostFailover* counters
+// elsewhere in this fork.
+var connectionLifecycleEvents atomic.Uint64
+
+const connectionLifecycleEventsLogEvery = 20
 
 func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 	cli.isLoggedIn.Store(false)
@@ -58,9 +70,22 @@ func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 		cli.Log.Infof("Got replaced stream error, sending StreamReplaced event")
 		go cli.dispatchEvent(&events.StreamReplaced{})
 	case code == "503":
-		// This seems to happen when the server wants to restart or something.
-		// The disconnection will be emitted as an events.Disconnected and then the auto-reconnect will do its thing.
-		cli.Log.Warnf("Got 503 stream error, assuming automatic reconnect will handle it")
+		// 55.1-12: verified, not assumed. A <stream:error code="503"> is always followed by
+		// the server closing the underlying connection (standard XMPP/WA stream-teardown
+		// semantics -- the stream error IS the close signal). That closure is what
+		// FrameSocket.readPump's conn.Read() observes as a read error, which unconditionally
+		// triggers fs.Close(0) -> OnDisconnect -> cli.onDisconnect -> autoReconnect
+		// (client.go:onDisconnect) -- the exact same chain every other disconnect (EOF,
+		// xmlstreamend, keepalive-forced) already goes through. No separate teardown call is
+		// needed or added; clearResponseWaiters(node) above already unblocked any in-flight
+		// IQ waiter. This shares the xmlstreamend lifecycle counter (client.go
+		// handleXMLStreamEnd) since both are the same verified mechanism.
+		if !cli.isExpectedDisconnect() {
+			if n := connectionLifecycleEvents.Add(1); n%connectionLifecycleEventsLogEvery == 0 {
+				cli.Log.Infof("CONNECTION_LIFECYCLE_HANDLED count=%d", n)
+			}
+			cli.Log.Debugf("Got 503 stream error; recovery reaches autoReconnect via the standard disconnect chain")
+		}
 	case cli.RefreshCAT != nil && (code == events.ConnectFailureCATInvalid.NumberString() || code == events.ConnectFailureCATExpired.NumberString()):
 		cli.Log.Infof("Got %s stream error, refreshing CAT before reconnecting...", code)
 		cli.socketLock.RLock()

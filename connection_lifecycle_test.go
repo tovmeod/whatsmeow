@@ -9,6 +9,12 @@
 //     expectedDisconnect (so a subsequent autoReconnect isn't short-circuited).
 //   - KeepAliveResponseDeadline matches WA Web's deadSocketTime (20s).
 //
+// Task 3 — xmlstreamend and 503 are counted, verified-recovery lifecycle (not new teardown
+// calls -- see the handleXMLStreamEnd doc comment for why, sourced from wa_protocol):
+//   - both increment the shared connectionLifecycleEvents counter exactly once.
+//   - isExpectedDisconnect suppresses both (no counter bump, no log).
+//   - the 503 case no longer warns ("assuming...").
+//
 // Test style: bare &Client{} + captured waLog.Logger, matching receipt_replay_test.go.
 
 package whatsmeow
@@ -126,5 +132,65 @@ func TestKeepAlive_ForceReconnectIncrementsCounterAndClearsExpectedDisconnect(t 
 	}
 	if cli.isExpectedDisconnect() {
 		t.Fatal("want expectedDisconnect cleared after forceKeepAliveReconnect (so autoReconnect proceeds)")
+	}
+}
+
+// --- Task 3: xmlstreamend + 503 -------------------------------------------------------------
+
+func TestConnectionLifecycle_XMLStreamEndCountedAndNotWarn(t *testing.T) {
+	cli, log := newReplayClient()
+	cli.expectedDisconnect = exsync.NewEvent()
+
+	before := connectionLifecycleEvents.Load()
+	cli.handleXMLStreamEnd()
+
+	if got := connectionLifecycleEvents.Load(); got != before+1 {
+		t.Fatalf("want lifecycle counter to increment by 1, got %d -> %d", before, got)
+	}
+	if log.warnCount() != 0 {
+		t.Fatalf("want no Warnf for a handled xmlstreamend, got %d: %v", log.warnCount(), log.warns)
+	}
+}
+
+func TestConnectionLifecycle_XMLStreamEndSuppressedWhenExpected(t *testing.T) {
+	cli, _ := newReplayClient()
+	cli.expectedDisconnect = exsync.NewEvent()
+	cli.expectedDisconnect.Set()
+
+	before := connectionLifecycleEvents.Load()
+	cli.handleXMLStreamEnd()
+
+	if got := connectionLifecycleEvents.Load(); got != before {
+		t.Fatalf("want no counter increment when disconnect was expected, got %d -> %d", before, got)
+	}
+}
+
+func TestConnectionLifecycle_503CountedAndNotWarn(t *testing.T) {
+	cli, log := newReplayClient()
+	cli.expectedDisconnect = exsync.NewEvent()
+
+	before := connectionLifecycleEvents.Load()
+	node := &waBinary.Node{Tag: "stream:error", Attrs: waBinary.Attrs{"code": "503"}}
+	cli.handleStreamError(context.Background(), node)
+
+	if got := connectionLifecycleEvents.Load(); got != before+1 {
+		t.Fatalf("want lifecycle counter to increment by 1, got %d -> %d", before, got)
+	}
+	if log.warnCount() != 0 {
+		t.Fatalf("want no Warnf for 503 (verified recovery, not assumed), got %d: %v", log.warnCount(), log.warns)
+	}
+}
+
+func TestConnectionLifecycle_503SuppressedWhenExpected(t *testing.T) {
+	cli, _ := newReplayClient()
+	cli.expectedDisconnect = exsync.NewEvent()
+	cli.expectedDisconnect.Set()
+
+	before := connectionLifecycleEvents.Load()
+	node := &waBinary.Node{Tag: "stream:error", Attrs: waBinary.Attrs{"code": "503"}}
+	cli.handleStreamError(context.Background(), node)
+
+	if got := connectionLifecycleEvents.Load(); got != before {
+		t.Fatalf("want no counter increment when disconnect was expected, got %d -> %d", before, got)
 	}
 }

@@ -956,6 +956,29 @@ func (cli *Client) RemoveEventHandlers() {
 	cli.eventHandlersLock.Unlock()
 }
 
+// handleXMLStreamEnd processes a received xmlstreamend frame (55.1-12).
+//
+// Sourced from WA Web's own client (~/work/wa_protocol,
+// WAWebCommsHandleLoggedInStanza.js:141-142): its xmlstreamend handler only logs
+// ("Comms.handleStanza received xmlstreamend, return NO_ACK") and does NOT proactively close
+// the socket -- only a handler that explicitly returns "CLOSE_SOCKET" does that
+// (WAComms.js:161-168), and xmlstreamend's handler isn't one of them. WA Web relies on the
+// transport-level close the server sends immediately after to drive the reconnect, via its own
+// deadSocketTimer/onclose plumbing outside handleStanza. The fork's existing
+// conn.Read()-failure -> onDisconnect -> autoReconnect chain (socket/framesocket.go readPump,
+// client.go onDisconnect) IS that same transport-level path, so no new teardown call is added
+// here -- the prior "TODO should we do something else?" is answered: no, this already matches
+// WA Web. Only the observability (counter) and the alarming Warnf were the actual gap.
+func (cli *Client) handleXMLStreamEnd() {
+	if cli.isExpectedDisconnect() {
+		return
+	}
+	if n := connectionLifecycleEvents.Add(1); n%connectionLifecycleEventsLogEvery == 0 {
+		cli.Log.Infof("CONNECTION_LIFECYCLE_HANDLED count=%d", n)
+	}
+	cli.Log.Debugf("Received stream end frame (handled lifecycle; reconnect follows the transport-level close, same as WA Web's own client)")
+}
+
 func (cli *Client) handleFrame(ctx context.Context, data []byte) {
 	decompressed, err := waBinary.Unpack(data)
 	if err != nil {
@@ -971,10 +994,7 @@ func (cli *Client) handleFrame(ctx context.Context, data []byte) {
 	}
 	cli.recvLog.Debugf("%s", node)
 	if node.Tag == "xmlstreamend" {
-		if !cli.isExpectedDisconnect() {
-			cli.Log.Warnf("Received stream end frame")
-		}
-		// TODO should we do something else?
+		cli.handleXMLStreamEnd()
 	} else if cli.receiveResponse(ctx, node) {
 		// handled
 	} else if _, ok := cli.nodeHandlers[node.Tag]; ok {
