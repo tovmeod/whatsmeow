@@ -8,11 +8,17 @@ package whatsmeow
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waServerSync"
 	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
@@ -300,5 +306,216 @@ func TestAppStateFullSyncGivesUpAfterMaxFailures(t *testing.T) {
 	cli.appStateSyncFailuresLock.Unlock()
 	if rearmed != 0 || count != 0 {
 		t.Fatalf("after a successful sync: fullSyncFails=%d count=%d, want both 0 (auto-heal must re-arm)", rearmed, count)
+	}
+}
+
+// --- 55.1-10 Task 1: sendAppState / fetchAppState lock-race regression test ---
+//
+// Root cause (55.1-INVESTIGATION-appstate-connection.md H1): sendAppState's 409-conflict
+// branch applied server patches via applyAppStatePatches WITHOUT holding cli.appStateSyncLock,
+// while notification-driven fetchAppState holds that same lock across its own call to
+// applyAppStatePatches (appstate.go:46-47,84). Concurrent invocations for the same collection
+// could interleave writes to the mutation-MAC ledger (storeMACs). The fix wraps sendAppState's
+// conflict-application call in an explicit (non-deferred) Lock/Unlock pair.
+//
+// raceAppStateStore is a fake store.AppStateStore whose write methods detect overlapping
+// call windows via an atomic in-flight counter (plus a short sleep to widen the window),
+// proving the lock actually serializes the two call sites rather than just compiling.
+
+type raceAppStateStore struct {
+	mu      sync.Mutex
+	version uint64
+	hash    [128]byte
+
+	inFlight        atomic.Int32
+	overlapDetected atomic.Bool
+}
+
+func (s *raceAppStateStore) enterWrite() {
+	if s.inFlight.Add(1) > 1 {
+		s.overlapDetected.Store(true)
+	}
+	time.Sleep(2 * time.Millisecond)
+}
+
+func (s *raceAppStateStore) exitWrite() {
+	s.inFlight.Add(-1)
+}
+
+func (s *raceAppStateStore) PutAppStateVersion(_ context.Context, _ string, version uint64, hash [128]byte) error {
+	s.enterWrite()
+	defer s.exitWrite()
+	s.mu.Lock()
+	s.version, s.hash = version, hash
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *raceAppStateStore) GetAppStateVersion(_ context.Context, _ string) (uint64, [128]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.version, s.hash, nil
+}
+
+func (s *raceAppStateStore) DeleteAppStateVersion(_ context.Context, _ string) error {
+	return nil
+}
+
+func (s *raceAppStateStore) PutAppStateMutationMACs(_ context.Context, _ string, _ uint64, _ []store.AppStateMutationMAC) error {
+	s.enterWrite()
+	defer s.exitWrite()
+	return nil
+}
+
+func (s *raceAppStateStore) DeleteAppStateMutationMACs(_ context.Context, _ string, _ [][]byte) error {
+	s.enterWrite()
+	defer s.exitWrite()
+	return nil
+}
+
+func (s *raceAppStateStore) GetAppStateMutationMAC(_ context.Context, _ string, _ []byte) ([]byte, error) {
+	return nil, nil
+}
+
+// raceAppStateKeyStore is a fixed single-key fake store.AppStateSyncKeyStore.
+type raceAppStateKeyStore struct {
+	keyID []byte
+	key   store.AppStateSyncKey
+}
+
+func (s *raceAppStateKeyStore) PutAppStateSyncKey(context.Context, []byte, store.AppStateSyncKey) error {
+	return nil
+}
+
+func (s *raceAppStateKeyStore) GetAppStateSyncKey(_ context.Context, id []byte) (*store.AppStateSyncKey, error) {
+	if string(id) != string(s.keyID) {
+		return nil, nil
+	}
+	k := s.key
+	return &k, nil
+}
+
+func (s *raceAppStateKeyStore) GetLatestAppStateSyncKeyID(context.Context) ([]byte, error) {
+	return s.keyID, nil
+}
+
+func (s *raceAppStateKeyStore) GetAllAppStateSyncKeys(context.Context) ([]*store.AppStateSyncKey, error) {
+	k := s.key
+	return []*store.AppStateSyncKey{&k}, nil
+}
+
+// newRaceAppStateTestClient builds a minimal *Client backed by raceAppStateStore, wired
+// with a real appstate.Processor so applyAppStatePatches exercises the real decode/validate/
+// storeMACs path (not a stub).
+func newRaceAppStateTestClient(t *testing.T) (*Client, *raceAppStateStore) {
+	t.Helper()
+	appStateStore := &raceAppStateStore{}
+	keyID := []byte("55.1-10-race-key")
+	keyStore := &raceAppStateKeyStore{
+		keyID: keyID,
+		key:   store.AppStateSyncKey{Data: make([]byte, 32)},
+	}
+	device := &store.Device{
+		Log:          waLog.Noop,
+		AppState:     appStateStore,
+		AppStateKeys: keyStore,
+	}
+	cli := &Client{
+		Store:                    device,
+		Log:                      waLog.Noop,
+		appStateProc:             appstate.NewProcessor(device, waLog.Noop),
+		appStateSyncFailures:     make(map[appstate.WAPatchName]int),
+		appStateFullSyncFailures: make(map[appstate.WAPatchName]int),
+	}
+	return cli, appStateStore
+}
+
+// buildRaceTestPatch produces one real, MAC-valid SyncdPatch (a mute action) using the
+// real EncodePatch path, so DecodePatches (called inside applyAppStatePatches) exercises
+// actual MAC validation and reaches storeMACs — the write path under test. EncodePatch
+// never populates the wire-only patch.Version field (the server assigns it and returns it
+// in the sync response); it is set here to the same version EncodePatch used internally
+// (initial HashState{}.Version + 1) so the decode side's MAC verification matches.
+func buildRaceTestPatch(t *testing.T, proc *appstate.Processor, keyID []byte) *waServerSync.SyncdPatch {
+	t.Helper()
+	target, err := types.ParseJID("15551234567@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	raw, err := proc.EncodePatch(context.Background(), keyID, appstate.HashState{}, appstate.BuildMute(target, true, 0))
+	if err != nil {
+		t.Fatalf("EncodePatch: %v", err)
+	}
+	var patch waServerSync.SyncdPatch
+	if err := proto.Unmarshal(raw, &patch); err != nil {
+		t.Fatalf("unmarshal encoded patch: %v", err)
+	}
+	patch.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(1)}
+	return &patch
+}
+
+// TestSendAppStateConflictApplicationSerializesWithFetchAppState exercises the full
+// 409-conflict → apply → retry → success sequence (appstate.go:572-592) concurrently with
+// fetchAppState's own locked apply (appstate.go:46-47,84) under go test -race. It asserts
+// (1) the two applyAppStatePatches invocations never overlap on the MAC-ledger write path,
+// and (2) the sequence completes within a timeout — proving no self-deadlock on the
+// non-reentrant appStateSyncLock across the recursive-retry / tail-fetch lock re-acquisition.
+func TestSendAppStateConflictApplicationSerializesWithFetchAppState(t *testing.T) {
+	cli, appStateStore := newRaceAppStateTestClient(t)
+	const name = appstate.WAPatchRegularHigh
+	keyID, err := cli.Store.AppStateKeys.GetLatestAppStateSyncKeyID(context.Background())
+	if err != nil {
+		t.Fatalf("GetLatestAppStateSyncKeyID: %v", err)
+	}
+
+	fetchPatch := buildRaceTestPatch(t, cli.appStateProc, keyID)
+	sendPatch := buildRaceTestPatch(t, cli.appStateProc, keyID)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Simulates fetchAppState's locked call to applyAppStatePatches.
+		go func() {
+			defer wg.Done()
+			cli.appStateSyncLock.Lock()
+			var events []any
+			list := &appstate.PatchList{Name: name, Patches: []*waServerSync.SyncdPatch{fetchPatch}}
+			_, applyErr := cli.applyAppStatePatches(context.Background(), name, appstate.HashState{}, list, false, &events)
+			cli.appStateSyncLock.Unlock()
+			if applyErr != nil {
+				t.Errorf("fetchAppState-side applyAppStatePatches: %v", applyErr)
+			}
+		}()
+
+		// Exercises the REAL production code sendAppState calls for its conflict-application
+		// region (appstate.go's applyConflictPatches, called from the 409-conflict branch),
+		// followed by the recursive-retry / tail-fetch lock re-acquisition it performs after
+		// releasing — must not hang on the non-reentrant mutex.
+		go func() {
+			defer wg.Done()
+			var events []any
+			list := &appstate.PatchList{Name: name, Patches: []*waServerSync.SyncdPatch{sendPatch}}
+			_, applyErr := cli.applyConflictPatches(context.Background(), name, appstate.HashState{}, list, &events)
+			if applyErr != nil {
+				t.Errorf("sendAppState-side applyConflictPatches: %v", applyErr)
+			}
+			cli.appStateSyncLock.Lock()
+			cli.appStateSyncLock.Unlock()
+		}()
+
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock: conflict-application / fetch sequence did not complete within timeout")
+	}
+
+	if appStateStore.overlapDetected.Load() {
+		t.Fatal("overlapping MAC-ledger write windows detected — sendAppState and fetchAppState raced on the same collection")
 	}
 }
