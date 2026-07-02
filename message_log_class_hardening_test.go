@@ -233,3 +233,65 @@ func TestUnavailableMessage_NoWarnAckAndEventUnchanged(t *testing.T) {
 		})
 	}
 }
+
+// --- 55.1-06 Task 2: newsletter body-less plaintext (class 6) -----------------------------------
+
+// TestHandlePlaintextMessage_NewsletterEmptyPlaintext verifies a <plaintext> node with no byte
+// content from a @newsletter sender (one of the five spec'd byte-free newsletter sub-types --
+// reaction / reaction-revoke / revoke / poll-vote / WAMOEmpty, per
+// 55.1-INVESTIGATION-message-classes.md §2) is recognized and counted, not warned.
+func TestHandlePlaintextMessage_NewsletterEmptyPlaintext(t *testing.T) {
+	log := &warnCapture{}
+	cli := &Client{Log: log}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Sender: types.JID{User: "120363000000000098", Server: types.NewsletterServer},
+			Chat:   types.JID{User: "120363000000000098", Server: types.NewsletterServer},
+		},
+	}
+	node := &waBinary.Node{
+		Tag: "message",
+		Content: []waBinary.Node{
+			{Tag: "plaintext", Content: nil},
+		},
+	}
+	startCount := newsletterControlEmpty.Load()
+
+	handlerFailed := cli.handlePlaintextMessage(context.Background(), info, node)
+
+	if handlerFailed {
+		t.Error("handlerFailed = true, want false for a recognized newsletter control event")
+	}
+	if n := log.warnCount("doesn't have byte content"); n != 0 {
+		t.Errorf("Warn-level log fired %d times for body-less newsletter plaintext, want 0 (recognized newsletter control event)", n)
+	}
+	if got := newsletterControlEmpty.Load() - startCount; got != 1 {
+		t.Errorf("newsletterControlEmpty advanced by %d, want 1", got)
+	}
+}
+
+// TestHandlePlaintextMessage_NonNewsletterEmptyPlaintextStillWarns verifies the same node shape
+// from a non-newsletter sender has no legitimate byte-free shape and still warns (regression guard
+// against over-broadening the newsletter early-return).
+func TestHandlePlaintextMessage_NonNewsletterEmptyPlaintextStillWarns(t *testing.T) {
+	log := &warnCapture{}
+	cli := &Client{Log: log}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Sender: types.JID{User: "15550001234", Server: types.DefaultUserServer},
+			Chat:   types.JID{User: "15550001234", Server: types.DefaultUserServer},
+		},
+	}
+	node := &waBinary.Node{
+		Tag: "message",
+		Content: []waBinary.Node{
+			{Tag: "plaintext", Content: nil},
+		},
+	}
+
+	cli.handlePlaintextMessage(context.Background(), info, node)
+
+	if n := log.warnCount("doesn't have byte content"); n != 1 {
+		t.Errorf("Warn-level log fired %d times for non-newsletter body-less plaintext, want 1 (genuine anomaly, no legitimate byte-free shape)", n)
+	}
+}
