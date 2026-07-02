@@ -14,9 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"time"
 
@@ -724,19 +722,10 @@ const recoveredMsgIDsListSize = 4096
 // override it. Save/restore around the test when changing from the default.
 var recoveredMsgIDsSize = recoveredMsgIDsListSize
 
-// retryCapSKMsgDefault is the number of retry receipts sent for group/sender-key class
-// messages before giving up. Overridable via env KAVTOV_RETRY_CAP_SKMSG.
-// Declared as a var (not const) so tests can override it.
-var retryCapSKMsg = func() int {
-	s := os.Getenv("KAVTOV_RETRY_CAP_SKMSG")
-	if s == "0" {
-		return 0
-	}
-	if n, err := strconv.Atoi(s); err == nil && n > 0 {
-		return n
-	}
-	return 3 // default: 3 receipts per (msgID, sender) for skmsg class
-}()
+// retryCapSKMsg is the number of retry receipts sent for group/sender-key class
+// messages before giving up. Declared as a var (not const) so tests can override it
+// (save/restore this value).
+var retryCapSKMsg = 3 // default: 3 receipts per (msgID, sender) for skmsg class
 
 // registerRetryAttempt records one retry attempt for (msgID, senderUser) and returns
 // (count, proceed, logTerminal).

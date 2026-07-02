@@ -23,11 +23,6 @@ func ClassifyNoDonor(ctx context.Context, s *SQLStore, ourJID, group, senderBare
 	return classifyNoDonor(ctx, s, ourJID, group, senderBare)
 }
 
-// SetSenderKeySubclassRate sets the sampler rate for tests (save/restore around the test).
-func SetSenderKeySubclassRate(rate int) {
-	senderKeySubclassRate = rate
-}
-
 // DeleteNoDonorCacheEntry removes a single entry from the negative-donor cache.
 // Test-only: allows DB-backed integration tests (package sqlstore_test) to
 // evict a specific sfKey so the cache does not bleed across subtests that share

@@ -42,7 +42,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,37 +135,6 @@ type donorSenderKeyState struct {
 	SkippedKeys []*ratchet.SenderMessageKeyStructure
 }
 
-// D-03 / 999.19: SENDERKEY_SUBCLASS sampler — classifies why no donor was found.
-// Default rate 10 (1-in-10 no-donor events); 0 disables. Declared as a var (not
-// const) so internal tests can override the rate without restarting the process.
-// Configured via env KAVTOV_SENDERKEY_SUBCLASS.
-const senderKeySubclassDefaultRate = 10
-
-var senderKeySubclassRate = func() int {
-	s := os.Getenv("KAVTOV_SENDERKEY_SUBCLASS")
-	if s == "0" {
-		return 0
-	}
-	if n, err := strconv.Atoi(s); err == nil && n > 0 {
-		return n
-	}
-	return senderKeySubclassDefaultRate
-}()
-
-// senderKeySubclassCounter is the per-process counter driving the subclass sampler.
-var senderKeySubclassCounter atomic.Uint64
-
-// senderKeySubclassShouldSample returns true on 1-in-senderKeySubclassRate calls.
-// Always false when rate == 0 (disabled path never touches the counter).
-func senderKeySubclassShouldSample() bool {
-	rate := senderKeySubclassRate
-	if rate == 0 {
-		return false
-	}
-	n := senderKeySubclassCounter.Add(1)
-	return n%uint64(rate) == 0
-}
-
 // subclassLIDMapQuery checks whatsmeow_lid_map for the sender's identifier.
 // Returns one of: "pn-mapped" (sender resolves as a PN→LID pair),
 // "lid-mapped" (sender resolves as a LID→PN pair), "unmapped" (no entry),
@@ -206,15 +174,17 @@ type noDonorFields struct {
 	KeysElsewhere bool   // true = sender has keys with us in at least one other group
 }
 
-// classifyNoDonor runs the two sampled read-only queries against s to produce
-// the SENDERKEY_SUBCLASS field values. Errors are swallowed with fallback field
+// classifyNoDonor runs two read-only queries against s to classify why no donor
+// was found for a failed decrypt. Errors are swallowed with fallback field
 // values so the fail path never gets slower or fails because of diagnostics.
 //
 //   - ourJID:     the recovering account's own JID string (our_jid in the table)
 //   - group:      the group chat ID (chat_id of the failing decrypt)
 //   - senderBare: the bare Signal-address user (no device suffix, no @server)
 //
-// This function is called only when the sampler fires; it is NOT on the hot path.
+// Not on the hot path — no production caller (D-12 removed the sampled
+// SENDERKEY_SUBCLASS log line this fed); exercised directly by
+// TestSenderKeySubclass / TestClassifyNoDonorLIDMapSuffix via export_test.go.
 func classifyNoDonor(ctx context.Context, s *SQLStore, ourJID, group, senderBare string) noDonorFields {
 	fields := noDonorFields{LIDMap: "err", KeysElsewhere: false}
 
@@ -521,21 +491,6 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	}
 
 	if donor == nil {
-		// D-03 / 999.19: sampled SENDERKEY_SUBCLASS classifier.
-		// Runs only when the sampler fires (default 1-in-10); reads whatsmeow_lid_map
-		// and whatsmeow_sender_keys (read-only, no writes). Errors are swallowed
-		// inside classifyNoDonor — the fail path must never get slower because of
-		// diagnostics.
-		if senderKeySubclassShouldSample() {
-			if sq, ok := c.inner.(*SQLStore); ok {
-				fields := classifyNoDonor(ctx, sq, c.jid, group, senderBare)
-				if sq.log != nil {
-					n := senderKeySubclassCounter.Load()
-					sq.log.Infof("SENDERKEY_SUBCLASS sender=%s group=%s lidmap=%s keys_elsewhere=%t sampled_n=%d",
-						senderBare, group, fields.LIDMap, fields.KeysElsewhere, n)
-				}
-			}
-		}
 		return "", false, nil // no qualifying donor
 	}
 
