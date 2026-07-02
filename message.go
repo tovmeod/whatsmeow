@@ -258,6 +258,15 @@ func (cli *Client) parseMessageInfo(node *waBinary.Node) (*types.MessageInfo, er
 	return &info, nil
 }
 
+// newsletterControlEmpty counts body-less <plaintext> nodes from a @newsletter sender -- one of
+// the five spec'd byte-free newsletter sub-types (reaction / reaction-revoke / revoke / poll-vote
+// / WAMOEmpty, per 55.1-INVESTIGATION-message-classes.md §2: WA Web's own newsletter SMAX parsers
+// require <plaintext> to structurally exist for every newsletter type but only payload-bearing
+// types require it to carry bytes). Recognized and counted, not silenced.
+var newsletterControlEmpty atomic.Uint64
+
+const newsletterControlEmptyLogEvery = 1000
+
 func (cli *Client) handlePlaintextMessage(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) (handlerFailed bool) {
 	// TODO edits have an additional <meta msg_edit_t="1696321271735" original_msg_t="1696321248"/> node
 	plaintext, ok := node.GetOptionalChildByTag("plaintext")
@@ -267,6 +276,16 @@ func (cli *Client) handlePlaintextMessage(ctx context.Context, info *types.Messa
 	}
 	plaintextBody, ok := plaintext.Content.([]byte)
 	if !ok {
+		if info.Sender.Server == types.NewsletterServer {
+			// kavtov-fork (55.1-06, class 6): a body-less <plaintext> from a newsletter sender is a
+			// legitimate byte-free control event (reaction/reaction-revoke/revoke/poll-vote/
+			// WAMOEmpty) per 55.1-INVESTIGATION-message-classes.md §2 -- not a malformed node.
+			if n := newsletterControlEmpty.Add(1); n%newsletterControlEmptyLogEvery == 0 {
+				cli.Log.Infof("NEWSLETTER_CONTROL_EMPTY count=%d", n)
+			}
+			cli.Log.Debugf("Newsletter control plaintext (no byte content) from %s", info.SourceString())
+			return
+		}
 		cli.Log.Warnf("Plaintext message from %s doesn't have byte content", info.SourceString())
 		return
 	}
