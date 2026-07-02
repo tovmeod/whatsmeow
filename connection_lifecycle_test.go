@@ -4,6 +4,11 @@
 //   - handleStreamError returns before a slow Store.Delete unblocks.
 //   - the Delete error is still logged, once the backgrounded goroutine completes.
 //
+// Task 2 — WA-cadence keepalive miss forces an immediate reconnect (no 3-minute tolerance):
+//   - forceKeepAliveReconnect increments the observability counter and clears
+//     expectedDisconnect (so a subsequent autoReconnect isn't short-circuited).
+//   - KeepAliveResponseDeadline matches WA Web's deadSocketTime (20s).
+//
 // Test style: bare &Client{} + captured waLog.Logger, matching receipt_replay_test.go.
 
 package whatsmeow
@@ -95,5 +100,31 @@ func TestDeviceRemoved_HandleStreamErrorReturnsBeforeStoreDeleteCompletes(t *tes
 	}
 	if log.warnCount() != 1 {
 		t.Fatalf("want exactly 1 Warnf for the Delete error, got %d: %v", log.warnCount(), log.warns)
+	}
+}
+
+// --- Task 2: WA-cadence keepalive miss ------------------------------------------------------
+
+func TestKeepAlive_ResponseDeadlineMatchesWADeadSocketTime(t *testing.T) {
+	if KeepAliveResponseDeadline != 20*time.Second {
+		t.Fatalf("want KeepAliveResponseDeadline=20s (WA Web deadSocketTime), got %v", KeepAliveResponseDeadline)
+	}
+}
+
+func TestKeepAlive_ForceReconnectIncrementsCounterAndClearsExpectedDisconnect(t *testing.T) {
+	cli, _ := newReplayClient()
+	cli.Store = &store.Device{}
+	cli.expectedDisconnect = exsync.NewEvent()
+	cli.EnableAutoReconnect = true
+
+	before := keepAliveForcedReconnects.Load()
+	cli.forceKeepAliveReconnect(context.Background())
+	after := keepAliveForcedReconnects.Load()
+
+	if after != before+1 {
+		t.Fatalf("want forced-reconnect counter to increment by 1, got %d -> %d", before, after)
+	}
+	if cli.isExpectedDisconnect() {
+		t.Fatal("want expectedDisconnect cleared after forceKeepAliveReconnect (so autoReconnect proceeds)")
 	}
 }
