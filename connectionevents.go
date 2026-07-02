@@ -41,10 +41,18 @@ func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 		cli.expectDisconnect()
 		cli.Log.Infof("Got device removed stream error, sending LoggedOut event and deleting session")
 		go cli.dispatchEvent(&events.LoggedOut{OnConnect: false, Reason: events.ConnectFailureLoggedOut})
-		err := cli.Store.Delete(ctx)
-		if err != nil {
-			cli.Log.Warnf("Failed to delete store after device_removed error: %v", err)
-		}
+		// 55.1-12: background the Store.Delete cascade-DELETE (multi-minute on a large
+		// account, investigation A2) so handleStreamError returns promptly and the
+		// handler-queue watchdog (client.go handlerQueueLoop) stops measuring the deletion's
+		// duration. Mirrors the dispatchEvent goroutine above. The deletion itself is
+		// unchanged -- no table pruning, no scope reduction. context.WithoutCancel: the
+		// handler ctx is tied to this same disconnect's connection context, which is
+		// cancelled right after this case returns, so the delete must outlive it.
+		go func() {
+			if err := cli.Store.Delete(context.WithoutCancel(ctx)); err != nil {
+				cli.Log.Warnf("Failed to delete store after device_removed error: %v", err)
+			}
+		}()
 	case conflictType == "replaced":
 		cli.expectDisconnect()
 		cli.Log.Infof("Got replaced stream error, sending StreamReplaced event")
