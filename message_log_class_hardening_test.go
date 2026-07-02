@@ -12,14 +12,22 @@ package whatsmeow
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
+	"go.mau.fi/libsignal/serialize"
+	"go.mau.fi/libsignal/signalerror"
+	"google.golang.org/protobuf/proto"
+
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/keys"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
@@ -293,5 +301,418 @@ func TestHandlePlaintextMessage_NonNewsletterEmptyPlaintextStillWarns(t *testing
 
 	if n := log.warnCount("doesn't have byte content"); n != 1 {
 		t.Errorf("Warn-level log fired %d times for non-newsletter body-less plaintext, want 1 (genuine anomaly, no legitimate byte-free shape)", n)
+	}
+}
+
+// --- 55.1-07 Task 1/2/3: old-counter / old-message-version / status-broadcast-no-valid-sessions /
+// STALE_PREKEY dedup ------------------------------------------------------------------------------
+//
+// handleDecryptError (message.go) is a pure extraction of decryptMessages' decrypt-error
+// classification chain -- decryptMessages calls it with exactly these arguments, so calling it
+// directly with a sentinel-wrapped error exercises the real production branch-routing code (log
+// level, ack, retry-receipt, event dispatch). Reproducing the exact libsignal session/ciphertext
+// state that PRODUCES ErrOldCounter/ErrNoValidSessions in prod (an established Signal session with
+// specific ratchet state) is out of this plan's scope -- libsignal's own test suite already covers
+// that error-derivation logic; errors.Is classification behaves identically for a
+// directly-constructed sentinel-wrapped error and a real one, since Go error identity is
+// location-independent. ErrOldMessageVersion is the one exception: it fires purely from parsing raw
+// ciphertext bytes with no session involved, so it gets a real end-to-end test through
+// cli.decryptMessages with crafted bytes below.
+
+// decryptErrorCapture records Warnf/Debugf/Infof calls so tests can assert exact log-level routing.
+// Implements waLog.Logger; Sub returns itself.
+type decryptErrorCapture struct {
+	mu     sync.Mutex
+	warns  []string
+	debugs []string
+}
+
+func (l *decryptErrorCapture) Errorf(string, ...interface{}) {}
+func (l *decryptErrorCapture) Infof(string, ...interface{})  {}
+func (l *decryptErrorCapture) Sub(string) waLog.Logger       { return l }
+func (l *decryptErrorCapture) Warnf(msg string, _ ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warns = append(l.warns, msg)
+}
+func (l *decryptErrorCapture) Debugf(msg string, _ ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.debugs = append(l.debugs, msg)
+}
+func countSubstr(lines []string, substr string) int {
+	n := 0
+	for _, s := range lines {
+		if strings.Contains(s, substr) {
+			n++
+		}
+	}
+	return n
+}
+func (l *decryptErrorCapture) warnCount(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return countSubstr(l.warns, substr)
+}
+func (l *decryptErrorCapture) debugCount(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return countSubstr(l.debugs, substr)
+}
+
+// fakeGenOnePreKeyStore implements store.PreKeyStore just enough for sendRetryReceipt's
+// forceIncludeIdentity path (GenOnePreKey) -- the rest of the interface is unused by that path.
+// calls counts GenOnePreKey invocations so tests can prove forceIncludeIdentity actually took the
+// keys-inclusion branch (sendRetryReceipt itself sends over the real cli.sendNode, which is NOT
+// covered by cli.sendNodeFunc -- see sendNodeOrHook's doc -- so the outbound wire node is not
+// observable from a bare &Client{} test; GenOnePreKey invocation is the reliable proxy).
+type fakeGenOnePreKeyStore struct {
+	mu     sync.Mutex
+	nextID uint32
+	calls  int
+}
+
+func (f *fakeGenOnePreKeyStore) GetOrGenPreKeys(context.Context, uint32) ([]*keys.PreKey, error) {
+	return nil, nil
+}
+func (f *fakeGenOnePreKeyStore) GenOnePreKey(context.Context) (*keys.PreKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.nextID++
+	return keys.NewPreKey(f.nextID), nil
+}
+func (f *fakeGenOnePreKeyStore) GetPreKey(context.Context, uint32) (*keys.PreKey, error) {
+	return nil, nil
+}
+func (f *fakeGenOnePreKeyStore) RemovePreKey(context.Context, uint32) error          { return nil }
+func (f *fakeGenOnePreKeyStore) MarkPreKeysAsUploaded(context.Context, uint32) error { return nil }
+func (f *fakeGenOnePreKeyStore) UploadedPreKeyCount(context.Context) (int, error)    { return 0, nil }
+func (f *fakeGenOnePreKeyStore) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// decryptErrorTestSetup wires a bare &Client{} with SynchronousAck=true (so sendRetryReceipt/sendAck
+// run inline instead of racing a goroutine), a minimal real Store (sendRetryReceipt always reads
+// Store.RegistrationID, and reads Store.PreKeys/IdentityKey/SignedPreKey/Account when
+// forceIncludeIdentity fires), a sendNodeFunc hook that records every outbound ack node (sendAck
+// goes through sendNodeOrHook, so it IS observable), and an event handler that captures the last
+// dispatched events.UndecryptableMessage -- no socket, no PG. Mirrors unavailableMessageTestSetup's
+// style. The returned *fakeGenOnePreKeyStore lets tests prove sendRetryReceipt's forceIncludeIdentity
+// branch fired (see the type doc -- the outbound retry-receipt node itself is not observable).
+func decryptErrorTestSetup(t *testing.T) (cli *Client, log *decryptErrorCapture, sentNodes *[]waBinary.Node, dispatched **events.UndecryptableMessage, preKeys *fakeGenOnePreKeyStore) {
+	t.Helper()
+	log = &decryptErrorCapture{}
+	identityKey := keys.NewKeyPair()
+	preKeys = &fakeGenOnePreKeyStore{}
+	cli = &Client{
+		Log:            log,
+		SynchronousAck: true,
+		Store: &store.Device{
+			Log:            waLog.Noop,
+			RegistrationID: 12345,
+			IdentityKey:    identityKey,
+			SignedPreKey:   identityKey.CreateSignedPreKey(1),
+			PreKeys:        preKeys,
+			Account:        &waAdv.ADVSignedDeviceIdentity{},
+		},
+	}
+	var nodes []waBinary.Node
+	sentNodes = &nodes
+	cli.sendNodeFunc = func(_ context.Context, node waBinary.Node) error {
+		*sentNodes = append(*sentNodes, node)
+		return nil
+	}
+	var got *events.UndecryptableMessage
+	dispatched = &got
+	cli.AddEventHandler(func(evt any) {
+		if um, ok := evt.(*events.UndecryptableMessage); ok {
+			*dispatched = um
+		}
+	})
+	return
+}
+
+// retryAttemptCount reads cli.retryAttempts directly (same package) to prove sendRetryReceipt's
+// registerRetryAttempt ran for (msgID, sender) -- registerRetryAttempt executes before the actual
+// wire send, so this is unaffected by sendRetryReceipt's real cli.sendNode failing with
+// ErrNotConnected (no socket in these tests).
+func retryAttemptCount(cli *Client, msgID, sender string) int {
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+	return cli.retryAttempts[retryAttemptKey{MsgID: msgID, Sender: sender}].Count
+}
+
+// decryptErrorTestInfoAndNode builds a minimal MessageInfo/Node/AttrUtility triple matching the
+// exact arguments decryptMessages passes to handleDecryptError.
+func decryptErrorTestInfoAndNode(chatServer string) (*types.MessageInfo, *waBinary.Node, *waBinary.AttrUtility) {
+	chatUser := "120363000000000200"
+	if chatServer == types.BroadcastServer {
+		chatUser = "status"
+	}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:   types.JID{User: chatUser, Server: chatServer},
+			Sender: types.JID{User: "15550002000", Server: types.HiddenUserServer},
+		},
+		ID: "DECRYPT-ERR-TEST-ID",
+	}
+	node := &waBinary.Node{
+		Tag:   "message",
+		Attrs: waBinary.Attrs{"id": string(info.ID), "from": info.Chat},
+	}
+	return info, node, node.AttrGetter()
+}
+
+// sentNodeCount counts outbound nodes matching tag (and, if typeAttr is non-empty, an exact
+// Attrs["type"] match).
+func sentNodeCount(nodes []waBinary.Node, tag, typeAttr string) int {
+	n := 0
+	for _, nd := range nodes {
+		if nd.Tag != tag {
+			continue
+		}
+		if typeAttr == "" {
+			n++
+			continue
+		}
+		if v, ok := nd.Attrs["type"].(string); ok && v == typeAttr {
+			n++
+		}
+	}
+	return n
+}
+
+// TestOldCounter_DebugContinueNoRetryNoDispatch verifies ErrOldCounter routes through the
+// already-processed handling: Debug-only (no Warn), shouldContinue=true, no retry receipt sent, and
+// no UndecryptableMessage dispatched (a known duplicate is not a loss).
+func TestOldCounter_DebugContinueNoRetryNoDispatch(t *testing.T) {
+	cli, log, _, dispatched, _ := decryptErrorTestSetup(t)
+	info, node, ag := decryptErrorTestInfoAndNode(types.GroupServer)
+	err := fmt.Errorf("%w (index: 5, count: 3)", signalerror.ErrOldCounter)
+
+	shouldContinue := cli.handleDecryptError(context.Background(), info, node, ag, "msg", []string{"msg"}, true, info.Sender, err)
+
+	if !shouldContinue {
+		t.Error("shouldContinue = false, want true (ErrOldCounter routes through the already-processed path)")
+	}
+	if n := log.warnCount("Ignoring message"); n != 0 {
+		t.Errorf("Warn-level log fired %d times for ErrOldCounter, want 0", n)
+	}
+	if n := log.debugCount("Ignoring message"); n != 1 {
+		t.Errorf("Debug-level log fired %d times for ErrOldCounter, want 1", n)
+	}
+	if n := retryAttemptCount(cli, string(info.ID), info.Sender.User); n != 0 {
+		t.Errorf("retry receipt sent %d times for ErrOldCounter, want 0 (known duplicate, no retry)", n)
+	}
+	if *dispatched != nil {
+		t.Error("UndecryptableMessage dispatched for ErrOldCounter, want none (a duplicate is not a loss)")
+	}
+}
+
+// oldVersionPreKeyBytes builds real wire bytes for a version-0 prekey message: a leading byte whose
+// high nibble is 0 (UnsupportedVersion=1, so version 0 is "too old") followed by a validly-marshaled
+// (but otherwise arbitrary) serialize.PreKeySignalMessage body. The version check
+// (protocol.NewPreKeySignalMessageFromStruct) fires before any session/store lookup, so this
+// triggers signalerror.ErrOldMessageVersion with no signal session needed at all -- unlike
+// ErrOldCounter/ErrNoValidSessions/ErrNoOneTimeKeyFound below.
+func oldVersionPreKeyBytes(t *testing.T) []byte {
+	t.Helper()
+	msg := &serialize.PreKeySignalMessage{
+		RegistrationId: proto.Uint32(1),
+		BaseKey:        []byte{1, 2, 3, 4},
+		IdentityKey:    []byte{5, 6, 7, 8},
+		Message:        []byte{9, 10, 11, 12},
+	}
+	body, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal test PreKeySignalMessage: %v", err)
+	}
+	return append([]byte{0x00}, body...)
+}
+
+// TestOldMessageVersion_RealBytesThroughDecryptMessages verifies a real version-0 prekey message,
+// fed through the actual cli.decryptMessages loop (decryptDM -> protocol.NewPreKeySignalMessageFromBytes
+// -> signalerror.ErrOldMessageVersion, no session lookup reached), acks, dispatches
+// UndecryptableMessage, advances staleMessageVersionTotal, logs Debug-only, and sends no retry
+// receipt.
+func TestOldMessageVersion_RealBytesThroughDecryptMessages(t *testing.T) {
+	log := &warnCapture{}
+	cli := &Client{Log: log, SynchronousAck: true}
+	var sentNodes []waBinary.Node
+	cli.sendNodeFunc = func(_ context.Context, node waBinary.Node) error {
+		sentNodes = append(sentNodes, node)
+		return nil
+	}
+	var dispatched *events.UndecryptableMessage
+	cli.AddEventHandler(func(evt any) {
+		if um, ok := evt.(*events.UndecryptableMessage); ok {
+			dispatched = um
+		}
+	})
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:   types.JID{User: "120363000000000201", Server: types.GroupServer},
+			Sender: types.JID{User: "15550002001", Server: types.HiddenUserServer},
+		},
+		ID: "OLD-VERSION-TEST-ID",
+	}
+	node := &waBinary.Node{
+		Tag:   "message",
+		Attrs: waBinary.Attrs{"id": string(info.ID), "from": info.Chat},
+		Content: []waBinary.Node{
+			{Tag: "enc", Attrs: waBinary.Attrs{"type": "pkmsg", "v": "2"}, Content: oldVersionPreKeyBytes(t)},
+		},
+	}
+	startTotal := staleMessageVersionTotal.Load()
+
+	cli.decryptMessages(context.Background(), info, node)
+
+	if n := log.warnCount("Error decrypting message"); n != 0 {
+		t.Errorf("generic decrypt Warnf fired %d times for a version-0 prekey message, want 0", n)
+	}
+	if got := staleMessageVersionTotal.Load() - startTotal; got != 1 {
+		t.Errorf("staleMessageVersionTotal advanced by %d, want 1", got)
+	}
+	if n := sentNodeCount(sentNodes, "ack", ""); n != 1 {
+		t.Errorf("ack sent %d times, want 1 (ack so WhatsApp stops redelivering)", n)
+	}
+	if n := sentNodeCount(sentNodes, "receipt", "retry"); n != 0 {
+		t.Errorf("retry receipt sent %d times, want 0 (a malformed version can never parse via retry)", n)
+	}
+	if dispatched == nil {
+		t.Fatal("UndecryptableMessage was not dispatched")
+	}
+	if dispatched.IsUnavailable {
+		t.Error("dispatched IsUnavailable = true, want false")
+	}
+}
+
+// TestGenericDecryptError_StillWarnsAndRetries is the regression guard: an unrelated decrypt error
+// (not EventAlreadyProcessed/ErrOldCounter/ErrOldMessageVersion) still takes the generic Warnf +
+// retry-receipt + ack + UndecryptableMessage-dispatch path, unchanged by this plan's new branches.
+func TestGenericDecryptError_StillWarnsAndRetries(t *testing.T) {
+	cli, log, sentNodes, dispatched, _ := decryptErrorTestSetup(t)
+	info, node, ag := decryptErrorTestInfoAndNode(types.GroupServer)
+	err := fmt.Errorf("boom: unrelated decrypt failure")
+
+	shouldContinue := cli.handleDecryptError(context.Background(), info, node, ag, "msg", []string{"msg"}, true, info.Sender, err)
+
+	if shouldContinue {
+		t.Error("shouldContinue = true, want false (an unrelated decrypt error must still return from decryptMessages)")
+	}
+	if n := log.warnCount("Error decrypting message"); n != 1 {
+		t.Errorf("Warn-level log fired %d times for an unrelated decrypt error, want 1 (generic path unchanged)", n)
+	}
+	if n := retryAttemptCount(cli, string(info.ID), info.Sender.User); n != 1 {
+		t.Errorf("retry receipt sent %d times, want 1 (generic decrypt errors still retry)", n)
+	}
+	if n := sentNodeCount(*sentNodes, "ack", ""); n != 1 {
+		t.Errorf("ack sent %d times, want 1", n)
+	}
+	if *dispatched == nil {
+		t.Fatal("UndecryptableMessage was not dispatched for a genuine decrypt failure")
+	}
+}
+
+// TestNoValidSessions_StatusBroadcastDebugRetryUnchanged verifies status@broadcast +
+// ErrNoValidSessions logs Debug (not the generic Warnf) while the retry-with-identity recovery path
+// (isUnavailable=true forcing forceIncludeIdentity) fires exactly as it does today.
+func TestNoValidSessions_StatusBroadcastDebugRetryUnchanged(t *testing.T) {
+	cli, log, _, dispatched, preKeys := decryptErrorTestSetup(t)
+	info, node, ag := decryptErrorTestInfoAndNode(types.BroadcastServer)
+	if info.Chat != types.StatusBroadcastJID {
+		t.Fatalf("test setup bug: info.Chat = %v, want types.StatusBroadcastJID", info.Chat)
+	}
+	err := fmt.Errorf("%w: pairwise status delivery", signalerror.ErrNoValidSessions)
+
+	shouldContinue := cli.handleDecryptError(context.Background(), info, node, ag, "msg", []string{"msg"}, true, info.Sender, err)
+
+	if shouldContinue {
+		t.Error("shouldContinue = true, want false (a genuine decrypt failure returns from decryptMessages)")
+	}
+	if n := log.warnCount("Error decrypting message"); n != 0 {
+		t.Errorf("Warn-level log fired %d times for status@broadcast ErrNoValidSessions, want 0", n)
+	}
+	if n := log.debugCount("Error decrypting message"); n != 1 {
+		t.Errorf("Debug-level log fired %d times for status@broadcast ErrNoValidSessions, want 1", n)
+	}
+	if n := retryAttemptCount(cli, string(info.ID), info.Sender.User); n != 1 {
+		t.Errorf("retry receipt sent %d times, want 1 (retry-with-identity recovery is unchanged)", n)
+	}
+	// GenOnePreKey is only called when sendRetryReceipt's forceIncludeIdentity branch fires
+	// (retry.go: "if retryCount > 1 || forceIncludeIdentity") -- on this first attempt
+	// (retryCount==1), only isUnavailable=true (forceIncludeIdentity) reaches it, so this proves
+	// the retry-with-identity recovery fired, without depending on the outbound wire node (not
+	// observable -- see fakeGenOnePreKeyStore's doc).
+	if n := preKeys.callCount(); n != 1 {
+		t.Errorf("GenOnePreKey called %d times, want 1 (forceIncludeIdentity=true from isUnavailable must include fresh identity/prekeys)", n)
+	}
+	if *dispatched == nil {
+		t.Fatal("UndecryptableMessage was not dispatched")
+	}
+	if !(*dispatched).IsUnavailable {
+		t.Error("dispatched IsUnavailable = false, want true (ErrNoValidSessions is in the isUnavailable set)")
+	}
+}
+
+// TestNoValidSessions_NonBroadcastStillWarns is the D-03 boundary regression guard: the identical
+// ErrNoValidSessions error on a non-broadcast chat still warns -- the Debug demotion is scoped
+// exclusively to status@broadcast, not broadened to every ErrNoValidSessions occurrence.
+func TestNoValidSessions_NonBroadcastStillWarns(t *testing.T) {
+	cli, log, _, _, _ := decryptErrorTestSetup(t)
+	info, node, ag := decryptErrorTestInfoAndNode(types.GroupServer)
+	err := fmt.Errorf("%w: pairwise group delivery", signalerror.ErrNoValidSessions)
+
+	cli.handleDecryptError(context.Background(), info, node, ag, "msg", []string{"msg"}, true, info.Sender, err)
+
+	if n := log.warnCount("Error decrypting message"); n != 1 {
+		t.Errorf("Warn-level log fired %d times for non-broadcast ErrNoValidSessions, want 1 (D-03 boundary: only status@broadcast demotes)", n)
+	}
+	if n := log.debugCount("Error decrypting message"); n != 0 {
+		t.Errorf("Debug-level log fired %d times for non-broadcast ErrNoValidSessions, want 0", n)
+	}
+}
+
+// TestStalePrekey_FirstOccurrenceWarnsRepeatOnlyCounts verifies the fresh-prekey retry fires on
+// every occurrence (recovery unchanged), but the WARN emits only on the first occurrence per sender
+// -- a repeat from the SAME sender advances stalePrekeyTotal without re-warning.
+func TestStalePrekey_FirstOccurrenceWarnsRepeatOnlyCounts(t *testing.T) {
+	cli, log, _, _, _ := decryptErrorTestSetup(t)
+	info, node, ag := decryptErrorTestInfoAndNode(types.GroupServer)
+	err := fmt.Errorf("%w with ID 7", signalerror.ErrNoOneTimeKeyFound)
+	startTotal := stalePrekeyTotal.Load()
+
+	cli.handleDecryptError(context.Background(), info, node, ag, "msg", []string{"msg"}, true, info.Sender, err)
+	cli.handleDecryptError(context.Background(), info, node, ag, "msg", []string{"msg"}, true, info.Sender, err)
+
+	if n := log.warnCount("STALE_PREKEY"); n != 1 {
+		t.Errorf("STALE_PREKEY warned %d times across 2 occurrences from the SAME sender, want exactly 1 (first occurrence only)", n)
+	}
+	if got := stalePrekeyTotal.Load() - startTotal; got != 2 {
+		t.Errorf("stalePrekeyTotal advanced by %d across 2 occurrences, want 2 (every occurrence counts)", got)
+	}
+	if n := retryAttemptCount(cli, string(info.ID), info.Sender.User); n != 2 {
+		t.Errorf("retry receipt sent %d times across 2 occurrences, want 2 (the fresh-prekey retry recovery fires every time, unaffected by WARN dedup)", n)
+	}
+}
+
+// TestStalePrekey_DifferentSenderGetsOwnWarn verifies a second, distinct sender still gets its own
+// first-occurrence WARN even though a different sender already fired one.
+func TestStalePrekey_DifferentSenderGetsOwnWarn(t *testing.T) {
+	cli, log, _, _, _ := decryptErrorTestSetup(t)
+	infoA, nodeA, agA := decryptErrorTestInfoAndNode(types.GroupServer)
+	infoB, nodeB, agB := decryptErrorTestInfoAndNode(types.GroupServer)
+	infoB.Sender = types.JID{User: "15550002099", Server: types.HiddenUserServer}
+	err := fmt.Errorf("%w with ID 9", signalerror.ErrNoOneTimeKeyFound)
+
+	cli.handleDecryptError(context.Background(), infoA, nodeA, agA, "msg", []string{"msg"}, true, infoA.Sender, err)
+	cli.handleDecryptError(context.Background(), infoA, nodeA, agA, "msg", []string{"msg"}, true, infoA.Sender, err) // repeat: no new WARN
+	cli.handleDecryptError(context.Background(), infoB, nodeB, agB, "msg", []string{"msg"}, true, infoB.Sender, err) // distinct sender: own first-occurrence
+
+	if n := log.warnCount("STALE_PREKEY"); n != 2 {
+		t.Errorf("two distinct senders (one repeated) produced %d STALE_PREKEY WARNs, want 2 (one per distinct sender)", n)
 	}
 }

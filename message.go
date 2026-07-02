@@ -318,6 +318,47 @@ func (cli *Client) migrateSessionStore(ctx context.Context, pn, lid types.JID) {
 	}
 }
 
+// staleMessageVersionTotal counts every decrypt failure classified as a version-0/unparseable
+// prekey message (55.1-07, class 8) -- first-seen and repeat alike, folded into a periodic INFO
+// line so the rate stays observable without a per-event Warnf.
+var staleMessageVersionTotal atomic.Uint64
+
+const staleMessageVersionLogEvery = 1000
+
+// stalePrekeySenderSize bounds the per-sender STALE_PREKEY dedup registry (55.1-07, Task 3),
+// mirroring skdmParseFailPairsSize -- a future-storm guard, not today's shape.
+const stalePrekeySenderSize = 1000
+
+// stalePrekeyTotal counts every STALE_PREKEY occurrence (first-seen and repeat), folded into a
+// periodic INFO line so a persistently-stuck sender stays visible even after its first-occurrence
+// WARN has already fired.
+var stalePrekeyTotal atomic.Uint64
+
+const stalePrekeyLogEvery = 1000
+
+// stalePrekeyShouldWarn reports whether THIS occurrence of a stale-prekey decrypt failure for
+// sender should emit the WARN line. Returns true only on the first-seen sender (which it then
+// records, subject to stalePrekeySenderSize); every later call for the same sender returns false.
+// On overflow (stalePrekeySenderSize distinct senders already recorded) a brand-new sender is
+// counted via stalePrekeyOverflow but does not get its own first-occurrence WARN.
+func (cli *Client) stalePrekeyShouldWarn(sender string) bool {
+	cli.stalePrekeyLock.Lock()
+	defer cli.stalePrekeyLock.Unlock()
+	if cli.stalePrekeySeen == nil {
+		// Lazy init: a bare &Client{} (tests / direct construction) must not nil-panic.
+		cli.stalePrekeySeen = make(map[string]struct{}, stalePrekeySenderSize)
+	}
+	if _, seen := cli.stalePrekeySeen[sender]; seen {
+		return false
+	}
+	if len(cli.stalePrekeySeen) >= stalePrekeySenderSize {
+		cli.stalePrekeyOverflow++
+		return false
+	}
+	cli.stalePrekeySeen[sender] = struct{}{}
+	return true
+}
+
 func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
 	// Phase 17.5.1-04: per-message wall-time observation covers every
 	// exit path (unavailable early-return, success-path ack, error
@@ -448,54 +489,10 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		if errors.Is(err, EventAlreadyProcessed) {
 			cli.Log.Debugf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
 			continue
-		} else if errors.Is(err, signalerror.ErrOldCounter) {
-			cli.Log.Warnf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
-			continue
 		} else if err != nil {
-			cli.Log.Warnf("Error decrypting message %s from %s (encTypes=%v, containsDirectMsg=%v): %v", info.ID, info.SourceString(), encTypes, containsDirectMsg, err)
-			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-				return
+			if cli.handleDecryptError(ctx, info, node, ag, encType, encTypes, containsDirectMsg, senderEncryptionJID, err) {
+				continue
 			}
-			// Force include identity (our prekeys) in retry when:
-			// 1. No sender key for group decryption (need SKDM)
-			// 2. No session for pairwise decryption
-			// 3. Sender used an old/invalid prekey ID (critical after data loss/recovery)
-			// 4. No valid sessions (session exists but chain state is invalid)
-			// 5. Sender key state mismatch (have sender key but wrong chain iteration)
-			isUnavailable := (encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser)) ||
-				(encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID)) ||
-				errors.Is(err, signalerror.ErrNoSessionForUser) ||
-				errors.Is(err, signalerror.ErrNoValidSessions) ||
-				errors.Is(err, signalerror.ErrNoOneTimeKeyFound)
-			// Log senders that haven't distributed SKDM to us yet
-			if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser) {
-				cli.Log.Debugf("SENDER_NEEDS_SESSION: sender=%s group=%s containsDirectMsg=%v - sender has not distributed SKDM to us yet", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg)
-			}
-			// Log sender key state mismatch for diagnostics
-			if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID) {
-				cli.Log.Warnf("SENDER_KEY_MISMATCH: sender=%s group=%s containsDirectMsg=%v error=%v", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg, err)
-			}
-			// Log stale prekey ID errors - sender has cached old prekey, retry with fresh prekeys should fix
-			if errors.Is(err, signalerror.ErrNoOneTimeKeyFound) {
-				cli.Log.Warnf("STALE_PREKEY: sender=%s - sender used old prekey ID, sending retry with fresh prekeys", senderEncryptionJID.String())
-			}
-			if encType == "msmsg" {
-				cli.backgroundIfAsyncAck(func() {
-					cli.sendAck(ctx, node, NackMissingMessageSecret)
-				})
-			} else if cli.SynchronousAck {
-				cli.sendRetryReceipt(ctx, node, info, isUnavailable)
-				// TODO this probably isn't supposed to ack
-				cli.sendAck(ctx, node, 0)
-			} else {
-				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
-				go cli.sendAck(ctx, node, 0)
-			}
-			cli.dispatchEvent(&events.UndecryptableMessage{
-				Info:            *info,
-				IsUnavailable:   isUnavailable,
-				DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
-			})
 			return
 		}
 		retryCount := ag.OptionalInt("count")
@@ -559,6 +556,121 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		}
 	})
 	return
+}
+
+// handleDecryptError applies the decrypt-error classification and response chain (55.1-07): given
+// the err returned from decryptDM/decryptGroupMsg/decryptBotMessage (already confirmed non-nil and
+// not EventAlreadyProcessed by the caller), it decides the log level, whether to ack, whether to
+// send a retry receipt, and whether to dispatch UndecryptableMessage. Returns true if the
+// decryptMessages loop should continue to the next <enc> child, false if decryptMessages should
+// return immediately (context cancelled, or after handling a genuine decrypt failure). Pure
+// extraction of the prior inline branch chain -- pulled into its own method so the branch-routing
+// rules are unit-testable independent of the specific decrypt error's underlying crypto origin:
+// errors.Is classification behaves identically for a directly-constructed sentinel-wrapped error
+// and a real libsignal one, since Go error identity is location-independent by design.
+func (cli *Client) handleDecryptError(ctx context.Context, info *types.MessageInfo, node *waBinary.Node, ag *waBinary.AttrUtility, encType string, encTypes []string, containsDirectMsg bool, senderEncryptionJID types.JID, err error) (shouldContinue bool) {
+	if errors.Is(err, signalerror.ErrOldCounter) {
+		// kavtov-fork (55.1-07, class 5): WA Web acks an old-counter duplicate delivery
+		// identically to a decrypt success and never retries it
+		// (55.1-INVESTIGATION-message-classes.md §3, the "#1027 case") -- route it through the
+		// same already-processed handling as EventAlreadyProcessed: Debug + continue, no retry.
+		cli.Log.Debugf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
+		return true
+	} else if errors.Is(err, signalerror.ErrOldMessageVersion) {
+		// kavtov-fork (55.1-07, class 8): a version-0 prekey/message is genuinely unparseable --
+		// the "version" is the high nibble of the ciphertext's first byte, so a resend of the
+		// identical bytes yields the identical version (55.1-INVESTIGATION-message-classes.md §4 /
+		// 55.1-RESEARCH.md class 8). Ack so WhatsApp stops redelivering the same unparseable
+		// bytes, dispatch UndecryptableMessage for the metric/loss-tracking leg, and log at Debug
+		// + a bounded counter instead of the generic decrypt-error Warnf. Do NOT send a retry
+		// receipt -- retrying a malformed version can never succeed.
+		if n := staleMessageVersionTotal.Add(1); n%staleMessageVersionLogEvery == 0 {
+			cli.Log.Infof("STALE_MESSAGE_VERSION count=%d", n)
+		}
+		cli.Log.Debugf("Ignoring message %s from %s: stale/unparseable prekey version, acking not retrying: %v", info.ID, info.SourceString(), err)
+		if encType == "msmsg" {
+			cli.backgroundIfAsyncAck(func() {
+				cli.sendAck(ctx, node, NackMissingMessageSecret)
+			})
+		} else if cli.SynchronousAck {
+			cli.sendAck(ctx, node, 0)
+		} else {
+			go cli.sendAck(ctx, node, 0)
+		}
+		cli.dispatchEvent(&events.UndecryptableMessage{
+			Info:            *info,
+			IsUnavailable:   false,
+			DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
+		})
+		return true
+	}
+
+	// kavtov-fork (55.1-07, class 11): status@broadcast content is ephemeral/non-critical and the
+	// existing retry-with-identity below already re-establishes the pairwise session
+	// (55.1-INVESTIGATION-message-classes.md §7) -- demote the classification line to Debug for
+	// this case; the recovery path (isUnavailable + sendRetryReceipt) is unchanged. A non-broadcast
+	// chat with the identical error still warns (D-03 boundary).
+	if info.Chat == types.StatusBroadcastJID && errors.Is(err, signalerror.ErrNoValidSessions) {
+		cli.Log.Debugf("Error decrypting message %s from %s (encTypes=%v, containsDirectMsg=%v): %v", info.ID, info.SourceString(), encTypes, containsDirectMsg, err)
+	} else {
+		cli.Log.Warnf("Error decrypting message %s from %s (encTypes=%v, containsDirectMsg=%v): %v", info.ID, info.SourceString(), encTypes, containsDirectMsg, err)
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	// Force include identity (our prekeys) in retry when:
+	// 1. No sender key for group decryption (need SKDM)
+	// 2. No session for pairwise decryption
+	// 3. Sender used an old/invalid prekey ID (critical after data loss/recovery)
+	// 4. No valid sessions (session exists but chain state is invalid)
+	// 5. Sender key state mismatch (have sender key but wrong chain iteration)
+	isUnavailable := (encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser)) ||
+		(encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID)) ||
+		errors.Is(err, signalerror.ErrNoSessionForUser) ||
+		errors.Is(err, signalerror.ErrNoValidSessions) ||
+		errors.Is(err, signalerror.ErrNoOneTimeKeyFound)
+	// Log senders that haven't distributed SKDM to us yet
+	if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser) {
+		cli.Log.Debugf("SENDER_NEEDS_SESSION: sender=%s group=%s containsDirectMsg=%v - sender has not distributed SKDM to us yet", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg)
+	}
+	// Log sender key state mismatch for diagnostics
+	if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID) {
+		cli.Log.Warnf("SENDER_KEY_MISMATCH: sender=%s group=%s containsDirectMsg=%v error=%v", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg, err)
+	}
+	// Log stale prekey ID errors - sender has cached old prekey, retry with fresh prekeys should fix.
+	// kavtov-fork (55.1-07, Task 3): the fresh-prekey retry chain is verified real -- isUnavailable
+	// (above) includes ErrNoOneTimeKeyFound, so sendRetryReceipt below fires with
+	// forceIncludeIdentity=true, which calls Store.PreKeys.GenOnePreKey (retry.go:1037) for a
+	// genuinely NEW one-time prekey on every occurrence. First occurrence per sender WARNs
+	// (recovery in flight, worth seeing); repeats from the same sender only advance
+	// stalePrekeyTotal, keeping a persistently-stuck sender visible via the periodic aggregate
+	// without a WARN on every message.
+	if errors.Is(err, signalerror.ErrNoOneTimeKeyFound) {
+		if cli.stalePrekeyShouldWarn(senderEncryptionJID.User) {
+			cli.Log.Warnf("STALE_PREKEY: sender=%s - sender used old prekey ID, sending retry with fresh prekeys", senderEncryptionJID.String())
+		}
+		if n := stalePrekeyTotal.Add(1); n%stalePrekeyLogEvery == 0 {
+			cli.Log.Infof("STALE_PREKEY count=%d", n)
+		}
+	}
+	if encType == "msmsg" {
+		cli.backgroundIfAsyncAck(func() {
+			cli.sendAck(ctx, node, NackMissingMessageSecret)
+		})
+	} else if cli.SynchronousAck {
+		cli.sendRetryReceipt(ctx, node, info, isUnavailable)
+		// TODO this probably isn't supposed to ack
+		cli.sendAck(ctx, node, 0)
+	} else {
+		go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
+		go cli.sendAck(ctx, node, 0)
+	}
+	cli.dispatchEvent(&events.UndecryptableMessage{
+		Info:            *info,
+		IsUnavailable:   isUnavailable,
+		DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
+	})
+	return false
 }
 
 func (cli *Client) clearUntrustedIdentity(ctx context.Context, target types.JID) error {

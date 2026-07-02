@@ -125,9 +125,9 @@ type Client struct {
 	// senders for the same msgID get independent counts. Bounded by a ring of size retryStoreSKMsgSize
 	// to cap memory growth at ~6000 failures/hr. Value-typed entries (no pointers) per 35.1 GC lesson.
 	// Lazy-init under messageRetriesLock so a bare &Client{} never nil-panics.
-	retryAttempts     map[retryAttemptKey]retryAttemptEntry
-	retryAttemptsList [retryAttemptsListSize]retryAttemptKey
-	retryAttemptsPtr  int
+	retryAttempts      map[retryAttemptKey]retryAttemptEntry
+	retryAttemptsList  [retryAttemptsListSize]retryAttemptKey
+	retryAttemptsPtr   int
 	messageRetriesLock sync.Mutex
 
 	// kavtov-fork (35.2-02 D-06): bounded set of message IDs whose content was already
@@ -140,7 +140,7 @@ type Client struct {
 	recoveredMsgIDsPtr  int
 	recoveredMsgIDsLock sync.Mutex
 
-	retrySema          *semaphore.Weighted
+	retrySema *semaphore.Weighted
 
 	incomingRetryRequestCounter     map[incomingRetryKey]int
 	incomingRetryRequestCounterLock sync.Mutex
@@ -256,6 +256,17 @@ type Client struct {
 	skdmParseFailCounts   map[skdmParseFailKey]uint64
 	skdmParseFailOverflow uint64
 	skdmParseFailLock     sync.Mutex
+
+	// kavtov-fork (55.1-07, Task 3): per-sender STALE_PREKEY dedup registry. The fresh-prekey retry
+	// (sendRetryReceipt with forceIncludeIdentity, retry.go:1036-1053) is the verified real recovery
+	// for a sender using a stale one-time prekey ID -- the first occurrence per sender WARNs (the
+	// recovery is in flight, worth seeing); repeats from the SAME sender only advance
+	// stalePrekeyTotal (message.go), keeping a persistently-stuck sender visible via the periodic
+	// aggregate without spamming a WARN on every message. Bounded like skdmParseFailSeen; on
+	// overflow a brand-new sender is counted but does not get its own first-occurrence WARN.
+	stalePrekeySeen     map[string]struct{}
+	stalePrekeyOverflow uint64
+	stalePrekeyLock     sync.Mutex
 
 	sessionRecreateHistory     map[types.JID]time.Time
 	sessionRecreateHistoryLock sync.Mutex
@@ -383,17 +394,17 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		groupCache:       make(map[types.JID]*groupMetaCache),
 		userDevicesCache: make(map[types.JID]deviceCache),
 
-		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
-		failedSenderKeyTuples:  make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
-		skdmInstalled:          make(map[skdmInstalledKey]uint32, skdmInstalledSize),
-		skdmParseFailSeen:      make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize),
-		skdmParseFailCounts:    make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize),
+		recentMessagesMap:        make(map[recentMessageKey]RecentMessage, recentMessagesSize),
+		failedSenderKeyTuples:    make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
+		skdmInstalled:            make(map[skdmInstalledKey]uint32, skdmInstalledSize),
+		skdmParseFailSeen:        make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize),
+		skdmParseFailCounts:      make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize),
 		botResendBlacklist:       make(map[botResendKey]int),
 		appStateSyncFailures:     make(map[appstate.WAPatchName]int),
 		appStateFullSyncFailures: make(map[appstate.WAPatchName]int),
-		sessionRecreateHistory: make(map[types.JID]time.Time),
-		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
-		appStateKeyRequests:    make(map[string]time.Time),
+		sessionRecreateHistory:   make(map[types.JID]time.Time),
+		GetMessageForRetry:       func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
+		appStateKeyRequests:      make(map[string]time.Time),
 
 		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
 
