@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/util/retryafter"
@@ -237,6 +238,19 @@ func (cli *Client) DownloadMediaWithOnlyPath(ctx context.Context, directPath str
 	return cli.DownloadMediaWithPath(ctx, directPath, nil, nil, nil, "", "", true)
 }
 
+// hostFailoverLogEvery samples the periodic HOST_FAILOVER aggregate line (mirrors the
+// message.go skdmDedupLogEvery pattern) so the recovered/exhausted split stays visible on
+// the log surface without a per-event WARN for every intermediate failover step (55.1-13).
+const hostFailoverLogEvery = 100
+
+// hostFailoverAttempted / hostFailoverRecovered / hostFailoverExhausted are process-wide
+// counters for DownloadMediaWithPath's multi-host failover loop (55.1-13). Attempted counts
+// every intermediate "this host failed, trying the next one" step (formerly a per-event
+// Warnf at what was line 277); Recovered counts a later host succeeding after >=1 prior
+// failure on the same call; Exhausted counts every host failing (the existing loud error
+// return from the last host, unchanged).
+var hostFailoverAttempted, hostFailoverRecovered, hostFailoverExhausted atomic.Uint64
+
 // DownloadMediaWithPath downloads an attachment by manually specifying the path and encryption details.
 func (cli *Client) DownloadMediaWithPath(
 	ctx context.Context,
@@ -264,17 +278,30 @@ func (cli *Client) DownloadMediaWithPath(
 		// TODO omit hash for unencrypted media?
 		mediaURL := fmt.Sprintf("https://%s%s&hash=%s&mms-type=%s&__wa-mms=", host.Hostname, directPath, base64.URLEncoding.EncodeToString(encFileHash), mmsType)
 		data, err = cli.downloadAndDecrypt(ctx, mediaURL, mediaKey, mediaType, encFileHash, fileHash)
-		if err == nil ||
-			errors.Is(err, ErrInvalidMediaSHA256) ||
+		if err == nil {
+			if i > 0 {
+				hostFailoverRecovered.Add(1)
+			}
+			return
+		}
+		if errors.Is(err, ErrInvalidMediaSHA256) ||
 			errors.Is(err, ErrMediaDownloadFailedWith403) ||
 			errors.Is(err, ErrMediaDownloadFailedWith404) ||
 			errors.Is(err, ErrMediaDownloadFailedWith410) ||
 			errors.Is(err, context.Canceled) {
 			return
 		} else if i >= len(mediaConn.Hosts)-1 {
+			hostFailoverExhausted.Add(1)
 			return nil, fmt.Errorf("failed to download media from last host: %w", err)
 		}
-		cli.Log.Warnf("Failed to download media: %s, trying with next host...", err)
+		// 55.1-13: this is an intermediate failover step, not a terminal outcome -- a later
+		// host may still recover. Demoted from Warnf to Debugf + counters; a periodic
+		// aggregate Infof carries the recovered/exhausted split so the class stays visible
+		// without a per-event WARN.
+		if n := hostFailoverAttempted.Add(1); n%hostFailoverLogEvery == 0 {
+			cli.Log.Infof("HOST_FAILOVER attempted=%d recovered=%d exhausted=%d", n, hostFailoverRecovered.Load(), hostFailoverExhausted.Load())
+		}
+		cli.Log.Debugf("Failed to download media: %s, trying with next host...", err)
 	}
 	return
 }
