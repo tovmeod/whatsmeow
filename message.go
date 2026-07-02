@@ -323,7 +323,14 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 	unavailableNode, ok := node.GetOptionalChildByTag("unavailable")
 	if ok && len(node.GetChildrenByTag("enc")) == 0 {
 		uType := events.UnavailableType(unavailableNode.AttrGetter().String("type"))
-		cli.Log.Warnf("Unavailable message %s from %s (type: %q)", info.ID, info.SourceString(), uType)
+		// kavtov-fork (55.1-06, D-06 Option B, classes 3/9): this placeholder is already fully
+		// handled -- the ack still fires unconditionally below and events.UndecryptableMessage is
+		// still dispatched so the driver's RIDE_REQUEST_TAP_* metrics see it (55.1-INVESTIGATION-
+		// message-classes.md §5: a headless companion never sends PLACEHOLDER_MESSAGE_RESEND at
+		// receipt time -- WA Web's own recovery trigger is UI-viewport-only, so phone-fetch staying
+		// off is protocol-conformant, not just the safer choice). Demoted to Debug: the per-event
+		// WARN was redundant with the already-correct ack+dispatch handling.
+		cli.Log.Debugf("Unavailable message %s from %s (type: %q)", info.ID, info.SourceString(), uType)
 		cli.backgroundIfAsyncAck(func() {
 			// 2026-06-30 incident: gate the unavailable-node phone-fetch behind the same flag as the
 			// decrypt-fail path (see retry.go). Ack still fires unconditionally.
