@@ -980,3 +980,98 @@ func TestPlaceholderResendResponse_UnmarshalAndParseFailureWarnsUnchanged(t *tes
 		t.Errorf("unmarshal-failure Warnf fired %d times, want 1 (unchanged by class 15 fix)", n)
 	}
 }
+
+// --- 55.1-10 Task 3: status <set> nil content (class 2) ------------------------------------
+
+// statusNotificationNode builds a <notification type="status"><set .../></notification>-shaped
+// node with the given "set" child content.
+func statusNotificationNode(sender types.JID, content any) *waBinary.Node {
+	return &waBinary.Node{
+		Tag:   "notification",
+		Attrs: waBinary.Attrs{"from": sender, "t": int64(1700000000)},
+		Content: []waBinary.Node{
+			{Tag: "set", Content: content},
+		},
+	}
+}
+
+// TestStatusNotification_NilContentDispatchesEmptyUserAboutNoWarn verifies a nil-content <set>
+// (the privacy-gated bare `<set hash="...">` shape -- a legitimate cleared/empty status update)
+// dispatches events.UserAbout{Status: ""} and does NOT warn.
+func TestStatusNotification_NilContentDispatchesEmptyUserAboutNoWarn(t *testing.T) {
+	log := &warnCapture{}
+	cli := &Client{Log: log}
+	sender := types.JID{User: "15550001111", Server: types.DefaultUserServer}
+	var dispatched *events.UserAbout
+	cli.AddEventHandler(func(evt any) {
+		if ua, ok := evt.(*events.UserAbout); ok {
+			dispatched = ua
+		}
+	})
+
+	cli.handleStatusNotification(context.Background(), statusNotificationNode(sender, nil))
+
+	if n := log.warnCount("Set status notification has unexpected content"); n != 0 {
+		t.Errorf("Warn-level log fired %d times for nil-content status set, want 0 (legitimate cleared status)", n)
+	}
+	if dispatched == nil {
+		t.Fatal("events.UserAbout was not dispatched for nil-content status set")
+	}
+	if dispatched.Status != "" {
+		t.Errorf("dispatched Status = %q, want \"\"", dispatched.Status)
+	}
+	if dispatched.JID != sender {
+		t.Errorf("dispatched JID = %v, want %v", dispatched.JID, sender)
+	}
+}
+
+// TestStatusNotification_UnrecognizedContentStillWarns verifies a genuinely unrecognized
+// non-nil, non-[]byte content shape still warns and does not dispatch (regression guard against
+// over-broadening the nil-only fix).
+func TestStatusNotification_UnrecognizedContentStillWarns(t *testing.T) {
+	log := &warnCapture{}
+	cli := &Client{Log: log}
+	sender := types.JID{User: "15550001111", Server: types.DefaultUserServer}
+	var dispatched *events.UserAbout
+	cli.AddEventHandler(func(evt any) {
+		if ua, ok := evt.(*events.UserAbout); ok {
+			dispatched = ua
+		}
+	})
+
+	// A list of child nodes (not a byte blob, not nil) is not a recognized status shape.
+	cli.handleStatusNotification(context.Background(), statusNotificationNode(sender, []waBinary.Node{{Tag: "child"}}))
+
+	if n := log.warnCount("Set status notification has unexpected content"); n != 1 {
+		t.Errorf("Warn-level log fired %d times for unrecognized status content, want 1", n)
+	}
+	if dispatched != nil {
+		t.Error("events.UserAbout was dispatched for unrecognized content, want no dispatch")
+	}
+}
+
+// TestStatusNotification_ByteContentUnaffected verifies the existing success path (a real
+// status string as byte content) is unchanged by the class-2 fix.
+func TestStatusNotification_ByteContentUnaffected(t *testing.T) {
+	log := &warnCapture{}
+	cli := &Client{Log: log}
+	sender := types.JID{User: "15550001111", Server: types.DefaultUserServer}
+	var dispatched *events.UserAbout
+	cli.AddEventHandler(func(evt any) {
+		if ua, ok := evt.(*events.UserAbout); ok {
+			dispatched = ua
+		}
+	})
+
+	cli.handleStatusNotification(context.Background(), statusNotificationNode(sender, []byte("Busy building things")))
+
+	if n := log.warnCount("Set status notification has unexpected content"); n != 0 {
+		t.Errorf("Warn-level log fired %d times for byte-content status set, want 0", n)
+	}
+	if dispatched == nil {
+		t.Fatal("events.UserAbout was not dispatched for byte-content status set")
+	}
+	if dispatched.Status != "Busy building things" {
+		t.Errorf("dispatched Status = %q, want %q", dispatched.Status, "Busy building things")
+	}
+}

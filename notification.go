@@ -526,9 +526,17 @@ func (cli *Client) handleStatusNotification(ctx context.Context, node *waBinary.
 		cli.Log.Debugf("Status notifcation did not contain child with tag 'set'")
 		return
 	}
-	status, ok := child.Content.([]byte)
-	if !ok {
-		cli.Log.Warnf("Set status notification has unexpected content (%T)", child.Content)
+	// kavtov-fork (55.1-10, class 2): a nil Content is the privacy-gated bare
+	// `<set hash="...">` shape (a legitimate cleared/empty status, matching
+	// WAWebHandleAboutNotification.js) — dispatch an empty UserAbout instead of warning.
+	// Any OTHER non-[]byte, non-nil shape is still genuinely unrecognized and still warns.
+	var status []byte
+	switch content := child.Content.(type) {
+	case []byte:
+		status = content
+	case nil:
+	default:
+		cli.Log.Warnf("Set status notification has unexpected content (%T)", content)
 		return
 	}
 	cli.dispatchEvent(&events.UserAbout{
