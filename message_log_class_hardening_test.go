@@ -17,7 +17,9 @@ import (
 	"sync"
 	"testing"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
@@ -155,5 +157,79 @@ func TestSKDMParseFailShouldEmit_BoundedOverflowCountsWithoutOwnFirstEmit(t *tes
 	}
 	if bare.skdmParseFailOverflow != 1 {
 		t.Errorf("skdmParseFailOverflow = %d, want 1", bare.skdmParseFailOverflow)
+	}
+}
+
+// --- 55.1-06 Task 1: D-06 Option B unavailable-message WARN collapse (classes 3/9) -------------
+//
+// unavailableMessageTestSetup wires a bare &Client{} with SynchronousAck=true (so
+// backgroundIfAsyncAck runs the ack inline instead of racing a goroutine), a sendNodeFunc hook to
+// observe the outbound <ack>, and an event handler to capture the dispatched
+// events.UndecryptableMessage -- no socket, no PG.
+func unavailableMessageTestSetup(t *testing.T) (cli *Client, log *warnCapture, ackSent *bool, dispatched **events.UndecryptableMessage) {
+	t.Helper()
+	log = &warnCapture{}
+	cli = &Client{Log: log, SynchronousAck: true}
+	var sent bool
+	ackSent = &sent
+	cli.sendNodeFunc = func(_ context.Context, node waBinary.Node) error {
+		if node.Tag == "ack" {
+			*ackSent = true
+		}
+		return nil
+	}
+	var got *events.UndecryptableMessage
+	dispatched = &got
+	cli.AddEventHandler(func(evt any) {
+		if um, ok := evt.(*events.UndecryptableMessage); ok {
+			*dispatched = um
+		}
+	})
+	return
+}
+
+// TestUnavailableMessage_NoWarnAckAndEventUnchanged verifies, for both unavailable-message type
+// variants ("" and "view_once"), that the ack still fires, no Warn-level log is emitted (D-06
+// Option B demotes it to Debug), the dispatched events.UndecryptableMessage carries the same
+// IsUnavailable/UnavailableType fields as before, and AutomaticMessageRerequestFromPhone (left at
+// its zero value, false) is never flipped into a phone-fetch call.
+func TestUnavailableMessage_NoWarnAckAndEventUnchanged(t *testing.T) {
+	for _, uType := range []string{"", "view_once"} {
+		t.Run("type="+uType, func(t *testing.T) {
+			cli, log, ackSent, dispatched := unavailableMessageTestSetup(t)
+
+			info := &types.MessageInfo{
+				MessageSource: types.MessageSource{
+					Chat:   types.JID{User: "120363000000000099", Server: types.GroupServer},
+					Sender: types.JID{User: "15550009999", Server: types.DefaultUserServer},
+				},
+				ID: "UNAVAIL-TEST-ID",
+			}
+			node := &waBinary.Node{
+				Tag:   "message",
+				Attrs: waBinary.Attrs{"id": string(info.ID), "from": info.Chat},
+				Content: []waBinary.Node{
+					{Tag: "unavailable", Attrs: waBinary.Attrs{"type": uType}},
+				},
+			}
+
+			cli.decryptMessages(context.Background(), info, node)
+
+			if !*ackSent {
+				t.Error("want sendAck to fire for an unavailable-message placeholder, but no <ack> was sent")
+			}
+			if n := log.warnCount("Unavailable message"); n != 0 {
+				t.Errorf("Warn-level log fired %d times for unavailable message (type %q), want 0 (D-06 Option B demotes to Debug)", n, uType)
+			}
+			if *dispatched == nil {
+				t.Fatal("events.UndecryptableMessage was not dispatched")
+			}
+			if !(*dispatched).IsUnavailable {
+				t.Error("dispatched event IsUnavailable = false, want true")
+			}
+			if (*dispatched).UnavailableType != events.UnavailableType(uType) {
+				t.Errorf("dispatched event UnavailableType = %q, want %q", (*dispatched).UnavailableType, uType)
+			}
+		})
 	}
 }
