@@ -33,7 +33,7 @@ type errCapture struct {
 func (l *errCapture) Infof(string, ...interface{})  {}
 func (l *errCapture) Warnf(string, ...interface{})  {}
 func (l *errCapture) Debugf(string, ...interface{}) {}
-func (l *errCapture) Sub(string) waLog.Logger        { return l }
+func (l *errCapture) Sub(string) waLog.Logger       { return l }
 func (l *errCapture) Errorf(msg string, _ ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
