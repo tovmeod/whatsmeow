@@ -135,10 +135,6 @@ func TestUnpackFlatSessionCurrentOnlyNoPrev(t *testing.T) {
 }
 
 func TestLazySendPathRoundTrip(t *testing.T) {
-	old := lazySessionDecode
-	lazySessionDecode = true
-	defer func() { lazySessionDecode = old }()
-
 	// A live current state (real Curve25519 keys, so NewSessionFromStructure
 	// accepts it) plus a synthetic archived tail. The lazy path never decodes the
 	// tail, so opaque bytes correctly exercise the carry-through.

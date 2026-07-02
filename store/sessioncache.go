@@ -9,68 +9,26 @@ package store
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"go.mau.fi/libsignal/state/record"
 
 	"go.mau.fi/util/exsync"
 )
 
-// lazySessionDecode gates the Phase 38.4 send-path optimization: decode only the
-// current state on the encrypt prefetch and carry the archived states as raw bytes,
-// instead of parsing all ~40 archived states + thousands of message keys per send.
-// Read once at package load; enable with KAVTOV_LAZY_SESSION_DECODE=1. Flipping it
-// off (and restarting) instantly reverts to full-decode behavior — no code rollback.
-var lazySessionDecode = os.Getenv("KAVTOV_LAZY_SESSION_DECODE") == "1"
-
-// sendTimingDebug emits a one-line diagnostic from WithCachedSessions so the
-// send-size attribution can be debugged (addresses queried, sessions loaded, max
-// bytes, whether the byte tracker reached this ctx). Gated by the same flag.
-var sendTimingDebug = os.Getenv("KAVTOV_SEND_TIMING_LOG") == "1"
-
 type contextKey int
 
-const (
-	contextKeySessionCache contextKey = iota
-	contextKeySessionByteTracker
-)
-
-// ContextWithSessionByteTracker installs a shared tracker that WithCachedSessions
-// updates with the largest raw session blob it loads on this ctx OR any descendant
-// ctx (it's a pointer, so it survives the inner ctx reassignment that a value would
-// not). Returns the new ctx and the pointer to read after the send completes — used
-// by the send-timing log to attribute latency to fat sessions directly. Caller must
-// not share the tracker across goroutines (one per send).
-func ContextWithSessionByteTracker(ctx context.Context) (context.Context, *int) {
-	tracker := new(int)
-	return context.WithValue(ctx, contextKeySessionByteTracker, tracker), tracker
-}
-
-func recordSessionBytes(ctx context.Context, n int) {
-	if t, ok := ctx.Value(contextKeySessionByteTracker).(*int); ok && n > *t {
-		*t = n
-	}
-}
-
-// MaxCachedSessionBytes returns the largest raw session blob recorded by the byte
-// tracker on this ctx (0 if no tracker or nothing loaded).
-func MaxCachedSessionBytes(ctx context.Context) int {
-	if t, ok := ctx.Value(contextKeySessionByteTracker).(*int); ok {
-		return *t
-	}
-	return 0
-}
+const contextKeySessionCache contextKey = iota
 
 type sessionCacheEntry struct {
 	Dirty  bool
 	Found  bool
 	Record *record.Session
 
-	// Lazy send-path fields (set only when lazySessionDecode and the blob had
-	// archived states). LazyTail is the raw, unparsed archived-states suffix of the
-	// original flat blob; LazyNPrev is its archived-state count. On write-back the
-	// (encrypt-mutated) live states are packed and LazyTail is appended verbatim, so
-	// no archived state is lost. See UnpackFlatSessionCurrentOnly.
+	// Lazy send-path fields (set for every loaded existing session). LazyTail is
+	// the raw, unparsed archived-states suffix of the original flat blob;
+	// LazyNPrev is its archived-state count. On write-back the (encrypt-mutated)
+	// live states are packed and LazyTail is appended verbatim, so no archived
+	// state is lost. See UnpackFlatSessionCurrentOnly.
 	Lazy      bool
 	LazyTail  []byte
 	LazyNPrev int
@@ -152,11 +110,7 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 	}
 	wrapped := make(map[string]sessionCacheEntry, len(sessions))
 	existingSessions := make(map[string]bool, len(sessions))
-	maxSessionBytes := 0
 	for addr, rawSess := range sessions {
-		if len(rawSess) > maxSessionBytes {
-			maxSessionBytes = len(rawSess)
-		}
 		var sessionRecord *record.Session
 		var found bool
 		var lazy bool
@@ -185,24 +139,17 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 				return nil, ctx, fmt.Errorf("WithCachedSessions: non-flat session blob for %s (%s); JSON read path removed in Stage 3", addr, byte0desc)
 			}
 			var structure *record.SessionStructure
-			if lazySessionDecode {
-				// Phase 38.4: decode only the current state; carry the archived
-				// states as a raw tail re-emitted unchanged on write-back. The
-				// encrypt path never reads previousSessions, and an existing
-				// session is never ProcessBundle'd in the send path (it has no
-				// bundle), so previousSessions stays empty through the encrypt and
-				// the tail is the complete, untouched archived set.
-				structure, lazyTail, lazyNPrev, err = UnpackFlatSessionCurrentOnly(rawSess)
-				if err != nil {
-					return nil, ctx, fmt.Errorf("WithCachedSessions: failed to deserialize flat session (current-only) with %s: %w", addr, err)
-				}
-				lazy = true
-			} else {
-				structure, err = UnpackFlatSession(rawSess)
-				if err != nil {
-					return nil, ctx, fmt.Errorf("WithCachedSessions: failed to deserialize flat session with %s: %w", addr, err)
-				}
+			// Phase 38.4: decode only the current state; carry the archived
+			// states as a raw tail re-emitted unchanged on write-back. The
+			// encrypt path never reads previousSessions, and an existing
+			// session is never ProcessBundle'd in the send path (it has no
+			// bundle), so previousSessions stays empty through the encrypt and
+			// the tail is the complete, untouched archived set.
+			structure, lazyTail, lazyNPrev, err = UnpackFlatSessionCurrentOnly(rawSess)
+			if err != nil {
+				return nil, ctx, fmt.Errorf("WithCachedSessions: failed to deserialize flat session (current-only) with %s: %w", addr, err)
 			}
+			lazy = true
 			sessionRecord, err = record.NewSessionFromStructure(structure, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
 			if err != nil {
 				return nil, ctx, fmt.Errorf("WithCachedSessions: failed to build session record for %s: %w", addr, err)
@@ -212,11 +159,6 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 		wrapped[addr] = sessionCacheEntry{Record: sessionRecord, Found: found, Lazy: lazy, LazyTail: lazyTail, LazyNPrev: lazyNPrev}
 	}
 
-	recordSessionBytes(ctx, maxSessionBytes)
-	if sendTimingDebug && device.Log != nil {
-		_, trackerFound := ctx.Value(contextKeySessionByteTracker).(*int)
-		device.Log.Warnf("WCS_DEBUG addrs=%d loaded=%d maxBytes=%d trackerFound=%t", len(addresses), len(sessions), maxSessionBytes, trackerFound)
-	}
 	ctx = context.WithValue(ctx, contextKeySessionCache, (*sessionCache)(exsync.NewMapWithData(wrapped)))
 	return existingSessions, ctx, nil
 }

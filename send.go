@@ -14,7 +14,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -34,7 +33,6 @@ import (
 	"go.mau.fi/whatsmeow/proto/waAICommon"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -89,63 +87,6 @@ type MessageDebugTimings struct {
 	Send  time.Duration
 	Resp  time.Duration
 	Retry time.Duration
-}
-
-// sendTimingLog enables an Info-level per-send timing line (KAVTOV_SEND_TIMING_LOG=1),
-// for measuring real server-side send latency in prod. Default off (per-send Info logs
-// are high volume); enable for a measurement window, then remove.
-var sendTimingLog = os.Getenv("KAVTOV_SEND_TIMING_LOG") == "1"
-
-// narrowSendLock releases messageSendLock after the frame is sent, before the
-// server-ack wait (which touches no session/retry state), so sends pipeline
-// instead of serializing behind each other's ~137ms ack round-trip. Encrypt +
-// frame-out + the recent-message (retry) write stay under the lock. Default off;
-// enable with KAVTOV_NARROW_SEND_LOCK=1, remove to revert instantly.
-var narrowSendLock = os.Getenv("KAVTOV_NARROW_SEND_LOCK") == "1"
-
-// msgTypeLabel returns which content field a sent message carries, so the
-// SEND_TIMING log identifies what is actually being sent (not inferred).
-func msgTypeLabel(m *waE2E.Message) string {
-	switch {
-	case m == nil:
-		return "nil"
-	case m.Conversation != nil:
-		return "conversation"
-	case m.ExtendedTextMessage != nil:
-		return "extended_text"
-	case m.ProtocolMessage != nil:
-		return "protocol:" + m.ProtocolMessage.GetType().String()
-	case m.DeviceSentMessage != nil:
-		return "device_sent"
-	case m.SenderKeyDistributionMessage != nil:
-		return "skdm"
-	case m.ReactionMessage != nil:
-		return "reaction"
-	case m.ButtonsResponseMessage != nil:
-		return "buttons_response"
-	case m.ButtonsMessage != nil:
-		return "buttons"
-	case m.InteractiveMessage != nil:
-		return "interactive"
-	case m.InteractiveResponseMessage != nil:
-		return "interactive_response"
-	case m.ImageMessage != nil:
-		return "image"
-	case m.AudioMessage != nil:
-		return "audio"
-	case m.VideoMessage != nil:
-		return "video"
-	case m.StickerMessage != nil:
-		return "sticker"
-	case m.PollCreationMessage != nil:
-		return "poll_creation"
-	case m.PollUpdateMessage != nil:
-		return "poll_update"
-	case m.MessageContextInfo != nil:
-		return "context_info_only"
-	default:
-		return "other"
-	}
 }
 
 func (mdt MessageDebugTimings) MarshalZerologObject(evt *zerolog.Event) {
@@ -459,12 +400,6 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	respChan := cli.waitResponse(req.ID)
 	var phash string
 	var data []byte
-	var sessSizeTracker *int
-	if sendTimingLog {
-		// Install a shared tracker so WithCachedSessions (deep in sendDM/sendGroup)
-		// can report the largest session blob this send touched, back here.
-		ctx, sessSizeTracker = store.ContextWithSessionByteTracker(ctx)
-	}
 	switch to.Server {
 	case types.GroupServer, types.BroadcastServer:
 		phash, data, err = cli.sendGroup(ctx, ownID, to, groupParticipants, req.ID, message, &resp.DebugTimings, extraParams)
@@ -487,9 +422,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	// Frame sent; session + retry state already persisted under the lock. The ack
 	// wait below touches no shared state — release here so the next send proceeds
 	// in parallel instead of serializing behind this send's ~137ms ack round-trip.
-	if narrowSendLock {
-		releaseSendLock()
-	}
+	releaseSendLock()
 	var respNode *waBinary.Node
 	var timeoutChan <-chan time.Time
 	if req.Timeout > 0 {
@@ -539,24 +472,6 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			delete(cli.userDevicesCache, to)
 			cli.userDevicesCacheLock.Unlock()
 		}
-	}
-	if sendTimingLog {
-		// Real server-side send timing. peer_encrypt is the session decode+encrypt
-		// cost (the fat-session lever); send/resp bracket the network round-trip.
-		maxSessBytes := 0
-		if sessSizeTracker != nil {
-			maxSessBytes = *sessSizeTracker
-		}
-		cli.Log.Infof("SEND_TIMING to=%s self=%t msg_type=%s peer=%t group=%t max_session_bytes=%d queue_us=%d marshal_us=%d lid_fetch_us=%d get_devices_us=%d get_participants_us=%d peer_encrypt_us=%d send_us=%d resp_us=%d",
-			to, to.User == ownID.User, msgTypeLabel(message), req.Peer, to.Server == types.GroupServer, maxSessBytes,
-			resp.DebugTimings.Queue.Microseconds(),
-			resp.DebugTimings.Marshal.Microseconds(),
-			resp.DebugTimings.LIDFetch.Microseconds(),
-			resp.DebugTimings.GetDevices.Microseconds(),
-			resp.DebugTimings.GetParticipants.Microseconds(),
-			resp.DebugTimings.PeerEncrypt.Microseconds(),
-			resp.DebugTimings.Send.Microseconds(),
-			resp.DebugTimings.Resp.Microseconds())
 	}
 	return
 }
@@ -1362,7 +1277,6 @@ func (cli *Client) encryptMessageForDevices(
 	ownLID := cli.getOwnLID()
 	includeIdentity := false
 	participantNodes := make([]waBinary.Node, 0, len(allDevices))
-	fnStart := time.Now()
 
 	var pnDevices []types.JID
 	for _, jid := range allDevices {
@@ -1396,24 +1310,18 @@ func (cli *Client) encryptMessageForDevices(
 		sessionAddressToJID[addr] = jid
 	}
 
-	setupDur := time.Since(fnStart)
-	prefetchStart := time.Now()
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
 	}
-	prefetchDur := time.Since(prefetchStart)
 	var retryDevices []types.JID
 	for addr, exists := range existingSessions {
 		if !exists {
 			retryDevices = append(retryDevices, sessionAddressToJID[addr])
 		}
 	}
-	prekeyStart := time.Now()
 	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
-	prekeyDur := time.Since(prekeyStart)
 
-	loopStart := time.Now()
 	for _, jid := range allDevices {
 		plaintext := msgPlaintext
 		if jid == ownJID || jid == ownLID {
@@ -1442,17 +1350,6 @@ func (cli *Client) encryptMessageForDevices(
 	err = cli.Store.PutCachedSessions(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
-	}
-	if sendTimingLog {
-		total := time.Since(fnStart)
-		if total > 500*time.Millisecond {
-			// Breakdown of a SLOW send, so we know which phase actually costs the
-			// time (decode prefetch vs prekey-fetch network vs the encrypt loop).
-			cli.Log.Warnf("SLOW_SEND total_ms=%d setup_ms=%d prefetch_ms=%d prekey_fetch_ms=%d encrypt_loop_ms=%d devices=%d retry_devices=%d max_session_bytes=%d",
-				total.Milliseconds(), setupDur.Milliseconds(), prefetchDur.Milliseconds(),
-				prekeyDur.Milliseconds(), time.Since(loopStart).Milliseconds(),
-				len(allDevices), len(retryDevices), store.MaxCachedSessionBytes(ctx))
-		}
 	}
 	return participantNodes, includeIdentity, nil
 }
