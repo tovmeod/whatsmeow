@@ -203,15 +203,6 @@ type Client struct {
 	failedSenderKeyTuplesPtr  int
 	failedSenderKeyTuplesLock sync.Mutex
 
-	// kavtov-fork (38.5): per-account counter of group skmsg decrypt failures per
-	// (group, bare-sender). Once the count reaches botResendBlacklistThreshold,
-	// sendRetryReceipt suppresses the futile resend-request stanza to that bot while
-	// leaving the ack, phone request, and donor scan intact. Cumulative, never reset,
-	// no eviction — the active failing-sender set is small. Mirrors the
-	// appStateSyncFailures pattern (counter map + dedicated lock).
-	botResendBlacklist     map[botResendKey]int
-	botResendBlacklistLock sync.Mutex
-
 	// kavtov-fork (D-12): per-collection consecutive ErrMismatchingLTHash failure counter.
 	// When the same collection name fails N times in a row, handleAppStateNotification triggers
 	// FetchAppState(fullSync=true) to self-heal the divergence. Uses its own lock — NOT
@@ -288,6 +279,12 @@ type Client struct {
 	// the ask-once gate is disabled (safe: phone request fires unconditionally, same
 	// as before this feature).
 	PhoneRequestClaims *PhoneRequestClaims
+
+	// kavtov-fork (q6h): fleet-wide bot-resend blacklist. Injected by the driver
+	// (one shared instance across all accounts) so a known-bad dispatch bot is
+	// suppressed fleet-wide after botResendBlacklistThreshold total misses. nil
+	// means the feature is off (safe no-op: resend-request stanzas fire as before).
+	BotResendBL *BotResendBlacklist
 
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
@@ -399,7 +396,6 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		skdmInstalled:            make(map[skdmInstalledKey]uint32, skdmInstalledSize),
 		skdmParseFailSeen:        make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize),
 		skdmParseFailCounts:      make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize),
-		botResendBlacklist:       make(map[botResendKey]int),
 		appStateSyncFailures:     make(map[appstate.WAPatchName]int),
 		appStateFullSyncFailures: make(map[appstate.WAPatchName]int),
 		sessionRecreateHistory:   make(map[types.JID]time.Time),

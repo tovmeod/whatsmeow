@@ -1,13 +1,19 @@
-// kavtov-fork (38.5): unit tests for bot-resend blacklist and ask-once phone-request claims.
+// kavtov-fork (q6h): unit tests for the shared, DB-agnostic bot-resend blacklist
+// and the ask-once phone-request claims.
 //
-// Task 1 — bot-resend blacklist:
-//   - 10th miss flips blacklisted; 9th does not.
-//   - counter is per (group, sender); different groups / senders are independent.
-//   - on a blacklisted sender, isBotResendBlacklisted returns true; below threshold false.
-//   - counter is per-Client (two bare clients share no state).
-//   - counter never resets (cumulative).
-//   - bare &Client{} does not nil-panic (lazy-init in incrementBotResendBlacklist).
-//   - log line is emitted exactly once (at the 10th miss), not on subsequent misses.
+// Task 1 — BotResendBlacklist (fleet-wide, threshold 3, 7d TTL re-probe):
+//   - 2 misses do NOT blacklist; the 3rd does (threshold=3, code default).
+//   - keying is per (group, sender); different groups / senders are independent.
+//   - fleet-wide: misses to ONE shared instance from what would be different
+//     accounts accumulate under one (group,sender) key — 3 total blacklist.
+//   - persistFunc is called EXACTLY once, at the threshold-cross (not misses 1-2,
+//     not misses 4+).
+//   - IsBlacklisted TTL expiry re-probes: a back-dated (>7d) entry returns false,
+//     drops from the blacklisted set, and resets its count so a single subsequent
+//     miss does NOT immediately re-blacklist (it takes the full threshold again).
+//   - LoadBlacklisted installs within-7d entries and skips older ones.
+//   - BOT_RESEND_BLACKLISTED is logged exactly once at the threshold-cross.
+//   - a bare &Client{} (nil BotResendBL) does not nil-panic (no-op / false).
 //
 // Task 2 — PhoneRequestClaims:
 //   - TryClaim returns true for a fresh key.
@@ -16,7 +22,7 @@
 //   - Two clients sharing one PhoneRequestClaims: first claims+asks, second skips.
 //   - After TTL a later miss re-asks (no loss).
 //
-// Test style: bare &Client{} and/or &PhoneRequestClaims{} — no socket, no PG.
+// Test style: bare &Client{} and/or shared instances — no socket, no PG.
 
 package whatsmeow
 
@@ -31,9 +37,10 @@ import (
 
 // --- helpers ------------------------------------------------------------------
 
-// newBlacklist returns a bare &Client{} for blacklist tests.
+// newBlacklist returns a &Client{} wired to a fresh shared BotResendBlacklist
+// (persistFunc off) for the delegating-method tests.
 func newBlacklist() *Client {
-	return &Client{}
+	return &Client{BotResendBL: NewBotResendBlacklist(nil)}
 }
 
 // warnCapture records Warnf calls so tests can assert exact log-once behavior.
@@ -43,10 +50,10 @@ type warnCapture struct {
 	warns []string
 }
 
-func (l *warnCapture) Infof(string, ...interface{})      {}
-func (l *warnCapture) Errorf(string, ...interface{})     {}
-func (l *warnCapture) Debugf(string, ...interface{})     {}
-func (l *warnCapture) Sub(string) waLog.Logger           { return l }
+func (l *warnCapture) Infof(string, ...interface{})  {}
+func (l *warnCapture) Errorf(string, ...interface{}) {}
+func (l *warnCapture) Debugf(string, ...interface{}) {}
+func (l *warnCapture) Sub(string) waLog.Logger       { return l }
 func (l *warnCapture) Warnf(msg string, _ ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -64,11 +71,21 @@ func (l *warnCapture) warnCount(substr string) int {
 	return n
 }
 
-// --- Task 1: blacklist --------------------------------------------------------
+// persistCall records a single persistFunc invocation.
+type persistCall struct {
+	group  string
+	sender string
+	at     time.Time
+}
 
-// TestBotResendBlacklist_ThresholdAt10 verifies that the 9th miss does NOT flip
-// the blacklist but the 10th does.
-func TestBotResendBlacklist_ThresholdAt10(t *testing.T) {
+// --- Task 1: BotResendBlacklist -----------------------------------------------
+
+// TestBotResendBlacklist_ThresholdAt3 verifies the code-default threshold is 3:
+// the 2nd miss does NOT flip the blacklist but the 3rd does.
+func TestBotResendBlacklist_ThresholdAt3(t *testing.T) {
+	if botResendBlacklistThreshold != 3 {
+		t.Fatalf("threshold must be the code default 3; got %d", botResendBlacklistThreshold)
+	}
 	cli := newBlacklist()
 	const group = "120363000000000001@g.us"
 	const sender = "15550001001"
@@ -79,10 +96,10 @@ func TestBotResendBlacklist_ThresholdAt10(t *testing.T) {
 			t.Errorf("miss %d: want not-yet-blacklisted, got blacklisted", i)
 		}
 	}
-	// 10th miss flips it.
+	// 3rd miss flips it.
 	cli.incrementBotResendBlacklist(group, sender)
 	if !cli.isBotResendBlacklisted(group, sender) {
-		t.Error("10th miss: want blacklisted, got not-blacklisted")
+		t.Error("3rd miss: want blacklisted, got not-blacklisted")
 	}
 }
 
@@ -94,14 +111,12 @@ func TestBotResendBlacklist_IndependentPerSender(t *testing.T) {
 	const senderA = "15550001002"
 	const senderB = "15550001003"
 
-	// Blacklist senderA.
 	for i := 0; i < botResendBlacklistThreshold; i++ {
 		cli.incrementBotResendBlacklist(group, senderA)
 	}
 	if !cli.isBotResendBlacklisted(group, senderA) {
 		t.Error("senderA should be blacklisted")
 	}
-	// senderB must not be affected.
 	if cli.isBotResendBlacklisted(group, senderB) {
 		t.Error("senderB must not be blacklisted (independent count)")
 	}
@@ -115,7 +130,6 @@ func TestBotResendBlacklist_IndependentPerGroup(t *testing.T) {
 	const groupB = "120363000000000004@g.us"
 	const sender = "15550001004"
 
-	// Blacklist in groupA only.
 	for i := 0; i < botResendBlacklistThreshold; i++ {
 		cli.incrementBotResendBlacklist(groupA, sender)
 	}
@@ -127,61 +141,139 @@ func TestBotResendBlacklist_IndependentPerGroup(t *testing.T) {
 	}
 }
 
-// TestBotResendBlacklist_PerClient verifies that two separate Client instances
-// share no state.
-func TestBotResendBlacklist_PerClient(t *testing.T) {
-	cli1 := newBlacklist()
-	cli2 := newBlacklist()
+// TestBotResendBlacklist_FleetWideAggregation verifies the fleet-wide contract:
+// misses routed through two Clients that share ONE BotResendBlacklist accumulate
+// under a single (group,sender) key, so 3 total misses across accounts blacklist.
+func TestBotResendBlacklist_FleetWideAggregation(t *testing.T) {
+	shared := NewBotResendBlacklist(nil)
 	const group = "120363000000000005@g.us"
 	const sender = "15550001005"
 
-	for i := 0; i < botResendBlacklistThreshold; i++ {
-		cli1.incrementBotResendBlacklist(group, sender)
+	cli1 := &Client{BotResendBL: shared}
+	cli2 := &Client{BotResendBL: shared}
+
+	cli1.incrementBotResendBlacklist(group, sender) // 1 (account A)
+	cli2.incrementBotResendBlacklist(group, sender) // 2 (account B)
+	if cli1.isBotResendBlacklisted(group, sender) {
+		t.Error("2 aggregated misses: must not yet be blacklisted")
 	}
-	if !cli1.isBotResendBlacklisted(group, sender) {
-		t.Error("cli1: should be blacklisted")
-	}
-	// cli2 must have its own zero-count.
-	if cli2.isBotResendBlacklisted(group, sender) {
-		t.Error("cli2: must not be blacklisted (separate Client)")
+	cli1.incrementBotResendBlacklist(group, sender) // 3 (account A)
+	if !cli2.isBotResendBlacklisted(group, sender) {
+		t.Error("3 aggregated misses across accounts: want blacklisted (fleet-wide)")
 	}
 }
 
-// TestBotResendBlacklist_NeverResets verifies that the count is cumulative and
-// never decremented (past threshold stays there after further increments).
-func TestBotResendBlacklist_NeverResets(t *testing.T) {
-	cli := newBlacklist()
+// TestBotResendBlacklist_PersistFuncOnce verifies persistFunc fires exactly once,
+// at the threshold-cross — not on misses 1-2 and not on misses 4+.
+func TestBotResendBlacklist_PersistFuncOnce(t *testing.T) {
+	calls := make(chan persistCall, 8)
+	b := NewBotResendBlacklist(func(group, sender string, at time.Time) {
+		calls <- persistCall{group: group, sender: sender, at: at}
+	})
 	const group = "120363000000000006@g.us"
 	const sender = "15550001006"
 
-	for i := 0; i < botResendBlacklistThreshold+5; i++ {
-		cli.incrementBotResendBlacklist(group, sender)
+	// Misses 1-2 must NOT persist.
+	b.Increment(group, sender)
+	b.Increment(group, sender)
+	select {
+	case <-calls:
+		t.Fatal("persistFunc called before threshold-cross")
+	case <-time.After(50 * time.Millisecond):
 	}
-	if !cli.isBotResendBlacklisted(group, sender) {
-		t.Error("should remain blacklisted after excess increments")
-	}
-}
 
-// TestBotResendBlacklist_LazyInit verifies that a bare &Client{} does not
-// nil-panic on incrementBotResendBlacklist or isBotResendBlacklisted.
-func TestBotResendBlacklist_LazyInit(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("nil-panic on bare &Client{}: %v", r)
+	// 3rd miss crosses the threshold -> exactly one persist.
+	b.Increment(group, sender)
+	select {
+	case c := <-calls:
+		if c.group != group || c.sender != sender {
+			t.Errorf("persist got (%s,%s); want (%s,%s)", c.group, c.sender, group, sender)
 		}
-	}()
-	cli := &Client{}
-	cli.incrementBotResendBlacklist("120363000000000007@g.us", "15550001007")
-	_ = cli.isBotResendBlacklisted("120363000000000007@g.us", "15550001007")
+		if c.at.IsZero() {
+			t.Error("persist blacklisted_at must be non-zero")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("persistFunc not called at threshold-cross")
+	}
+
+	// Misses 4-5 must NOT persist again.
+	b.Increment(group, sender)
+	b.Increment(group, sender)
+	select {
+	case <-calls:
+		t.Error("persistFunc called again after threshold-cross")
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
-// TestBotResendBlacklist_LogExactlyOnce verifies that BOT_RESEND_BLACKLISTED is
-// logged exactly once — at the 10th miss — and not on subsequent misses.
+// TestBotResendBlacklist_TTLReprobe verifies the data-loss guard: a blacklisted
+// entry back-dated beyond the 7-day TTL is re-probed — IsBlacklisted returns
+// false, the entry drops from the blacklisted set, and its count resets so a
+// single subsequent miss does NOT immediately re-blacklist.
+func TestBotResendBlacklist_TTLReprobe(t *testing.T) {
+	b := NewBotResendBlacklist(nil)
+	const group = "120363000000000007@g.us"
+	const sender = "15550001007"
+
+	for i := 0; i < botResendBlacklistThreshold; i++ {
+		b.Increment(group, sender)
+	}
+	if !b.IsBlacklisted(group, sender) {
+		t.Fatal("want blacklisted after reaching threshold")
+	}
+
+	// Back-date blacklisted_at beyond the TTL.
+	k := botResendKey{Group: group, Sender: sender}
+	b.mu.Lock()
+	b.blacklisted[k] = time.Now().Add(-(botResendBlacklistTTL + time.Minute))
+	b.mu.Unlock()
+
+	// IsBlacklisted must re-probe: return false AND remove the entry AND reset count.
+	if b.IsBlacklisted(group, sender) {
+		t.Error("expired entry: want IsBlacklisted=false (re-probe)")
+	}
+	b.mu.Lock()
+	_, stillListed := b.blacklisted[k]
+	cnt := b.counts[k]
+	b.mu.Unlock()
+	if stillListed {
+		t.Error("expired entry must be dropped from the blacklisted set")
+	}
+	if cnt != 0 {
+		t.Errorf("counts must reset on re-probe; got %d", cnt)
+	}
+
+	// One miss after re-probe must NOT immediately re-blacklist (needs full threshold).
+	b.Increment(group, sender)
+	if b.IsBlacklisted(group, sender) {
+		t.Error("one miss after re-probe must not re-blacklist (needs the full threshold again)")
+	}
+}
+
+// TestBotResendBlacklist_LoadBlacklisted verifies startup seeding: within-7d
+// entries install as blacklisted and >7d entries are skipped.
+func TestBotResendBlacklist_LoadBlacklisted(t *testing.T) {
+	b := NewBotResendBlacklist(nil)
+	fresh := BotResendBlacklistEntry{Group: "120363000000000008@g.us", Sender: "15550001008", At: time.Now().Add(-time.Hour)}
+	stale := BotResendBlacklistEntry{Group: "120363000000000009@g.us", Sender: "15550001009", At: time.Now().Add(-(botResendBlacklistTTL + time.Hour))}
+
+	b.LoadBlacklisted([]BotResendBlacklistEntry{fresh, stale})
+
+	if !b.IsBlacklisted(fresh.Group, fresh.Sender) {
+		t.Error("within-7d entry should be installed as blacklisted")
+	}
+	if b.IsBlacklisted(stale.Group, stale.Sender) {
+		t.Error(">7d entry must be skipped, not installed")
+	}
+}
+
+// TestBotResendBlacklist_LogExactlyOnce verifies BOT_RESEND_BLACKLISTED is logged
+// exactly once — at the threshold-cross — and not on subsequent misses.
 func TestBotResendBlacklist_LogExactlyOnce(t *testing.T) {
 	log := &warnCapture{}
-	cli := &Client{Log: log}
-	const group = "120363000000000008@g.us"
-	const sender = "15550001008"
+	cli := &Client{Log: log, BotResendBL: NewBotResendBlacklist(nil)}
+	const group = "120363000000000010@g.us"
+	const sender = "15550001010"
 
 	for i := 0; i < botResendBlacklistThreshold+3; i++ {
 		cli.incrementBotResendBlacklist(group, sender)
@@ -189,6 +281,21 @@ func TestBotResendBlacklist_LogExactlyOnce(t *testing.T) {
 	n := log.warnCount("BOT_RESEND_BLACKLISTED")
 	if n != 1 {
 		t.Errorf("BOT_RESEND_BLACKLISTED logged %d times; want exactly 1", n)
+	}
+}
+
+// TestBotResendBlacklist_NilSafe verifies a bare &Client{} (nil BotResendBL) does
+// not nil-panic: increment is a no-op and isBotResendBlacklisted returns false.
+func TestBotResendBlacklist_NilSafe(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("nil-panic on bare &Client{}: %v", r)
+		}
+	}()
+	cli := &Client{}
+	cli.incrementBotResendBlacklist("120363000000000011@g.us", "15550001011")
+	if cli.isBotResendBlacklisted("120363000000000011@g.us", "15550001011") {
+		t.Error("nil BotResendBL: isBotResendBlacklisted must return false")
 	}
 }
 

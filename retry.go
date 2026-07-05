@@ -255,8 +255,14 @@ type botResendKey struct {
 
 // botResendBlacklistThreshold is the number of cumulative skmsg decrypts failures
 // for a (group, sender) before the resend-request stanza to that bot is suppressed.
-// The ack, phone request, and donor scan are NOT suppressed.
-const botResendBlacklistThreshold = 10
+// The ack, phone request, and donor scan are NOT suppressed. Code default (no env
+// flag): fleet-wide aggregation across all accounts makes 3 total misses enough.
+const botResendBlacklistThreshold = 3
+
+// botResendBlacklistTTL bounds how long a (group, sender) stays suppressed. After
+// this window IsBlacklisted re-probes (drops the entry + resets its count) so a
+// recovered bot is retried rather than permanently dropped — no silent loss.
+const botResendBlacklistTTL = 7 * 24 * time.Hour
 
 // claimKey is the key for the process-wide PhoneRequestClaims map.
 type claimKey struct {
@@ -297,31 +303,28 @@ func (p *PhoneRequestClaims) TryClaim(group, msgID string) bool {
 	return true
 }
 
-// incrementBotResendBlacklist increments the failure counter for (group, sender)
-// and logs BOT_RESEND_BLACKLISTED exactly once when the counter first reaches
-// botResendBlacklistThreshold. Guarded by botResendBlacklistLock; lazy-inits
-// the map on a bare &Client{}.
+// incrementBotResendBlacklist delegates one skmsg-decrypt miss to the shared,
+// fleet-wide BotResendBlacklist and logs BOT_RESEND_BLACKLISTED exactly once when
+// this miss first crosses botResendBlacklistThreshold. Client-owned logging keeps
+// the log-once semantics while BotResendBlacklist stays log-free (persistFunc
+// carries no logger). nil BotResendBL (bare &Client{}) is a safe no-op.
 func (cli *Client) incrementBotResendBlacklist(group, sender string) {
-	k := botResendKey{Group: group, Sender: sender}
-	cli.botResendBlacklistLock.Lock()
-	defer cli.botResendBlacklistLock.Unlock()
-	if cli.botResendBlacklist == nil {
-		cli.botResendBlacklist = make(map[botResendKey]int)
+	if cli.BotResendBL == nil {
+		return
 	}
-	cli.botResendBlacklist[k]++
-	if cli.botResendBlacklist[k] == botResendBlacklistThreshold && cli.Log != nil {
+	if cli.BotResendBL.Increment(group, sender) && cli.Log != nil {
 		cli.Log.Warnf("BOT_RESEND_BLACKLISTED group=%s sender=%s", group, sender)
 	}
 }
 
-// isBotResendBlacklisted reports whether the (group, sender) pair has accumulated
-// >= botResendBlacklistThreshold failures. Called in sendRetryReceipt to suppress
-// the futile resend-request stanza to the bot.
+// isBotResendBlacklisted reports whether the (group, sender) pair is currently
+// suppressed in the shared blacklist. Called in sendRetryReceipt to suppress the
+// futile resend-request stanza to the bot. nil BotResendBL returns false.
 func (cli *Client) isBotResendBlacklisted(group, sender string) bool {
-	k := botResendKey{Group: group, Sender: sender}
-	cli.botResendBlacklistLock.Lock()
-	defer cli.botResendBlacklistLock.Unlock()
-	return cli.botResendBlacklist[k] >= botResendBlacklistThreshold
+	if cli.BotResendBL == nil {
+		return false
+	}
+	return cli.BotResendBL.IsBlacklisted(group, sender)
 }
 
 func (cli *Client) tryHandleRetryReceipt(ctx context.Context, receipt *events.Receipt, node *waBinary.Node) {
