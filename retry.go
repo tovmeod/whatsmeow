@@ -1033,7 +1033,18 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 			{Tag: "registration", Content: registrationIDBytes[:]},
 		},
 	}
-	if retryCount > 1 || forceIncludeIdentity {
+	// kavtov-fork (quick-260705-ill): prekey gate conformance. WA Web
+	// (WAWebSendRetryReceiptJob.js:6 module constant d = 2, gate at :110 `e >= d`) attaches the
+	// <keys> identity+prekey bundle only at retryCount>=2. This fork previously forced the bundle
+	// onto attempt 1 for group no-sender-key misses via forceIncludeIdentity -- the suspected
+	// WhatsApp 401/403 companion-removal fingerprint. Per the group-retry gap analysis
+	// (wa_protocol WA-SKDM-GRPRETRY-001 / retry-receipt-protocol.md "Prekey gate"): the sender's
+	// honor/drop decision is hasDevice-based and the group retry carries no
+	// sender-key-redistribution request, so attempt-1 keys have unproven recovery value for the
+	// group-miss class while being the anomalous fingerprint. The pairwise (non-skmsg)
+	// forceIncludeIdentity path is deliberately preserved (low volume; genuine
+	// session-establishment recovery need) -- a conscious, scoped deviation from strict conformance.
+	if retryCount > 1 || (forceIncludeIdentity && !isSKMsg) {
 		if key, err := cli.Store.PreKeys.GenOnePreKey(ctx); err != nil {
 			cli.Log.Errorf("Failed to get prekey for retry receipt: %v", err)
 		} else if deviceIdentity, err := proto.Marshal(cli.Store.Account); err != nil {
