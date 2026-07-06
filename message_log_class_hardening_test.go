@@ -623,8 +623,10 @@ func TestGenericDecryptError_StillWarnsAndRetries(t *testing.T) {
 }
 
 // TestNoValidSessions_StatusBroadcastDebugRetryUnchanged verifies status@broadcast +
-// ErrNoValidSessions logs Debug (not the generic Warnf) while the retry-with-identity recovery path
-// (isUnavailable=true forcing forceIncludeIdentity) fires exactly as it does today.
+// ErrNoValidSessions logs Debug (not the generic Warnf) while the retry receipt itself still fires
+// exactly as it does today. Per D-08 #1 (60-CONTEXT.md), the forceIncludeIdentity pairwise attempt-1
+// <keys>-attach exception has been removed -- this attempt-1 pairwise retry no longer attaches keys
+// (the gate is now unconditionally retryCount>1, matching the group-skmsg case).
 func TestNoValidSessions_StatusBroadcastDebugRetryUnchanged(t *testing.T) {
 	cli, log, _, dispatched, preKeys := decryptErrorTestSetup(t)
 	info, node, ag := decryptErrorTestInfoAndNode(types.BroadcastServer)
@@ -647,13 +649,12 @@ func TestNoValidSessions_StatusBroadcastDebugRetryUnchanged(t *testing.T) {
 	if n := retryAttemptCount(cli, string(info.ID), info.Sender.User); n != 1 {
 		t.Errorf("retry receipt sent %d times, want 1 (retry-with-identity recovery is unchanged)", n)
 	}
-	// GenOnePreKey is only called when sendRetryReceipt's forceIncludeIdentity branch fires
-	// (retry.go: "if retryCount > 1 || forceIncludeIdentity") -- on this first attempt
-	// (retryCount==1), only isUnavailable=true (forceIncludeIdentity) reaches it, so this proves
-	// the retry-with-identity recovery fired, without depending on the outbound wire node (not
-	// observable -- see fakeGenOnePreKeyStore's doc).
-	if n := preKeys.callCount(); n != 1 {
-		t.Errorf("GenOnePreKey called %d times, want 1 (forceIncludeIdentity=true from isUnavailable must include fresh identity/prekeys)", n)
+	// GenOnePreKey is only called when sendRetryReceipt's <keys>-attach branch fires (retry.go:
+	// "if retryCount > 1"). Per D-08 #1, the forceIncludeIdentity pairwise exception is removed, so
+	// this attempt-1 (retryCount==1) pairwise retry must NOT attach keys even though
+	// isUnavailable=true (forceIncludeIdentity=true).
+	if n := preKeys.callCount(); n != 0 {
+		t.Errorf("GenOnePreKey called %d times, want 0 (pairwise attempt 1 must NOT attach keys -- the forceIncludeIdentity exception is removed)", n)
 	}
 	if *dispatched == nil {
 		t.Fatal("UndecryptableMessage was not dispatched")
