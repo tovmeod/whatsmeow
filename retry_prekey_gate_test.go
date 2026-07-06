@@ -2,8 +2,9 @@
 // gate. WA Web (WAWebSendRetryReceiptJob.js:6 constant d = 2, gate at :110 `e >= d`) attaches the
 // <keys> identity+prekey bundle only at retryCount>=2. This suite pins the conformant behavior:
 // group (skmsg) attempt-1 receipts carry NO keys even with forceIncludeIdentity, attempt-2 receipts
-// carry keys via the retryCount>1 leg, and the pairwise (non-skmsg) forceIncludeIdentity attempt-1
-// path is deliberately preserved (genuine session-establishment recovery, low volume).
+// carry keys via the retryCount>1 leg, and (per D-08 #1, 60-CONTEXT.md) the pairwise (non-skmsg)
+// forceIncludeIdentity attempt-1 exception has been REMOVED -- ALL retry classes now honor
+// retryCount>=2 before attaching <keys>.
 //
 // Assertion strategy: sendRetryReceipt sends via the REAL cli.sendNode (not the sendNodeFunc hook
 // -- see fakeGenOnePreKeyStore's doc in message_log_class_hardening_test.go), so the outbound
@@ -63,10 +64,11 @@ func TestRetryPrekeyGate_SKMsgAttempt2IncludesKeys(t *testing.T) {
 	}
 }
 
-// TestRetryPrekeyGate_PairwiseForceIncludeIdentityAttempt1Keys: the pairwise (non-skmsg)
-// forceIncludeIdentity path still attaches <keys> on attempt 1 -- deliberate preserved deviation
-// from strict WA Web conformance (genuine session-establishment recovery need, low volume).
-func TestRetryPrekeyGate_PairwiseForceIncludeIdentityAttempt1Keys(t *testing.T) {
+// TestRetryPrekeyGate_PairwiseAttempt1NoKeys: the pairwise (non-skmsg) forceIncludeIdentity
+// attempt-1 exception has been removed (D-08 #1, 60-CONTEXT.md) -- a pairwise attempt-1 receipt
+// must NOT attach <keys>, closing the last attempt-1 identity-fingerprint leg (same family as the
+// already-fixed group-skmsg case, fork 7c9bd9f).
+func TestRetryPrekeyGate_PairwiseAttempt1NoKeys(t *testing.T) {
 	cli, _, _, _, preKeys := decryptErrorTestSetup(t)
 	info, node, ag := decryptErrorTestInfoAndNode(types.GroupServer)
 	// pkmsg enc child for explicitness: classifyRetryEnc still yields isSKMsg=false.
@@ -78,7 +80,7 @@ func TestRetryPrekeyGate_PairwiseForceIncludeIdentityAttempt1Keys(t *testing.T) 
 	if n := retryAttemptCount(cli, string(info.ID), info.Sender.User); n != 1 {
 		t.Errorf("retryAttemptCount = %d, want 1", n)
 	}
-	if n := preKeys.callCount(); n != 1 {
-		t.Errorf("GenOnePreKey called %d times, want 1 (pairwise forceIncludeIdentity recovery must be preserved)", n)
+	if n := preKeys.callCount(); n != 0 {
+		t.Errorf("GenOnePreKey called %d times, want 0 (pairwise attempt 1 must NOT attach <keys> -- the forceIncludeIdentity exception is removed)", n)
 	}
 }
