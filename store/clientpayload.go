@@ -129,11 +129,15 @@ var DeviceProps = &waCompanionReg.DeviceProps{
 		Tertiary:  proto.Uint32(0),
 	},
 	HistorySyncConfig: &waCompanionReg.DeviceProps_HistorySyncConfig{
-		FullSyncDaysLimit:                        nil,
-		FullSyncSizeMbLimit:                      nil,
+		// kavtov-fork (60-05, D-08 #2): the 6 fields below were nil, an obvious non-browser
+		// fingerprint. FullSyncDaysLimit is CITED (wa_protocol docs/spec/history-sync.md SS6); the
+		// other 5 are ASSUMED (not exact-value-verified in the pinned snapshot, only "(set)") --
+		// browser-plausible values chosen to be consistent with the existing StorageQuotaMb ceiling.
+		FullSyncDaysLimit:                        proto.Uint32(365),   // CITED: wa_protocol docs/spec/history-sync.md SS6
+		FullSyncSizeMbLimit:                      proto.Uint32(10240), // ASSUMED: matches StorageQuotaMb ceiling
 		StorageQuotaMb:                           proto.Uint32(10240),
 		InlineInitialPayloadInE2EeMsg:            proto.Bool(true),
-		RecentSyncDaysLimit:                      nil,
+		RecentSyncDaysLimit:                      proto.Uint32(3), // ASSUMED: conservative recent-sync window
 		SupportCallLogHistory:                    proto.Bool(true),
 		SupportBotUserAgentChatHistory:           proto.Bool(true),
 		SupportCagReactionsAndPolls:              proto.Bool(true),
@@ -144,11 +148,11 @@ var DeviceProps = &waCompanionReg.DeviceProps{
 		SupportAddOnHistorySyncMigration:         nil,
 		SupportMessageAssociation:                proto.Bool(true),
 		SupportGroupHistory:                      proto.Bool(true),
-		OnDemandReady:                            nil,
+		OnDemandReady:                            proto.Bool(true),
 		SupportGuestChat:                         nil,
-		CompleteOnDemandReady:                    nil,
+		CompleteOnDemandReady:                    proto.Bool(true),
 		ThumbnailSyncDaysLimit:                   proto.Uint32(60),
-		InitialSyncMaxMessagesPerChat:            nil,
+		InitialSyncMaxMessagesPerChat:            proto.Uint32(300), // ASSUMED: conservative per-chat cap
 		SupportManusHistory:                      proto.Bool(true),
 		SupportHatchHistory:                      proto.Bool(true),
 	},
