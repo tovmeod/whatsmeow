@@ -638,6 +638,11 @@ func (cli *Client) ConnectContext(ctx context.Context) error {
 	cli.socketLock.Lock()
 	defer cli.socketLock.Unlock()
 
+	// kavtov-fork (60-05, D-08 #5): this is the explicit/manual connect entry point (Connect()'s
+	// path), distinct from autoReconnect's private connect() wrapper -- reset to the default
+	// USER_ACTIVATED reason here so a stale ERROR_RECONNECT override from a prior autoReconnect
+	// attempt on THIS account's Store doesn't leak into an explicit reconnect.
+	cli.Store.SetConnectReasonOverride(nil)
 	err := cli.unlockedConnect(ctx)
 	if isRetryableConnectError(err) && cli.InitialAutoReconnect && cli.EnableAutoReconnect {
 		cli.Log.Errorf("Initial connection failed but reconnecting in background (%v)", err)
@@ -773,6 +778,10 @@ func (cli *Client) autoReconnect(ctx context.Context) {
 			cli.Log.Debugf("Cancelling automatic reconnect due to context cancellation")
 			return
 		}
+		// kavtov-fork (60-05, D-08 #5): this account's Store, not the caller's -- an auto-reconnect
+		// advertises ERROR_RECONNECT (matching a browser's actual auto-reconnect signal) instead of
+		// always claiming USER_ACTIVATED, the last unclosed fingerprint leg per 60-CONTEXT.md.
+		cli.Store.SetConnectReasonOverride(waWa6.ClientPayload_ERROR_RECONNECT.Enum())
 		err := cli.connect(ctx)
 		if errors.Is(err, ErrAlreadyConnected) {
 			cli.Log.Debugf("Connect() said we're already connected after autoreconnect sleep")

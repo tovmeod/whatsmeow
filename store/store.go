@@ -10,11 +10,13 @@ package store
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 
 	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/proto/waWa6"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/util/keys"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -287,6 +289,12 @@ type Device struct {
 	EventBuffer     EventBuffer
 	LIDs            LIDStore
 	Container       DeviceContainer
+
+	// connectReasonOverride is scoped per-Device (per WhatsApp account), NOT process-global -- the
+	// kavtov driver runs ~60 accounts in one process (manager.go's
+	// `accounts map[string]*driver.Client`), so a shared override would race across concurrent
+	// connect/reconnect activity on different accounts. See SetConnectReasonOverride.
+	connectReasonOverride atomic.Pointer[waWa6.ClientPayload_ConnectReason]
 }
 
 func (device *Device) GetJID() types.JID {
@@ -305,6 +313,18 @@ func (device *Device) GetLID() types.JID {
 		return types.EmptyJID
 	}
 	return device.LID
+}
+
+// SetConnectReasonOverride sets the ConnectReason for the next client payload built by this
+// Device's getLoginPayload/getRegistrationPayload. Pass nil to clear the override and fall back to
+// BaseClientPayload.ConnectReason (USER_ACTIVATED). Scoped per-Device (per WhatsApp account), NOT
+// process-global -- the kavtov driver runs ~60 accounts in one process (manager.go's
+// `accounts map[string]*driver.Client`), so a shared override would race across concurrent
+// connect/reconnect activity on different accounts. D-08 #5 (60-CONTEXT.md): whatsmeow-fork's
+// autoReconnect calls this with ClientPayload_ERROR_RECONNECT before reconnecting ITS OWN device,
+// matching a browser's actual auto-reconnect signal instead of always claiming USER_ACTIVATED.
+func (device *Device) SetConnectReasonOverride(reason *waWa6.ClientPayload_ConnectReason) {
+	device.connectReasonOverride.Store(reason)
 }
 
 var ErrDeviceDeleted = errors.New("invalid use of deleted device")

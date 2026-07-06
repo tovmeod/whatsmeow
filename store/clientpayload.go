@@ -171,6 +171,9 @@ func SetOSInfo(name string, version [3]uint32) {
 
 func (device *Device) getRegistrationPayload() *waWa6.ClientPayload {
 	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
+	if reason := device.connectReasonOverride.Load(); reason != nil {
+		payload.ConnectReason = reason
+	}
 	regID := make([]byte, 4)
 	binary.BigEndian.PutUint32(regID, device.RegistrationID)
 	preKeyID := make([]byte, 4)
@@ -193,6 +196,9 @@ func (device *Device) getRegistrationPayload() *waWa6.ClientPayload {
 
 func (device *Device) getLoginPayload() *waWa6.ClientPayload {
 	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
+	if reason := device.connectReasonOverride.Load(); reason != nil {
+		payload.ConnectReason = reason
+	}
 	payload.Username = proto.Uint64(device.ID.UserInt())
 	payload.Device = proto.Uint32(uint32(device.ID.Device))
 	payload.Passive = proto.Bool(true)
