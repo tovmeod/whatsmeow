@@ -1045,9 +1045,11 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 	// honor/drop decision is hasDevice-based and the group retry carries no
 	// sender-key-redistribution request, so attempt-1 keys have unproven recovery value for the
 	// group-miss class while being the anomalous fingerprint. The pairwise (non-skmsg)
-	// forceIncludeIdentity path is deliberately preserved (low volume; genuine
-	// session-establishment recovery need) -- a conscious, scoped deviation from strict conformance.
-	if retryCount > 1 || (forceIncludeIdentity && !isSKMsg) {
+	// forceIncludeIdentity exception is now REMOVED (D-08 #1, 60-CONTEXT.md) -- ALL retry classes
+	// (group skmsg AND pairwise pkmsg) honor retryCount>=2 before attaching <keys>, closing the
+	// last attempt-1 identity-fingerprint leg from the same family as the already-fixed
+	// group-skmsg case (fork 7c9bd9f).
+	if retryCount > 1 {
 		if key, err := cli.Store.PreKeys.GenOnePreKey(ctx); err != nil {
 			cli.Log.Errorf("Failed to get prekey for retry receipt: %v", err)
 		} else if deviceIdentity, err := proto.Marshal(cli.Store.Account); err != nil {
