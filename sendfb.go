@@ -558,6 +558,12 @@ func (cli *Client) encryptMessageForDevicesV3(
 		}
 		encrypted, err := cli.encryptMessageForDeviceAndWrapV3(ctx, payload, skdm, dsmForDevice, jid, bundles[jid], encAttrs)
 		if err != nil {
+			if jid.Device == 0 {
+				// D-01: a recipient's PRIMARY device failing to encrypt aborts the
+				// whole send, matching WA Web (which requires the primary device).
+				cli.Log.Warnf("GROUP_SEND_PRIMARY_ABORT_V3: failed to encrypt %s for primary device %s: %v", id, jid, err)
+				return nil, err
+			}
 			// TODO return these errors if it's a fatal one (like context cancellation or database)
 			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
 			if ctx.Err() != nil {
