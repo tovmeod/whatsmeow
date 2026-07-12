@@ -309,7 +309,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			}
 
 			var participantNodes []waBinary.Node
-			participantNodes, _, err = cli.encryptMessageForDevices(ctx, []types.JID{req.InlineBotJID}, resp.ID, messagePlaintext, nil, waBinary.Attrs{})
+			participantNodes, _, err = cli.encryptMessageForDevices(ctx, []types.JID{req.InlineBotJID}, resp.ID, messagePlaintext, nil, waBinary.Attrs{}, "bot")
 			if err != nil {
 				return
 			}
@@ -1220,6 +1220,20 @@ func (cli *Client) getMessageContent(
 	return content
 }
 
+// sendPathForTo classifies a send's recipient into the group/broadcast/dm
+// split needed by the D-01 primary-device-abort WARN token below. It is NOT
+// a general-purpose JID classifier.
+func sendPathForTo(to types.JID) string {
+	switch to.Server {
+	case types.GroupServer:
+		return "group"
+	case types.BroadcastServer:
+		return "broadcast"
+	default:
+		return "dm"
+	}
+}
+
 func (cli *Client) prepareMessageNode(
 	ctx context.Context,
 	to types.JID,
@@ -1268,7 +1282,7 @@ func (cli *Client) prepareMessageNode(
 
 	start = time.Now()
 	participantNodes, includeIdentity, err := cli.encryptMessageForDevices(
-		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
+		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs, sendPathForTo(to),
 	)
 	timings.PeerEncrypt = time.Since(start)
 	if err != nil {
@@ -1331,6 +1345,7 @@ func (cli *Client) encryptMessageForDevices(
 	id string,
 	msgPlaintext, dsmPlaintext []byte,
 	encAttrs waBinary.Attrs,
+	sendPath string,
 ) ([]waBinary.Node, bool, error) {
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
@@ -1396,7 +1411,12 @@ func (cli *Client) encryptMessageForDevices(
 			if jid.Device == 0 {
 				// D-01: a recipient's PRIMARY device failing to encrypt aborts the
 				// whole send, matching WA Web (which requires the primary device).
-				cli.Log.Warnf("GROUP_SEND_PRIMARY_ABORT: failed to encrypt %s for primary device %s: %v", id, jid, err)
+				// This loop is shared by group, broadcast, DM, and inline-bot sends
+				// (see sendPathForTo callers); sendPath makes the resulting
+				// driver_log_class token accurate per path instead of always
+				// claiming a group-send class.
+				token := strings.ToUpper(sendPath) + "_SEND_PRIMARY_ABORT"
+				cli.Log.Warnf(token+": failed to encrypt %s for primary device %s: %v", id, jid, err)
 				return nil, false, err
 			}
 			// TODO return these errors if it's a fatal one (like context cancellation or database)

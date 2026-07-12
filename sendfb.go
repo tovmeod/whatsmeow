@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -470,7 +471,7 @@ func (cli *Client) prepareMessageNodeV3(
 	}
 
 	start = time.Now()
-	participantNodes, err := cli.encryptMessageForDevicesV3(ctx, allDevices, ownID, id, payload, skdm, dsm, encAttrs)
+	participantNodes, err := cli.encryptMessageForDevicesV3(ctx, allDevices, ownID, id, payload, skdm, dsm, encAttrs, sendPathForTo(to))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -523,6 +524,7 @@ func (cli *Client) encryptMessageForDevicesV3(
 	skdm *waMsgTransport.MessageTransport_Protocol_Ancillary_SenderKeyDistributionMessage,
 	dsm *waMsgTransport.MessageTransport_Protocol_Integral_DeviceSentMessage,
 	encAttrs waBinary.Attrs,
+	sendPath string,
 ) ([]waBinary.Node, error) {
 	participantNodes := make([]waBinary.Node, 0, len(allDevices))
 
@@ -561,7 +563,12 @@ func (cli *Client) encryptMessageForDevicesV3(
 			if jid.Device == 0 {
 				// D-01: a recipient's PRIMARY device failing to encrypt aborts the
 				// whole send, matching WA Web (which requires the primary device).
-				cli.Log.Warnf("GROUP_SEND_PRIMARY_ABORT_V3: failed to encrypt %s for primary device %s: %v", id, jid, err)
+				// This loop is shared by group, broadcast, and DM sends (see
+				// sendPathForTo callers; the v3 loop has no inline-bot caller);
+				// sendPath makes the resulting driver_log_class token accurate
+				// per path instead of always claiming a group-send class.
+				token := strings.ToUpper(sendPath) + "_SEND_PRIMARY_ABORT_V3"
+				cli.Log.Warnf(token+": failed to encrypt %s for primary device %s: %v", id, jid, err)
 				return nil, err
 			}
 			// TODO return these errors if it's a fatal one (like context cancellation or database)
