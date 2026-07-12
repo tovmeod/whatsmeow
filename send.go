@@ -126,6 +126,35 @@ type SendResponse struct {
 	// The identity the message was sent with (LID or PN)
 	// This is currently not reliable in all cases.
 	Sender types.JID
+
+	// GroupDebug carries the actual outbound stanza structure for group/broadcast
+	// sends -- nil for all other sends. Populated as soon as the send reaches node
+	// assembly, even if the send later fails during or after the ack wait.
+	GroupDebug *GroupSendDebug
+}
+
+// GroupSendDebugDevice is one emitted <to>/<enc> child of a group-send stanza.
+type GroupSendDebugDevice struct {
+	JID     types.JID
+	EncType string
+}
+
+// GroupSendDebug captures the actual outbound group-send stanza structure --
+// intended vs emitted device set, phash, addressing mode, ack attributes, and
+// (only on an ack error) the raw outbound frame -- for root-causing server-side
+// group-send errors (e.g. 479) from real wire data instead of inference.
+type GroupSendDebug struct {
+	OwnID             types.JID
+	AddressingMode    string
+	IntendedDevices   []types.JID
+	EmittedDevices    []GroupSendDebugDevice
+	Phash             string
+	AckErrorCode      int
+	AckPhash          string
+	AckAddressingMode string
+	AckRefreshLID     string
+	AckCount          string
+	RawFrameB64       string
 }
 
 // SendRequestExtra contains the optional parameters for SendMessage.
@@ -400,9 +429,11 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	respChan := cli.waitResponse(req.ID)
 	var phash string
 	var data []byte
+	var groupDebug *GroupSendDebug
 	switch to.Server {
 	case types.GroupServer, types.BroadcastServer:
-		phash, data, err = cli.sendGroup(ctx, ownID, to, groupParticipants, req.ID, message, &resp.DebugTimings, extraParams)
+		groupDebug = &GroupSendDebug{}
+		phash, data, err = cli.sendGroup(ctx, ownID, to, groupParticipants, req.ID, message, &resp.DebugTimings, groupDebug, extraParams)
 	case types.DefaultUserServer, types.BotServer, types.HiddenUserServer:
 		if req.Peer {
 			data, err = cli.sendPeerMessage(ctx, to, req.ID, message, &resp.DebugTimings)
@@ -414,6 +445,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	default:
 		err = fmt.Errorf("%w %s", ErrUnknownServer, to.Server)
 	}
+	resp.GroupDebug = groupDebug
 	start = time.Now()
 	if err != nil {
 		cli.cancelResponse(req.ID, respChan)
@@ -453,10 +485,21 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	ag := respNode.AttrGetter()
 	resp.ServerID = types.MessageServerID(ag.OptionalInt("server_id"))
 	resp.Timestamp = ag.UnixTime("t")
-	if errorCode := ag.Int("error"); errorCode != 0 {
+	errorCode := ag.Int("error")
+	if errorCode != 0 {
 		err = fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
 	}
 	expectedPHash := ag.OptionalString("phash")
+	if groupDebug != nil {
+		groupDebug.AckErrorCode = errorCode
+		groupDebug.AckPhash = expectedPHash
+		groupDebug.AckAddressingMode = ag.OptionalString("addressing_mode")
+		groupDebug.AckRefreshLID = ag.OptionalString("refresh_lid")
+		groupDebug.AckCount = ag.OptionalString("count")
+		if errorCode != 0 {
+			groupDebug.RawFrameB64 = base64.StdEncoding.EncodeToString(data)
+		}
+	}
 	if len(expectedPHash) > 0 && phash != expectedPHash {
 		cli.Log.Warnf("Server returned different participant list hash (%s != %s) when sending to %s. Some devices may not have received the message.", phash, expectedPHash, to)
 		switch to.Server {
@@ -763,6 +806,7 @@ func (cli *Client) sendGroup(
 	id types.MessageID,
 	message *waE2E.Message,
 	timings *MessageDebugTimings,
+	debug *GroupSendDebug,
 	extraParams nodeExtraParams,
 ) (string, []byte, error) {
 	start := time.Now()
@@ -818,6 +862,21 @@ func (cli *Client) sendGroup(
 	node.Content = append(node.GetChildren(), skMsg)
 	if cli.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
 		node.Content = append(node.GetChildren(), cli.getMessageReportingToken(plaintext, message, ownID, to, id))
+	}
+
+	if debug != nil {
+		debug.OwnID = ownID
+		debug.AddressingMode = string(extraParams.addressingMode)
+		debug.IntendedDevices = allDevices
+		debug.Phash = phash
+		if participantsNode, ok := node.GetOptionalChildByTag("participants"); ok {
+			for _, toNode := range participantsNode.GetChildrenByTag("to") {
+				jid := toNode.AttrGetter().JID("jid")
+				encNode := toNode.GetChildByTag("enc")
+				encType := encNode.AttrGetter().OptionalString("type")
+				debug.EmittedDevices = append(debug.EmittedDevices, GroupSendDebugDevice{JID: jid, EncType: encType})
+			}
+		}
 	}
 
 	start = time.Now()

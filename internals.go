@@ -690,7 +690,7 @@ func (int *DangerousInternalClient) SendNewsletter(ctx context.Context, to types
 }
 
 func (int *DangerousInternalClient) SendGroup(ctx context.Context, ownID, to types.JID, participants []types.JID, id types.MessageID, message *waE2E.Message, timings *MessageDebugTimings, extraParams nodeExtraParams) (string, []byte, error) {
-	return int.c.sendGroup(ctx, ownID, to, participants, id, message, timings, extraParams)
+	return int.c.sendGroup(ctx, ownID, to, participants, id, message, timings, nil, extraParams)
 }
 
 func (int *DangerousInternalClient) SendPeerMessage(ctx context.Context, to types.JID, id types.MessageID, message *waE2E.Message, timings *MessageDebugTimings) ([]byte, error) {
