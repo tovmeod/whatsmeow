@@ -698,7 +698,7 @@ func (int *DangerousInternalClient) SendPeerMessage(ctx context.Context, to type
 }
 
 func (int *DangerousInternalClient) SendDM(ctx context.Context, ownID, to types.JID, id types.MessageID, message *waE2E.Message, timings *MessageDebugTimings, extraParams nodeExtraParams) (string, []byte, error) {
-	return int.c.sendDM(ctx, ownID, to, id, message, timings, extraParams)
+	return int.c.sendDM(ctx, ownID, to, id, message, timings, nil, extraParams)
 }
 
 func (int *DangerousInternalClient) PreparePeerMessageNode(ctx context.Context, to types.JID, id types.MessageID, message *waE2E.Message, timings *MessageDebugTimings) (*waBinary.Node, error) {
@@ -710,7 +710,8 @@ func (int *DangerousInternalClient) GetMessageContent(baseNode waBinary.Node, me
 }
 
 func (int *DangerousInternalClient) PrepareMessageNode(ctx context.Context, to types.JID, id types.MessageID, message *waE2E.Message, participants []types.JID, plaintext, dsmPlaintext []byte, timings *MessageDebugTimings, extraParams nodeExtraParams) (*waBinary.Node, []types.JID, error) {
-	return int.c.prepareMessageNode(ctx, to, id, message, participants, plaintext, dsmPlaintext, timings, extraParams)
+	node, allDevices, _, err := int.c.prepareMessageNode(ctx, to, id, message, participants, plaintext, dsmPlaintext, timings, extraParams)
+	return node, allDevices, err
 }
 
 func (int *DangerousInternalClient) MakeDeviceIdentityNode() waBinary.Node {
@@ -718,7 +719,8 @@ func (int *DangerousInternalClient) MakeDeviceIdentityNode() waBinary.Node {
 }
 
 func (int *DangerousInternalClient) EncryptMessageForDevices(ctx context.Context, allDevices []types.JID, id string, msgPlaintext, dsmPlaintext []byte, encAttrs waBinary.Attrs) ([]waBinary.Node, bool, error) {
-	return int.c.encryptMessageForDevices(ctx, allDevices, id, msgPlaintext, dsmPlaintext, encAttrs, "internal")
+	participantNodes, includeIdentity, _, err := int.c.encryptMessageForDevices(ctx, allDevices, id, msgPlaintext, dsmPlaintext, encAttrs, "internal")
+	return participantNodes, includeIdentity, err
 }
 
 func (int *DangerousInternalClient) EncryptMessageForDeviceAndWrap(ctx context.Context, plaintext []byte, wireIdentity, encryptionIdentity types.JID, bundle *prekey.Bundle, encAttrs waBinary.Attrs, existingSessions map[string]bool) (*waBinary.Node, bool, error) {
