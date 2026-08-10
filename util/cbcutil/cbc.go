@@ -215,3 +215,60 @@ func EncryptStream(key, iv, macKey []byte, plaintext io.Reader, ciphertext io.Wr
 	}
 	return plainHasher.Sum(nil), cipherHasher.Sum(nil), uint64(size), uint64(size + extraSize), nil
 }
+
+// DecryptStream decrypts a WhatsApp-media-shaped AES-CBC ciphertext of ciphertextLen bytes from
+// ciphertext, writing the recovered plaintext to plaintext as it goes rather than buffering the
+// full plaintext in memory. It mirrors EncryptStream: an HMAC is accumulated over iv then every
+// raw ciphertext chunk as read, but comparing it against the caller's expected tag is the
+// caller's responsibility, matching EncryptStream's existing division of labor. The returned
+// plainHash is the SHA-256 of the recovered plaintext.
+func DecryptStream(key, iv, macKey []byte, ciphertextLen int64, ciphertext io.Reader, plaintext io.Writer) (plainHash []byte, err error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+	cbc := cipher.NewCBCDecrypter(block, iv)
+
+	plainHasher := sha256.New()
+	cipherMAC := hmac.New(sha256.New, macKey)
+	cipherMAC.Write(iv)
+
+	buf := make([]byte, 32*1024)
+	var held []byte
+	var read int64
+	for read < ciphertextLen {
+		chunkSize := int64(len(buf))
+		if remaining := ciphertextLen - read; remaining < chunkSize {
+			chunkSize = remaining
+		}
+		var n int
+		n, err = io.ReadFull(ciphertext, buf[:chunkSize])
+		if err != nil {
+			return nil, fmt.Errorf("failed to read ciphertext: %w", err)
+		}
+		read += int64(n)
+		chunk := buf[:n]
+		cipherMAC.Write(chunk)
+		cbc.CryptBlocks(chunk, chunk)
+		if held != nil {
+			if _, err = plaintext.Write(held); err != nil {
+				return nil, fmt.Errorf("failed to write plaintext: %w", err)
+			}
+			plainHasher.Write(held)
+		}
+		held = append([]byte(nil), chunk...)
+	}
+	if len(held) == 0 {
+		return plainHasher.Sum(nil), nil
+	}
+	padLen := int(held[len(held)-1])
+	if padLen > len(held) {
+		return nil, fmt.Errorf("padding is greater then the length: %d / %d", padLen, len(held))
+	}
+	held = held[:len(held)-padLen]
+	if _, err = plaintext.Write(held); err != nil {
+		return nil, fmt.Errorf("failed to write plaintext: %w", err)
+	}
+	plainHasher.Write(held)
+	return plainHasher.Sum(nil), nil
+}
