@@ -218,10 +218,11 @@ func EncryptStream(key, iv, macKey []byte, plaintext io.Reader, ciphertext io.Wr
 
 // DecryptStream decrypts a WhatsApp-media-shaped AES-CBC ciphertext of ciphertextLen bytes from
 // ciphertext, writing the recovered plaintext to plaintext as it goes rather than buffering the
-// full plaintext in memory. It mirrors EncryptStream: an HMAC is accumulated over iv then every
-// raw ciphertext chunk as read, but comparing it against the caller's expected tag is the
-// caller's responsibility, matching EncryptStream's existing division of labor. The returned
-// plainHash is the SHA-256 of the recovered plaintext.
+// full plaintext in memory. Unlike EncryptStream, DecryptStream does not accumulate or compare a
+// MAC over the ciphertext -- verification is entirely the caller's responsibility, typically via
+// an io.TeeReader wrapped around the reader passed in as ciphertext (see media.go's
+// downloadRespToFile). The returned plainHash is the SHA-256 of the recovered plaintext. macKey
+// is accepted for signature symmetry with EncryptStream but is not used internally.
 func DecryptStream(key, iv, macKey []byte, ciphertextLen int64, ciphertext io.Reader, plaintext io.Writer) (plainHash []byte, err error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -230,8 +231,6 @@ func DecryptStream(key, iv, macKey []byte, ciphertextLen int64, ciphertext io.Re
 	cbc := cipher.NewCBCDecrypter(block, iv)
 
 	plainHasher := sha256.New()
-	cipherMAC := hmac.New(sha256.New, macKey)
-	cipherMAC.Write(iv)
 
 	buf := make([]byte, 32*1024)
 	var held []byte
@@ -248,7 +247,6 @@ func DecryptStream(key, iv, macKey []byte, ciphertextLen int64, ciphertext io.Re
 		}
 		read += int64(n)
 		chunk := buf[:n]
-		cipherMAC.Write(chunk)
 		cbc.CryptBlocks(chunk, chunk)
 		if held != nil {
 			if _, err = plaintext.Write(held); err != nil {
