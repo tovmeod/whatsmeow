@@ -247,6 +247,9 @@ func DecryptStream(key, iv, macKey []byte, ciphertextLen int64, ciphertext io.Re
 		}
 		read += int64(n)
 		chunk := buf[:n]
+		if len(chunk)%aes.BlockSize != 0 {
+			return nil, fmt.Errorf("ciphertext chunk isn't a multiple of block size: %d / %d", len(chunk), aes.BlockSize)
+		}
 		cbc.CryptBlocks(chunk, chunk)
 		if held != nil {
 			if _, err = plaintext.Write(held); err != nil {

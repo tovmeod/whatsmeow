@@ -101,6 +101,27 @@ func TestDecryptStreamTruncatedStream(t *testing.T) {
 	}
 }
 
+// TestDecryptStreamNonBlockMultipleLength confirms DecryptStream returns an error, instead of
+// panicking in cbc.CryptBlocks, when ciphertextLen is fully satisfiable by the reader but is not
+// a multiple of the AES block size -- the exact shape of the ciphertext that caused
+// panic: crypto/cipher: input not full blocks in production.
+func TestDecryptStreamNonBlockMultipleLength(t *testing.T) {
+	key, iv, macKey := streamKeys()
+	plaintext := randomBytes(t, 100)
+	ciphertext, _ := streamEncrypt(t, key, iv, macKey, plaintext)
+
+	// Claim fewer bytes than the reader actually holds (so io.ReadFull fully succeeds), but not
+	// a multiple of 16 (the real ciphertext from streamEncrypt always is, by construction of
+	// EncryptStream's own padding).
+	claimedLen := int64(len(ciphertext)) - 3
+
+	var recovered bytes.Buffer
+	_, err := DecryptStream(key, iv, macKey, claimedLen, bytes.NewReader(ciphertext), &recovered)
+	if err == nil {
+		t.Fatalf("expected an error for a non-block-multiple chunk length, got nil")
+	}
+}
+
 // TestDecryptStreamParityWithDecrypt confirms DecryptStream recovers exactly the same
 // plaintext as the existing all-at-once Decrypt, for every size class covered above.
 func TestDecryptStreamParityWithDecrypt(t *testing.T) {
