@@ -115,6 +115,10 @@ const noDonorCacheTTL = 5 * time.Minute
 // donorSFLogEvery skips for observability (same cadence as DONOR_SF_COALESCED).
 var noDonorCacheSkips atomic.Uint64
 
+// noDonorCacheEvictions counts bounded-cache evictions. An eviction affects
+// scan volume only: an evicted tuple runs its normal donor query next time.
+var noDonorCacheEvictions atomic.Uint64
+
 func mustNewNoDonorCache(capacity int) *lru.Cache[string, noDonorCacheEntry] {
 	cache, err := lru.New[string, noDonorCacheEntry](capacity)
 	if err != nil {
@@ -512,7 +516,18 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 	// Store only genuine negatives. Each write replaces the observed coverage
 	// bound and expiry; positives never populate or refresh this cache.
 	if donor == nil {
-		addNoDonorCacheEntry(sfKey, targetIter, time.Now())
+		if addNoDonorCacheEntry(sfKey, targetIter, time.Now()) {
+			n := noDonorCacheEvictions.Add(1)
+			if n%donorSFLogEvery == 0 {
+				var evictLog waLog.Logger
+				if sq, sqOK := c.inner.(*SQLStore); sqOK {
+					evictLog = sq.log
+				}
+				if evictLog != nil {
+					evictLog.Infof("NO_DONOR_CACHE_EVICT evictions=%d", n)
+				}
+			}
+		}
 	}
 
 	if donor == nil {

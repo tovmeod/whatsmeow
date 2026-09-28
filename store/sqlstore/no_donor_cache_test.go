@@ -38,6 +38,7 @@ func resetNoDonorCacheWithCapacityForTest(capacity int) {
 	defer noDonorCacheMu.Unlock()
 	noDonorCache = mustNewNoDonorCache(capacity)
 	noDonorCacheSkips.Store(0)
+	noDonorCacheEvictions.Store(0)
 }
 
 // backdateNoDonorCache overwrites the stored time for key with a time that is
@@ -233,5 +234,42 @@ func TestNoDonorCacheIterationBound(t *testing.T) {
 	}
 	if got := stub.findCalls.Load(); got != 2 {
 		t.Errorf("findSenderKeyDonor calls = %d, want 2 because target-10 is outside target-5 coverage", got)
+	}
+}
+
+func TestNoDonorCacheEvictionRescans(t *testing.T) {
+	resetNoDonorCacheWithCapacityForTest(2)
+	t.Cleanup(resetNoDonorCacheForTest)
+
+	stub := &stubRecoveryInner{}
+	cs := newStubCachedStore(t, stub, nil)
+	const (
+		senderBare = "55512340005_1"
+		targetID   = senderBare + ":0"
+		keyID      = uint32(105)
+	)
+
+	for _, group := range []string{"evict-a@g.us", "evict-b@g.us", "evict-c@g.us"} {
+		_, ok, err := cs.TryInlineRecovery(context.Background(), group, targetID, senderBare, keyID, 10)
+		if err != nil {
+			t.Fatalf("insert %s: %v", group, err)
+		}
+		if ok {
+			t.Errorf("insert %s: want ok=false for no donor", group)
+		}
+	}
+	if got := noDonorCacheEvictions.Load(); got == 0 {
+		t.Error("want a bounded-cache eviction after inserting three entries into capacity two")
+	}
+
+	_, ok, err := cs.TryInlineRecovery(context.Background(), "evict-a@g.us", targetID, senderBare, keyID, 10)
+	if err != nil {
+		t.Fatalf("evicted re-scan: %v", err)
+	}
+	if ok {
+		t.Error("evicted re-scan: want ok=false for no donor")
+	}
+	if got := stub.findCalls.Load(); got != 4 {
+		t.Errorf("findSenderKeyDonor calls = %d, want 4 because the evicted key re-scans", got)
 	}
 }
