@@ -750,15 +750,22 @@ func TestInlineDecryptIterationSafeRecovery(t *testing.T) {
 	legacyKeyID := legacySKDM.ID()
 	labeled := aliceName.Sender().String()
 	const senderBare = "alice"
+	cCipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(deviceC, store.SignalProtobufSerializer), aliceName, deviceC)
 
 	// At target 5 the only current-key donor is B@9, which is ahead and must
-	// neither install nor overwrite C's usable older state.
+	// neither decrypt, install, nor overwrite C's usable older state.
+	if got, decryptErr := cCipher.Decrypt(ctx, messages[5]); decryptErr == nil {
+		t.Fatalf("C target-5 decrypt before recovery = %q, %v; want failure", got, decryptErr)
+	}
 	lowDonor, lowOK, lowErr := cachedC.TryInlineRecovery(ctx, group, labeled, senderBare, currentKeyID, 5)
 	if lowErr != nil {
 		t.Fatalf("target-5 TryInlineRecovery: %v", lowErr)
 	}
 	if lowOK || lowDonor != "" {
 		t.Fatalf("target-5 recovery = donor %q, ok=%t; want no ahead-donor install", lowDonor, lowOK)
+	}
+	if got, decryptErr := cCipher.Decrypt(ctx, messages[5]); decryptErr == nil {
+		t.Fatalf("C target-5 decrypt after declined recovery = %q, %v; want failure", got, decryptErr)
 	}
 	beforeMerge, err := cachedC.GetSenderKeyStructure(ctx, group, labeled)
 	if err != nil {
@@ -793,7 +800,6 @@ func TestInlineDecryptIterationSafeRecovery(t *testing.T) {
 		t.Fatalf("merge states legacy=%t current=%t; want both preserved and installed", hasLegacy, hasCurrent)
 	}
 
-	cCipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(deviceC, store.SignalProtobufSerializer), aliceName, deviceC)
 	if got, decryptErr := cCipher.Decrypt(ctx, legacyMessage); decryptErr != nil || string(got) != "older usable state" {
 		t.Fatalf("C legacy decrypt after merge = %q, %v; want older usable state", got, decryptErr)
 	}
