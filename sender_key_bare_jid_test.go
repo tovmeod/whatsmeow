@@ -624,3 +624,190 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	}
 	t.Logf("PASS: TestInlineDecryptEquivalence — donor=%s, decrypted=%q", donorJID, decrypted)
 }
+
+// TestInlineDecryptIterationSafeRecovery proves the production recovery path
+// with real sender-key ciphertext: a donor at iteration 10 cannot recover C's
+// target-5 message, but that negative cannot suppress recovery of target 10.
+//
+// B advances by decrypting message 9, which leaves real skipped-key state for
+// messages 0 through 8. C starts with a distinct, older Alice key state. After
+// borrowing B's state, C must retain its older state, decrypt a skipped message,
+// and decrypt the later target-10 ciphertext.
+func TestInlineDecryptIterationSafeRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("pgx", inlineTestDSN())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		t.Fatalf("non-production Postgres must be reachable: %v", err)
+	}
+	testContainer := sqlstore.NewWithDB(db, "postgres", nil)
+	if err := testContainer.Upgrade(ctx); err != nil {
+		db.Close()
+		t.Fatalf("initialize non-production Whatsmeow schema: %v", err)
+	}
+
+	const (
+		inlineTestJIDB = "17799990041@s.whatsapp.net"
+		inlineTestJIDC = "17799990042@s.whatsapp.net"
+		group          = "inline_iteration_safe_recovery@g.us"
+	)
+	cleanupB := insertInlineTestDevice(t, db, inlineTestJIDB)
+	cleanupC := insertInlineTestDevice(t, db, inlineTestJIDC)
+	t.Cleanup(func() {
+		cleanupB()
+		cleanupC()
+		db.Close()
+	})
+	_, _ = db.ExecContext(ctx,
+		`DELETE FROM whatsmeow_sender_keys WHERE our_jid IN ($1,$2) AND chat_id=$3`,
+		inlineTestJIDB, inlineTestJIDC, group)
+
+	newCachedDevice := func(jid string) (*store.Device, *sqlstore.CachedSenderKeyStore, types.JID) {
+		t.Helper()
+		parsed, parseErr := types.ParseJID(jid)
+		if parseErr != nil {
+			t.Fatalf("ParseJID %s: %v", jid, parseErr)
+		}
+		byteCache, cacheErr := lru.New[string, []byte](256)
+		if cacheErr != nil {
+			t.Fatalf("lru.New byte cache: %v", cacheErr)
+		}
+		deviceCache, cacheErr := lru.New[string, []string](256)
+		if cacheErr != nil {
+			t.Fatalf("lru.New device cache: %v", cacheErr)
+		}
+		inner := sqlstore.NewSQLStore(testContainer, parsed)
+		cached := sqlstore.NewCachedSenderKeyStore(inner, jid, byteCache, deviceCache, nil)
+		return &store.Device{SenderKeys: cached, InlineRecoverer: cached, Log: waLog.Noop, ID: &parsed}, cached, parsed
+	}
+	deviceB, cachedB, _ := newCachedDevice(inlineTestJIDB)
+	deviceC, cachedC, _ := newCachedDevice(inlineTestJIDC)
+
+	aliceAddr := protocol.NewSignalAddress("alice", 0)
+	aliceName := protocol.NewSenderKeyName(group, aliceAddr)
+
+	// Seed C with a usable older Alice key. It must survive the donor merge.
+	legacyStore := newAliceSenderKeyStore()
+	legacyBuilder := groups.NewGroupSessionBuilder(legacyStore, store.SignalProtobufSerializer)
+	legacySKDM, err := legacyBuilder.Create(ctx, aliceName)
+	if err != nil {
+		t.Fatalf("legacy builder.Create: %v", err)
+	}
+	legacyCipher := groups.NewGroupCipher(legacyBuilder, aliceName, legacyStore)
+	legacyEnc, err := legacyCipher.Encrypt(ctx, []byte("older usable state"))
+	if err != nil {
+		t.Fatalf("legacy cipher.Encrypt: %v", err)
+	}
+	legacyMessage, ok := legacyEnc.(*protocol.SenderKeyMessage)
+	if !ok {
+		t.Fatalf("legacy cipher.Encrypt returned %T, want *protocol.SenderKeyMessage", legacyEnc)
+	}
+	legacyBuilderC := groups.NewGroupSessionBuilder(deviceC, store.SignalProtobufSerializer)
+	if err := legacyBuilderC.Process(ctx, aliceName, legacySKDM); err != nil {
+		t.Fatalf("C legacy builder.Process: %v", err)
+	}
+
+	// One persistent sender session produces actual iteration-0 through -10 messages.
+	aliceStore := newAliceSenderKeyStore()
+	aliceBuilder := groups.NewGroupSessionBuilder(aliceStore, store.SignalProtobufSerializer)
+	currentSKDM, err := aliceBuilder.Create(ctx, aliceName)
+	if err != nil {
+		t.Fatalf("current builder.Create: %v", err)
+	}
+	aliceCipher := groups.NewGroupCipher(aliceBuilder, aliceName, aliceStore)
+	messages := make([]*protocol.SenderKeyMessage, 11)
+	for iteration := range messages {
+		plaintext := []byte("current iteration " + strconv.Itoa(iteration))
+		enc, encryptErr := aliceCipher.Encrypt(ctx, plaintext)
+		if encryptErr != nil {
+			t.Fatalf("Alice cipher.Encrypt iteration %d: %v", iteration, encryptErr)
+		}
+		message, messageOK := enc.(*protocol.SenderKeyMessage)
+		if !messageOK {
+			t.Fatalf("Alice cipher.Encrypt iteration %d returned %T, want *protocol.SenderKeyMessage", iteration, enc)
+		}
+		if got := message.Iteration(); got != uint32(iteration) {
+			t.Fatalf("generated message iteration = %d, want %d", got, iteration)
+		}
+		messages[iteration] = message
+	}
+
+	// B processes the current SKDM and advances directly to iteration 9. The
+	// production GroupCipher leaves skipped-message-key state for 0..8.
+	builderB := groups.NewGroupSessionBuilder(deviceB, store.SignalProtobufSerializer)
+	if err := builderB.Process(ctx, aliceName, currentSKDM); err != nil {
+		t.Fatalf("B current builder.Process: %v", err)
+	}
+	bCipher := groups.NewGroupCipher(builderB, aliceName, deviceB)
+	if got, decryptErr := bCipher.Decrypt(ctx, messages[9]); decryptErr != nil || string(got) != "current iteration 9" {
+		t.Fatalf("B direct iteration-9 decrypt = %q, %v; want current iteration 9", got, decryptErr)
+	}
+
+	currentKeyID := currentSKDM.ID()
+	legacyKeyID := legacySKDM.ID()
+	labeled := aliceName.Sender().String()
+	const senderBare = "alice"
+
+	// At target 5 the only current-key donor is B@9, which is ahead and must
+	// neither install nor overwrite C's usable older state.
+	lowDonor, lowOK, lowErr := cachedC.TryInlineRecovery(ctx, group, labeled, senderBare, currentKeyID, 5)
+	if lowErr != nil {
+		t.Fatalf("target-5 TryInlineRecovery: %v", lowErr)
+	}
+	if lowOK || lowDonor != "" {
+		t.Fatalf("target-5 recovery = donor %q, ok=%t; want no ahead-donor install", lowDonor, lowOK)
+	}
+	beforeMerge, err := cachedC.GetSenderKeyStructure(ctx, group, labeled)
+	if err != nil {
+		t.Fatalf("C GetSenderKeyStructure after target-5: %v", err)
+	}
+	if beforeMerge == nil || len(beforeMerge.SenderKeyStates) != 1 || beforeMerge.SenderKeyStates[0].KeyID != legacyKeyID {
+		t.Fatalf("target-5 changed C state: got %+v, want only legacy key %d", beforeMerge, legacyKeyID)
+	}
+
+	// Target 10 is outside target-5's lower-or-equal negative coverage. B@9
+	// is eligible, so C borrows the structure and decrypts real ciphertext.
+	donorJID, recovered, recoveryErr := cachedC.TryInlineRecovery(ctx, group, labeled, senderBare, currentKeyID, 10)
+	if recoveryErr != nil {
+		t.Fatalf("target-10 TryInlineRecovery: %v", recoveryErr)
+	}
+	if !recovered || donorJID == "" {
+		t.Fatalf("target-10 recovery = donor %q, ok=%t; want eligible donor install", donorJID, recovered)
+	}
+	afterMerge, err := cachedC.GetSenderKeyStructure(ctx, group, labeled)
+	if err != nil {
+		t.Fatalf("C GetSenderKeyStructure after target-10: %v", err)
+	}
+	var hasLegacy, hasCurrent bool
+	for _, state := range afterMerge.SenderKeyStates {
+		if state == nil {
+			continue
+		}
+		hasLegacy = hasLegacy || state.KeyID == legacyKeyID
+		hasCurrent = hasCurrent || state.KeyID == currentKeyID
+	}
+	if !hasLegacy || !hasCurrent {
+		t.Fatalf("merge states legacy=%t current=%t; want both preserved and installed", hasLegacy, hasCurrent)
+	}
+
+	cCipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(deviceC, store.SignalProtobufSerializer), aliceName, deviceC)
+	if got, decryptErr := cCipher.Decrypt(ctx, legacyMessage); decryptErr != nil || string(got) != "older usable state" {
+		t.Fatalf("C legacy decrypt after merge = %q, %v; want older usable state", got, decryptErr)
+	}
+	if got, decryptErr := cCipher.Decrypt(ctx, messages[4]); decryptErr != nil || string(got) != "current iteration 4" {
+		t.Fatalf("C retained skipped-key decrypt = %q, %v; want current iteration 4", got, decryptErr)
+	}
+	if got, decryptErr := cCipher.Decrypt(ctx, messages[10]); decryptErr != nil || string(got) != "current iteration 10" {
+		t.Fatalf("C target-10 decrypt = %q, %v; want current iteration 10", got, decryptErr)
+	}
+
+	// Keep cachedB referenced so this test documents that B's real cached store
+	// is the donor row selected by TryInlineRecovery through shared PostgreSQL.
+	if cachedB == nil {
+		t.Fatal("B cached sender-key store is nil")
+	}
+	t.Logf("PASS: target-5 rejected, target-10 donor=%s decrypted with preserved legacy and skipped states", donorJID)
+}
