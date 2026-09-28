@@ -48,6 +48,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 
@@ -84,16 +85,23 @@ var (
 // 100 yields observable lines within minutes given the ~10/min donor-attempt rate.
 const donorSFLogEvery = 100
 
-// noDonorCache memoizes the negative result of the donor scan (Phase 38.6-01).
-// Key: sfKey string (group|senderBare|keyID); Value: time.Time when the entry
-// was stored. A stored entry means the scan returned donor==nil. Only negatives
-// are cached; a found donor is never stored. Entries expire after noDonorCacheTTL
-// — stale entries are re-scanned and refreshed when found.
-//
-// Process-wide: the cache stores a global, deterministic fact ("no donor exists
-// for this tuple across all accounts") which makes process-wide memoization
-// correct. A new keyID (e.g. bot rotation) is a different sfKey → fresh scan.
-var noDonorCache sync.Map
+// noDonorCacheEntry describes the query domain covered by one negative donor
+// scan. A no-donor result at iteration N also covers targets <= N, but must
+// never suppress a scan at a later target iteration.
+type noDonorCacheEntry struct {
+	expiresAt             time.Time
+	maxNegativeTargetIter uint32
+}
+
+const noDonorCacheCapacity = 10_000
+
+// noDonorCache is process-wide and bounded. The base key is
+// group|senderBare|keyID; each value records the target-iteration bound of the
+// exact donor query that produced its negative result.
+var (
+	noDonorCacheMu sync.Mutex
+	noDonorCache   = mustNewNoDonorCache(noDonorCacheCapacity)
+)
 
 // noDonorCacheTTL is the time-to-live for negative-donor cache entries.
 // A no-donor tuple is re-scanned at most once per this period instead of on
@@ -106,6 +114,48 @@ const noDonorCacheTTL = 5 * time.Minute
 // (the donor scan was skipped because a non-expired entry existed). Logged every
 // donorSFLogEvery skips for observability (same cadence as DONOR_SF_COALESCED).
 var noDonorCacheSkips atomic.Uint64
+
+// noDonorCacheEvictions counts bounded-cache evictions. An eviction affects
+// scan volume only: an evicted tuple runs its normal donor query next time.
+var noDonorCacheEvictions atomic.Uint64
+
+func mustNewNoDonorCache(capacity int) *lru.Cache[string, noDonorCacheEntry] {
+	cache, err := lru.New[string, noDonorCacheEntry](capacity)
+	if err != nil {
+		panic(err)
+	}
+	return cache
+}
+
+func getNoDonorCacheEntry(key string, targetIter uint32, now time.Time) bool {
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+
+	entry, found := noDonorCache.Get(key)
+	if !found {
+		return false
+	}
+	if !now.Before(entry.expiresAt) {
+		noDonorCache.Remove(key)
+		return false
+	}
+	return targetIter <= entry.maxNegativeTargetIter
+}
+
+func addNoDonorCacheEntry(key string, targetIter uint32, now time.Time) bool {
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+	return noDonorCache.Add(key, noDonorCacheEntry{
+		expiresAt:             now.Add(noDonorCacheTTL),
+		maxNegativeTargetIter: targetIter,
+	})
+}
+
+func removeNoDonorCacheEntry(key string) {
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+	noDonorCache.Remove(key)
+}
 
 // senderKeyRecoveryReader is the local interface that *SQLStore satisfies to
 // expose the cross-account donor scan. Using a local interface avoids exposing
@@ -394,44 +444,34 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 		return "", false, nil
 	}
 
-	// D-01: coalesce concurrent findSenderKeyDonor calls for the same
-	// (group, senderBare, keyID) via the process-global singleflight.Group.
+	// D-01: coalesce concurrent findSenderKeyDonor calls for the same exact
+	// (group, senderBare, keyID, targetIter) query via process-global singleflight.
 	// N accounts missing the same key will share ONE donor DB scan; each
 	// account then independently runs the downgrade guard + install below.
-	// targetIter is excluded from the key (RESEARCH Open Q1); because the
-	// shared closure captures the LEADER's targetIter, every coalesced caller
-	// must re-check the returned donor against its OWN targetIter (the WR-04
-	// forward-only re-check below — the per-account downgrade guard alone does
-	// NOT cover the no-existing-state case).
 	// The "|" separator prevents key collisions between distinct tuples that
 	// share a prefix (T-29-01-01 mitigation).
 	sfKey := group + "|" + senderBare + "|" + strconv.FormatUint(uint64(targetKeyID), 10)
+	workKey := sfKey + "|" + strconv.FormatUint(uint64(targetIter), 10)
 
-	// Phase 38.6-01: negative-donor cache check. If a non-expired entry exists
-	// for sfKey it means a previous scan returned no donor for this tuple; skip
-	// the scan and return early. Only negatives are cached (found donors are never
-	// stored), so this never suppresses a recovery that would succeed.
-	// Expired entries fall through to the full scan path, which refreshes the entry.
-	if v, ok := noDonorCache.Load(sfKey); ok {
-		if stored, valid := v.(time.Time); valid && time.Since(stored) < noDonorCacheTTL {
-			n := noDonorCacheSkips.Add(1)
-			if n%donorSFLogEvery == 0 {
-				var skipLog waLog.Logger
-				if sq, sqOk := c.inner.(*SQLStore); sqOk {
-					skipLog = sq.log
-				}
-				if skipLog != nil {
-					skipLog.Infof("NO_DONOR_CACHE_SKIP skips=%d group=%s sender=%s keyID=%s",
-						n, group, senderBare, strconv.FormatUint(uint64(targetKeyID), 10))
-				}
+	// A live negative entry only covers target iterations at or below the exact
+	// scan that produced it. Expired entries are removed before a normal re-scan.
+	if getNoDonorCacheEntry(sfKey, targetIter, time.Now()) {
+		n := noDonorCacheSkips.Add(1)
+		if n%donorSFLogEvery == 0 {
+			var skipLog waLog.Logger
+			if sq, sqOk := c.inner.(*SQLStore); sqOk {
+				skipLog = sq.log
 			}
-			return "", false, nil
+			if skipLog != nil {
+				skipLog.Infof("NO_DONOR_CACHE_SKIP skips=%d", n)
+			}
 		}
+		return "", false, nil
 	}
 
 	var donor *donorSenderKeyState
 	if c.sf != nil {
-		v, sfErr, shared := c.sf.Do(sfKey, func() (any, error) {
+		v, sfErr, shared := c.sf.Do(workKey, func() (any, error) {
 			return r.findSenderKeyDonor(ctx, group, senderBare, targetKeyID, targetIter)
 		})
 		// D-01: count total attempts and coalesced followers; emit every donorSFLogEvery
@@ -467,27 +507,27 @@ func (c *CachedSenderKeyStore) TryInlineRecovery(ctx context.Context, group, tar
 			return "", false, findErr
 		}
 	}
-	// WR-04 (2026-06-10): forward-only re-check against the CALLER's own
-	// targetIter. The singleflight key excludes targetIter and the shared
-	// closure captures the LEADER's targetIter, so a coalesced FOLLOWER with a
-	// lower target can receive a shared donor whose iteration is AHEAD of its
-	// target. The per-account downgrade guard below only compares
-	// existing-vs-donor and passes when the follower has NO existing state for
-	// the KeyID — installing a donor the failing message cannot use
-	// (forward-only ratchet: a higher-iteration chain key cannot re-derive an
-	// earlier iteration, and the donor's skipped keys are unlikely to cover
-	// it), returning ok=true, and burning the inline decrypt retry. Mirror
-	// findSenderKeyDonor's own donorIter > targetIter filter here.
+	// Keep this caller-side forward-only guard as defense in depth for custom
+	// readers. Exact target-iteration work keys prevent cross-domain sharing.
 	if donor != nil && donor.Iteration > targetIter {
 		return "", false, nil // not recovered: shared donor is past this caller's target
 	}
 
-	// Phase 38.6-01: populate the negative-donor cache. Store ONLY when the scan
-	// found no donor. A found donor (donor != nil) is never stored so positive
-	// results keep working and are always re-scanned. The TTL is the sole
-	// invalidation; a new keyID (bot rotation) uses a different sfKey.
+	// Store only genuine negatives. Each write replaces the observed coverage
+	// bound and expiry; positives never populate or refresh this cache.
 	if donor == nil {
-		noDonorCache.Store(sfKey, time.Now())
+		if addNoDonorCacheEntry(sfKey, targetIter, time.Now()) {
+			n := noDonorCacheEvictions.Add(1)
+			if n%donorSFLogEvery == 0 {
+				var evictLog waLog.Logger
+				if sq, sqOK := c.inner.(*SQLStore); sqOK {
+					evictLog = sq.log
+				}
+				if evictLog != nil {
+					evictLog.Infof("NO_DONOR_CACHE_EVICT evictions=%d", n)
+				}
+			}
+		}
 	}
 
 	if donor == nil {

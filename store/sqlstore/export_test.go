@@ -30,5 +30,5 @@ func ClassifyNoDonor(ctx context.Context, s *SQLStore, ourJID, group, senderBare
 // scenarios.
 func DeleteNoDonorCacheEntry(group, senderBare string, keyID uint32) {
 	sfKey := group + "|" + senderBare + "|" + strconv.FormatUint(uint64(keyID), 10)
-	noDonorCache.Delete(sfKey)
+	removeNoDonorCacheEntry(sfKey)
 }

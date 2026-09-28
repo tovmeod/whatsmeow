@@ -36,6 +36,9 @@ import (
 // cannot produce this deterministically.
 type stubRecoveryInner struct {
 	donor *donorSenderKeyState
+	// donorForTarget lets tests model the real donor query's target-iteration
+	// domain while preserving the fixed donor path used by older tests.
+	donorForTarget func(targetIter uint32) *donorSenderKeyState
 
 	// existing, when non-nil, is returned by GetSenderKey — lets a test seed
 	// the recovering account's pre-merge structure (a PackFlat blob) for the
@@ -66,6 +69,9 @@ func (s *stubRecoveryInner) findSenderKeyDonor(ctx context.Context, group, sende
 	}
 	if s.release != nil {
 		<-s.release
+	}
+	if s.donorForTarget != nil {
+		return s.donorForTarget(targetIter), nil
 	}
 	return s.donor, nil
 }
@@ -122,6 +128,68 @@ func newStubCachedStore(t *testing.T, inner *stubRecoveryInner, sf *singleflight
 		t.Fatalf("lru.New dev: %v", err)
 	}
 	return NewCachedSenderKeyStore(inner, "follower@s.whatsapp.net", byteCache, devCache, sf)
+}
+
+func TestInlineRecoveryDifferentIterationsDoNotCoalesce(t *testing.T) {
+	stub := &stubRecoveryInner{
+		donorForTarget: func(targetIter uint32) *donorSenderKeyState {
+			if targetIter >= 10 {
+				return stubDonor(11, 10)
+			}
+			return nil
+		},
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	var sf singleflight.Group
+	cs := newStubCachedStore(t, stub, &sf)
+
+	const (
+		group      = "iteration-domain@g.us"
+		targetID   = "777_1:0"
+		senderBare = "777_1"
+		keyID      = uint32(11)
+	)
+
+	var wg sync.WaitGroup
+	var lowerOK, higherOK bool
+	var lowerErr, higherErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, lowerOK, lowerErr = cs.TryInlineRecovery(context.Background(), group, targetID, senderBare, keyID, 5)
+	}()
+	select {
+	case <-stub.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("target-5 scan never entered findSenderKeyDonor")
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, higherOK, higherErr = cs.TryInlineRecovery(context.Background(), group, targetID, senderBare, keyID, 10)
+	}()
+	select {
+	case <-stub.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("target-10 scan was coalesced with target-5 scan")
+	}
+	close(stub.release)
+	wg.Wait()
+
+	if lowerErr != nil || higherErr != nil {
+		t.Fatalf("errors: target-5=%v target-10=%v", lowerErr, higherErr)
+	}
+	if lowerOK {
+		t.Error("target-5: want ok=false after its nil donor scan")
+	}
+	if !higherOK {
+		t.Error("target-10: want ok=true after its eligible donor scan")
+	}
+	if got := stub.findCalls.Load(); got != 2 {
+		t.Errorf("findSenderKeyDonor calls = %d, want 2 distinct target-iteration scans", got)
+	}
 }
 
 // TestInlineRecoveryForwardOnlyFollowerGuard asserts the WR-04 re-check in
