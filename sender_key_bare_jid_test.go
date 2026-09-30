@@ -286,7 +286,7 @@ func TestGroupSenderKeyDeviceDisregardFallback(t *testing.T) {
 
 	for _, lookupDev := range []uint8{0, 2} {
 		lookupDev := lookupDev
-		t.Run(strings.Join([]string{"lookupDev", string(rune('0'+lookupDev))}, ""), func(t *testing.T) {
+		t.Run(strings.Join([]string{"lookupDev", string(rune('0' + lookupDev))}, ""), func(t *testing.T) {
 			fake := newFakeSenderKeyStore()
 			cli := newTestClient(fake)
 
@@ -519,7 +519,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	containerB := sqlstore.NewWithDB(db, "postgres", nil)
 	innerB := sqlstore.NewSQLStore(containerB, jidBParsed)
 	byteB, _ := lru.New[string, []byte](256)
-	devB, _ := lru.New[string, []string](256)
+	devB, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	csBStore := sqlstore.NewCachedSenderKeyStore(innerB, inlineTestJIDB, byteB, devB, nil)
 
 	// Phase 38.4-03: the parsed struct cache is deleted. The flat c.cache
@@ -564,7 +564,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	containerC := sqlstore.NewWithDB(db, "postgres", nil)
 	innerC := sqlstore.NewSQLStore(containerC, jidCParsed)
 	byteC, _ := lru.New[string, []byte](256)
-	devC, _ := lru.New[string, []string](256)
+	devC, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	csC := sqlstore.NewCachedSenderKeyStore(innerC, inlineTestJIDC, byteC, devC, nil)
 
 	deviceC := &store.Device{
@@ -675,7 +675,7 @@ func TestInlineDecryptIterationSafeRecovery(t *testing.T) {
 		if cacheErr != nil {
 			t.Fatalf("lru.New byte cache: %v", cacheErr)
 		}
-		deviceCache, cacheErr := lru.New[string, []string](256)
+		deviceCache, cacheErr := sqlstore.NewSenderKeyDeviceCache(256)
 		if cacheErr != nil {
 			t.Fatalf("lru.New device cache: %v", cacheErr)
 		}

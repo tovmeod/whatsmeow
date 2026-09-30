@@ -9,8 +9,11 @@ package sqlstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,9 +47,9 @@ func newTestCachedSenderKeyStore(t *testing.T, capSize int) (*CachedSenderKeySto
 	if err != nil {
 		t.Fatalf("lru.New[string, []byte] failed: %v", err)
 	}
-	deviceCache, err := lru.New[string, []string](capSize)
+	deviceCache, err := NewSenderKeyDeviceCache(capSize)
 	if err != nil {
-		t.Fatalf("lru.New[string, []string] failed: %v", err)
+		t.Fatalf("NewSenderKeyDeviceCache failed: %v", err)
 	}
 	// "test-jid" with no trailing pipe — wrapper's key() prepends the
 	// separator. Matches production format used by Container.initializeDevice.
@@ -71,6 +74,8 @@ func TestCachedSenderKeyStore_InterfaceConformance(t *testing.T) {
 
 func TestSenderKeyDeviceNegativeFixedTTL(t *testing.T) {
 	c, inner := newTestCachedSenderKeyStore(t, 16)
+	now := time.Unix(1_000, 0)
+	c.deviceCache.now = func() time.Time { return now }
 	for range 3 {
 		if _, err := c.GetSenderKeyDevices(context.Background(), "empty", "user_1"); err != nil {
 			t.Fatal(err)
@@ -78,6 +83,173 @@ func TestSenderKeyDeviceNegativeFixedTTL(t *testing.T) {
 	}
 	if got := inner.devicesCalls.Load(); got != 1 {
 		t.Fatalf("repeated authoritative empty queries = %d, want 1", got)
+	}
+	now = now.Add(5*time.Minute - time.Nanosecond)
+	_, _ = c.GetSenderKeyDevices(context.Background(), "empty", "user_1:99")
+	if inner.devicesCalls.Load() != 1 {
+		t.Fatal("pre-expiry device suffix lookup missed")
+	}
+	now = now.Add(time.Nanosecond)
+	_, _ = c.GetSenderKeyDevices(context.Background(), "empty", "user_1")
+	if inner.devicesCalls.Load() != 2 {
+		t.Fatal("equality must expire")
+	}
+	if err := c.PutSenderKey(context.Background(), "empty", "user_1:7", []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	got, err := c.GetSenderKeyDevices(context.Background(), "empty", "user_1")
+	if err != nil || !containsString(got, "user_1:7") || inner.devicesCalls.Load() != 2 {
+		t.Fatalf("positive expired: %v %v", got, err)
+	}
+}
+
+type devicePolicyInner struct {
+	*fakeSenderKeyStore
+	read  func(context.Context, string, string) ([]string, error)
+	calls atomic.Int64
+}
+
+func (s *devicePolicyInner) GetSenderKeyDevices(ctx context.Context, group, sender string) ([]string, error) {
+	s.calls.Add(1)
+	return s.read(ctx, group, sender)
+}
+
+func newDevicePolicyStore(t *testing.T, cap int, read func(context.Context, string, string) ([]string, error)) (*CachedSenderKeyStore, *devicePolicyInner) {
+	t.Helper()
+	inner := &devicePolicyInner{fakeSenderKeyStore: newFakeSenderKeyStore(), read: read}
+	blobs, _ := lru.New[string, []byte](cap)
+	devices, err := NewSenderKeyDeviceCache(cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewCachedSenderKeyStore(inner, "account", blobs, devices, nil), inner
+}
+
+func TestSenderKeyDeviceNegativeIdentity(t *testing.T) {
+	c, inner := newDevicePolicyStore(t, 32, func(context.Context, string, string) ([]string, error) { return []string{}, nil })
+	for _, pair := range [][2]string{{"a|b", "c"}, {"a", "b|c"}, {"g", "42_1"}, {"g", "42_2"}, {"g", "42@s.whatsapp.net"}, {"g", "42@lid"}} {
+		for range 2 {
+			_, _ = c.GetSenderKeyDevices(context.Background(), pair[0], pair[1])
+		}
+	}
+	if inner.calls.Load() != 6 {
+		t.Fatalf("identity collision: %d queries", inner.calls.Load())
+	}
+	c2 := NewCachedSenderKeyStore(inner, "other-account", c.cache, c.deviceCache, nil)
+	_, _ = c2.GetSenderKeyDevices(context.Background(), "a", "b|c")
+	other := &devicePolicyInner{fakeSenderKeyStore: newFakeSenderKeyStore(), read: inner.read}
+	c3 := NewCachedSenderKeyStore(other, c.jid, c.cache, c.deviceCache, nil)
+	_, _ = c3.GetSenderKeyDevices(context.Background(), "a", "b|c")
+	if inner.calls.Load() != 7 || other.calls.Load() != 1 {
+		t.Fatal("account/store absence leaked")
+	}
+}
+
+func TestSenderKeyDeviceNegativeNonAuthoritative(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		devices []string
+		err     error
+	}{
+		{"nil", nil, nil}, {"malformed", []string{"user_1:"}, nil}, {"wrong-sender", []string{"other:0"}, nil}, {"error", nil, errors.New("query failed")}, {"cancel", []string{}, context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, inner := newDevicePolicyStore(t, 4, func(context.Context, string, string) ([]string, error) { return tc.devices, tc.err })
+			for range 2 {
+				_, _ = c.GetSenderKeyDevices(context.Background(), "g", "user_1")
+			}
+			if inner.calls.Load() != 2 || c.deviceCache.Len() != 0 {
+				t.Fatal("non-authoritative result cached")
+			}
+		})
+	}
+}
+
+func awaitDeviceParticipants(t *testing.T, c *CachedSenderKeyStore, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.deviceCache.mu.Lock()
+		n := 0
+		for _, f := range c.deviceCache.flights {
+			n += f.participants
+		}
+		c.deviceCache.mu.Unlock()
+		if n == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("participants=%d want=%d", n, want)
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestSenderKeyDeviceNegativeCoalescing(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	c, inner := newDevicePolicyStore(t, 4, func(ctx context.Context, _, _ string) ([]string, error) {
+		close(entered)
+		select {
+		case <-release:
+			return []string{}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	var wg sync.WaitGroup
+	results := make(chan error, 50)
+	launch := func(ctx context.Context) {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, err := c.GetSenderKeyDevices(ctx, "g", "user_1"); results <- err }()
+	}
+	launch(context.Background())
+	<-entered
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	launch(cancelCtx)
+	for range 48 {
+		launch(context.Background())
+	}
+	awaitDeviceParticipants(t, c, 50)
+	cancel()
+	if err := <-results; !errors.Is(err, context.Canceled) {
+		t.Fatalf("follower cancel: %v", err)
+	}
+	close(release)
+	wg.Wait()
+	for range 49 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if inner.calls.Load() != 1 || len(c.deviceCache.flights) != 0 {
+		t.Fatal("coalescing or cleanup failed")
+	}
+}
+
+func TestSenderKeyDeviceNegativeWriteFence(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	c, _ := newDevicePolicyStore(t, 4, func(context.Context, string, string) ([]string, error) {
+		close(entered)
+		<-release
+		return []string{}, nil
+	})
+	result := make(chan []string, 1)
+	go func() { got, _ := c.GetSenderKeyDevices(context.Background(), "g", "user_1"); result <- got }()
+	<-entered
+	if err := c.PutSenderKey(context.Background(), "g", "user_1:7", []byte("usable")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.GetSenderKeyDevices(context.Background(), "g", "user_1")
+	if err != nil || !containsString(got, "user_1:7") {
+		t.Fatalf("pin hidden while query blocked: %v %v", got, err)
+	}
+	close(release)
+	if got := <-result; !containsString(got, "user_1:7") {
+		t.Fatalf("late completion hid pin: %v", got)
+	}
+	if entry, ok := c.deviceCache.Peek(c.deviceKey("g", "user_1")); ok && len(entry.devices) == 0 {
+		t.Fatal("late absence published")
 	}
 }
 

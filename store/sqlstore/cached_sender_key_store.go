@@ -52,7 +52,7 @@ type CachedSenderKeyStore struct {
 	// device-qualified sender_id list for that sender. Lets GetSenderKeyDevices
 	// be served from cache (the device-tolerant lookup's enumerate). Invalidated
 	// by PutSenderKey only when a genuinely new device appears (see PutSenderKey).
-	deviceCache *lru.Cache[string, []string]
+	deviceCache *SenderKeyDeviceCache
 
 	// Phase 29 D-01: pointer to the process-global singleflight.Group for
 	// findSenderKeyDonor coalescing. Shared by all CachedSenderKeyStore instances
@@ -75,7 +75,7 @@ type CachedSenderKeyStore struct {
 	// Value: set of device-qualified sender_id strings (e.g. "9725..._1:0").
 	// On write: the device sid is added. On drain callback: sid removed; inner
 	// map deleted when empty. GetSenderKeyDevices returns pinned UNION DB-result.
-	pinned map[string]map[string]struct{}
+	pinned map[deviceQueryKey]map[string]struct{}
 
 	// pinnedBlobs holds the flat blob for writes that have not yet drained to DB
 	// AND whose c.cache entry may have been evicted (risk c: eviction-before-drain).
@@ -105,14 +105,14 @@ var _ store.SenderKeyColumnarStore = (*CachedSenderKeyStore)(nil)
 // Container. sf is a pointer to the process-global singleflight.Group for
 // findSenderKeyDonor coalescing (passed from signalCaches.DonorSF); nil is
 // accepted for test contexts that do not wire a Container.
-func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte], deviceCache *lru.Cache[string, []string], sf *singleflight.Group) *CachedSenderKeyStore {
+func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte], deviceCache *SenderKeyDeviceCache, sf *singleflight.Group) *CachedSenderKeyStore {
 	return &CachedSenderKeyStore{
 		inner:       inner,
 		jid:         jid,
 		cache:       cache,
 		deviceCache: deviceCache,
 		sf:          sf,
-		pinned:      make(map[string]map[string]struct{}),
+		pinned:      make(map[deviceQueryKey]map[string]struct{}),
 		pinnedBlobs: make(map[string][]byte),
 	}
 }
@@ -131,7 +131,7 @@ func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 		return
 	}
 	f.SetOnDrained(func(group, user string) {
-		dk := c.key(group, senderKeyUserBare(user))
+		dk := c.deviceKey(group, user)
 		bk := c.key(group, user)
 		c.pinnedMu.Lock()
 		if ps := c.pinned[dk]; ps != nil {
@@ -546,70 +546,165 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 	return true, nil
 }
 
-// updateDeviceCache adds device sid to both the deviceCache LRU and the pinned
-// overlay on every sender-key write. For the LRU: if an entry is already cached,
-// append the sid if not present (add-on-write, O(1)). If no LRU entry exists,
-// do NOT create one — GetSenderKeyDevices will cold-load from DB on first call
-// and the pinned overlay covers the pre-drain window.
-// Per D-01: add-on-write replaces the old invalidate-on-new-device behavior.
-func (c *CachedSenderKeyStore) updateDeviceCache(group, user string) {
-	dk := c.key(group, senderKeyUserBare(user))
+// deviceKey keeps account/group/sender boundaries separate and does not collapse
+// agent or address namespaces. Device suffixes do not narrow enumeration.
+func (c *CachedSenderKeyStore) deviceKey(group, user string) deviceQueryKey {
+	var universe any = c.inner
+	if sql, ok := c.inner.(*SQLStore); ok {
+		universe = sql.Container
+	}
+	return deviceQueryKey{universe: universe, account: c.jid, group: group, sender: senderKeyUserBare(user)}
+}
 
-	// Always add to pinned under pinnedMu (D-04: eviction-safe anchor).
+func (c *CachedSenderKeyStore) pinnedDevices(dk deviceQueryKey) []string {
+	c.pinnedMu.Lock()
+	defer c.pinnedMu.Unlock()
+	var result []string
+	for sid := range c.pinned[dk] {
+		result = append(result, sid)
+	}
+	return result
+}
+
+// updateDeviceCache fences readers and replaces an existing empty entry before
+// an asynchronous SQL drain. Copy ownership is preserved for every merge.
+func (c *CachedSenderKeyStore) updateDeviceCache(group, user string) {
+	dk := c.deviceKey(group, user)
 	c.pinnedMu.Lock()
 	if c.pinned[dk] == nil {
 		c.pinned[dk] = make(map[string]struct{})
 	}
 	c.pinned[dk][user] = struct{}{}
 	c.pinnedMu.Unlock()
-
-	// Update the LRU cache if an entry already exists — add the device sid.
-	// If the entry was evicted or never loaded, leave it absent; the pinned
-	// overlay ensures GetSenderKeyDevices still returns this device.
-	if existing, ok := c.deviceCache.Get(dk); ok {
-		if !containsString(existing, user) {
-			c.deviceCache.Add(dk, append(existing, user))
-		}
+	owner := c.deviceCache
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if f := owner.flights[dk]; f != nil {
+		f.invalid = true
+	}
+	if entry, ok := owner.Get(dk); ok {
+		owner.Add(dk, deviceCacheEntry{devices: mergeDeviceSets(entry.devices, []string{user})})
 	}
 }
 
-// GetSenderKeyDevices answers the device-tolerant lookup's enumerate from the
-// dedicated device-set LRU (keyed jid|group|userBare), falling to the inner
-// store once on a cold key. Returns pinned UNION DB result so a just-written
-// device is visible immediately, even before the async flusher drains to DB.
-func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
-	dk := c.key(group, userBare)
-
-	// Snapshot pinned set first, outside LRU lock.
-	c.pinnedMu.Lock()
-	var pinnedSids []string
-	if ps := c.pinned[dk]; len(ps) > 0 {
-		pinnedSids = make([]string, 0, len(ps))
-		for sid := range ps {
-			pinnedSids = append(pinnedSids, sid)
+func validDeviceResult(devices []string, sender string) bool {
+	if devices == nil {
+		return false
+	}
+	for _, sid := range devices {
+		i := strings.LastIndex(sid, ":")
+		if i < 1 || i == len(sid)-1 || senderKeyUserBare(sid) != sender {
+			return false
+		}
+		for _, ch := range sid[i+1:] {
+			if ch < '0' || ch > '9' {
+				return false
+			}
 		}
 	}
-	c.pinnedMu.Unlock()
+	return true
+}
 
-	// Try LRU cache.
-	if v, ok := c.deviceCache.Get(dk); ok {
-		atomic.AddUint64(&c.hits, 1)
-		return mergeDeviceSets(v, pinnedSids), nil
+// cachedDevicesLocked checks and removes expiry under the same lock used for
+// writes: it can never delete a newer positive during an expiry race.
+func (c *CachedSenderKeyStore) cachedDevicesLocked(dk deviceQueryKey) ([]string, bool) {
+	owner := c.deviceCache
+	entry, ok := owner.Get(dk)
+	if !ok {
+		return nil, false
 	}
+	if len(entry.devices) == 0 && !owner.now().Before(entry.expiresAt) {
+		owner.Remove(dk)
+		return nil, false
+	}
+	atomic.AddUint64(&c.hits, 1)
+	return mergeDeviceSets(entry.devices, c.pinnedDevices(dk)), true
+}
 
-	atomic.AddUint64(&c.misses, 1)
-	devices, err := c.inner.GetSenderKeyDevices(ctx, group, userBare)
-	if err != nil {
+// GetSenderKeyDevices coalesces cold enumeration without a worker goroutine.
+// Followers own their cancellation; a canceled leader allows a live follower
+// to retry. Overflow never publishes, and tokens remain until every participant
+// has consumed the first completed result (including its fixed TTL).
+func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// D-02: do NOT cache empty sets. An empty result means the sender has
-	// no DB row yet (or the key truly doesn't exist). A flusher drain will
-	// commit the row and fire onDrained; subsequent GetSenderKeyDevices calls
-	// must re-query so they see it. Caching empty would freeze the absence.
-	if len(devices) > 0 {
-		c.deviceCache.Add(dk, append([]string(nil), devices...))
+	dk := c.deviceKey(group, userBare)
+	owner := c.deviceCache
+	owner.mu.Lock()
+	if devices, hit := c.cachedDevicesLocked(dk); hit {
+		owner.mu.Unlock()
+		return devices, nil
 	}
-	return mergeDeviceSets(devices, pinnedSids), nil
+	if pins := c.pinnedDevices(dk); len(pins) > 0 {
+		owner.mu.Unlock()
+		return pins, nil
+	}
+	atomic.AddUint64(&c.misses, 1)
+	flight := owner.flights[dk]
+	if flight != nil {
+		flight.participants++
+		owner.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			c.releaseDeviceFlight(dk, flight)
+			return nil, ctx.Err()
+		case <-flight.done:
+			owner.mu.Lock()
+			devices, err := mergeDeviceSets(flight.devices, c.pinnedDevices(dk)), flight.err
+			if entry, ok := owner.Peek(dk); ok && len(entry.devices) > 0 {
+				devices = mergeDeviceSets(entry.devices, devices)
+			}
+			owner.mu.Unlock()
+			c.releaseDeviceFlight(dk, flight)
+			if err != nil && ctx.Err() == nil && (err == context.Canceled || err == context.DeadlineExceeded) {
+				return c.GetSenderKeyDevices(ctx, group, userBare)
+			}
+			return devices, err
+		}
+	}
+	if len(owner.flights) >= owner.capacity {
+		owner.mu.Unlock()
+		devices, err := c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
+		return mergeDeviceSets(devices, c.pinnedDevices(dk)), err
+	}
+	flight = &deviceQueryFlight{done: make(chan struct{}), participants: 1}
+	owner.flights[dk] = flight
+	owner.mu.Unlock()
+	devices, err := c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
+	if err == nil {
+		err = ctx.Err()
+	}
+	owner.mu.Lock()
+	// Completion is serialized with accepted writes. Re-read pins here rather
+	// than using a pre-query snapshot that can miss a just-accepted key.
+	pins := c.pinnedDevices(dk)
+	if err == nil && !flight.invalid && validDeviceResult(devices, dk.sender) {
+		entry := deviceCacheEntry{devices: mergeDeviceSets(devices, pins)}
+		if len(entry.devices) == 0 {
+			entry.expiresAt = owner.now().Add(senderKeyDeviceNegativeTTL)
+		}
+		owner.Add(dk, entry)
+	}
+	devices = mergeDeviceSets(devices, pins)
+	if entry, ok := owner.Peek(dk); ok && len(entry.devices) > 0 {
+		devices = mergeDeviceSets(entry.devices, devices)
+	}
+	flight.devices, flight.err = devices, err
+	close(flight.done)
+	owner.mu.Unlock()
+	c.releaseDeviceFlight(dk, flight)
+	return mergeDeviceSets(devices, nil), err
+}
+
+func (c *CachedSenderKeyStore) releaseDeviceFlight(dk deviceQueryKey, flight *deviceQueryFlight) {
+	owner := c.deviceCache
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	flight.participants--
+	if flight.participants == 0 && owner.flights[dk] == flight {
+		delete(owner.flights, dk)
+	}
 }
 
 // mergeDeviceSets returns the union of base and extra, deduplicated.

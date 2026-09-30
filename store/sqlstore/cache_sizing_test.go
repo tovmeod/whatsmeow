@@ -74,7 +74,7 @@ func TestCacheMemoryBudget(t *testing.T) {
 		capIdentity  = 100_000 // quick 260619-10v: lowered 150k -> 100k (GC entry-count cut)
 		capSKDevices = 300_000
 		capMsgSecret = 30_000 // quick 260619-10v: lowered 300k -> 30k (mostly-dead-weight cache)
-		baseRSSMB    = 228.0 // base RSS (non-cache) from incident pprof + pgtype strings
+		baseRSSMB    = 228.0  // base RSS (non-cache) from incident pprof + pgtype strings
 		goMemLimitMB = 3200.0
 	)
 
@@ -148,12 +148,12 @@ func TestCacheMemoryBudget(t *testing.T) {
 	runtime.KeepAlive(idLRU)
 
 	// ---- 5. SenderKeyDevices []string ------------------------------------------
-	skDevLRU, err := lru.New[string, []string](N + 100)
+	skDevLRU, err := NewSenderKeyDeviceCache(N + 100)
 	if err != nil {
 		t.Fatalf("lru.New skDevices: %v", err)
 	}
 	perObjSKDevices, perBytesSKDevices := measureHeapDelta(func(i int) {
-		skDevLRU.Add(fmt.Sprintf("skd%d|grp%d", i, i), []string{"dev1:0", "dev2:0"})
+		skDevLRU.Add(deviceQueryKey{account: fmt.Sprintf("skd%d", i), group: fmt.Sprintf("grp%d", i)}, deviceCacheEntry{devices: []string{"dev1:0", "dev2:0"}})
 	})
 	t.Logf("SKDevices    : per-entry %.2f objects, %.0f bytes (cap=%d → %.0f MB)",
 		perObjSKDevices, perBytesSKDevices, capSKDevices,

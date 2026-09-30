@@ -77,7 +77,7 @@ func TestSKPinEvictThenEnum(t *testing.T) {
 	c.updateDeviceCache("group-A", "user_1:0")
 
 	// Simulate LRU eviction by explicitly removing the deviceCache entry.
-	dk := c.key("group-A", senderKeyUserBare("user_1:0"))
+	dk := c.deviceKey("group-A", "user_1:0")
 	c.deviceCache.Remove(dk)
 
 	// After eviction the LRU is empty, but the pinned overlay still holds the entry.
@@ -124,7 +124,7 @@ func TestSKPinDrainUnpins(t *testing.T) {
 	c.flusher.Drain()
 
 	// After drain, the pin must be gone.
-	dk := c.key("group-B", senderKeyUserBare("user_2:0"))
+	dk := c.deviceKey("group-B", "user_2:0")
 	c.pinnedMu.Lock()
 	_, stillPinned := c.pinned[dk]
 	c.pinnedMu.Unlock()
@@ -172,7 +172,7 @@ func TestSKPinConcurrentWrites(t *testing.T) {
 	}
 	wg.Wait()
 
-	dk := c.key("group-C", senderKeyUserBare("user_3:0"))
+	dk := c.deviceKey("group-C", "user_3:0")
 	c.pinnedMu.Lock()
 	ps := c.pinned[dk]
 	_, has0 := ps["user_3:0"]
@@ -292,9 +292,8 @@ func TestSKPinStructureReadBeforeDrain(t *testing.T) {
 	})
 }
 
-// TestSKPinEmptyNotCached verifies that when inner returns 0 devices, the
-// result is NOT cached in the deviceCache LRU, forcing a re-query on the next call.
-func TestSKPinEmptyNotCached(t *testing.T) {
+// TestSKPinEmptyCached verifies successful empty device results share the LRU.
+func TestSKPinEmptyCached(t *testing.T) {
 	ctx := context.Background()
 	// Fresh store with no inner data; no flusher wired.
 	c, inner := newTestCachedSenderKeyStore(t, 16)
@@ -307,13 +306,13 @@ func TestSKPinEmptyNotCached(t *testing.T) {
 		t.Fatalf("GetSenderKeyDevices (2nd): %v", err)
 	}
 
-	// Both calls must have reached inner (empty not cached → 2 inner queries).
-	if got := inner.devicesCalls.Load(); got != 2 {
-		t.Errorf("inner.devicesCalls = %d, want 2 (empty result must not be cached)", got)
+	// Only the first call reaches inner during the fixed negative TTL.
+	if got := inner.devicesCalls.Load(); got != 1 {
+		t.Errorf("inner.devicesCalls = %d, want 1 (authoritative empty cached)", got)
 	}
 
-	// deviceCache must be empty (no cached entry for an empty result).
-	if got := c.deviceCache.Len(); got != 0 {
-		t.Errorf("deviceCache.Len() = %d, want 0 (empty result not cached)", got)
+	// The authoritative empty occupies exactly one existing LRU slot.
+	if got := c.deviceCache.Len(); got != 1 {
+		t.Errorf("deviceCache.Len() = %d, want 1 (empty entry shares LRU)", got)
 	}
 }

@@ -814,7 +814,7 @@ func (s *SQLStore) GetSenderKeyDevices(ctx context.Context, group, userBare stri
 		return nil, err
 	}
 	defer rows.Close()
-	var devices []string
+	devices := []string{}
 	for rows.Next() {
 		var senderID string
 		if err := rows.Scan(&senderID); err != nil {

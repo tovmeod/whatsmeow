@@ -123,7 +123,7 @@ func newStubCachedStore(t *testing.T, inner *stubRecoveryInner, sf *singleflight
 	if err != nil {
 		t.Fatalf("lru.New byte: %v", err)
 	}
-	devCache, err := lru.New[string, []string](16)
+	devCache, err := NewSenderKeyDeviceCache(16)
 	if err != nil {
 		t.Fatalf("lru.New dev: %v", err)
 	}

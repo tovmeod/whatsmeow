@@ -116,6 +116,52 @@ var (
 // portion of the libsignal address (the "<user>" part of "<user>:<device>").
 type indexKey struct{ jid, phone string }
 
+const senderKeyDeviceNegativeTTL = 5 * time.Minute
+
+// deviceQueryKey mirrors the complete enumeration domain. Universe is the
+// Container in production, or the concrete inner store in test wrappers.
+type deviceQueryKey struct {
+	universe               any
+	account, group, sender string
+}
+
+// Entries are immutable after publication. Only successful non-nil empty
+// enumerations carry an expiry; positives retain their previous semantics.
+type deviceCacheEntry struct {
+	devices   []string
+	expiresAt time.Time
+}
+
+type deviceQueryFlight struct {
+	done         chan struct{}
+	participants int
+	invalid      bool
+	devices      []string
+	err          error
+}
+
+// SenderKeyDeviceCache owns the single positive/empty LRU and bounded active
+// coordination. mu serializes expiry, publication and write fencing. Never
+// hold it across SQL, waits, flusher calls or callbacks; pinnedMu may be taken
+// under mu, and every writer releases pinnedMu before taking mu.
+type SenderKeyDeviceCache struct {
+	*lru.Cache[deviceQueryKey, deviceCacheEntry]
+	mu       sync.Mutex
+	flights  map[deviceQueryKey]*deviceQueryFlight
+	capacity int
+	now      func() time.Time
+}
+
+// NewSenderKeyDeviceCache provides one typed shared owner to external tests
+// and Container wiring. It creates no timer or worker goroutine.
+func NewSenderKeyDeviceCache(capacity int) (*SenderKeyDeviceCache, error) {
+	cache, err := lru.New[deviceQueryKey, deviceCacheEntry](capacity)
+	if err != nil {
+		return nil, err
+	}
+	return &SenderKeyDeviceCache{Cache: cache, flights: make(map[deviceQueryKey]*deviceQueryFlight), capacity: capacity, now: time.Now}, nil
+}
+
 // sessionSecondaryIndex is a process-shared secondary index for the Session
 // cache. It maps (jid, phone) → set of cacheKeys, allowing O(1) bulk-removal
 // of all cache entries belonging to a given (jid, phone) pair without walking
@@ -356,7 +402,7 @@ type signalCaches struct {
 	// sender_id list. Lets GetSenderKeyDevices be answered from cache (0 DB
 	// queries warm) instead of the DB passthrough; invalidated by PutSenderKey
 	// when a sender's device set may have changed (a new SKDM).
-	SenderKeyDevices *lru.Cache[string, []string]
+	SenderKeyDevices *SenderKeyDeviceCache
 	// perf 260601-uuy: message-secret pair cache. Keyed
 	// jid|chat.ToNonAD()|sender.ToNonAD()|message_id → (secret, realSender).
 	// Avoids a PG read + JSON-less Scan on the 22 GB whatsmeow_message_secrets
@@ -502,7 +548,7 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 	// attachCachedStores (one per SQLStore, so each flusher has the correct JID)
 	// and tracked in c.caches.senderKeyFlushers.
 	// kavtov-fork: Phase 27 — device-set index cache (see signalCaches.SenderKeyDevices).
-	c.caches.SenderKeyDevices, err = lru.New[string, []string](signalSenderKeyDevicesCacheCap)
+	c.caches.SenderKeyDevices, err = NewSenderKeyDeviceCache(signalSenderKeyDevicesCacheCap)
 	if err != nil {
 		log.Errorf("Failed to construct SenderKeyDevicesCache (cap=%d): %v", signalSenderKeyDevicesCacheCap, err)
 		panic(err)
