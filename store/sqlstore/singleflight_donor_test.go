@@ -227,7 +227,7 @@ func TestSingleFlightPerAccountInstall(t *testing.T) {
 		jid := "account" + strconv.Itoa(i) + "@s.whatsapp.net"
 		inner := newFakePutCountingStore()
 		byteCache, _ := lru.New[string, []byte](256)
-		devCache, _ := lru.New[string, []string](256)
+		devCache, _ := NewSenderKeyDeviceCache(256)
 		// No singleflight wired — each account runs PutSenderKeyStructure independently.
 		cs := NewCachedSenderKeyStore(inner, jid, byteCache, devCache, nil)
 		accounts[i] = account{cs: cs, inner: inner}

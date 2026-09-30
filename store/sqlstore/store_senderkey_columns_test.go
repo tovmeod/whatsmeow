@@ -168,7 +168,7 @@ func newCachedTestStore(t *testing.T) (*sqlstore.CachedSenderKeyStore, func()) {
 	t.Helper()
 	inner, _ := newBatchTestStore(t)
 	byteCache, _ := lru.New[string, []byte](1024)
-	devCache, _ := lru.New[string, []string](1024)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(1024)
 	cs := sqlstore.NewCachedSenderKeyStore(inner, testJID, byteCache, devCache, nil)
 	// No flusher: write-through mode for these tests.
 	return cs, func() {}
@@ -219,7 +219,7 @@ func TestSenderKeyColumnsSQL_LegacyRow(t *testing.T) {
 
 	// GetSenderKeyStructure via CachedSenderKeyStore wrapping the inner.
 	byteCache, _ := lru.New[string, []byte](1024)
-	devCache, _ := lru.New[string, []string](1024)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(1024)
 	cs := sqlstore.NewCachedSenderKeyStore(inner, testJID, byteCache, devCache, nil)
 
 	got, err := cs.GetSenderKeyStructure(ctx, "g2@g.us", "u2_1:0")
@@ -250,7 +250,7 @@ func TestSenderKeyColumnsSQL_FmtVer2IgnoresBlob(t *testing.T) {
 
 	// Verify initial read works.
 	byteCache, _ := lru.New[string, []byte](1024)
-	devCache, _ := lru.New[string, []string](1024)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(1024)
 	cs := sqlstore.NewCachedSenderKeyStore(inner, testJID, byteCache, devCache, nil)
 
 	got, err := cs.GetSenderKeyStructure(ctx, "g3@g.us", "u3_1:0")
@@ -314,7 +314,7 @@ func TestSenderKeyColumnOnlyWrite(t *testing.T) {
 
 	// The flat blob must round-trip back to the original structure.
 	byteCache, _ := lru.New[string, []byte](1024)
-	devCache, _ := lru.New[string, []string](1024)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(1024)
 	cs := sqlstore.NewCachedSenderKeyStore(inner, testJID, byteCache, devCache, nil)
 
 	fromFlat, err := cs.GetSenderKeyStructure(ctx, "g4@g.us", "u4_1:0")

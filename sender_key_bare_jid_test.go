@@ -286,7 +286,7 @@ func TestGroupSenderKeyDeviceDisregardFallback(t *testing.T) {
 
 	for _, lookupDev := range []uint8{0, 2} {
 		lookupDev := lookupDev
-		t.Run(strings.Join([]string{"lookupDev", string(rune('0'+lookupDev))}, ""), func(t *testing.T) {
+		t.Run(strings.Join([]string{"lookupDev", string(rune('0' + lookupDev))}, ""), func(t *testing.T) {
 			fake := newFakeSenderKeyStore()
 			cli := newTestClient(fake)
 
@@ -519,7 +519,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	containerB := sqlstore.NewWithDB(db, "postgres", nil)
 	innerB := sqlstore.NewSQLStore(containerB, jidBParsed)
 	byteB, _ := lru.New[string, []byte](256)
-	devB, _ := lru.New[string, []string](256)
+	devB, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	csBStore := sqlstore.NewCachedSenderKeyStore(innerB, inlineTestJIDB, byteB, devB, nil)
 
 	// Phase 38.4-03: the parsed struct cache is deleted. The flat c.cache
@@ -564,7 +564,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	containerC := sqlstore.NewWithDB(db, "postgres", nil)
 	innerC := sqlstore.NewSQLStore(containerC, jidCParsed)
 	byteC, _ := lru.New[string, []byte](256)
-	devC, _ := lru.New[string, []string](256)
+	devC, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	csC := sqlstore.NewCachedSenderKeyStore(innerC, inlineTestJIDC, byteC, devC, nil)
 
 	deviceC := &store.Device{
@@ -627,7 +627,9 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 
 // TestInlineDecryptIterationSafeRecovery proves the production recovery path
 // with real sender-key ciphertext: a donor at iteration 10 cannot recover C's
-// target-5 message, but that negative cannot suppress recovery of target 10.
+// target-5 message. Phase 38.10 intentionally suppresses target 10 until the
+// fixed negative expires or a readable write invalidates it. This variant
+// proves observable-write invalidation without changing the cryptographic gates.
 //
 // B advances by decrypting message 9, which leaves real skipped-key state for
 // messages 0 through 8. C starts with a distinct, older Alice key state. After
@@ -675,7 +677,7 @@ func TestInlineDecryptIterationSafeRecovery(t *testing.T) {
 		if cacheErr != nil {
 			t.Fatalf("lru.New byte cache: %v", cacheErr)
 		}
-		deviceCache, cacheErr := lru.New[string, []string](256)
+		deviceCache, cacheErr := sqlstore.NewSenderKeyDeviceCache(256)
 		if cacheErr != nil {
 			t.Fatalf("lru.New device cache: %v", cacheErr)
 		}
@@ -775,8 +777,24 @@ func TestInlineDecryptIterationSafeRecovery(t *testing.T) {
 		t.Fatalf("target-5 changed C state: got %+v, want only legacy key %d", beforeMerge, legacyKeyID)
 	}
 
-	// Target 10 is outside target-5's lower-or-equal negative coverage. B@9
-	// is eligible, so C borrows the structure and decrypts real ciphertext.
+	// Target 6 and 10 are suppressed by the same fixed live negative.
+	for _, target := range []uint32{6, 10} {
+		if donor, ok, err := cachedC.TryInlineRecovery(ctx, group, labeled, senderBare, currentKeyID, target); err != nil || ok || donor != "" {
+			t.Fatalf("live negative target-%d = %q, %t, %v; want suppression", target, donor, ok, err)
+		}
+		if got, err := cCipher.Decrypt(ctx, messages[target]); err == nil {
+			t.Fatalf("live negative target-%d unexpectedly decrypted %q", target, got)
+		}
+	}
+	// Re-publish B's readable state through the observable write path. This
+	// defeats the matching negative before five minutes and permits new work.
+	donorState, err := cachedB.GetSenderKeyStructure(ctx, group, labeled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cachedB.PutSenderKeyStructure(ctx, group, labeled, donorState); err != nil {
+		t.Fatal(err)
+	}
 	donorJID, recovered, recoveryErr := cachedC.TryInlineRecovery(ctx, group, labeled, senderBare, currentKeyID, 10)
 	if recoveryErr != nil {
 		t.Fatalf("target-10 TryInlineRecovery: %v", recoveryErr)
@@ -815,5 +833,5 @@ func TestInlineDecryptIterationSafeRecovery(t *testing.T) {
 	if cachedB == nil {
 		t.Fatal("B cached sender-key store is nil")
 	}
-	t.Logf("PASS: target-5 rejected, target-10 donor=%s decrypted with preserved legacy and skipped states", donorJID)
+	t.Log("PASS: target-5 rejected, targets-6/10 suppressed, observable-write invalidation allowed later decrypt; legacy and skipped states preserved")
 }

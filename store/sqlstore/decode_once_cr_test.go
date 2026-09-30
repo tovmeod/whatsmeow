@@ -74,7 +74,7 @@ func buildTestDevice(t *testing.T, lruCap int) *testDeviceHandles {
 	if err != nil {
 		t.Fatalf("lru.New skCache: %v", err)
 	}
-	devCache, err := lru.New[string, []string](lruCap)
+	devCache, err := NewSenderKeyDeviceCache(lruCap)
 	if err != nil {
 		t.Fatalf("lru.New devCache: %v", err)
 	}

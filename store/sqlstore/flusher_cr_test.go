@@ -279,7 +279,7 @@ func TestCR05BulkWriteReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lru.New: %v", err)
 	}
-	deviceCache, err := lru.New[string, []string](16)
+	deviceCache, err := NewSenderKeyDeviceCache(16)
 	if err != nil {
 		t.Fatalf("lru.New deviceCache: %v", err)
 	}

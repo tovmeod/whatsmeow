@@ -96,7 +96,7 @@ func newRecoveryTestStoreB(t *testing.T, db *sql.DB) *sqlstore.CachedSenderKeySt
 	innerB := sqlstore.NewSQLStore(containerB, jidB)
 
 	byteCache, _ := lru.New[string, []byte](256)
-	devCache, _ := lru.New[string, []string](256)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	return sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 }
 
@@ -646,7 +646,7 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		containerB := sqlstore.NewWithDB(db, "postgres", nil)
 		innerB := sqlstore.NewSQLStore(containerB, flatJIDB)
 		byteCache, _ := lru.New[string, []byte](256)
-		devCache, _ := lru.New[string, []string](256)
+		devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
 		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache, nil)
 
 		targetSenderID := flatBareUser + ":0"
@@ -719,7 +719,7 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		containerB := sqlstore.NewWithDB(db, "postgres", nil)
 		innerB := sqlstore.NewSQLStore(containerB, flatJIDB)
 		byteCache, _ := lru.New[string, []byte](256)
-		devCache, _ := lru.New[string, []string](256)
+		devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
 		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache, nil)
 
 		targetSenderID := flatBareUser + ":0"
@@ -873,7 +873,7 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 	innerB := sqlstore.NewSQLStore(containerB, jidB)
 
 	byteCache, _ := lru.New[string, []byte](256)
-	devCache, _ := lru.New[string, []string](256)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 
 	// Wire a flusher that is NOT started (attached-not-drained = stale DB window).
@@ -1452,7 +1452,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		containerB := sqlstore.NewWithDB(db, "postgres", nil)
 		innerBSeed := sqlstore.NewSQLStore(containerB, jidB)
 		byteCache, _ := lru.New[string, []byte](256)
-		devCache, _ := lru.New[string, []string](256)
+		devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
 		csBSeed := sqlstore.NewCachedSenderKeyStore(innerBSeed, recoveryTestJIDB, byteCache, devCache, nil)
 		// No flusher → write-through mode (warms the flat c.cache + writes DB).
 
@@ -1608,7 +1608,7 @@ func TestInlineRecoveryDonorPrependedAndFlushed(t *testing.T) {
 	containerB := sqlstore.NewWithDB(db, "postgres", nil)
 	innerB := sqlstore.NewSQLStore(containerB, jidB)
 	byteCache, _ := lru.New[string, []byte](256)
-	devCache, _ := lru.New[string, []string](256)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 
 	flusher := sqlstore.NewSenderKeyFlusher(innerB, waLog.Noop, 0)
@@ -1786,7 +1786,7 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	containerB := sqlstore.NewWithDB(db, "postgres", nil)
 	innerB := sqlstore.NewSQLStore(containerB, jidB)
 	byteCache, _ := lru.New[string, []byte](256)
-	devCache, _ := lru.New[string, []string](256)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 
 	// Warm the flat cache with the (cacheable) 6-state existing structure via the
@@ -1920,7 +1920,7 @@ func TestInlineRecoveryCacheOnlyGenerationSurvives(t *testing.T) {
 	containerB := sqlstore.NewWithDB(db, "postgres", nil)
 	innerB := sqlstore.NewSQLStore(containerB, jidB)
 	byteCache, _ := lru.New[string, []byte](256)
-	devCache, _ := lru.New[string, []string](256)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
 	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
 
 	flusher := sqlstore.NewSenderKeyFlusher(innerB, waLog.Noop, 0)

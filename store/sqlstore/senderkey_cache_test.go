@@ -173,7 +173,7 @@ func newCohTestDevice(t *testing.T) (device *store.Device, cs *sqlstore.CachedSe
 	inner, db = newBatchTestStoreWithJID(t, cohTestJID)
 
 	byteCache, _ := lru.New[string, []byte](1024)
-	devCache, _ := lru.New[string, []string](1024)
+	devCache, _ := sqlstore.NewSenderKeyDeviceCache(1024)
 	cs = sqlstore.NewCachedSenderKeyStore(inner, cohTestJID, byteCache, devCache, nil)
 
 	// Build a minimal *store.Device with the JID set (required for cacheKey scoping).

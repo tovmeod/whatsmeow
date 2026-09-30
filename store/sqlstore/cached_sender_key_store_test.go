@@ -9,13 +9,263 @@ package sqlstore
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+func TestSenderKeyReinitialization(t *testing.T) {
+	container := &Container{log: waLog.Noop}
+	wireSignalCaches(container, waLog.Noop)
+	t.Cleanup(func() { closeSignalCaches(container) })
+	jid := types.NewJID("account", types.DefaultUserServer)
+	device := &store.Device{ID: &jid}
+	attachCachedStores(container, device, NewSQLStore(container, jid))
+	old := device.SenderKeys.(*CachedSenderKeyStore)
+	dk := old.deviceKey("g", "sender:1")
+	old.deviceCache.Add(dk, deviceCacheEntry{})
+	old.pinned[dk] = map[string]struct{}{"sender:1": {}}
+	old.pinnedBlobs[old.key("g", "sender:1")] = []byte("pending")
+	flusher := old.flusher
+	attachCachedStores(container, device, NewSQLStore(container, jid))
+	fresh := device.SenderKeys.(*CachedSenderKeyStore)
+	if _, err := old.GetSenderKeyDevices(context.Background(), "g", "sender"); err == nil {
+		t.Fatal("retired sender-key wrapper remains usable after reinitialization")
+	}
+	if fresh.flusher != flusher || !containsString(fresh.pinnedDevices(dk), "sender:1") {
+		t.Fatal("reattachment lost the singleton flusher or pending overlay")
+	}
+	flusher.notifyDrained(SenderKeyRow{Group: "g", User: "sender:1", Blob: []byte("pending")})
+	if len(fresh.pinnedDevices(dk)) != 0 || len(old.pinned) != 0 || len(old.pinnedBlobs) != 0 {
+		t.Fatal("drain callback or retired overlay cleanup failed")
+	}
+}
+
+// Pause after a successful inline SQL flush has removed the dirty row, while
+// its writer still owns writeMu and must acquire snapshotMu to unpin.
+func TestSenderKeyInlineFlushRetirement(t *testing.T) {
+	for _, action := range []string{"attach", "delete", "close"} {
+		t.Run(action, func(t *testing.T) {
+			old, inner := newTestCachedSenderKeyStore(t, 16)
+			f := NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100)
+			old.SetFlusher(f)
+			structure, _ := store.UnpackFlat(testBlob(7, 2))
+			if err := old.PutSenderKeyStructure(context.Background(), "g", "sender:2", structure); err != nil {
+				t.Fatal(err)
+			}
+			entered, release := make(chan struct{}), make(chan struct{})
+			f.SetOnDrained(func(_, user string) {
+				if user == "sender:1" {
+					close(entered)
+					<-release
+				}
+			})
+			f.backpressureCap = 0
+			writeDone := make(chan error, 1)
+			go func() { writeDone <- old.PutSenderKeyStructure(context.Background(), "g", "sender:1", structure) }()
+			<-entered
+			fresh := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
+			container := &Container{log: waLog.Noop}
+			container.caches.senderKeyFlusherMap = map[string]*SenderKeyFlusher{old.jid: f}
+			retireDone := make(chan struct{})
+			go func() {
+				defer close(retireDone)
+				switch action {
+				case "attach":
+					fresh.SetFlusher(f)
+				case "delete":
+					stopAccountSignalCaches(container, old.jid)
+				case "close":
+					closeSignalCaches(container)
+				}
+			}()
+			awaitSenderKeyRetirementWait(t)
+			close(release)
+			select {
+			case err := <-writeDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("inline writer deadlocked with owner retirement")
+			}
+			select {
+			case <-retireDone:
+			case <-time.After(time.Second):
+				t.Fatal("owner retirement did not finish")
+			}
+			if !old.retired.Load() {
+				t.Fatal("old owner remains writable")
+			}
+			if action == "attach" {
+				pins := fresh.pinnedDevices(fresh.deviceKey("g", "sender"))
+				if len(pins) != 1 || pins[0] != "sender:2" {
+					t.Fatalf("replacement lost pending pin or retained drained pin: %v", pins)
+				}
+				fresh.cache.Purge()
+				if got, err := fresh.GetSenderKeyStructure(context.Background(), "g", "sender:2"); err != nil || got == nil {
+					t.Fatalf("replacement lost pending blob: %v, %v", got, err)
+				}
+				f.Stop()
+			}
+		})
+	}
+}
+
+func awaitSenderKeyRetirementWait(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		buf := make([]byte, 128<<10)
+		n := runtime.Stack(buf, true)
+		stack := string(buf[:n])
+		if strings.Contains(stack, "(*CachedSenderKeyStore).retire(") || strings.Contains(stack, "(*SenderKeyFlusher).lockOwner(") {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatal("lifecycle did not reach its owner-write barrier")
+}
+
+func TestSenderKeyConcurrentOwnerReplacement(t *testing.T) {
+	old, inner := newTestCachedSenderKeyStore(t, 16)
+	f := NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100)
+	old.SetFlusher(f)
+	structure, _ := store.UnpackFlat(testBlob(7, 2))
+	if err := old.PutSenderKeyStructure(context.Background(), "g", "sender:1", structure); err != nil {
+		t.Fatal(err)
+	}
+	first := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
+	second := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
+	old.writeMu.Lock()
+	done := make(chan struct{}, 2)
+	for _, next := range []*CachedSenderKeyStore{first, second} {
+		go func() { next.SetFlusher(f); done <- struct{}{} }()
+	}
+	// Both attachments have selected the old owner and are waiting for its
+	// writer. The loser must recheck instead of transferring the old empty map.
+	deadline := time.Now().Add(time.Second)
+	for {
+		buf := make([]byte, 128<<10)
+		n := runtime.Stack(buf, true)
+		if strings.Count(string(buf[:n]), "(*SenderKeyFlusher).lockOwner(") >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			old.writeMu.Unlock()
+			t.Fatal("attachments did not reach the write barrier")
+		}
+		runtime.Gosched()
+	}
+	old.writeMu.Unlock()
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent attachment deadlocked")
+		}
+	}
+	f.snapshotMu.RLock()
+	owner := f.owner
+	f.snapshotMu.RUnlock()
+	if owner.retired.Load() || !containsString(owner.pinnedDevices(owner.deviceKey("g", "sender")), "sender:1") {
+		t.Fatal("concurrent replacement lost the live owner or pending overlay")
+	}
+	if !old.retired.Load() || first.retired.Load() == second.retired.Load() {
+		t.Fatal("replacement did not retire exactly the displaced owners")
+	}
+	f.Stop()
+}
+
+func TestSenderKeyTeardownDonorFlights(t *testing.T) {
+	stub := &stubRecoveryInner{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	blobs, _ := lru.New[string, []byte](4)
+	devices, _ := NewSenderKeyDeviceCache(4)
+	c := NewCachedSenderKeyStore(stub, "account", blobs, devices, nil)
+	key := c.donorKey("g", "sender", 7)
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = c.lookupDonor(context.Background(), stub, key, 1) }()
+	<-stub.entered
+	other := donorQueryKey{universe: &Container{}, group: "other", sender: "sender", keyID: 7}
+	noDonorCacheMu.Lock()
+	noDonorCache.Add(other, noDonorCacheEntry{expiresAt: time.Now().Add(time.Hour)})
+	noDonorCacheMu.Unlock()
+	clearDonorUniverse(stub)
+	noDonorCacheMu.Lock()
+	_, retained := donorWaves[key]
+	_, active := donorFlights[donorWorkKey{key, 1}]
+	_, otherPresent := noDonorCache.Peek(other)
+	noDonorCacheMu.Unlock()
+	close(stub.release)
+	<-done
+	if retained || active {
+		t.Fatal("teardown retained old-domain coordination")
+	}
+	if !otherPresent || getNoDonorCacheEntry(key, 1, time.Now()) {
+		t.Fatal("teardown affected another universe or allowed stale absence")
+	}
+	clearDonorUniverse(other.universe)
+}
+
+func TestSenderKeyTeardownDeleteDevice(t *testing.T) {
+	sq := commitTestStore(t, func([]driver.NamedValue) error { return nil })
+	c := sq.Container
+	wireSignalCaches(c, waLog.Noop)
+	t.Cleanup(func() { closeSignalCaches(c) })
+	jidA := types.NewJID("removed", types.DefaultUserServer)
+	jidB := types.NewJID("preserved", types.DefaultUserServer)
+	a, b := &store.Device{ID: &jidA}, &store.Device{ID: &jidB}
+	attachCachedStores(c, a, NewSQLStore(c, jidA))
+	attachCachedStores(c, b, NewSQLStore(c, jidB))
+	old := a.SenderKeys.(*CachedSenderKeyStore)
+	other := b.SenderKeys.(*CachedSenderKeyStore)
+	keyA, keyB := old.deviceKey("g", "sender"), other.deviceKey("g", "sender")
+	c.caches.SenderKeyDevices.Add(keyA, deviceCacheEntry{})
+	c.caches.SenderKeyDevices.Add(keyB, deviceCacheEntry{})
+	old.pinned[keyA] = map[string]struct{}{"sender:1": {}}
+	if err := c.DeleteDevice(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	if c.caches.SenderKeyDevices.Contains(keyA) || !c.caches.SenderKeyDevices.Contains(keyB) || len(old.pinned) != 0 {
+		t.Fatal("account cleanup retained removed state or damaged another account")
+	}
+	if len(c.caches.senderKeyFlusherMap) != 1 || len(c.caches.sessionFlusherMap) != 1 || old.retired.Load() == false {
+		t.Fatal("removed account's owner/flushers survived teardown")
+	}
+}
+
+func TestSenderKeyReinitializationFencesDeviceFlight(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	c, inner := newDevicePolicyStore(t, 4, func(context.Context, string, string) ([]string, error) {
+		close(entered)
+		<-release
+		return []string{}, nil
+	})
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = c.GetSenderKeyDevices(context.Background(), "g", "sender") }()
+	<-entered
+	fresh := NewCachedSenderKeyStore(inner, c.jid, c.cache, c.deviceCache, nil)
+	c.retire(fresh)
+	if len(c.deviceCache.flights) != 0 {
+		t.Fatal("retirement retained old device flights")
+	}
+	close(release)
+	<-done
+	if c.deviceCache.Len() != 0 {
+		t.Fatal("old empty query published into replacement owner")
+	}
+}
 
 // Compile-time conformance is asserted inside cached_sender_key_store.go via
 //   var _ store.SenderKeyStore = (*CachedSenderKeyStore)(nil)
@@ -44,9 +294,9 @@ func newTestCachedSenderKeyStore(t *testing.T, capSize int) (*CachedSenderKeySto
 	if err != nil {
 		t.Fatalf("lru.New[string, []byte] failed: %v", err)
 	}
-	deviceCache, err := lru.New[string, []string](capSize)
+	deviceCache, err := NewSenderKeyDeviceCache(capSize)
 	if err != nil {
-		t.Fatalf("lru.New[string, []string] failed: %v", err)
+		t.Fatalf("NewSenderKeyDeviceCache failed: %v", err)
 	}
 	// "test-jid" with no trailing pipe — wrapper's key() prepends the
 	// separator. Matches production format used by Container.initializeDevice.
@@ -67,6 +317,314 @@ func TestCachedSenderKeyStore_InterfaceConformance(t *testing.T) {
 	if c != nil {
 		t.Fatal("nil pointer should stay nil")
 	}
+}
+
+func TestSenderKeyDeviceNegativeTTLStartsAtCompletion(t *testing.T) {
+	startedAt := time.Unix(2_000, 0)
+	now := startedAt
+	calls := 0
+	c, _ := newDevicePolicyStore(t, 16, func(context.Context, string, string) ([]string, error) {
+		calls++
+		if calls == 1 {
+			// The first query consumes one minute before authoritative absence.
+			now = startedAt.Add(time.Minute)
+		}
+		return []string{}, nil
+	})
+	c.deviceCache.now = func() time.Time { return now }
+	read := func() {
+		t.Helper()
+		devices, err := c.GetSenderKeyDevices(context.Background(), "empty", "user_1")
+		if err != nil || len(devices) != 0 {
+			t.Fatalf("authoritative empty = %v, %v", devices, err)
+		}
+	}
+	read()
+	now = startedAt.Add(5 * time.Minute)
+	read()
+	if calls != 1 {
+		t.Fatalf("deadline anchored at query start: calls = %d, want 1", calls)
+	}
+	now = startedAt.Add(6*time.Minute - time.Nanosecond)
+	read()
+	if calls != 1 {
+		t.Fatalf("pre-completion-deadline calls = %d, want 1", calls)
+	}
+	now = now.Add(time.Nanosecond)
+	read()
+	if calls != 2 {
+		t.Fatalf("completion deadline equality calls = %d, want 2", calls)
+	}
+}
+
+func TestSenderKeyDeviceNegativeFixedTTL(t *testing.T) {
+	c, inner := newTestCachedSenderKeyStore(t, 16)
+	now := time.Unix(1_000, 0)
+	c.deviceCache.now = func() time.Time { return now }
+	for range 3 {
+		if _, err := c.GetSenderKeyDevices(context.Background(), "empty", "user_1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := inner.devicesCalls.Load(); got != 1 {
+		t.Fatalf("repeated authoritative empty queries = %d, want 1", got)
+	}
+	now = now.Add(5*time.Minute - time.Nanosecond)
+	_, _ = c.GetSenderKeyDevices(context.Background(), "empty", "user_1:99")
+	if inner.devicesCalls.Load() != 1 {
+		t.Fatal("pre-expiry device suffix lookup missed")
+	}
+	now = now.Add(time.Nanosecond)
+	_, _ = c.GetSenderKeyDevices(context.Background(), "empty", "user_1")
+	if inner.devicesCalls.Load() != 2 {
+		t.Fatal("equality must expire")
+	}
+	if err := c.PutSenderKey(context.Background(), "empty", "user_1:7", []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	got, err := c.GetSenderKeyDevices(context.Background(), "empty", "user_1")
+	if err != nil || !containsString(got, "user_1:7") || inner.devicesCalls.Load() != 2 {
+		t.Fatalf("positive expired: %v %v", got, err)
+	}
+}
+
+type devicePolicyInner struct {
+	*fakeSenderKeyStore
+	read  func(context.Context, string, string) ([]string, error)
+	calls atomic.Int64
+}
+
+func (s *devicePolicyInner) GetSenderKeyDevices(ctx context.Context, group, sender string) ([]string, error) {
+	s.calls.Add(1)
+	return s.read(ctx, group, sender)
+}
+
+func newDevicePolicyStore(t *testing.T, cap int, read func(context.Context, string, string) ([]string, error)) (*CachedSenderKeyStore, *devicePolicyInner) {
+	t.Helper()
+	inner := &devicePolicyInner{fakeSenderKeyStore: newFakeSenderKeyStore(), read: read}
+	blobs, _ := lru.New[string, []byte](cap)
+	devices, err := NewSenderKeyDeviceCache(cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewCachedSenderKeyStore(inner, "account", blobs, devices, nil), inner
+}
+
+func TestSenderKeyDeviceNegativeIdentity(t *testing.T) {
+	c, inner := newDevicePolicyStore(t, 32, func(context.Context, string, string) ([]string, error) { return []string{}, nil })
+	for _, pair := range [][2]string{{"a|b", "c"}, {"a", "b|c"}, {"g", "42_1"}, {"g", "42_2"}, {"g", "42@s.whatsapp.net"}, {"g", "42@lid"}} {
+		for range 2 {
+			_, _ = c.GetSenderKeyDevices(context.Background(), pair[0], pair[1])
+		}
+	}
+	if inner.calls.Load() != 6 {
+		t.Fatalf("identity collision: %d queries", inner.calls.Load())
+	}
+	c2 := NewCachedSenderKeyStore(inner, "other-account", c.cache, c.deviceCache, nil)
+	_, _ = c2.GetSenderKeyDevices(context.Background(), "a", "b|c")
+	other := &devicePolicyInner{fakeSenderKeyStore: newFakeSenderKeyStore(), read: inner.read}
+	c3 := NewCachedSenderKeyStore(other, c.jid, c.cache, c.deviceCache, nil)
+	_, _ = c3.GetSenderKeyDevices(context.Background(), "a", "b|c")
+	if inner.calls.Load() != 7 || other.calls.Load() != 1 {
+		t.Fatal("account/store absence leaked")
+	}
+}
+
+func TestSenderKeyDeviceNegativeNonAuthoritative(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		devices []string
+		err     error
+	}{
+		{"nil", nil, nil}, {"malformed", []string{"user_1:"}, nil}, {"wrong-sender", []string{"other:0"}, nil}, {"error", nil, errors.New("query failed")}, {"cancel", []string{}, context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, inner := newDevicePolicyStore(t, 4, func(context.Context, string, string) ([]string, error) { return tc.devices, tc.err })
+			for range 2 {
+				_, _ = c.GetSenderKeyDevices(context.Background(), "g", "user_1")
+			}
+			if inner.calls.Load() != 2 || c.deviceCache.Len() != 0 {
+				t.Fatal("non-authoritative result cached")
+			}
+		})
+	}
+}
+
+func awaitDeviceParticipants(t *testing.T, c *CachedSenderKeyStore, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.deviceCache.mu.Lock()
+		n := 0
+		for _, f := range c.deviceCache.flights {
+			n += f.participants
+		}
+		c.deviceCache.mu.Unlock()
+		if n == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("participants=%d want=%d", n, want)
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestSenderKeyDeviceNegativeCoalescing(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	c, inner := newDevicePolicyStore(t, 4, func(ctx context.Context, _, _ string) ([]string, error) {
+		close(entered)
+		select {
+		case <-release:
+			return []string{}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	var wg sync.WaitGroup
+	results := make(chan error, 50)
+	launch := func(ctx context.Context) {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, err := c.GetSenderKeyDevices(ctx, "g", "user_1"); results <- err }()
+	}
+	launch(context.Background())
+	<-entered
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	launch(cancelCtx)
+	for range 48 {
+		launch(context.Background())
+	}
+	awaitDeviceParticipants(t, c, 50)
+	cancel()
+	if err := <-results; !errors.Is(err, context.Canceled) {
+		t.Fatalf("follower cancel: %v", err)
+	}
+	close(release)
+	wg.Wait()
+	for range 49 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if inner.calls.Load() != 1 || len(c.deviceCache.flights) != 0 {
+		t.Fatal("coalescing or cleanup failed")
+	}
+}
+
+func TestSenderKeyDeviceNegativeWriteFence(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var reads atomic.Int64
+	c, inner := newDevicePolicyStore(t, 4, func(context.Context, string, string) ([]string, error) {
+		if reads.Add(1) == 1 {
+			close(entered)
+			<-release
+			return []string{}, nil
+		}
+		return []string{"user_1:0"}, nil
+	})
+	result := make(chan []string, 1)
+	go func() { got, _ := c.GetSenderKeyDevices(context.Background(), "g", "user_1"); result <- got }()
+	<-entered
+	if err := c.PutSenderKey(context.Background(), "g", "user_1:7", []byte("usable")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.GetSenderKeyDevices(context.Background(), "g", "user_1")
+	if err != nil || !containsString(got, "user_1:7") || !containsString(got, "user_1:0") {
+		t.Fatalf("pin hidden while query blocked: %v %v", got, err)
+	}
+	close(release)
+	if got := <-result; !containsString(got, "user_1:7") {
+		t.Fatalf("late completion hid pin: %v", got)
+	}
+	if entry, ok := c.deviceCache.Peek(c.deviceKey("g", "user_1")); ok && len(entry.devices) == 0 {
+		t.Fatal("late absence published")
+	}
+	for range 2 {
+		got, err := c.GetSenderKeyDevices(context.Background(), "g", "user_1")
+		if err != nil || len(got) != 2 {
+			t.Fatalf("incomplete entry hid a device after stale scan: %v, %v", got, err)
+		}
+	}
+	if inner.calls.Load() != 3 {
+		t.Fatalf("expected old scan, bounded bypass, then one complete scan: %d", inner.calls.Load())
+	}
+}
+
+func TestSenderKeyDeviceTelemetry(t *testing.T) {
+	c, _ := newDevicePolicyStore(t, 2, func(_ context.Context, group, sender string) ([]string, error) {
+		if group == "positive" {
+			return []string{sender + ":0"}, nil
+		}
+		return []string{}, nil
+	})
+	now := time.Unix(1_000, 0)
+	c.deviceCache.now = func() time.Time { return now }
+	ctx := context.Background()
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	now = now.Add(5 * time.Minute)
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "positive", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "positive", "user_1")
+	c.updateDeviceCache("negative", "user_1:7")
+	_, _ = c.GetSenderKeyDevices(ctx, "other", "user_1")
+	m := c.deviceCache.Metrics()
+	if m.PositiveHits != 1 || m.NegativeHits != 1 || m.Queries != 4 || m.Expiries != 1 || m.Invalidations != 1 || m.Evictions != 1 || m.Overflows != 0 {
+		t.Fatalf("metrics: %+v", m)
+	}
+}
+
+func TestSenderKeyDeviceCacheCapacity(t *testing.T) {
+	c, inner := newDevicePolicyStore(t, 2, func(_ context.Context, group, sender string) ([]string, error) {
+		if group == "positive" {
+			return []string{sender + ":0"}, nil
+		}
+		return []string{}, nil
+	})
+	ctx := context.Background()
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "positive", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "churn", "user_1")
+	if c.deviceCache.Len() != 2 {
+		t.Fatal("positive and empty must compete at cap")
+	}
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	if inner.calls.Load() != 4 {
+		t.Fatal("evicted absence must query")
+	}
+	for i := range 1000 {
+		_, _ = c.GetSenderKeyDevices(ctx, fmt.Sprintf("churn-%d", i), "user_1")
+		if c.deviceCache.Len() > 2 || len(c.deviceCache.flights) != 0 {
+			t.Fatal("state exceeded cap or retained completed flight")
+		}
+	}
+	t.Run("overflow", func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		c, inner := newDevicePolicyStore(t, 1, func(_ context.Context, group, _ string) ([]string, error) {
+			if group == "blocked" {
+				close(entered)
+				<-release
+			}
+			return []string{}, nil
+		})
+		done := make(chan struct{})
+		go func() { _, _ = c.GetSenderKeyDevices(ctx, "blocked", "user_1"); close(done) }()
+		<-entered
+		for range 2 {
+			_, _ = c.GetSenderKeyDevices(ctx, "overflow", "user_1")
+		}
+		c.deviceCache.mu.Lock()
+		if len(c.deviceCache.flights) != 1 || c.deviceCache.Len() != 0 {
+			t.Fatal("overflow allocated or cached absence")
+		}
+		c.deviceCache.mu.Unlock()
+		close(release)
+		<-done
+		if inner.calls.Load() != 3 || c.deviceCache.Metrics().Overflows != 2 || len(c.deviceCache.flights) != 0 {
+			t.Fatal("overflow query or cleanup failed")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

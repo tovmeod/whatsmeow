@@ -116,6 +116,75 @@ var (
 // portion of the libsignal address (the "<user>" part of "<user>:<device>").
 type indexKey struct{ jid, phone string }
 
+const senderKeyDeviceNegativeTTL = 5 * time.Minute
+
+// deviceQueryKey mirrors the complete enumeration domain. Universe is the
+// Container in production, or the concrete inner store in test wrappers.
+type deviceQueryKey struct {
+	universe               any
+	account, group, sender string
+}
+
+// Entries are immutable after publication. Only successful non-nil empty
+// enumerations carry an expiry; positives retain their previous semantics.
+type deviceCacheEntry struct {
+	devices   []string
+	expiresAt time.Time
+	// A cold write proves these devices readable, but says nothing about other
+	// persisted siblings. Only an authoritative enumeration completes the set.
+	incomplete bool
+}
+
+type deviceQueryFlight struct {
+	done         chan struct{}
+	participants int
+	invalid      bool
+	devices      []string
+	err          error
+	completed    bool
+	expiresAt    time.Time
+}
+
+// SenderKeyDeviceCache owns the single positive/empty LRU and bounded active
+// coordination. mu serializes expiry, publication and write fencing. Never
+// hold it across SQL, waits, flusher calls or callbacks; pinnedMu may be taken
+// under mu, and every writer releases pinnedMu before taking mu.
+type SenderKeyDeviceCache struct {
+	*lru.Cache[deviceQueryKey, deviceCacheEntry]
+	mu                                                                                 sync.Mutex
+	flights                                                                            map[deviceQueryKey]*deviceQueryFlight
+	capacity                                                                           int
+	now                                                                                func() time.Time
+	positiveHits, negativeHits, queries, expiries, invalidations, evictions, overflows atomic.Uint64
+}
+
+// DeviceCacheMetrics contains aggregate totals only: no identity or key labels.
+type DeviceCacheMetrics struct {
+	PositiveHits, NegativeHits, Queries, Expiries, Invalidations, Evictions, Overflows uint64
+}
+
+func (c *SenderKeyDeviceCache) Metrics() DeviceCacheMetrics {
+	return DeviceCacheMetrics{c.positiveHits.Load(), c.negativeHits.Load(), c.queries.Load(), c.expiries.Load(), c.invalidations.Load(), c.evictions.Load(), c.overflows.Load()}
+}
+
+func (c *SenderKeyDeviceCache) Add(key deviceQueryKey, entry deviceCacheEntry) bool {
+	evicted := c.Cache.Add(key, entry)
+	if evicted {
+		c.evictions.Add(1)
+	}
+	return evicted
+}
+
+// NewSenderKeyDeviceCache provides one typed shared owner to external tests
+// and Container wiring. It creates no timer or worker goroutine.
+func NewSenderKeyDeviceCache(capacity int) (*SenderKeyDeviceCache, error) {
+	cache, err := lru.New[deviceQueryKey, deviceCacheEntry](capacity)
+	if err != nil {
+		return nil, err
+	}
+	return &SenderKeyDeviceCache{Cache: cache, flights: make(map[deviceQueryKey]*deviceQueryFlight), capacity: capacity, now: time.Now}, nil
+}
+
 // sessionSecondaryIndex is a process-shared secondary index for the Session
 // cache. It maps (jid, phone) → set of cacheKeys, allowing O(1) bulk-removal
 // of all cache entries belonging to a given (jid, phone) pair without walking
@@ -339,6 +408,7 @@ func addressUser(address string) string {
 // upstream merges into container.go only ever conflict on those 4-5 surface
 // lines, not on every cache-related field declaration.
 type signalCaches struct {
+	lifecycleMu sync.Mutex // serializes account attachment, removal and Container close
 	// Phase 17.5: shared LRU caches. One LRU per cache type, shared across
 	// every device. Per-wrapper JID scoping (jid + "|" prefix on every key)
 	// keeps device A's entries from colliding with device B's.
@@ -356,7 +426,7 @@ type signalCaches struct {
 	// sender_id list. Lets GetSenderKeyDevices be answered from cache (0 DB
 	// queries warm) instead of the DB passthrough; invalidated by PutSenderKey
 	// when a sender's device set may have changed (a new SKDM).
-	SenderKeyDevices *lru.Cache[string, []string]
+	SenderKeyDevices *SenderKeyDeviceCache
 	// perf 260601-uuy: message-secret pair cache. Keyed
 	// jid|chat.ToNonAD()|sender.ToNonAD()|message_id → (secret, realSender).
 	// Avoids a PG read + JSON-less Scan on the 22 GB whatsmeow_message_secrets
@@ -502,7 +572,7 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 	// attachCachedStores (one per SQLStore, so each flusher has the correct JID)
 	// and tracked in c.caches.senderKeyFlushers.
 	// kavtov-fork: Phase 27 — device-set index cache (see signalCaches.SenderKeyDevices).
-	c.caches.SenderKeyDevices, err = lru.New[string, []string](signalSenderKeyDevicesCacheCap)
+	c.caches.SenderKeyDevices, err = NewSenderKeyDeviceCache(signalSenderKeyDevicesCacheCap)
 	if err != nil {
 		log.Errorf("Failed to construct SenderKeyDevicesCache (cap=%d): %v", signalSenderKeyDevicesCacheCap, err)
 		panic(err)
@@ -540,6 +610,8 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 // of Wave 1 and the end of Wave 2 — do not partial-deploy or commit during
 // this window.
 func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore) {
+	c.caches.lifecycleMu.Lock()
+	defer c.caches.lifecycleMu.Unlock()
 	jid := device.ID.String()
 	sessionStore := NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
 	// Phase 35.2-09: per-device session flusher, same singleton-reuse pattern as
@@ -609,6 +681,8 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 // Nil-guarded so Close stays safe on a partially-constructed Container (test
 // struct literals that never went through wireSignalCaches).
 func closeSignalCaches(c *Container) {
+	c.caches.lifecycleMu.Lock()
+	defer c.caches.lifecycleMu.Unlock()
 	if c.caches.metricsCancel != nil {
 		c.caches.metricsCancel()
 	}
@@ -630,7 +704,27 @@ func closeSignalCaches(c *Container) {
 	}
 	c.caches.senderKeyFlushersMu.Unlock()
 	for _, f := range skFlushers {
+		f.retireOwner()
 		f.Stop()
+	}
+	c.caches.senderKeyFlushersMu.Lock()
+	clear(c.caches.senderKeyFlusherMap)
+	c.caches.senderKeyFlushersMu.Unlock()
+	clearDonorUniverse(c)
+	if owner := c.caches.SenderKeyDevices; owner != nil {
+		owner.mu.Lock()
+		for key, flight := range owner.flights {
+			if key.universe == c {
+				flight.invalid = true
+				delete(owner.flights, key)
+			}
+		}
+		for _, key := range owner.Keys() {
+			if key.universe == c {
+				owner.Remove(key)
+			}
+		}
+		owner.mu.Unlock()
 	}
 	// Phase 35.2-09: stop all per-device session flushers synchronously so
 	// buffered sessions reach the DB before the connection closes. Same
@@ -645,6 +739,47 @@ func closeSignalCaches(c *Container) {
 	for _, f := range sessionFlushers {
 		f.Stop()
 	}
+	c.caches.sessionFlushersMu.Lock()
+	clear(c.caches.sessionFlusherMap)
+	c.caches.sessionFlushersMu.Unlock()
+}
+
+// Called with lifecycleMu held. Stop/drain before deleting the SQL account so
+// an old buffered write cannot recreate removed account state after deletion.
+func stopAccountSignalCaches(c *Container, jid string) {
+	c.caches.senderKeyFlushersMu.Lock()
+	f := c.caches.senderKeyFlusherMap[jid]
+	delete(c.caches.senderKeyFlusherMap, jid)
+	c.caches.senderKeyFlushersMu.Unlock()
+	if f != nil {
+		f.retireOwner()
+		f.Stop()
+	}
+	c.caches.sessionFlushersMu.Lock()
+	s := c.caches.sessionFlusherMap[jid]
+	delete(c.caches.sessionFlusherMap, jid)
+	c.caches.sessionFlushersMu.Unlock()
+	if s != nil {
+		s.Stop()
+	}
+	// A successful drain observed SQL writes after owner retirement. Remove
+	// those account entries too, and cover accounts with no attached flusher.
+	if owner := c.caches.SenderKeyDevices; owner != nil {
+		owner.mu.Lock()
+		for _, key := range owner.Keys() {
+			if key.universe == c && key.account == jid {
+				owner.Remove(key)
+			}
+		}
+		for key, flight := range owner.flights {
+			if key.universe == c && key.account == jid {
+				flight.invalid = true
+				delete(owner.flights, key)
+			}
+		}
+		owner.mu.Unlock()
+	}
+	clearDonorUniverse(c)
 }
 
 // cleanCounters computes the three log-time values from a pair of raw atomic
@@ -728,12 +863,18 @@ func formatCacheMetrics(c *Container) string {
 	// D-10 auto-accepts every key rotation fleet-wide, so this aggregate is the
 	// only alerting-ready signal for an anomalous rotation spike (the realistic
 	// attack/abuse signature is a single address rotating repeatedly).
+	deviceBlock := "sk_devices={not_wired}"
+	if owner := c.caches.SenderKeyDevices; owner != nil {
+		m := owner.Metrics()
+		deviceBlock = fmt.Sprintf("sk_devices={len=%d, cap=%d, positive_hit=%d, negative_hit=%d, query=%d, expiry=%d, invalidation=%d, eviction=%d, overflow=%d}", owner.Len(), owner.capacity, m.PositiveHits, m.NegativeHits, m.Queries, m.Expiries, m.Invalidations, m.Evictions, m.Overflows)
+	}
 	return fmt.Sprintf(
-		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d, identity_changed=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
+		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d, identity_changed=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s %s decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
 		c.caches.Session.Len(), signalSessionCacheCap, sessEvic, sessCap, sessExp,
 		c.caches.Identity.Len(), signalIdentityCacheCap, idntEvic, idntCap, idntExp, identityChangedTotal.Load(),
 		c.caches.SenderKey.Len(), signalSenderKeyCacheCap, sndkEvic, sndkCap, sndkExp,
 		msgSecBlock,
+		deviceBlock,
 		walltime.DecryptHistogram.Quantile(0.5),
 		walltime.DecryptHistogram.Quantile(0.95),
 		walltime.DecryptHistogram.Quantile(0.99),

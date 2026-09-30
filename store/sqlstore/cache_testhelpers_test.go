@@ -370,7 +370,7 @@ func (f *fakeSenderKeyStore) GetSenderKeyDevices(_ context.Context, group, userB
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	prefix := group + "|" + userBare + ":"
-	var devices []string
+	devices := []string{}
 	for k := range f.keys {
 		if strings.HasPrefix(k, prefix) {
 			devices = append(devices, k[len(group)+1:])

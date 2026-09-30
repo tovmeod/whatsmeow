@@ -293,6 +293,9 @@ func (c *Container) DeleteDevice(ctx context.Context, store *store.Device) error
 	if store.ID == nil {
 		return ErrDeviceIDMustBeSet
 	}
+	c.caches.lifecycleMu.Lock()
+	defer c.caches.lifecycleMu.Unlock()
+	stopAccountSignalCaches(c, store.ID.String())
 	_, err := c.db.Exec(ctx, deleteDeviceQuery, store.ID)
 	return err
 }

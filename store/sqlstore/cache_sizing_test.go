@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 
@@ -43,6 +44,7 @@ import (
 //	headroom = 1 - (1942+228)/3200 = 0.322 (32.2% >= 30% OK)
 func TestCacheMemoryBudget(t *testing.T) {
 	const N = 10_000
+	t.Log("local heap/objects and post-churn GC observed; capacity figures are extrapolated; CPU=unmeasured production-runtime=unmeasured")
 
 	// Per-entry fill sizes calibrated to reproduce the pprof-measured per-entry heap
 	// cost when the LRU measureHeapDelta function runs.
@@ -74,7 +76,7 @@ func TestCacheMemoryBudget(t *testing.T) {
 		capIdentity  = 100_000 // quick 260619-10v: lowered 150k -> 100k (GC entry-count cut)
 		capSKDevices = 300_000
 		capMsgSecret = 30_000 // quick 260619-10v: lowered 300k -> 30k (mostly-dead-weight cache)
-		baseRSSMB    = 228.0 // base RSS (non-cache) from incident pprof + pgtype strings
+		baseRSSMB    = 228.0  // base RSS (non-cache) from incident pprof + pgtype strings
 		goMemLimitMB = 3200.0
 	)
 
@@ -147,18 +149,68 @@ func TestCacheMemoryBudget(t *testing.T) {
 		float64(capIdentity)*perBytesIdentity/(1024*1024))
 	runtime.KeepAlive(idLRU)
 
-	// ---- 5. SenderKeyDevices []string ------------------------------------------
-	skDevLRU, err := lru.New[string, []string](N + 100)
+	// ---- 5. Actual shared typed positive/empty device owner -------------------
+	skDevLRU, err := NewSenderKeyDeviceCache(N + 100)
 	if err != nil {
 		t.Fatalf("lru.New skDevices: %v", err)
 	}
 	perObjSKDevices, perBytesSKDevices := measureHeapDelta(func(i int) {
-		skDevLRU.Add(fmt.Sprintf("skd%d|grp%d", i, i), []string{"dev1:0", "dev2:0"})
+		skDevLRU.Add(deviceQueryKey{universe: skDevLRU, account: fmt.Sprintf("skd%d", i), group: fmt.Sprintf("grp%d", i), sender: fmt.Sprintf("user%d_1", i)}, deviceCacheEntry{devices: []string{"dev1:0", "dev2:0"}})
 	})
-	t.Logf("SKDevices    : per-entry %.2f objects, %.0f bytes (cap=%d → %.0f MB)",
-		perObjSKDevices, perBytesSKDevices, capSKDevices,
-		float64(capSKDevices)*perBytesSKDevices/(1024*1024))
+	t.Logf("SKDevices positive-only observed N=%d heap_objects=%.0f heap_bytes=%.0f; linear extrapolation to %d=%.0f bytes (not a full-cap observation)",
+		N, perObjSKDevices*N, perBytesSKDevices*N, capSKDevices, float64(capSKDevices)*perBytesSKDevices)
 	runtime.KeepAlive(skDevLRU)
+	coord, err := NewSenderKeyDeviceCache(N)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordObj, coordBytes := measureHeapDelta(func(i int) {
+		coord.flights[deviceQueryKey{universe: coord, account: fmt.Sprintf("account%d", i), group: "group", sender: "sender"}] = &deviceQueryFlight{done: make(chan struct{}), participants: 1}
+	})
+	t.Logf("SKDevices active coordination observed N=%d heap_objects=%.0f heap_bytes=%.0f; linear extrapolation to 300000=%.0f bytes (not a full-cap observation)", N, coordObj*N, coordBytes*N, coordBytes*300000)
+	if len(coord.flights) != N {
+		t.Fatal("coordination fixture did not reach measured capacity")
+	}
+	clear(coord.flights)
+	runtime.GC()
+	runtime.KeepAlive(coord)
+	for _, mode := range []string{"empty-only", "mixed"} {
+		owner, err := NewSenderKeyDeviceCache(N)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expiry := time.Now().Add(5 * time.Minute)
+		obj, bytes := measureHeapDelta(func(i int) {
+			entry := deviceCacheEntry{expiresAt: expiry}
+			if mode == "mixed" && i%2 == 0 {
+				entry = deviceCacheEntry{devices: []string{"dev1:0", "dev2:0"}}
+			}
+			owner.Add(deviceQueryKey{universe: owner, account: fmt.Sprintf("account%d", i), group: fmt.Sprintf("group%d", i), sender: fmt.Sprintf("user%d_1", i)}, entry)
+		})
+		t.Logf("SKDevices %s observed N=%d heap_objects=%.0f heap_bytes=%.0f; linear extrapolation to 300000=%.0f bytes (not a full-cap observation)", mode, N, obj*N, bytes*N, bytes*300000)
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		for i := range N * 3 {
+			key := deviceQueryKey{universe: owner, account: fmt.Sprintf("churn%d", i), sender: "sender"}
+			owner.Add(key, deviceCacheEntry{expiresAt: expiry})
+			owner.mu.Lock()
+			owner.flights[key] = &deviceQueryFlight{done: make(chan struct{}), participants: 1}
+			delete(owner.flights, key)
+			owner.mu.Unlock()
+		}
+		owner.Purge()
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		t.Logf("SKDevices %s post-churn-GC observed retained_heap_bytes_delta=%d retained_objects_delta=%d resident_entries=%d active_flights=%d", mode, int64(after.HeapAlloc)-int64(before.HeapAlloc), int64(after.HeapObjects)-int64(before.HeapObjects), owner.Len(), len(owner.flights))
+		if owner.Len() != 0 || len(owner.flights) != 0 {
+			t.Fatal("device state not reclaimed")
+		}
+		if after.HeapObjects >= before.HeapObjects {
+			t.Fatal("churn entries/flight objects remained reachable after purge/GC")
+		}
+		runtime.KeepAlive(owner)
+	}
 
 	// ---- 6. MsgSecret msgSecretEntry -------------------------------------------
 	msLRU, err := lru.New[string, msgSecretEntry](N + 100)

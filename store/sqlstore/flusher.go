@@ -16,6 +16,7 @@
 package sqlstore
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -47,6 +48,7 @@ type dirtyEntry struct {
 	highIter    uint32 // highest iteration seen for this entry
 	lastFlushed uint32 // iteration at last successful DB write
 	keyID       uint32 // keyID (generation) of the most-recent state; new keyID resets dedup
+	keyIDs      []uint32
 }
 
 // SenderKeyFlusher batches dirty sender-key entries and drains them
@@ -76,6 +78,12 @@ type SenderKeyFlusher struct {
 	// (lock-ordering rule: onDrained takes pinnedMu in CachedSenderKeyStore;
 	// calling it under f.mu would invert the lock order and deadlock). nil = no-op.
 	onDrained func(group, user string)
+	// Snapshot identity protects a newer pin installed after dirty-set removal.
+	onDrainedSnapshot func(group, user string, blob []byte)
+	// One owner per existing account flusher, never a separate registry. The
+	// lock also orders callback completion against overlay transfer on reattach.
+	snapshotMu sync.RWMutex
+	owner      *CachedSenderKeyStore
 
 	mu    sync.Mutex
 	dirty map[string]*dirtyEntry // key = "<group>|<user>"
@@ -142,6 +150,57 @@ func (f *SenderKeyFlusher) SetOnDrained(fn func(group, user string)) {
 	f.onDrained = fn
 }
 
+func (f *SenderKeyFlusher) notifyDrained(row SenderKeyRow) {
+	if f.onDrained != nil {
+		f.onDrained(row.Group, row.User)
+	}
+	f.snapshotMu.RLock()
+	defer f.snapshotMu.RUnlock()
+	if f.onDrainedSnapshot != nil {
+		f.onDrainedSnapshot(row.Group, row.User, row.Blob)
+	}
+}
+
+// lockOwner takes the current owner's writeMu BEFORE snapshotMu. An inline
+// flush holds writeMu until its snapshot callback completes, so reversing this
+// order would deadlock retirement. Recheck after locking: another attachment
+// can replace the owner while we wait for its writer.
+func (f *SenderKeyFlusher) lockOwner() *CachedSenderKeyStore {
+	for {
+		f.snapshotMu.RLock()
+		owner := f.owner
+		f.snapshotMu.RUnlock()
+		if owner != nil {
+			owner.writeMu.Lock()
+		}
+		f.snapshotMu.Lock()
+		if f.owner == owner {
+			return owner
+		}
+		f.snapshotMu.Unlock()
+		if owner != nil {
+			owner.writeMu.Unlock()
+		}
+	}
+}
+
+func (f *SenderKeyFlusher) unlockOwner(owner *CachedSenderKeyStore) {
+	f.snapshotMu.Unlock()
+	if owner != nil {
+		owner.writeMu.Unlock()
+	}
+}
+
+func (f *SenderKeyFlusher) retireOwner() {
+	owner := f.lockOwner()
+	defer f.unlockOwner(owner)
+	if owner != nil {
+		owner.retireLocked(nil)
+		f.owner = nil
+	}
+	f.onDrainedSnapshot = nil
+}
+
 // crossesBoundary returns true when iter crosses an N-boundary relative to
 // lastFlushed. Design §5: floor(iter/N) > floor(lastFlushed/N).
 func (f *SenderKeyFlusher) crossesBoundary(iter, lastFlushed uint32) bool {
@@ -159,6 +218,10 @@ func (f *SenderKeyFlusher) crossesBoundary(iter, lastFlushed uint32) bool {
 // Phase 17.11-05: accepts []byte (PackFlat blob) instead of *senderKeyColumns.
 // keyID and iter are still passed explicitly by the producer (PutSenderKeyStructure).
 func (f *SenderKeyFlusher) Enqueue(group, user string, blob []byte, keyID, iter uint32, wasFailed bool) {
+	f.enqueueWithKeyIDs(group, user, blob, keyID, iter, wasFailed, nil)
+}
+
+func (f *SenderKeyFlusher) enqueueWithKeyIDs(group, user string, blob []byte, keyID, iter uint32, wasFailed bool, keyIDs []uint32) {
 	k := group + "|" + user
 
 	f.mu.Lock()
@@ -202,6 +265,7 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, blob []byte, keyID, iter 
 		entry.blob = blob // blob replaces previous; monotonic ratchet makes last-wins safe
 		entry.highIter = iter
 		entry.keyID = keyID
+		entry.keyIDs = keyIDs
 	} else {
 		entry = &dirtyEntry{
 			group:    group,
@@ -209,6 +273,7 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, blob []byte, keyID, iter 
 			blob:     blob,
 			highIter: iter,
 			keyID:    keyID,
+			keyIDs:   keyIDs,
 		}
 		f.dirty[k] = entry
 	}
@@ -230,7 +295,7 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, blob []byte, keyID, iter 
 	// Inline synchronous write on backpressure (valve fires when dirty-set > backpressureCap).
 	// This runs outside the lock — PutManySenderKeys must not be called under mu.
 	if needsInlineWrite {
-		f.flushOneSynchronous(group, user, blob, iter)
+		f.flushOneWithKeyIDs(group, user, blob, iter, keyIDs)
 	}
 }
 
@@ -238,9 +303,14 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, blob []byte, keyID, iter 
 // Removes the entry from the dirty-set on success. On failure, retains dirty state.
 // Must NOT be called while f.mu is held.
 func (f *SenderKeyFlusher) flushOneSynchronous(group, user string, blob []byte, iter uint32) {
+	f.flushOneWithKeyIDs(group, user, blob, iter, nil)
+}
+
+func (f *SenderKeyFlusher) flushOneWithKeyIDs(group, user string, blob []byte, iter uint32, keyIDs []uint32) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err := f.store.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Blob: blob}})
+	row := SenderKeyRow{Group: group, User: user, Blob: blob, keyIDs: keyIDs}
+	err := f.store.PutManySenderKeys(ctx, []SenderKeyRow{row})
 	if err != nil {
 		slog.Error(fmt.Sprintf("SenderKeyFlusher inline flush failed group=%s user=%s iter=%d: %v", group, user, iter, err))
 
@@ -257,7 +327,7 @@ func (f *SenderKeyFlusher) flushOneSynchronous(group, user string, blob []byte, 
 	k := group + "|" + user
 	f.mu.Lock()
 	deleted := false
-	if e, ok := f.dirty[k]; ok && e.highIter == iter {
+	if e, ok := f.dirty[k]; ok && e.highIter == iter && bytes.Equal(e.blob, blob) {
 		e.lastFlushed = iter
 		delete(f.dirty, k)
 		deleted = true
@@ -269,8 +339,8 @@ func (f *SenderKeyFlusher) flushOneSynchronous(group, user string, blob []byte, 
 	// that advanced highIter leaves deleted=false and the entry dirty — do NOT
 	// unpin (its newer key is not yet in the DB). Reached only on success: the
 	// error path returned early above. Invoked outside f.mu (lock-ordering rule).
-	if deleted && f.onDrained != nil {
-		f.onDrained(group, user)
+	if deleted {
+		f.notifyDrained(row)
 	}
 }
 
@@ -300,8 +370,8 @@ func (f *SenderKeyFlusher) Drain() {
 		rows := make([]SenderKeyRow, 0, len(f.dirty))
 		snaps := make(map[string]senderKeyFlushSnap, len(f.dirty))
 		for k, e := range f.dirty {
-			rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob})
-			snaps[k] = senderKeyFlushSnap{keyID: e.keyID, iter: e.highIter}
+			rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob, keyIDs: e.keyIDs})
+			snaps[k] = senderKeyFlushSnap{keyID: e.keyID, iter: e.highIter, blob: e.blob}
 		}
 		f.mu.Unlock()
 
@@ -321,11 +391,9 @@ func (f *SenderKeyFlusher) Drain() {
 		drained := len(rows)
 		f.mu.Unlock()
 
-		if f.onDrained != nil {
-			for _, k := range drainedKeys {
-				group, user, _ := strings.Cut(k, "|")
-				f.onDrained(group, user)
-			}
+		for _, k := range drainedKeys {
+			group, user, _ := strings.Cut(k, "|")
+			f.notifyDrained(SenderKeyRow{Group: group, User: user, Blob: snaps[k].blob})
 		}
 
 		f.log.Infof("flush: drained %d on shutdown", drained)
@@ -344,8 +412,8 @@ func (f *SenderKeyFlusher) runFlush() {
 	rows := make([]SenderKeyRow, 0, len(f.dirty))
 	snaps := make(map[string]senderKeyFlushSnap, len(f.dirty))
 	for k, e := range f.dirty {
-		rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob})
-		snaps[k] = senderKeyFlushSnap{keyID: e.keyID, iter: e.highIter}
+		rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob, keyIDs: e.keyIDs})
+		snaps[k] = senderKeyFlushSnap{keyID: e.keyID, iter: e.highIter, blob: e.blob}
 	}
 	f.mu.Unlock()
 
@@ -371,11 +439,9 @@ func (f *SenderKeyFlusher) runFlush() {
 
 	// Fire onDrained for ONLY the entries actually deleted (CR-02-safe).
 	// Outside f.mu so the callback may take pinnedMu (lock-ordering rule).
-	if f.onDrained != nil {
-		for _, k := range drainedKeys {
-			group, user, _ := strings.Cut(k, "|")
-			f.onDrained(group, user)
-		}
+	for _, k := range drainedKeys {
+		group, user, _ := strings.Cut(k, "|")
+		f.notifyDrained(SenderKeyRow{Group: group, User: user, Blob: snaps[k].blob})
 	}
 }
 
@@ -384,6 +450,7 @@ func (f *SenderKeyFlusher) runFlush() {
 type senderKeyFlushSnap struct {
 	keyID uint32
 	iter  uint32
+	blob  []byte
 }
 
 // clearFlushedSenderKeysLocked applies the CR-02 staleness guard to the batch
@@ -406,7 +473,7 @@ func clearFlushedSenderKeysLocked(dirty map[string]*dirtyEntry, snaps map[string
 				continue
 			}
 			e.lastFlushed = snap.iter
-			if e.highIter == snap.iter {
+			if e.highIter == snap.iter && bytes.Equal(e.blob, snap.blob) {
 				delete(dirty, k)
 				deleted = append(deleted, k)
 			}
