@@ -24,7 +24,9 @@ package whatsmeow
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +36,47 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+// Reflection lets the RED test exercise the existing real decrypt path before
+// the diagnostic method exists, failing on its missing aggregate contract.
+func outcomeSnapshot(t *testing.T, cli *Client) map[string]any {
+	t.Helper()
+	method := reflect.ValueOf(cli).MethodByName("SenderKeyRecoverySnapshot")
+	if !method.IsValid() {
+		t.Fatal("sender-key recovery aggregate is missing; original failure and exact-ID recovery must be observable")
+	}
+	data, err := json.Marshal(method.Call(nil)[0].Interface())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot map[string]any
+	if err = json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func TestSenderKeyOutcomeOriginalLater(t *testing.T) {
+	ctx := context.Background()
+	chat := types.JID{User: "outcome-group", Server: types.GroupServer}
+	sender := types.JID{User: "outcome-sender", Server: types.HiddenUserServer, Device: 1}
+	skdm, ciphertext := aliceCrypto(ctx, t, chat.String(), []byte("exact original"))
+	cli := newTestClient(newFakeSenderKeyStore())
+	node := &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: ciphertext}
+	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now()); err == nil {
+		t.Fatal("original must fail before its sender key arrives")
+	}
+	if snapshot := outcomeSnapshot(t, cli); snapshot["original_failures"] != float64(1) {
+		t.Fatalf("expected one terminal original failure, got %v", snapshot)
+	}
+	cli.handleSenderKeyDistributionMessage(ctx, chat, sender, skdm)
+	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := outcomeSnapshot(t, cli); snapshot["original_recovered"] != float64(1) || snapshot["later_success"] != float64(0) {
+		t.Fatalf("exact original retry must recover only the original, got %v", snapshot)
+	}
+}
 
 // --- capturing logger -------------------------------------------------------
 
