@@ -405,6 +405,7 @@ func addressUser(address string) string {
 // upstream merges into container.go only ever conflict on those 4-5 surface
 // lines, not on every cache-related field declaration.
 type signalCaches struct {
+	lifecycleMu sync.Mutex // serializes account attachment, removal and Container close
 	// Phase 17.5: shared LRU caches. One LRU per cache type, shared across
 	// every device. Per-wrapper JID scoping (jid + "|" prefix on every key)
 	// keeps device A's entries from colliding with device B's.
@@ -606,6 +607,8 @@ func wireSignalCaches(c *Container, log waLog.Logger) {
 // of Wave 1 and the end of Wave 2 — do not partial-deploy or commit during
 // this window.
 func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore) {
+	c.caches.lifecycleMu.Lock()
+	defer c.caches.lifecycleMu.Unlock()
 	jid := device.ID.String()
 	sessionStore := NewCachedSessionStore(innerStore, jid, c.caches.Session, &c.caches.SessionExplicitRemoves, c.caches.SessionIndex)
 	// Phase 35.2-09: per-device session flusher, same singleton-reuse pattern as
@@ -675,6 +678,8 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 // Nil-guarded so Close stays safe on a partially-constructed Container (test
 // struct literals that never went through wireSignalCaches).
 func closeSignalCaches(c *Container) {
+	c.caches.lifecycleMu.Lock()
+	defer c.caches.lifecycleMu.Unlock()
 	if c.caches.metricsCancel != nil {
 		c.caches.metricsCancel()
 	}
@@ -697,6 +702,32 @@ func closeSignalCaches(c *Container) {
 	c.caches.senderKeyFlushersMu.Unlock()
 	for _, f := range skFlushers {
 		f.Stop()
+		f.snapshotMu.Lock()
+		if f.owner != nil {
+			f.owner.retire(nil)
+			f.owner = nil
+		}
+		f.onDrainedSnapshot = nil
+		f.snapshotMu.Unlock()
+	}
+	c.caches.senderKeyFlushersMu.Lock()
+	clear(c.caches.senderKeyFlusherMap)
+	c.caches.senderKeyFlushersMu.Unlock()
+	clearDonorUniverse(c)
+	if owner := c.caches.SenderKeyDevices; owner != nil {
+		owner.mu.Lock()
+		for key, flight := range owner.flights {
+			if key.universe == c {
+				flight.invalid = true
+				delete(owner.flights, key)
+			}
+		}
+		for _, key := range owner.Keys() {
+			if key.universe == c {
+				owner.Remove(key)
+			}
+		}
+		owner.mu.Unlock()
 	}
 	// Phase 35.2-09: stop all per-device session flushers synchronously so
 	// buffered sessions reach the DB before the connection closes. Same
@@ -711,6 +742,53 @@ func closeSignalCaches(c *Container) {
 	for _, f := range sessionFlushers {
 		f.Stop()
 	}
+	c.caches.sessionFlushersMu.Lock()
+	clear(c.caches.sessionFlusherMap)
+	c.caches.sessionFlushersMu.Unlock()
+}
+
+// Called with lifecycleMu held. Stop/drain before deleting the SQL account so
+// an old buffered write cannot recreate removed account state after deletion.
+func stopAccountSignalCaches(c *Container, jid string) {
+	c.caches.senderKeyFlushersMu.Lock()
+	f := c.caches.senderKeyFlusherMap[jid]
+	delete(c.caches.senderKeyFlusherMap, jid)
+	c.caches.senderKeyFlushersMu.Unlock()
+	if f != nil {
+		f.snapshotMu.Lock()
+		if f.owner != nil {
+			f.owner.retire(nil)
+			f.owner = nil
+		}
+		f.onDrainedSnapshot = nil
+		f.snapshotMu.Unlock()
+		f.Stop()
+	}
+	c.caches.sessionFlushersMu.Lock()
+	s := c.caches.sessionFlusherMap[jid]
+	delete(c.caches.sessionFlusherMap, jid)
+	c.caches.sessionFlushersMu.Unlock()
+	if s != nil {
+		s.Stop()
+	}
+	// A successful drain observed SQL writes after owner retirement. Remove
+	// those account entries too, and cover accounts with no attached flusher.
+	if owner := c.caches.SenderKeyDevices; owner != nil {
+		owner.mu.Lock()
+		for _, key := range owner.Keys() {
+			if key.universe == c && key.account == jid {
+				owner.Remove(key)
+			}
+		}
+		for key, flight := range owner.flights {
+			if key.universe == c && key.account == jid {
+				flight.invalid = true
+				delete(owner.flights, key)
+			}
+		}
+		owner.mu.Unlock()
+	}
+	clearDonorUniverse(c)
 }
 
 // cleanCounters computes the three log-time values from a pair of raw atomic

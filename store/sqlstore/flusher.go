@@ -80,6 +80,10 @@ type SenderKeyFlusher struct {
 	onDrained func(group, user string)
 	// Snapshot identity protects a newer pin installed after dirty-set removal.
 	onDrainedSnapshot func(group, user string, blob []byte)
+	// One owner per existing account flusher, never a separate registry. The
+	// lock also orders callback completion against overlay transfer on reattach.
+	snapshotMu sync.RWMutex
+	owner      *CachedSenderKeyStore
 
 	mu    sync.Mutex
 	dirty map[string]*dirtyEntry // key = "<group>|<user>"
@@ -150,6 +154,8 @@ func (f *SenderKeyFlusher) notifyDrained(row SenderKeyRow) {
 	if f.onDrained != nil {
 		f.onDrained(row.Group, row.User)
 	}
+	f.snapshotMu.RLock()
+	defer f.snapshotMu.RUnlock()
 	if f.onDrainedSnapshot != nil {
 		f.onDrainedSnapshot(row.Group, row.User, row.Blob)
 	}

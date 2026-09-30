@@ -248,6 +248,12 @@ func clearDonorUniverse(universe any) {
 	for key, wave := range donorWaves {
 		if key.universe == universe {
 			wave.invalid = true
+			delete(donorWaves, key)
+		}
+	}
+	for key := range donorFlights {
+		if key.universe == universe {
+			delete(donorFlights, key)
 		}
 	}
 }
@@ -262,11 +268,18 @@ func (c *CachedSenderKeyStore) logDonorPolicy() {
 
 // Locks protect only bookkeeping, never SQL, waits, crypto/install or callbacks.
 func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecoveryReader, key donorQueryKey, targetIter uint32) (*donorSenderKeyState, error) {
+	if c.retired.Load() {
+		return nil, errSenderKeyStoreRetired
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	work := donorWorkKey{key, targetIter}
 	noDonorCacheMu.Lock()
+	if c.retired.Load() {
+		noDonorCacheMu.Unlock()
+		return nil, errSenderKeyStoreRetired
+	}
 	if noDonorCacheHitLocked(key, donorClock()) {
 		noDonorCacheMu.Unlock()
 		if noDonorCacheSkips.Load()%donorSFLogEvery == 0 {
@@ -344,7 +357,7 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 	noDonorCacheMu.Lock()
 	flight.donor, flight.err = donor, err
 	now := donorClock()
-	if donor == nil && complete && err == nil && !flight.wave.invalid {
+	if donor == nil && complete && err == nil && !flight.wave.invalid && !c.retired.Load() {
 		if flight.wave.deadline.IsZero() {
 			flight.wave.deadline = now.Add(noDonorCacheTTL)
 			if noDonorCache.Add(key, noDonorCacheEntry{expiresAt: flight.wave.deadline}) {

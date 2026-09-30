@@ -624,6 +624,11 @@ func observeSenderKeyWrite(owner *SenderKeyDeviceCache, universe any, account, g
 		owner.invalidations.Add(1)
 		if entry, ok := owner.Get(dk); ok {
 			owner.Add(dk, deviceCacheEntry{devices: mergeDeviceSets(entry.devices, []string{user})})
+		} else if committed {
+			// A synchronous commit can precede a cold enumeration's completion.
+			// Its overlay is about to unpin: retain the now-readable device so a
+			// following reader does not join the invalid old empty flight.
+			owner.Add(dk, deviceCacheEntry{devices: []string{user}})
 		}
 		owner.mu.Unlock()
 	}

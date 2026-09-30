@@ -9,6 +9,7 @@ package sqlstore
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"runtime"
@@ -78,6 +79,55 @@ func TestSenderKeyTeardownDonorFlights(t *testing.T) {
 		t.Fatal("teardown affected another universe or allowed stale absence")
 	}
 	clearDonorUniverse(other.universe)
+}
+
+func TestSenderKeyTeardownDeleteDevice(t *testing.T) {
+	sq := commitTestStore(t, func([]driver.NamedValue) error { return nil })
+	c := sq.Container
+	wireSignalCaches(c, waLog.Noop)
+	t.Cleanup(func() { closeSignalCaches(c) })
+	jidA := types.NewJID("removed", types.DefaultUserServer)
+	jidB := types.NewJID("preserved", types.DefaultUserServer)
+	a, b := &store.Device{ID: &jidA}, &store.Device{ID: &jidB}
+	attachCachedStores(c, a, NewSQLStore(c, jidA))
+	attachCachedStores(c, b, NewSQLStore(c, jidB))
+	old := a.SenderKeys.(*CachedSenderKeyStore)
+	other := b.SenderKeys.(*CachedSenderKeyStore)
+	keyA, keyB := old.deviceKey("g", "sender"), other.deviceKey("g", "sender")
+	c.caches.SenderKeyDevices.Add(keyA, deviceCacheEntry{})
+	c.caches.SenderKeyDevices.Add(keyB, deviceCacheEntry{})
+	old.pinned[keyA] = map[string]struct{}{"sender:1": {}}
+	if err := c.DeleteDevice(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	if c.caches.SenderKeyDevices.Contains(keyA) || !c.caches.SenderKeyDevices.Contains(keyB) || len(old.pinned) != 0 {
+		t.Fatal("account cleanup retained removed state or damaged another account")
+	}
+	if len(c.caches.senderKeyFlusherMap) != 1 || len(c.caches.sessionFlusherMap) != 1 || old.retired.Load() == false {
+		t.Fatal("removed account's owner/flushers survived teardown")
+	}
+}
+
+func TestSenderKeyReinitializationFencesDeviceFlight(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	c, inner := newDevicePolicyStore(t, 4, func(context.Context, string, string) ([]string, error) {
+		close(entered)
+		<-release
+		return []string{}, nil
+	})
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = c.GetSenderKeyDevices(context.Background(), "g", "sender") }()
+	<-entered
+	fresh := NewCachedSenderKeyStore(inner, c.jid, c.cache, c.deviceCache, nil)
+	c.retire(fresh)
+	if len(c.deviceCache.flights) != 0 {
+		t.Fatal("retirement retained old device flights")
+	}
+	close(release)
+	<-done
+	if c.deviceCache.Len() != 0 {
+		t.Fatal("old empty query published into replacement owner")
+	}
 }
 
 // Compile-time conformance is asserted inside cached_sender_key_store.go via

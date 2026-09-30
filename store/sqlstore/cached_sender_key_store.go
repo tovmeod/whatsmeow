@@ -9,6 +9,7 @@ package sqlstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,9 +47,11 @@ type senderKeyFlatReader interface {
 // the cached slice; PutSenderKey stores a copy of the caller's slice.
 // Neither side aliases the other's buffer.
 type CachedSenderKeyStore struct {
-	inner store.SenderKeyStore
-	jid   string
-	cache *lru.Cache[string, []byte]
+	writeMu sync.Mutex // orders accepted writes against retirement, never held by SQL readers
+	retired atomic.Bool
+	inner   store.SenderKeyStore
+	jid     string
+	cache   *lru.Cache[string, []byte]
 	// kavtov-fork: Phase 27 — device-set index, keyed jid|group|userBare → the
 	// device-qualified sender_id list for that sender. Lets GetSenderKeyDevices
 	// be served from cache (the device-tolerant lookup's enumerate). Invalidated
@@ -91,6 +94,55 @@ type CachedSenderKeyStore struct {
 	hits, misses uint64
 }
 
+var errSenderKeyStoreRetired = errors.New("sender-key store owner retired")
+
+// retire fences detached readers before removing bounded records. Existing
+// flights retain their own token until completion, but cannot publish or join
+// a replacement owner's work. Pending pins transfer only on reattachment.
+func (c *CachedSenderKeyStore) retire(next *CachedSenderKeyStore) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.deviceCache != nil {
+		c.deviceCache.mu.Lock()
+		defer c.deviceCache.mu.Unlock()
+	}
+	c.pinnedMu.Lock()
+	defer c.pinnedMu.Unlock()
+	c.retired.Store(true)
+	if next != nil {
+		next.pinned, next.pinnedBlobs = c.pinned, c.pinnedBlobs
+	}
+	c.pinned = make(map[deviceQueryKey]map[string]struct{})
+	c.pinnedBlobs = make(map[string][]byte)
+	if c.deviceCache != nil {
+		universe := c.deviceKey("", "").universe
+		for _, key := range c.deviceCache.Keys() {
+			if key.universe == universe && key.account == c.jid {
+				c.deviceCache.Remove(key)
+			}
+		}
+		for key, flight := range c.deviceCache.flights {
+			if key.universe == universe && key.account == c.jid {
+				flight.invalid = true
+				delete(c.deviceCache.flights, key)
+			}
+		}
+	}
+	for _, key := range c.cache.Keys() {
+		if strings.HasPrefix(key, c.jid+"|") {
+			c.cache.Remove(key)
+		}
+	}
+}
+
+func (c *CachedSenderKeyStore) cacheBlob(key string, blob []byte) {
+	c.pinnedMu.Lock()
+	defer c.pinnedMu.Unlock()
+	if !c.retired.Load() {
+		c.cache.Add(key, blob)
+	}
+}
+
 var _ store.SenderKeyStore = (*CachedSenderKeyStore)(nil)
 
 // Compile-time assertion: CachedSenderKeyStore satisfies the fork-local
@@ -131,6 +183,13 @@ func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 	if f == nil {
 		return
 	}
+	f.snapshotMu.Lock()
+	defer f.snapshotMu.Unlock()
+	if previous := f.owner; previous != nil && previous != c {
+		previous.retire(c)
+		clearDonorUniverse(c.deviceKey("", "").universe)
+	}
+	f.owner = c
 	f.onDrainedSnapshot = func(group, user string, blob []byte) {
 		dk := c.deviceKey(group, user)
 		bk := c.key(group, user)
@@ -189,6 +248,9 @@ func extractStructMeta(s *groupRecord.SenderKeyStructure) (keyID, iteration uint
 // ---------------------------------------------------------------------------
 
 func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user string) ([]byte, error) {
+	if c.retired.Load() {
+		return nil, errSenderKeyStoreRetired
+	}
 	k := c.key(group, user)
 	if v, ok := c.cache.Get(k); ok {
 		atomic.AddUint64(&c.hits, 1)
@@ -207,7 +269,7 @@ func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user str
 		// slice we cache, but copying once more here would only matter if
 		// the caller mutates it before the next Get — copy for safety.
 		stored := copyBytes(v)
-		c.cache.Add(k, stored)
+		c.cacheBlob(k, stored)
 		return copyBytes(stored), err
 	}
 	return v, err
@@ -229,6 +291,9 @@ func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user str
 // The returned *SenderKeyStructure is READ-ONLY. The caller calls
 // NewSenderKeyFromStruct to obtain a live *SenderKey record.
 func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group, user string) (*groupRecord.SenderKeyStructure, error) {
+	if c.retired.Load() {
+		return nil, errSenderKeyStoreRetired
+	}
 	k := c.key(group, user)
 
 	// Cache-aware read: check the write-through flat c.cache first.
@@ -265,7 +330,7 @@ func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group,
 			return nil, err
 		}
 		// Cache the DB result for subsequent reads.
-		c.cache.Add(k, copyBytes(blob))
+		c.cacheBlob(k, copyBytes(blob))
 		return store.UnpackFlat(blob)
 	}
 
@@ -278,7 +343,7 @@ func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group,
 		return nil, nil
 	}
 	// Cache the DB result (mirror GetSenderKey L254-255: Add before decode, never cache nil).
-	c.cache.Add(k, copyBytes(blob))
+	c.cacheBlob(k, copyBytes(blob))
 	return store.UnpackFlat(blob)
 }
 
@@ -312,6 +377,15 @@ func (c *CachedSenderKeyStore) PutSenderKeyWithMeta(ctx context.Context, group, 
 // through PutSenderKeyStructure → flusher). The legacy synchronous write here
 // is only reached by non-columnar callers (test stores, SKDM handler fallbacks).
 func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, user string, session []byte, wasFailed bool) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.retired.Load() {
+		return errSenderKeyStoreRetired
+	}
+	return c.putSenderKeyLocked(ctx, group, user, session, wasFailed)
+}
+
+func (c *CachedSenderKeyStore) putSenderKeyLocked(ctx context.Context, group, user string, session []byte, wasFailed bool) error {
 	// Legacy path: always synchronous write to inner (fmt_ver=1; no decompose).
 	if err := c.inner.PutSenderKey(ctx, group, user, session); err != nil {
 		return err
@@ -339,6 +413,11 @@ func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, 
 // T-17.9-16 REPLACE-on-write coherence: parsedReplace fires with the in-hand
 // structure so LoadSenderKey returns the fresh key before the flusher drains.
 func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group, user string, s *groupRecord.SenderKeyStructure) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.retired.Load() {
+		return errSenderKeyStoreRetired
+	}
 	// Encode to flat binary. PackFlat makes its own copies of all byte fields,
 	// so the blob is disjoint from the libsignal structure's backing arrays.
 	blob, ok := store.PackFlat(s)
@@ -351,7 +430,7 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 		if sk != nil {
 			legacyBlob = sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
 		}
-		return c.putSenderKeyInternal(ctx, group, user, legacyBlob, false)
+		return c.putSenderKeyLocked(ctx, group, user, legacyBlob, false)
 	}
 
 	// Derive keyID/iter from the structure (0-state → (0,0)).
@@ -423,6 +502,11 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 //
 // Callers: TryInlineRecovery (recovery_sender_key.go install site).
 func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context, group, user string, s *groupRecord.SenderKeyStructure, donorKeyID uint32) (bool, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.retired.Load() {
+		return false, errSenderKeyStoreRetired
+	}
 	blob, ok := store.PackFlat(s)
 	if !ok {
 		// 0-state or invalid structure — fall back to legacy PutSenderKey (safety net).
@@ -433,7 +517,7 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 		if sk != nil {
 			legacyBlob = sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
 		}
-		err := c.putSenderKeyInternal(ctx, group, user, legacyBlob, false)
+		err := c.putSenderKeyLocked(ctx, group, user, legacyBlob, false)
 		return err == nil, err
 	}
 
@@ -645,12 +729,19 @@ func (c *CachedSenderKeyStore) cachedDevicesLocked(dk deviceQueryKey) ([]string,
 // to retry. Overflow never publishes, and tokens remain until every participant
 // has consumed the first completed result (including its fixed TTL).
 func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
+	if c.retired.Load() {
+		return nil, errSenderKeyStoreRetired
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	dk := c.deviceKey(group, userBare)
 	owner := c.deviceCache
 	owner.mu.Lock()
+	if c.retired.Load() {
+		owner.mu.Unlock()
+		return nil, errSenderKeyStoreRetired
+	}
 	if devices, hit := c.cachedDevicesLocked(dk); hit {
 		owner.mu.Unlock()
 		return devices, nil
@@ -705,7 +796,7 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 	// Completion is serialized with accepted writes. Re-read pins here rather
 	// than using a pre-query snapshot that can miss a just-accepted key.
 	pins := c.pinnedDevices(dk)
-	if err == nil && !flight.invalid && validDeviceResult(devices, dk.sender) {
+	if err == nil && !flight.invalid && !c.retired.Load() && validDeviceResult(devices, dk.sender) {
 		entry := deviceCacheEntry{devices: mergeDeviceSets(devices, pins)}
 		if len(entry.devices) == 0 {
 			entry.expiresAt = completedAt.Add(senderKeyDeviceNegativeTTL)
