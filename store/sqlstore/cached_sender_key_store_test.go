@@ -69,6 +69,18 @@ func TestCachedSenderKeyStore_InterfaceConformance(t *testing.T) {
 	}
 }
 
+func TestSenderKeyDeviceNegativeFixedTTL(t *testing.T) {
+	c, inner := newTestCachedSenderKeyStore(t, 16)
+	for range 3 {
+		if _, err := c.GetSenderKeyDevices(context.Background(), "empty", "user_1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := inner.devicesCalls.Load(); got != 1 {
+		t.Fatalf("repeated authoritative empty queries = %d, want 1", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // GetSenderKey: miss → inner; second call → cache hit.
 // ---------------------------------------------------------------------------
