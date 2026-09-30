@@ -57,6 +57,7 @@ type stubRecoveryInner struct {
 	// send); release, when non-nil, blocks findSenderKeyDonor until closed.
 	entered chan struct{}
 	release chan struct{}
+	findErr error
 }
 
 func (s *stubRecoveryInner) findSenderKeyDonor(ctx context.Context, group, senderBare string, targetKeyID, targetIter uint32) (*donorSenderKeyState, error) {
@@ -68,7 +69,14 @@ func (s *stubRecoveryInner) findSenderKeyDonor(ctx context.Context, group, sende
 		}
 	}
 	if s.release != nil {
-		<-s.release
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if s.findErr != nil {
+		return nil, s.findErr
 	}
 	if s.donorForTarget != nil {
 		return s.donorForTarget(targetIter), nil
@@ -101,6 +109,31 @@ func (s *stubRecoveryInner) GetSenderKeyDevices(ctx context.Context, group, user
 
 var _ store.SenderKeyStore = (*stubRecoveryInner)(nil)
 var _ senderKeyRecoveryReader = (*stubRecoveryInner)(nil)
+
+type flatRecoveryRows struct {
+	blobs [][]byte
+	index int
+}
+
+func (r *flatRecoveryRows) Next() bool { return r.index < len(r.blobs) }
+func (r *flatRecoveryRows) Scan(dest ...any) error {
+	*(dest[0].(*string)) = "donor"
+	*(dest[1].(*[]byte)) = r.blobs[r.index]
+	r.index++
+	return nil
+}
+func (r *flatRecoveryRows) Err() error { return nil }
+
+// An uncertain scan must be distinguishable from successful absence even
+// though the public recovery API still reports no donor without an error.
+func TestNoDonorCacheMalformed(t *testing.T) {
+	for _, blob := range [][]byte{nil, []byte("malformed-flat")} {
+		_, err := scanFlatRows(&flatRecoveryRows{blobs: [][]byte{blob}}, 1, 5, nil)
+		if err == nil {
+			t.Fatal("uncertain all-negative scan must carry non-cacheable evidence")
+		}
+	}
+}
 
 // stubDonor builds a donorSenderKeyState with valid field lengths
 // (chainKey=32, signingPub=33) so PackFlat accepts the install on the
