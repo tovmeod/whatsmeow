@@ -6,9 +6,13 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/util/dbutil"
 	"go.mau.fi/whatsmeow/store"
@@ -17,7 +21,8 @@ import (
 
 // This connector has no network or DSN: each test owns the entire SQL surface.
 type senderKeyCommitConnector struct {
-	exec func([]driver.NamedValue) error
+	exec  func([]driver.NamedValue) error
+	query func(context.Context, string, []driver.NamedValue) (driver.Rows, error)
 }
 
 func (c *senderKeyCommitConnector) Connect(context.Context) (driver.Conn, error) {
@@ -45,9 +50,20 @@ func (c *senderKeyCommitConn) ExecContext(_ context.Context, _ string, args []dr
 	return driver.RowsAffected(1), nil
 }
 
+func (c *senderKeyCommitConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if c.c.query == nil {
+		return nil, errors.New("unexpected query")
+	}
+	return c.c.query(ctx, query, args)
+}
+
 func commitTestStore(t *testing.T, exec func([]driver.NamedValue) error) *SQLStore {
+	return commitTestStoreWithQuery(t, exec, nil)
+}
+
+func commitTestStoreWithQuery(t *testing.T, exec func([]driver.NamedValue) error, query func(context.Context, string, []driver.NamedValue) (driver.Rows, error)) *SQLStore {
 	t.Helper()
-	db := sql.OpenDB(&senderKeyCommitConnector{exec})
+	db := sql.OpenDB(&senderKeyCommitConnector{exec: exec, query: query})
 	t.Cleanup(func() { _ = db.Close() })
 	wrapped, err := dbutil.NewWithDB(db, "postgres")
 	if err != nil {
@@ -60,6 +76,174 @@ func commitTestStore(t *testing.T, exec func([]driver.NamedValue) error) *SQLSto
 	c := &Container{db: wrapped, log: waLog.Noop}
 	c.caches.SenderKeyDevices = owner
 	return &SQLStore{Container: c, JID: "recipient"}
+}
+
+type senderKeyDeviceRows struct{ devices []string }
+
+func (*senderKeyDeviceRows) Columns() []string { return []string{"sender_id"} }
+func (*senderKeyDeviceRows) Close() error      { return nil }
+func (r *senderKeyDeviceRows) Next(values []driver.Value) error {
+	if len(r.devices) == 0 {
+		return io.EOF
+	}
+	values[0] = r.devices[0]
+	r.devices = r.devices[1:]
+	return nil
+}
+
+func TestSenderKeyColdWritePreservesPersistedSiblings(t *testing.T) {
+	for _, cacheState := range []string{"cold", "evicted"} {
+		for _, path := range []string{"buffered", "single", "batch", "inline", "async"} {
+			for _, user := range []string{"sender:1", "sender:2"} {
+				t.Run(cacheState+"/"+path+"/"+user, func(t *testing.T) {
+					var mu sync.Mutex
+					persisted := map[string]bool{"sender:0": true, "sender:1": true}
+					var queries atomic.Int64
+					sq := commitTestStoreWithQuery(t, func(args []driver.NamedValue) error {
+						mu.Lock()
+						defer mu.Unlock()
+						for i := 2; i < len(args); i += 4 {
+							persisted[args[i].Value.(string)] = true
+						}
+						return nil
+					}, func(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+						if query != getSenderKeyDevicesQuery {
+							return nil, fmt.Errorf("unexpected query: %s", query)
+						}
+						queries.Add(1)
+						mu.Lock()
+						defer mu.Unlock()
+						devices := []string{}
+						for sid := range persisted {
+							devices = append(devices, sid)
+						}
+						return &senderKeyDeviceRows{devices}, nil
+					})
+					blobs, _ := lru.New[string, []byte](16)
+					cs := NewCachedSenderKeyStore(sq, sq.JID, blobs, sq.caches.SenderKeyDevices, nil)
+					ctx := context.Background()
+					if cacheState == "evicted" {
+						if _, err := cs.GetSenderKeyDevices(ctx, "g", "sender"); err != nil {
+							t.Fatal(err)
+						}
+						// Actual capacity churn, not just an explicit removal.
+						for i := range cs.deviceCache.capacity {
+							cs.deviceCache.Add(cs.deviceKey(fmt.Sprintf("churn%d", i), "sender"), deviceCacheEntry{devices: []string{"sender:9"}})
+						}
+						if cs.deviceCache.Contains(cs.deviceKey("g", "sender")) {
+							t.Fatal("entry did not evict")
+						}
+					}
+					before := queries.Load()
+					structure, _ := store.UnpackFlat(testBlob(7, 2))
+					var f *SenderKeyFlusher
+					var err error
+					if path == "single" {
+						err = sq.PutSenderKey(ctx, "g", user, testBlob(7, 2))
+					} else if path == "batch" {
+						err = sq.PutManySenderKeys(ctx, []SenderKeyRow{{Group: "g", User: user, Blob: testBlob(7, 2)}})
+					} else {
+						f = NewSenderKeyFlusher(sq, waLog.Noop, 100)
+						cs.SetFlusher(f)
+						if path == "inline" {
+							f.backpressureCap = 0
+						}
+						err = cs.PutSenderKeyStructure(ctx, "g", user, structure)
+						if path == "async" {
+							f.runFlush()
+						}
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					for range 2 {
+						got, err := cs.GetSenderKeyDevices(ctx, "g", "sender")
+						want := mergeDeviceSets([]string{"sender:0", "sender:1"}, []string{user})
+						if err != nil || len(got) != len(want) {
+							t.Fatalf("write hid persisted sibling: got=%v want=%v err=%v", got, want, err)
+						}
+						for _, sid := range want {
+							if !containsString(got, sid) {
+								t.Fatalf("missing persisted device %s in %v", sid, got)
+							}
+						}
+					}
+					if queries.Load() != before+1 {
+						t.Fatalf("incomplete set did not complete exactly once: queries=%d before=%d", queries.Load(), before)
+					}
+					if f != nil {
+						f.Stop()
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestSenderKeyColdWriteDuringStaleEnumeration(t *testing.T) {
+	for _, buffered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("buffered=%v", buffered), func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			var queries atomic.Int64
+			sq := commitTestStoreWithQuery(t, func([]driver.NamedValue) error { return nil },
+				func(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+					if query != getSenderKeyDevicesQuery {
+						return nil, errors.New("unexpected query")
+					}
+					if queries.Add(1) == 1 {
+						close(entered)
+						<-release
+						return &senderKeyDeviceRows{}, nil // stale pre-write snapshot
+					}
+					return &senderKeyDeviceRows{[]string{"sender:0", "sender:1"}}, nil
+				})
+			blobs, _ := lru.New[string, []byte](16)
+			cs := NewCachedSenderKeyStore(sq, sq.JID, blobs, sq.caches.SenderKeyDevices, nil)
+			oldResult := make(chan []string, 1)
+			go func() {
+				devices, _ := cs.GetSenderKeyDevices(context.Background(), "g", "sender")
+				oldResult <- devices
+			}()
+			<-entered
+			var f *SenderKeyFlusher
+			if buffered {
+				f = NewSenderKeyFlusher(sq, waLog.Noop, 100)
+				cs.SetFlusher(f)
+				structure, _ := store.UnpackFlat(testBlob(7, 2))
+				if err := cs.PutSenderKeyStructure(context.Background(), "g", "sender:2", structure); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := sq.PutManySenderKeys(context.Background(), []SenderKeyRow{{Group: "g", User: "sender:2", Blob: testBlob(7, 2)}}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			devices, err := cs.GetSenderKeyDevices(ctx, "g", "sender")
+			close(release)
+			if err != nil || len(devices) != 3 || !containsString(devices, "sender:2") {
+				t.Fatalf("known write/siblings hidden behind stale scan: %v, %v", devices, err)
+			}
+			if got := <-oldResult; !containsString(got, "sender:2") {
+				t.Fatalf("stale completion hid accepted write: %v", got)
+			}
+			entry, ok := cs.deviceCache.Peek(cs.deviceKey("g", "sender"))
+			if !ok || len(entry.devices) == 0 {
+				t.Fatal("stale empty replaced known positive")
+			}
+			for range 2 {
+				devices, err := cs.GetSenderKeyDevices(context.Background(), "g", "sender")
+				if err != nil || len(devices) != 3 {
+					t.Fatalf("fresh enumeration lost siblings: %v, %v", devices, err)
+				}
+			}
+			if queries.Load() != 3 || len(cs.deviceCache.flights) != 0 {
+				t.Fatalf("incomplete enumeration failed to complete/clean up: queries=%d", queries.Load())
+			}
+			if f != nil {
+				f.Stop()
+			}
+		})
+	}
 }
 
 func seedCommitNegative(key donorQueryKey) {

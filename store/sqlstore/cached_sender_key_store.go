@@ -717,6 +717,9 @@ func (c *CachedSenderKeyStore) cachedDevicesLocked(dk deviceQueryKey) ([]string,
 	if !ok {
 		return nil, false
 	}
+	if entry.incomplete {
+		return nil, false
+	}
 	if len(entry.devices) == 0 && !owner.now().Before(entry.expiresAt) {
 		owner.Remove(dk)
 		owner.expiries.Add(1)
@@ -753,14 +756,9 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 		owner.mu.Unlock()
 		return devices, nil
 	}
-	if pins := c.pinnedDevices(dk); len(pins) > 0 {
-		owner.positiveHits.Add(1)
-		owner.mu.Unlock()
-		return pins, nil
-	}
 	atomic.AddUint64(&c.misses, 1)
 	flight := owner.flights[dk]
-	if flight != nil && !(flight.completed && !flight.expiresAt.IsZero() && !owner.now().Before(flight.expiresAt)) {
+	if flight != nil && !flight.invalid && !(flight.completed && !flight.expiresAt.IsZero() && !owner.now().Before(flight.expiresAt)) {
 		flight.participants++
 		owner.mu.Unlock()
 		select {
@@ -778,7 +776,7 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 			if err != nil && ctx.Err() == nil && (err == context.Canceled || err == context.DeadlineExceeded) {
 				owner.queries.Add(1)
 				devices, err = c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
-				return mergeDeviceSets(devices, c.pinnedDevices(dk)), err
+				return c.mergeKnownDevices(dk, devices), err
 			}
 			return devices, err
 		}
@@ -788,7 +786,7 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 		owner.queries.Add(1)
 		owner.mu.Unlock()
 		devices, err := c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
-		return mergeDeviceSets(devices, c.pinnedDevices(dk)), err
+		return c.mergeKnownDevices(dk, devices), err
 	}
 	flight = &deviceQueryFlight{done: make(chan struct{}), participants: 1}
 	owner.flights[dk] = flight
@@ -803,8 +801,12 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 	// Completion is serialized with accepted writes. Re-read pins here rather
 	// than using a pre-query snapshot that can miss a just-accepted key.
 	pins := c.pinnedDevices(dk)
+	known := pins
+	if entry, ok := owner.Peek(dk); ok {
+		known = mergeDeviceSets(entry.devices, pins)
+	}
 	if err == nil && !flight.invalid && !c.retired.Load() && validDeviceResult(devices, dk.sender) {
-		entry := deviceCacheEntry{devices: mergeDeviceSets(devices, pins)}
+		entry := deviceCacheEntry{devices: mergeDeviceSets(devices, known)}
 		if len(entry.devices) == 0 {
 			entry.expiresAt = completedAt.Add(senderKeyDeviceNegativeTTL)
 			flight.expiresAt = entry.expiresAt
@@ -831,6 +833,18 @@ func (c *CachedSenderKeyStore) releaseDeviceFlight(dk deviceQueryKey, flight *de
 	if flight.participants == 0 && owner.flights[dk] == flight {
 		delete(owner.flights, dk)
 	}
+}
+
+// Uncached retries/overflow still union the current readable entry and pins.
+// In particular, a retired empty flight must neither block a new enumeration
+// nor hide a synchronous commit whose temporary pin has already been removed.
+func (c *CachedSenderKeyStore) mergeKnownDevices(dk deviceQueryKey, devices []string) []string {
+	c.deviceCache.mu.Lock()
+	defer c.deviceCache.mu.Unlock()
+	if entry, ok := c.deviceCache.Peek(dk); ok {
+		devices = mergeDeviceSets(devices, entry.devices)
+	}
+	return mergeDeviceSets(devices, c.pinnedDevices(dk))
 }
 
 // mergeDeviceSets returns the union of base and extra, deduplicated.

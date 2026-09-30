@@ -130,6 +130,9 @@ type deviceQueryKey struct {
 type deviceCacheEntry struct {
 	devices   []string
 	expiresAt time.Time
+	// A cold write proves these devices readable, but says nothing about other
+	// persisted siblings. Only an authoritative enumeration completes the set.
+	incomplete bool
 }
 
 type deviceQueryFlight struct {

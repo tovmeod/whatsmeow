@@ -623,12 +623,15 @@ func observeSenderKeyWrite(owner *SenderKeyDeviceCache, universe any, account, g
 		}
 		owner.invalidations.Add(1)
 		if entry, ok := owner.Get(dk); ok {
-			owner.Add(dk, deviceCacheEntry{devices: mergeDeviceSets(entry.devices, []string{user})})
-		} else if committed {
-			// A synchronous commit can precede a cold enumeration's completion.
-			// Its overlay is about to unpin: retain the now-readable device so a
-			// following reader does not join the invalid old empty flight.
-			owner.Add(dk, deviceCacheEntry{devices: []string{user}})
+			// A live verified empty is complete; an expired empty is no longer
+			// evidence that SQL contains no siblings. Preserve completeness only
+			// for the former and existing complete positives.
+			incomplete := entry.incomplete || (len(entry.devices) == 0 && !owner.now().Before(entry.expiresAt))
+			owner.Add(dk, deviceCacheEntry{devices: mergeDeviceSets(entry.devices, []string{user}), incomplete: incomplete})
+		} else {
+			// Retain accepted pins and committed readable devices across a stale
+			// query, without treating one observed device as the complete SQL set.
+			owner.Add(dk, deviceCacheEntry{devices: []string{user}, incomplete: true})
 		}
 		owner.mu.Unlock()
 	}

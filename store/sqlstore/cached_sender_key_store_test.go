@@ -476,10 +476,14 @@ func TestSenderKeyDeviceNegativeCoalescing(t *testing.T) {
 
 func TestSenderKeyDeviceNegativeWriteFence(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
-	c, _ := newDevicePolicyStore(t, 4, func(context.Context, string, string) ([]string, error) {
-		close(entered)
-		<-release
-		return []string{}, nil
+	var reads atomic.Int64
+	c, inner := newDevicePolicyStore(t, 4, func(context.Context, string, string) ([]string, error) {
+		if reads.Add(1) == 1 {
+			close(entered)
+			<-release
+			return []string{}, nil
+		}
+		return []string{"user_1:0"}, nil
 	})
 	result := make(chan []string, 1)
 	go func() { got, _ := c.GetSenderKeyDevices(context.Background(), "g", "user_1"); result <- got }()
@@ -488,7 +492,7 @@ func TestSenderKeyDeviceNegativeWriteFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := c.GetSenderKeyDevices(context.Background(), "g", "user_1")
-	if err != nil || !containsString(got, "user_1:7") {
+	if err != nil || !containsString(got, "user_1:7") || !containsString(got, "user_1:0") {
 		t.Fatalf("pin hidden while query blocked: %v %v", got, err)
 	}
 	close(release)
@@ -497,6 +501,15 @@ func TestSenderKeyDeviceNegativeWriteFence(t *testing.T) {
 	}
 	if entry, ok := c.deviceCache.Peek(c.deviceKey("g", "user_1")); ok && len(entry.devices) == 0 {
 		t.Fatal("late absence published")
+	}
+	for range 2 {
+		got, err := c.GetSenderKeyDevices(context.Background(), "g", "user_1")
+		if err != nil || len(got) != 2 {
+			t.Fatalf("incomplete entry hid a device after stale scan: %v, %v", got, err)
+		}
+	}
+	if inner.calls.Load() != 3 {
+		t.Fatalf("expected old scan, bounded bypass, then one complete scan: %d", inner.calls.Load())
 	}
 }
 
