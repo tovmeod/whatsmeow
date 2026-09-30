@@ -582,6 +582,7 @@ func (c *CachedSenderKeyStore) updateDeviceCache(group, user string) {
 	if f := owner.flights[dk]; f != nil {
 		f.invalid = true
 	}
+	owner.invalidations.Add(1)
 	if entry, ok := owner.Get(dk); ok {
 		owner.Add(dk, deviceCacheEntry{devices: mergeDeviceSets(entry.devices, []string{user})})
 	}
@@ -615,7 +616,13 @@ func (c *CachedSenderKeyStore) cachedDevicesLocked(dk deviceQueryKey) ([]string,
 	}
 	if len(entry.devices) == 0 && !owner.now().Before(entry.expiresAt) {
 		owner.Remove(dk)
+		owner.expiries.Add(1)
 		return nil, false
+	}
+	if len(entry.devices) == 0 {
+		owner.negativeHits.Add(1)
+	} else {
+		owner.positiveHits.Add(1)
 	}
 	atomic.AddUint64(&c.hits, 1)
 	return mergeDeviceSets(entry.devices, c.pinnedDevices(dk)), true
@@ -637,12 +644,13 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 		return devices, nil
 	}
 	if pins := c.pinnedDevices(dk); len(pins) > 0 {
+		owner.positiveHits.Add(1)
 		owner.mu.Unlock()
 		return pins, nil
 	}
 	atomic.AddUint64(&c.misses, 1)
 	flight := owner.flights[dk]
-	if flight != nil {
+	if flight != nil && !(flight.completed && !flight.expiresAt.IsZero() && !owner.now().Before(flight.expiresAt)) {
 		flight.participants++
 		owner.mu.Unlock()
 		select {
@@ -658,20 +666,26 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 			owner.mu.Unlock()
 			c.releaseDeviceFlight(dk, flight)
 			if err != nil && ctx.Err() == nil && (err == context.Canceled || err == context.DeadlineExceeded) {
-				return c.GetSenderKeyDevices(ctx, group, userBare)
+				owner.queries.Add(1)
+				devices, err = c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
+				return mergeDeviceSets(devices, c.pinnedDevices(dk)), err
 			}
 			return devices, err
 		}
 	}
-	if len(owner.flights) >= owner.capacity {
+	if flight != nil || len(owner.flights) >= owner.capacity {
+		owner.overflows.Add(1)
+		owner.queries.Add(1)
 		owner.mu.Unlock()
 		devices, err := c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
 		return mergeDeviceSets(devices, c.pinnedDevices(dk)), err
 	}
 	flight = &deviceQueryFlight{done: make(chan struct{}), participants: 1}
 	owner.flights[dk] = flight
+	owner.queries.Add(1)
 	owner.mu.Unlock()
 	devices, err := c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
+	completedAt := owner.now()
 	if err == nil {
 		err = ctx.Err()
 	}
@@ -682,7 +696,8 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 	if err == nil && !flight.invalid && validDeviceResult(devices, dk.sender) {
 		entry := deviceCacheEntry{devices: mergeDeviceSets(devices, pins)}
 		if len(entry.devices) == 0 {
-			entry.expiresAt = owner.now().Add(senderKeyDeviceNegativeTTL)
+			entry.expiresAt = completedAt.Add(senderKeyDeviceNegativeTTL)
+			flight.expiresAt = entry.expiresAt
 		}
 		owner.Add(dk, entry)
 	}
@@ -691,6 +706,7 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 		devices = mergeDeviceSets(entry.devices, devices)
 	}
 	flight.devices, flight.err = devices, err
+	flight.completed = true
 	close(flight.done)
 	owner.mu.Unlock()
 	c.releaseDeviceFlight(dk, flight)

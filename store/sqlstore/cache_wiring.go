@@ -138,6 +138,8 @@ type deviceQueryFlight struct {
 	invalid      bool
 	devices      []string
 	err          error
+	completed    bool
+	expiresAt    time.Time
 }
 
 // SenderKeyDeviceCache owns the single positive/empty LRU and bounded active
@@ -146,10 +148,28 @@ type deviceQueryFlight struct {
 // under mu, and every writer releases pinnedMu before taking mu.
 type SenderKeyDeviceCache struct {
 	*lru.Cache[deviceQueryKey, deviceCacheEntry]
-	mu       sync.Mutex
-	flights  map[deviceQueryKey]*deviceQueryFlight
-	capacity int
-	now      func() time.Time
+	mu                                                                                 sync.Mutex
+	flights                                                                            map[deviceQueryKey]*deviceQueryFlight
+	capacity                                                                           int
+	now                                                                                func() time.Time
+	positiveHits, negativeHits, queries, expiries, invalidations, evictions, overflows atomic.Uint64
+}
+
+// DeviceCacheMetrics contains aggregate totals only: no identity or key labels.
+type DeviceCacheMetrics struct {
+	PositiveHits, NegativeHits, Queries, Expiries, Invalidations, Evictions, Overflows uint64
+}
+
+func (c *SenderKeyDeviceCache) Metrics() DeviceCacheMetrics {
+	return DeviceCacheMetrics{c.positiveHits.Load(), c.negativeHits.Load(), c.queries.Load(), c.expiries.Load(), c.invalidations.Load(), c.evictions.Load(), c.overflows.Load()}
+}
+
+func (c *SenderKeyDeviceCache) Add(key deviceQueryKey, entry deviceCacheEntry) bool {
+	evicted := c.Cache.Add(key, entry)
+	if evicted {
+		c.evictions.Add(1)
+	}
+	return evicted
 }
 
 // NewSenderKeyDeviceCache provides one typed shared owner to external tests
@@ -774,12 +794,18 @@ func formatCacheMetrics(c *Container) string {
 	// D-10 auto-accepts every key rotation fleet-wide, so this aggregate is the
 	// only alerting-ready signal for an anomalous rotation spike (the realistic
 	// attack/abuse signature is a single address rotating repeatedly).
+	deviceBlock := "sk_devices={not_wired}"
+	if owner := c.caches.SenderKeyDevices; owner != nil {
+		m := owner.Metrics()
+		deviceBlock = fmt.Sprintf("sk_devices={len=%d, cap=%d, positive_hit=%d, negative_hit=%d, query=%d, expiry=%d, invalidation=%d, eviction=%d, overflow=%d}", owner.Len(), owner.capacity, m.PositiveHits, m.NegativeHits, m.Queries, m.Expiries, m.Invalidations, m.Evictions, m.Overflows)
+	}
 	return fmt.Sprintf(
-		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d, identity_changed=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
+		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d, identity_changed=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s %s decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
 		c.caches.Session.Len(), signalSessionCacheCap, sessEvic, sessCap, sessExp,
 		c.caches.Identity.Len(), signalIdentityCacheCap, idntEvic, idntCap, idntExp, identityChangedTotal.Load(),
 		c.caches.SenderKey.Len(), signalSenderKeyCacheCap, sndkEvic, sndkCap, sndkExp,
 		msgSecBlock,
+		deviceBlock,
 		walltime.DecryptHistogram.Quantile(0.5),
 		walltime.DecryptHistogram.Quantile(0.95),
 		walltime.DecryptHistogram.Quantile(0.99),

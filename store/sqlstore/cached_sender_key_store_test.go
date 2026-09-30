@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -255,10 +254,79 @@ func TestSenderKeyDeviceNegativeWriteFence(t *testing.T) {
 }
 
 func TestSenderKeyDeviceTelemetry(t *testing.T) {
-	c, _ := newTestCachedSenderKeyStore(t, 2)
-	if !reflect.ValueOf(c.deviceCache).MethodByName("Metrics").IsValid() {
-		t.Fatal("shared device cache must expose aggregate policy metrics")
+	c, _ := newDevicePolicyStore(t, 2, func(_ context.Context, group, sender string) ([]string, error) {
+		if group == "positive" {
+			return []string{sender + ":0"}, nil
+		}
+		return []string{}, nil
+	})
+	now := time.Unix(1_000, 0)
+	c.deviceCache.now = func() time.Time { return now }
+	ctx := context.Background()
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	now = now.Add(5 * time.Minute)
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "positive", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "positive", "user_1")
+	c.updateDeviceCache("negative", "user_1:7")
+	_, _ = c.GetSenderKeyDevices(ctx, "other", "user_1")
+	m := c.deviceCache.Metrics()
+	if m.PositiveHits != 1 || m.NegativeHits != 1 || m.Queries != 4 || m.Expiries != 1 || m.Invalidations != 1 || m.Evictions != 1 || m.Overflows != 0 {
+		t.Fatalf("metrics: %+v", m)
 	}
+}
+
+func TestSenderKeyDeviceCacheCapacity(t *testing.T) {
+	c, inner := newDevicePolicyStore(t, 2, func(_ context.Context, group, sender string) ([]string, error) {
+		if group == "positive" {
+			return []string{sender + ":0"}, nil
+		}
+		return []string{}, nil
+	})
+	ctx := context.Background()
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "positive", "user_1")
+	_, _ = c.GetSenderKeyDevices(ctx, "churn", "user_1")
+	if c.deviceCache.Len() != 2 {
+		t.Fatal("positive and empty must compete at cap")
+	}
+	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
+	if inner.calls.Load() != 4 {
+		t.Fatal("evicted absence must query")
+	}
+	for i := range 1000 {
+		_, _ = c.GetSenderKeyDevices(ctx, fmt.Sprintf("churn-%d", i), "user_1")
+		if c.deviceCache.Len() > 2 || len(c.deviceCache.flights) != 0 {
+			t.Fatal("state exceeded cap or retained completed flight")
+		}
+	}
+	t.Run("overflow", func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		c, inner := newDevicePolicyStore(t, 1, func(_ context.Context, group, _ string) ([]string, error) {
+			if group == "blocked" {
+				close(entered)
+				<-release
+			}
+			return []string{}, nil
+		})
+		done := make(chan struct{})
+		go func() { _, _ = c.GetSenderKeyDevices(ctx, "blocked", "user_1"); close(done) }()
+		<-entered
+		for range 2 {
+			_, _ = c.GetSenderKeyDevices(ctx, "overflow", "user_1")
+		}
+		c.deviceCache.mu.Lock()
+		if len(c.deviceCache.flights) != 1 || c.deviceCache.Len() != 0 {
+			t.Fatal("overflow allocated or cached absence")
+		}
+		c.deviceCache.mu.Unlock()
+		close(release)
+		<-done
+		if inner.calls.Load() != 3 || c.deviceCache.Metrics().Overflows != 2 || len(c.deviceCache.flights) != 0 {
+			t.Fatal("overflow query or cleanup failed")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
