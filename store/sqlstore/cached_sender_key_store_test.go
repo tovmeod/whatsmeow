@@ -18,7 +18,67 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+func TestSenderKeyReinitialization(t *testing.T) {
+	container := &Container{log: waLog.Noop}
+	wireSignalCaches(container, waLog.Noop)
+	t.Cleanup(func() { closeSignalCaches(container) })
+	jid := types.NewJID("account", types.DefaultUserServer)
+	device := &store.Device{ID: &jid}
+	attachCachedStores(container, device, NewSQLStore(container, jid))
+	old := device.SenderKeys.(*CachedSenderKeyStore)
+	dk := old.deviceKey("g", "sender:1")
+	old.deviceCache.Add(dk, deviceCacheEntry{})
+	old.pinned[dk] = map[string]struct{}{"sender:1": {}}
+	old.pinnedBlobs[old.key("g", "sender:1")] = []byte("pending")
+	flusher := old.flusher
+	attachCachedStores(container, device, NewSQLStore(container, jid))
+	fresh := device.SenderKeys.(*CachedSenderKeyStore)
+	if _, err := old.GetSenderKeyDevices(context.Background(), "g", "sender"); err == nil {
+		t.Fatal("retired sender-key wrapper remains usable after reinitialization")
+	}
+	if fresh.flusher != flusher || !containsString(fresh.pinnedDevices(dk), "sender:1") {
+		t.Fatal("reattachment lost the singleton flusher or pending overlay")
+	}
+	flusher.notifyDrained(SenderKeyRow{Group: "g", User: "sender:1", Blob: []byte("pending")})
+	if len(fresh.pinnedDevices(dk)) != 0 || len(old.pinned) != 0 || len(old.pinnedBlobs) != 0 {
+		t.Fatal("drain callback or retired overlay cleanup failed")
+	}
+}
+
+func TestSenderKeyTeardownDonorFlights(t *testing.T) {
+	stub := &stubRecoveryInner{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	blobs, _ := lru.New[string, []byte](4)
+	devices, _ := NewSenderKeyDeviceCache(4)
+	c := NewCachedSenderKeyStore(stub, "account", blobs, devices, nil)
+	key := c.donorKey("g", "sender", 7)
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = c.lookupDonor(context.Background(), stub, key, 1) }()
+	<-stub.entered
+	other := donorQueryKey{universe: &Container{}, group: "other", sender: "sender", keyID: 7}
+	noDonorCacheMu.Lock()
+	noDonorCache.Add(other, noDonorCacheEntry{expiresAt: time.Now().Add(time.Hour)})
+	noDonorCacheMu.Unlock()
+	clearDonorUniverse(stub)
+	noDonorCacheMu.Lock()
+	_, retained := donorWaves[key]
+	_, active := donorFlights[donorWorkKey{key, 1}]
+	_, otherPresent := noDonorCache.Peek(other)
+	noDonorCacheMu.Unlock()
+	close(stub.release)
+	<-done
+	if retained || active {
+		t.Fatal("teardown retained old-domain coordination")
+	}
+	if !otherPresent || getNoDonorCacheEntry(key, 1, time.Now()) {
+		t.Fatal("teardown affected another universe or allowed stale absence")
+	}
+	clearDonorUniverse(other.universe)
+}
 
 // Compile-time conformance is asserted inside cached_sender_key_store.go via
 //   var _ store.SenderKeyStore = (*CachedSenderKeyStore)(nil)
