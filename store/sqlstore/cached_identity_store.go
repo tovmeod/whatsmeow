@@ -1,0 +1,307 @@
+// Copyright (c) 2026 Kavtov Platform (Phase 17.5)
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package sqlstore
+
+import (
+	"context"
+	"sync/atomic"
+
+	lru "github.com/hashicorp/golang-lru/v2"
+
+	"go.mau.fi/whatsmeow/store"
+	waLog "go.mau.fi/whatsmeow/util/log"
+)
+
+// CachedIdentityStore wraps an inner store.IdentityStore with a process-shared
+// *lru.Cache[string, *[32]byte]. The cache value uses *[32]byte so a nil
+// pointer encodes "known absent" (TOFU pass-through, mirroring
+// SQLStore.IsTrustedIdentity ErrNoRows handling at store.go:97-109) while a
+// non-nil pointer holds the cached identity bytes.
+//
+// PutIdentity applies a value-equal write-skip: when the incoming key bytes
+// equal the cached bytes, the wrapper returns nil WITHOUT delegating to inner
+// and increments dedupedWrites. This closes RESEARCH Pitfall 3 — libsignal
+// defensively calls SaveIdentity after every IsTrustedIdentity, producing the
+// 37.4M:37.4M SELECT:UPSERT 1:1 ratio observed in pg_stat_statements; with
+// the dedup, ~99% of those UPSERTs are eliminated in steady state.
+//
+// IsTrustedIdentity populates the cache on miss via a runtime type-assertion
+// against `interface{ getIdentityBytes(context.Context, string) (*[32]byte, error) }`.
+// The concrete *SQLStore satisfies this assertion (see the private
+// getIdentityBytes method on SQLStore in this package). The
+// fakeIdentityStore test-helper also satisfies it. If a future test
+// injects a non-conforming fake, the wrapper falls back to
+// inner.IsTrustedIdentity without caching — defensive, no log spam.
+//
+// Single-goroutine-per-account assumption (WR-05 closure):
+// The kavtov-driver-go deployment runs one whatsmeow.Client per phone,
+// and all signal-store operations for that phone execute on that
+// Client's read-loop goroutine. Different phones map to different
+// *store.Device and thus different CachedIdentityStore instances; the
+// shared process-LRU is keyed by `jid + "|" + address`, so per-device
+// key spaces never overlap. For any single cache key, at most one
+// goroutine ever calls IsTrustedIdentity / PutIdentity / DeleteIdentity.
+// This closes the WR-05 populate-on-miss race (two concurrent
+// IsTrustedIdentity calls for the same address both reaching c.cache.Add
+// before either's PutIdentity) — that interleaving cannot occur under
+// the single-writer invariant.
+type CachedIdentityStore struct {
+	inner store.IdentityStore
+	jid   string
+	cache *lru.Cache[string, *[32]byte]
+
+	hits, misses, dedupedWrites uint64
+
+	// identityChangedCount counts mismatch-accept events (D-10): IsTrustedIdentity
+	// returned (true, nil) for a sender whose stored key differed from the presented key.
+	// Incremented at both compare sites (cache-hit and populate-on-miss).
+	// Read via IdentityChangedCount(). Implementation in GREEN (feat 35.2-03).
+	identityChangedCount uint64
+
+	// explicitRemoves points at the Container-level IdentityExplicitRemoves
+	// counter (signalCaches.IdentityExplicitRemoves). Incremented at call
+	// sites of Remove() and Purge() before delegating to the LRU (Phase 17.5.2).
+	explicitRemoves *uint64
+
+	// secondaryIndex is the process-shared (jid,phone)→cacheKeys index
+	// shared across all device wrappers. Used by DeleteAllIdentities for
+	// O(K) bulk removal. Maintained in lockstep with every c.cache.Add call.
+	// Phase 24.
+	secondaryIndex *identitySecondaryIndex
+}
+
+var _ store.IdentityStore = (*CachedIdentityStore)(nil)
+
+// identityChangedTotal is the process-global aggregate of D-10 mismatch-accept
+// (IDENTITY_CHANGED) events across ALL CachedIdentityStore wrappers (one per
+// device). The per-wrapper identityChangedCount remains the test-visible
+// per-device counter; this aggregate is what emitMetricsLoop surfaces every 5
+// minutes in the identities={...} block (WR-02: without it the counter was
+// write-only in production — D-10 disables the Signal protocol's session-level
+// MITM defense fleet-wide, and an anomalous spike, e.g. a single address
+// rotating repeatedly, had no alerting path). Read via IdentityChangedTotal().
+var identityChangedTotal atomic.Uint64
+
+// IdentityChangedTotal returns the process-global count of D-10
+// mismatch-accept (IDENTITY_CHANGED) events across all device wrappers.
+// Exported for the driver's DebugStats payload (manager.go) — the same
+// observability seam as store.SenderKeyParsedCacheStats and Container.CacheLens.
+func IdentityChangedTotal() uint64 {
+	return identityChangedTotal.Load()
+}
+
+// identityReader is the unexported populate-on-miss seam. The concrete
+// *SQLStore (in this package) and the in-package fakeIdentityStore both
+// satisfy it. The cache uses a runtime type-assertion against this
+// interface so the IdentityStore interface itself stays unchanged.
+type identityReader interface {
+	getIdentityBytes(ctx context.Context, address string) (*[32]byte, error)
+}
+
+// NewCachedIdentityStore constructs a wrapper over inner. jid is the
+// device JID (used as cache-key prefix). cache is a shared LRU
+// constructed by the Container. explicitRemoves is a pointer to the
+// Container-level IdentityExplicitRemoves counter (Phase 17.5.2).
+// secondaryIndex is the process-shared (jid,phone)→cacheKeys secondary
+// index (Phase 24).
+func NewCachedIdentityStore(inner store.IdentityStore, jid string, cache *lru.Cache[string, *[32]byte], explicitRemoves *uint64, secondaryIndex *identitySecondaryIndex) *CachedIdentityStore {
+	return &CachedIdentityStore{
+		inner:           inner,
+		jid:             jid,
+		cache:           cache,
+		explicitRemoves: explicitRemoves,
+		secondaryIndex:  secondaryIndex,
+	}
+}
+
+func (c *CachedIdentityStore) key(address string) string {
+	return c.jid + "|" + address
+}
+
+// Stats returns (hits, misses, dedupedWrites) for test observability and
+// for the Container's emitMetricsLoop to surface deduped UPSERT counts —
+// the headline closure of the libsignal "SaveIdentity after every
+// IsTrustedIdentity" 1:1 SELECT:UPSERT pattern (~99% of those UPSERTs
+// eliminated in steady state by the value-equal write-skip in
+// PutIdentity below).
+func (c *CachedIdentityStore) Stats() (hits, misses, dedupedWrites uint64) {
+	return atomic.LoadUint64(&c.hits),
+		atomic.LoadUint64(&c.misses),
+		atomic.LoadUint64(&c.dedupedWrites)
+}
+
+// IdentityChangedCount returns the number of mismatch-accept events (D-10)
+// fired by this wrapper's IsTrustedIdentity — once per (sender, key) change,
+// via both the cache-hit and populate-on-miss compare sites.
+// Used by tests to assert audit-log emission without a live logger.
+func (c *CachedIdentityStore) IdentityChangedCount() uint64 {
+	return atomic.LoadUint64(&c.identityChangedCount)
+}
+
+// ---------------------------------------------------------------------------
+// store.IdentityStore — read
+// ---------------------------------------------------------------------------
+
+// logIdentityChanged emits one IDENTITY_CHANGED debug line and increments
+// identityChangedCount. The logger is borrowed from c.inner when it is a
+// *SQLStore (intra-package type assertion — same idiom as recovery_sender_key.go:311-317).
+// If inner is not *SQLStore (test fakes, future wrappers) the log line is
+// skipped but the counter is still incremented — the counter is the test-visible signal.
+// Class 4 (55.1-03): a peer key rotation is already handled losslessly by the
+// D-10 auto-accept above; the per-event WARN was redundant with the
+// process-global identityChangedTotal aggregate already surfaced every 5
+// minutes by emitMetricsLoop, so this is demoted to Debug.
+func (c *CachedIdentityStore) logIdentityChanged(address string, old, newKey [32]byte) {
+	atomic.AddUint64(&c.identityChangedCount, 1)
+	identityChangedTotal.Add(1) // WR-02: process-global aggregate for emitMetricsLoop/DebugStats
+	var log waLog.Logger
+	if sq, ok := c.inner.(*SQLStore); ok {
+		log = sq.log
+	}
+	if log != nil {
+		log.Debugf("IDENTITY_CHANGED address=%s old=%x new=%x", address, old[:8], newKey[:8])
+	}
+}
+
+func (c *CachedIdentityStore) IsTrustedIdentity(ctx context.Context, address string, key [32]byte) (bool, error) {
+	k := c.key(address)
+	if v, ok := c.cache.Get(k); ok {
+		atomic.AddUint64(&c.hits, 1)
+		if v == nil {
+			// Cached absent sentinel — mirrors SQLStore.IsTrustedIdentity
+			// ErrNoRows handling: trust on first sight.
+			return true, nil
+		}
+		if *v == key {
+			return true, nil
+		}
+		// D-10: cache-hit compare site — stored key differs from presented key.
+		// Accept and audit-log; do NOT update the cache here — libsignal's
+		// subsequent SaveIdentity -> PutIdentity does it, preserving the
+		// once-per-change dedup semantics.
+		c.logIdentityChanged(address, *v, key)
+		return true, nil
+	}
+	atomic.AddUint64(&c.misses, 1)
+
+	// Populate-on-miss via the private identityReader seam. If inner does not
+	// implement it (only possible if a future test injects a non-conforming
+	// fake), fall back to inner.IsTrustedIdentity without caching the miss.
+	reader, ok := c.inner.(identityReader)
+	if !ok {
+		return c.inner.IsTrustedIdentity(ctx, address, key)
+	}
+	bytes, err := reader.getIdentityBytes(ctx, address)
+	if err != nil {
+		return false, err
+	}
+	// bytes == nil represents "known absent"; cache it so subsequent calls
+	// for the same address are also served from cache.
+	c.cache.Add(k, bytes)
+	// Phase 24 orphan-free invariant: every c.cache.Add must be paired with
+	// a secondaryIndex.Insert so SnapshotKeys can reach all entries for this
+	// (jid, phone) during DeleteAllIdentities — including the cached-nil
+	// "known absent" sentinel entries, which must also be evicted when the
+	// SQL row is gone.
+	c.secondaryIndex.Insert(c.jid, addressUser(address), k)
+	if bytes == nil {
+		return true, nil
+	}
+	if *bytes == key {
+		return true, nil
+	}
+	// D-10: populate-on-miss compare site — stored key differs from presented key.
+	// Accept and audit-log; cache already holds the stored key (bytes) from the
+	// populate above — libsignal's SaveIdentity -> PutIdentity will update it.
+	c.logIdentityChanged(address, *bytes, key)
+	return true, nil
+}
+
+// ---------------------------------------------------------------------------
+// store.IdentityStore — write
+// ---------------------------------------------------------------------------
+
+// PutIdentity applies the value-equal write-skip. The cache holds a copy of
+// the most recently observed key; if the incoming key matches byte-for-byte,
+// the inner UPSERT is skipped (dedupedWrites += 1). Otherwise the inner
+// store is updated and the cache reflects the new value.
+//
+// Aliasing: the cache stores a heap copy of key (keyCopy local + &keyCopy)
+// so caller-stack mutation after the call cannot corrupt cache entries.
+func (c *CachedIdentityStore) PutIdentity(ctx context.Context, address string, key [32]byte) error {
+	k := c.key(address)
+	if cached, ok := c.cache.Get(k); ok && cached != nil && *cached == key {
+		atomic.AddUint64(&c.dedupedWrites, 1)
+		return nil
+	}
+	if err := c.inner.PutIdentity(ctx, address, key); err != nil {
+		return err
+	}
+	keyCopy := key
+	c.cache.Add(k, &keyCopy)
+	// Phase 24 orphan-free invariant: maintain secondaryIndex in lockstep
+	// with every cache.Add (D-05). addressUser extracts the libsignal user
+	// portion ("<user>" from "<user>:<device>") as the index "phone".
+	// Insert is idempotent: re-inserting an existing key (e.g. PutIdentity
+	// updating the cached value when the index entry already exists from a
+	// prior populate) is a map-set no-op.
+	c.secondaryIndex.Insert(c.jid, addressUser(address), k)
+	return nil
+}
+
+func (c *CachedIdentityStore) DeleteIdentity(ctx context.Context, address string) error {
+	if err := c.inner.DeleteIdentity(ctx, address); err != nil {
+		return err
+	}
+	// kavtov-fork: Phase 17.5.2 - pre-increment explicit-remove counter (see Plan 17.5.2-03)
+	atomic.AddUint64(c.explicitRemoves, 1)
+	c.cache.Remove(c.key(address))
+	// Phase 24: No explicit secondaryIndex.Remove call here. Index cleanup
+	// happens via the eviction callback in cache_wiring.go which fires for
+	// every cache.Remove including explicit ones — no separate index.Remove
+	// needed here.
+	return nil
+}
+
+func (c *CachedIdentityStore) DeleteAllIdentities(ctx context.Context, phone string) error {
+	if err := c.inner.DeleteAllIdentities(ctx, phone); err != nil {
+		return err
+	}
+	// kavtov-fork: Phase 17.5.3 - the secondary index keyed by (jid, phone)
+	// returns only this wrapper's entries for the target remote phone,
+	// preserving the Phase 17.5.3 cross-wrapper isolation invariant exactly.
+	// Previously this called the LRU's bulk Purge which wiped the entire
+	// process-shared cache across all device wrappers, causing ~26
+	// explicit_removes/sec churn and undoing the Phase 17.5 cache benefit
+	// for unrelated devices. See 17.5.3-RCA-IDENTITIES-CACHE.md for
+	// evidence (identities.len swinging 30..1617, capacity_evictions=0).
+	// The SQL predicate `our_jid=$1 AND their_id LIKE $phone||':' ...`
+	// matches libsignal addresses of the form `<phone>:<device>`; the
+	// secondary index stores them under (jid, phone) so the lookup is
+	// bounded to exactly this wrapper's entries for the target phone.
+	//
+	// Phase 24: the former O(N) cache.Keys() prefix-walk is replaced by a
+	// single O(K) SnapshotKeys lookup (where K is the number of matching
+	// entries for this (jid, phone) pair, typically 1–10).
+	// SnapshotKeys acquires a read lock, copies the bucket, and releases
+	// before returning — callers iterate the snapshot without holding any
+	// index lock (lock-ordering discipline prevents deadlock with the
+	// EvictCleanup callback).
+	victims := c.secondaryIndex.SnapshotKeys(c.jid, phone)
+	for _, k := range victims {
+		// kavtov-fork: Phase 17.5.2 - pre-increment per iteration (Phase 24: one per snapshot entry)
+		atomic.AddUint64(c.explicitRemoves, 1)
+		c.cache.Remove(k)
+		// Each cache.Remove fires the eviction callback (cache_wiring.go)
+		// which calls EvictCleanup on the index — no separate index.Remove.
+	}
+	// Defensive sweep: DropKey is idempotent and guards against the race
+	// where capacity eviction removed some keys between SnapshotKeys and
+	// the explicit Remove loop, leaving a stale empty bucket in the index.
+	c.secondaryIndex.DropKey(c.jid, phone)
+	return nil
+}

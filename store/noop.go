@@ -36,6 +36,7 @@ var NoopDevice = &Device{
 	ChatSettings:  nilStore,
 	MsgSecrets:    nilStore,
 	PrivacyTokens: nilStore,
+	NCTSalt:       nilStore,
 	EventBuffer:   nilStore,
 	LIDs:          nilStore,
 	Container:     nilStore,
@@ -124,6 +125,10 @@ func (n *NoopStore) GetSenderKey(ctx context.Context, group, user string) ([]byt
 	return nil, n.Error
 }
 
+func (n *NoopStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
+	return nil, nil
+}
+
 func (n *NoopStore) PutAppStateSyncKey(ctx context.Context, id []byte, key AppStateSyncKey) error {
 	return n.Error
 }
@@ -162,6 +167,10 @@ func (n *NoopStore) DeleteAppStateMutationMACs(ctx context.Context, name string,
 
 func (n *NoopStore) GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error) {
 	return nil, n.Error
+}
+
+func (n *NoopStore) PutAppStateVersionAndMACs(ctx context.Context, name string, version uint64, hash [128]byte, removedMACs [][]byte, addedMACs []AppStateMutationMAC) error {
+	return n.Error
 }
 
 func (n *NoopStore) PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error) {
@@ -228,6 +237,22 @@ func (n *NoopStore) GetPrivacyToken(ctx context.Context, user types.JID) (*Priva
 	return nil, n.Error
 }
 
+func (n *NoopStore) PutNCTSalt(ctx context.Context, salt []byte) error {
+	return n.Error
+}
+
+func (n *NoopStore) GetNCTSalt(ctx context.Context) ([]byte, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) DeleteNCTSalt(ctx context.Context) error {
+	return n.Error
+}
+
+func (n *NoopStore) DeleteExpiredPrivacyTokens(ctx context.Context, cutoff time.Time) (int64, error) {
+	return 0, n.Error
+}
+
 func (n *NoopStore) PutDevice(ctx context.Context, store *Device) error {
 	return n.Error
 }
@@ -281,6 +306,10 @@ func (n *NoopStore) DeleteOldOutgoingEvents(ctx context.Context) error {
 }
 
 func (n *NoopStore) GetOutgoingEvent(ctx context.Context, chatJID, altChatJID types.JID, id types.MessageID) (string, []byte, error) {
+	return "", nil, nil
+}
+
+func (n *NoopStore) GetOutgoingEventByID(ctx context.Context, id types.MessageID) (string, []byte, error) {
 	return "", nil, nil
 }
 

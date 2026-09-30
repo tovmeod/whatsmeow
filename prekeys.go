@@ -24,7 +24,7 @@ import (
 
 const (
 	// WantedPreKeyCount is the number of prekeys that the client should upload to the WhatsApp servers in a single batch.
-	WantedPreKeyCount = 50
+	WantedPreKeyCount = 812
 	// MinPreKeyCount is the number of prekeys when the client will upload a new batch of prekeys to the WhatsApp servers.
 	MinPreKeyCount = 5
 )
@@ -60,9 +60,6 @@ func (cli *Client) uploadPreKeys(ctx context.Context, initialUpload bool) {
 	var registrationIDBytes [4]byte
 	binary.BigEndian.PutUint32(registrationIDBytes[:], cli.Store.RegistrationID)
 	wantedCount := WantedPreKeyCount
-	if initialUpload {
-		wantedCount = 812
-	}
 	preKeys, err := cli.Store.PreKeys.GetOrGenPreKeys(ctx, uint32(wantedCount))
 	if err != nil {
 		cli.Log.Errorf("Failed to get prekeys to upload: %v", err)
@@ -180,7 +177,7 @@ func preKeyToNode(key *keys.PreKey) waBinary.Node {
 func nodeToPreKeyBundle(deviceID uint32, node waBinary.Node) (*prekey.Bundle, error) {
 	errorNode, ok := node.GetOptionalChildByTag("error")
 	if ok && errorNode.Tag == "error" {
-		return nil, fmt.Errorf("got error getting prekeys: %s", errorNode.XMLString())
+		return nil, fmt.Errorf("got error getting prekeys: %s", &errorNode)
 	}
 
 	registrationBytes, ok := node.GetChildByTag("registration").Content.([]byte)

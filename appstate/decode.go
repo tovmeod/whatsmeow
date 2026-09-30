@@ -9,6 +9,7 @@ package appstate
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -122,7 +123,7 @@ func (out *patchOutput) RemoveMAC(indexMAC []byte) {
 	out.RemovedMACs = append(out.RemovedMACs, indexMAC)
 	// If the mutation was previously added in this patch, remove it from AddedMACs
 	out.AddedMACs = slices.DeleteFunc(out.AddedMACs, func(mac store.AppStateMutationMAC) bool {
-		return bytes.Equal(mac.IndexMAC, indexMAC)
+		return hmac.Equal(mac.IndexMAC, indexMAC)
 	})
 }
 
@@ -149,7 +150,7 @@ func (proc *Processor) decodeMutation(
 	content, valueMAC = content[:len(content)-32], content[len(content)-32:]
 	if validateMACs {
 		expectedValueMAC := generateContentMAC(mutation.GetOperation(), content, keyID, keys.ValueMAC)
-		if !bytes.Equal(expectedValueMAC, valueMAC) {
+		if !hmac.Equal(expectedValueMAC, valueMAC) {
 			err = fmt.Errorf("failed to verify mutation #%d: %w", i+1, ErrMismatchingContentMAC)
 			return
 		}
@@ -169,7 +170,7 @@ func (proc *Processor) decodeMutation(
 	indexMAC = mutation.GetRecord().GetIndex().GetBlob()
 	if validateMACs {
 		expectedIndexMAC := concatAndHMAC(sha256.New, keys.Index, syncAction.Index)
-		if !bytes.Equal(expectedIndexMAC, indexMAC) {
+		if !hmac.Equal(expectedIndexMAC, indexMAC) {
 			err = fmt.Errorf("failed to verify mutation #%d: %w", i+1, ErrMismatchingIndexMAC)
 			return
 		}
@@ -225,20 +226,14 @@ func (proc *Processor) decodeMutations(
 	return nil
 }
 
+// storeMACs persists the version cursor together with the removed and added mutation MACs
+// in a single atomic call (55.1-10, class 14 root cause H1). Previously these were three
+// independent non-transactional statements; a crash or per-statement error between them
+// could leave the version cursor ahead of (or behind) the mutation-MAC ledger, corrupting
+// the ledger a later REMOVE-lookup silently misses against (hash.go's
+// ErrMissingPreviousSetValueOperation warning path), producing a wrong computed LTHash.
 func (proc *Processor) storeMACs(ctx context.Context, name WAPatchName, currentState HashState, out *patchOutput) error {
-	err := proc.Store.AppState.PutAppStateVersion(ctx, string(name), currentState.Version, currentState.Hash)
-	if err != nil {
-		return fmt.Errorf("failed to update app state version in the database: %w", err)
-	}
-	err = proc.Store.AppState.DeleteAppStateMutationMACs(ctx, string(name), out.RemovedMACs)
-	if err != nil {
-		return fmt.Errorf("failed to remove deleted mutation MACs from the database: %w", err)
-	}
-	err = proc.Store.AppState.PutAppStateMutationMACs(ctx, string(name), currentState.Version, out.AddedMACs)
-	if err != nil {
-		return fmt.Errorf("failed to insert added mutation MACs to the database: %w", err)
-	}
-	return nil
+	return proc.Store.AppState.PutAppStateVersionAndMACs(ctx, string(name), currentState.Version, currentState.Hash, out.RemovedMACs, out.AddedMACs)
 }
 
 func (proc *Processor) validateSnapshotMAC(ctx context.Context, name WAPatchName, currentState HashState, keyID, expectedSnapshotMAC []byte) (keys ExpandedAppStateKeys, err error) {
@@ -248,7 +243,7 @@ func (proc *Processor) validateSnapshotMAC(ctx context.Context, name WAPatchName
 		return
 	}
 	snapshotMAC := currentState.generateSnapshotMAC(name, keys.SnapshotMAC)
-	if !bytes.Equal(snapshotMAC, expectedSnapshotMAC) {
+	if !hmac.Equal(snapshotMAC, expectedSnapshotMAC) {
 		err = fmt.Errorf("failed to verify patch v%d: %w", currentState.Version, ErrMismatchingLTHash)
 	}
 	return
@@ -321,7 +316,7 @@ func (proc *Processor) validatePatch(
 	newState.Version = version
 	warn, err = newState.updateHash(patch.GetMutations(), func(indexMAC []byte, maxIndex int) ([]byte, error) {
 		for i := maxIndex - 1; i >= 0; i-- {
-			if bytes.Equal(patch.Mutations[i].GetRecord().GetIndex().GetBlob(), indexMAC) {
+			if hmac.Equal(patch.Mutations[i].GetRecord().GetIndex().GetBlob(), indexMAC) {
 				if patch.Mutations[i].GetOperation() == waServerSync.SyncdMutation_SET {
 					value := patch.Mutations[i].GetRecord().GetValue().GetBlob()
 					return value[len(value)-32:], nil
@@ -345,7 +340,7 @@ func (proc *Processor) validatePatch(
 			return
 		}
 		patchMAC := generatePatchMAC(patch, patchName, keys.PatchMAC, patch.GetVersion().GetVersion())
-		if !bytes.Equal(patchMAC, patch.GetPatchMAC()) {
+		if !hmac.Equal(patchMAC, patch.GetPatchMAC()) {
 			err = fmt.Errorf("failed to verify patch v%d: %w", version, ErrMismatchingPatchMAC)
 			return
 		}
@@ -395,6 +390,19 @@ func (proc *Processor) DecodePatches(
 		if err != nil {
 			return
 		}
+		// 55.1-10 H2 decision: storeMACs is persisted here, per-patch, BEFORE the caller
+		// applies the decoded mutation values (collectEventsToDispatch, appstate.go — a step
+		// that only exists in the whatsmeow package and cannot be called from here). Deferring
+		// this persist to after value-application was considered (55.1-INVESTIGATION-
+		// appstate-connection.md H2) but rejected: validatePatch's REMOVE lookup falls back to
+		// proc.Store.AppState.GetAppStateMutationMAC for indexMACs not SET earlier in the SAME
+		// patch, which requires an EARLIER patch's added MACs to already be in the database.
+		// Deferring the persist across patches would break that cross-patch lookup and
+		// reintroduce the exact "REMOVE silently skipped" corruption (hash.go's
+		// ErrMissingPreviousSetValueOperation) this plan closes. The atomic write added by
+		// PutAppStateVersionAndMACs (storeMACs, below) already closes the class 14 ERROR this
+		// plan targets; a crash between this persist and value-application can only leave
+		// application-level store data (contacts/mutes) stale, not the MAC ledger or LTHash.
 		err = proc.storeMACs(ctx, list.Name, newState, &out)
 		if err != nil {
 			return

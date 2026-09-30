@@ -8,6 +8,7 @@ package whatsmeow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,12 +28,7 @@ func (cli *Client) handleReceipt(ctx context.Context, node *waBinary.Node) {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
 	} else if receipt != nil {
 		if receipt.Type == types.ReceiptTypeRetry {
-			go func() {
-				err := cli.handleRetryReceipt(ctx, receipt, node)
-				if err != nil {
-					cli.Log.Errorf("Failed to handle retry receipt for %s/%s from %s: %v", receipt.Chat, receipt.MessageIDs[0], receipt.Sender, err)
-				}
-			}()
+			go cli.tryHandleRetryReceipt(ctx, receipt, node)
 		}
 		cancelled = cli.dispatchEvent(receipt)
 	}
@@ -43,7 +39,7 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 	partialReceipt.MessageIDs = []types.MessageID{pag.String("key")}
 	for _, child := range participants.GetChildren() {
 		if child.Tag != "user" {
-			cli.Log.Warnf("Unexpected node in grouped receipt participants: %s", child.XMLString())
+			cli.Log.Warnf("Unexpected node in grouped receipt participants: %s", &child)
 			continue
 		}
 		ag := child.AttrGetter()
@@ -51,7 +47,7 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 		receipt.Timestamp = ag.UnixTime("t")
 		receipt.MessageSource.Sender = ag.JID("jid")
 		if !ag.OK() {
-			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", child.XMLString(), ag.Error())
+			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", &child, ag.Error())
 			continue
 		}
 		cli.dispatchEvent(&receipt)
@@ -172,12 +168,20 @@ func (cli *Client) sendAck(ctx context.Context, node *waBinary.Node, error int) 
 	if error != 0 {
 		attrs["error"] = error
 	}
-	err := cli.sendNode(ctx, waBinary.Node{
+	ackNode := waBinary.Node{
 		Tag:   "ack",
 		Attrs: attrs,
-	})
+	}
+	err := cli.sendNodeOrHook(ctx, ackNode)
 	if err != nil {
-		cli.Log.Warnf("Failed to send acknowledgement for %s %s: %v", node.Tag, node.Attrs["id"], err)
+		if errors.Is(err, ErrNotConnected) {
+			// 55.1-02: the socket is down mid-reconnect — queue for replay on the next
+			// successful connect instead of dropping (see pendingStanzas doc on Client).
+			cli.enqueuePendingStanza(ackNode)
+			cli.Log.Debugf("Deferred acknowledgement for %s %s until reconnect (socket not connected)", node.Tag, node.Attrs["id"])
+		} else {
+			cli.Log.Warnf("Failed to send acknowledgement for %s %s: %v", node.Tag, node.Attrs["id"], err)
+		}
 	}
 }
 
@@ -284,11 +288,19 @@ func (cli *Client) sendMessageReceipt(ctx context.Context, info *types.MessageIn
 	} else if cli.sendActiveReceipts.Load() == 0 {
 		attrs["type"] = string(types.ReceiptTypeInactive)
 	}
-	err := cli.sendNode(ctx, waBinary.Node{
+	receiptNode := waBinary.Node{
 		Tag:   "receipt",
 		Attrs: attrs,
-	})
+	}
+	err := cli.sendNodeOrHook(ctx, receiptNode)
 	if err != nil {
-		cli.Log.Warnf("Failed to send receipt for %s: %v", info.ID, err)
+		if errors.Is(err, ErrNotConnected) {
+			// 55.1-02: the socket is down mid-reconnect — queue for replay on the next
+			// successful connect instead of dropping (see pendingStanzas doc on Client).
+			cli.enqueuePendingStanza(receiptNode)
+			cli.Log.Debugf("Deferred receipt for %s until reconnect (socket not connected)", info.ID)
+		} else {
+			cli.Log.Warnf("Failed to send receipt for %s: %v", info.ID, err)
+		}
 	}
 }

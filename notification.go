@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -22,6 +23,19 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
+// appStateSyncFailureThreshold is the number of consecutive ErrMismatchingLTHash errors
+// for the same app-state collection that triggers an automatic full resync.
+const appStateSyncFailureThreshold = 3
+
+// maxAppStateFullSyncFailures bounds how many times a fullSync may itself fail with
+// ErrMismatchingLTHash before we give up on auto-healing a collection. A permanently
+// diverged collection (server snapshot itself fails LTHash verification, e.g. a stuck
+// patch version) cannot be healed by re-fetching, so without a cap the auto-resync
+// degenerates into an unbounded fullSync loop hammering the server (D-12 prod loop on
+// 972527147052, patch v67292). After this many failed fullSyncs we stop triggering and
+// leave the collection diverged; any later successful sync re-arms auto-heal.
+const maxAppStateFullSyncFailures = 3
+
 func (cli *Client) handleEncryptNotification(ctx context.Context, node *waBinary.Node) {
 	from := node.AttrGetter().JID("from")
 	if from == types.ServerJID {
@@ -29,15 +43,15 @@ func (cli *Client) handleEncryptNotification(ctx context.Context, node *waBinary
 		ag := count.AttrGetter()
 		otksLeft := ag.Int("value")
 		if !ag.OK() {
-			cli.Log.Warnf("Didn't get number of OTKs left in encryption notification %s", node.XMLString())
+			cli.Log.Warnf("Didn't get number of OTKs left in encryption notification %s", node)
 			return
 		}
-		cli.Log.Infof("Got prekey count from server: %s", node.XMLString())
+		cli.Log.Infof("Got prekey count from server: %s", node)
 		if otksLeft < MinPreKeyCount {
 			cli.uploadPreKeys(ctx, false)
 		}
 	} else if _, ok := node.GetOptionalChildByTag("identity"); ok {
-		cli.Log.Debugf("Got identity change for %s: %s, deleting all identities/sessions for that number", from, node.XMLString())
+		cli.Log.Debugf("Got identity change for %s: %s, deleting all identities/sessions for that number", from, node)
 		err := cli.Store.Identities.DeleteAllIdentities(ctx, from.User)
 		if err != nil {
 			cli.Log.Warnf("Failed to delete all identities of %s from store after identity change: %v", from, err)
@@ -47,9 +61,25 @@ func (cli *Client) handleEncryptNotification(ctx context.Context, node *waBinary
 			cli.Log.Warnf("Failed to delete all sessions of %s from store after identity change: %v", from, err)
 		}
 		ts := node.AttrGetter().UnixTime("t")
+		storageLID := cli.resolveTCTokenStorageLID(ctx, from)
+		pt, err := cli.Store.PrivacyTokens.GetPrivacyToken(ctx, storageLID)
+		if err != nil {
+			cli.Log.Debugf("Failed to load tctoken for identity change re-issue %s: %v", storageLID, err)
+		}
+		storedSenderTS := time.Time{}
+		if pt != nil {
+			storedSenderTS = pt.SenderTimestamp
+		}
+		if cli.validateAndSetTCTokenSenderTS(storageLID, storedSenderTS) {
+			senderTS := cli.getTCTokenSenderTS(storageLID)
+			if !senderTS.IsZero() {
+				cli.Log.Debugf("Identity changed for %s, re-issuing tctoken", from)
+				go cli.issuePrivacyTokenAndSave(storageLID, senderTS)
+			}
+		}
 		cli.dispatchEvent(&events.IdentityChange{JID: from, Timestamp: ts})
 	} else {
-		cli.Log.Debugf("Got unknown encryption notification from server: %s", node.XMLString())
+		cli.Log.Debugf("Got unknown encryption notification from server: %s", node)
 	}
 }
 
@@ -59,13 +89,48 @@ func (cli *Client) handleAppStateNotification(ctx context.Context, node *waBinar
 		name := appstate.WAPatchName(ag.String("name"))
 		version := ag.Uint64("version")
 		cli.Log.Debugf("Got server sync notification that app state %s has updated to version %d", name, version)
-		err := cli.FetchAppState(ctx, name, false, false)
+		err := cli.fetchAppStateFunc(ctx, name, false, false)
 		if errors.Is(err, ErrIQDisconnected) || errors.Is(err, ErrNotConnected) {
 			// There are some app state changes right before a remote logout, so stop syncing if we're disconnected.
 			cli.Log.Debugf("Failed to sync app state after notification: %v, not trying to sync other states", err)
 			return
+		} else if errors.Is(err, appstate.ErrMismatchingLTHash) {
+			cli.appStateSyncFailuresLock.Lock()
+			cli.appStateSyncFailures[name]++
+			count := cli.appStateSyncFailures[name]
+			gaveUp := cli.appStateFullSyncFailures[name] >= maxAppStateFullSyncFailures
+			cli.appStateSyncFailuresLock.Unlock()
+			cli.Log.Errorf("Failed to sync app state after notification: %v", err)
+			if count >= appStateSyncFailureThreshold && !gaveUp {
+				cli.Log.Warnf("APP_STATE_AUTO_RESYNC: %d consecutive ErrMismatchingLTHash for %s — triggering fullSync", count, name)
+				err2 := cli.fetchAppStateFunc(ctx, name, true, false)
+				cli.appStateSyncFailuresLock.Lock()
+				// Reset the consecutive-error counter after EVERY fullSync attempt so a
+				// failed fullSync backs off to one attempt per appStateSyncFailureThreshold
+				// errors instead of re-firing on every subsequent notification (D-12 loop fix).
+				cli.appStateSyncFailures[name] = 0
+				if err2 == nil {
+					cli.appStateFullSyncFailures[name] = 0
+				} else {
+					cli.appStateFullSyncFailures[name]++
+				}
+				fullSyncFails := cli.appStateFullSyncFailures[name]
+				cli.appStateSyncFailuresLock.Unlock()
+				if err2 != nil {
+					cli.Log.Errorf("APP_STATE_AUTO_RESYNC fullSync also failed for %s (attempt %d/%d): %v", name, fullSyncFails, maxAppStateFullSyncFailures, err2)
+					if fullSyncFails >= maxAppStateFullSyncFailures {
+						cli.Log.Errorf("APP_STATE_AUTO_RESYNC giving up on %s after %d failed fullSync attempts — collection left diverged; manual intervention required", name, fullSyncFails)
+					}
+				}
+			}
 		} else if err != nil {
 			cli.Log.Errorf("Failed to sync app state after notification: %v", err)
+		} else {
+			// Success: reset both failure counters for this collection (re-arms auto-heal).
+			cli.appStateSyncFailuresLock.Lock()
+			cli.appStateSyncFailures[name] = 0
+			cli.appStateFullSyncFailures[name] = 0
+			cli.appStateSyncFailuresLock.Unlock()
 		}
 	}
 }
@@ -117,6 +182,7 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 		cachedLIDHash = participantListHashV2(cachedLID.devices)
 	}
 	cachedParticipantHash := participantListHashV2(cached.devices)
+	var removedDevices []types.JID
 	for _, child := range node.GetChildren() {
 		cag := child.AttrGetter()
 		deviceHash := cag.String("device_hash")
@@ -138,6 +204,14 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 				cachedLID.devices = slices.DeleteFunc(cachedLID.devices, func(existing types.JID) bool {
 					return existing == *changedDeviceLID
 				})
+			}
+			// A removed device's pairwise session/identity are cryptographically
+			// dead; retaining them only accumulates stale rows. Delete them
+			// (matches WA Web's deleteRemoteInfo on device removal). Both the PN
+			// and LID address forms are deleted since sessions may be keyed either way.
+			removedDevices = append(removedDevices, changedDeviceJID)
+			if changedDeviceLID != nil {
+				removedDevices = append(removedDevices, *changedDeviceLID)
 			}
 		case "update":
 			// Exact meaning of "update" is unknown, clear device list cache to be safe
@@ -167,6 +241,31 @@ func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.
 			}
 		}
 	}
+	if len(removedDevices) > 0 {
+		// Run the store deletes off the userDevicesCacheLock and detached from the
+		// notification ctx (WithoutCancel + goroutine, so the cache lock isn't held
+		// during store I/O).
+		go cli.deleteRemovedDeviceData(context.WithoutCancel(ctx), removedDevices)
+	}
+}
+
+// deleteRemovedDeviceData deletes the pairwise session + identity for devices that
+// were removed from a peer's device list (<notification type="devices"><remove>).
+// WA Web does this (deleteRemoteInfo): a removed device is cryptographically dead,
+// so keeping its session only accumulates stale whatsmeow_sessions rows — the
+// primary 1:1-session disk-bloat source for peers that cycle devices (dispatch bots).
+// Per-device failures are logged and skipped, not fatal.
+func (cli *Client) deleteRemovedDeviceData(ctx context.Context, devices []types.JID) {
+	for _, device := range devices {
+		addr := device.SignalAddress().String()
+		if err := cli.Store.Sessions.DeleteSession(ctx, addr); err != nil {
+			cli.Log.Warnf("DEVICE_REMOVED: failed to delete session for %s: %v", addr, err)
+		}
+		if err := cli.Store.Identities.DeleteIdentity(ctx, addr); err != nil {
+			cli.Log.Warnf("DEVICE_REMOVED: failed to delete identity for %s: %v", addr, err)
+		}
+	}
+	cli.Log.Infof("DEVICE_REMOVED: cleaned session+identity for %d removed device(s)", len(devices))
 }
 
 func (cli *Client) handleFBDeviceNotification(ctx context.Context, node *waBinary.Node) {
@@ -177,35 +276,50 @@ func (cli *Client) handleFBDeviceNotification(ctx context.Context, node *waBinar
 	cli.userDevicesCache[jid] = userDevices
 }
 
-func (cli *Client) handleOwnDevicesNotification(ctx context.Context, node *waBinary.Node) {
+func (cli *Client) handleOwnDevicesNotification(ctx context.Context, node *waBinary.Node, fromJID types.JID) {
 	cli.userDevicesCacheLock.Lock()
 	defer cli.userDevicesCacheLock.Unlock()
+	ownLID := cli.getOwnLID().ToNonAD()
 	ownID := cli.getOwnID().ToNonAD()
 	if ownID.IsEmpty() {
 		cli.Log.Debugf("Ignoring own device change notification, session was deleted")
 		return
 	}
-	cached, ok := cli.userDevicesCache[ownID]
-	if !ok {
-		cli.Log.Debugf("Ignoring own device change notification, device list not cached")
+	fromJIDPlain := fromJID.ToNonAD()
+	var altJID types.JID
+	switch fromJIDPlain {
+	case ownID:
+		altJID = ownLID
+	case ownLID:
+		altJID = ownID
+	default:
+		cli.Log.Warnf("Unexpected own device notification sender %s", fromJID)
 		return
 	}
-	oldHash := participantListHashV2(cached.devices)
+	var oldHash string
+	if cached, ok := cli.userDevicesCache[fromJIDPlain]; ok {
+		oldHash = participantListHashV2(cached.devices)
+	}
 	expectedNewHash := node.AttrGetter().String("dhash")
-	var newDeviceList []types.JID
+	var newDeviceList, altDeviceList []types.JID
 	for _, child := range node.GetChildren() {
 		jid := child.AttrGetter().JID("jid")
 		if child.Tag == "device" && !jid.IsEmpty() {
 			newDeviceList = append(newDeviceList, jid)
+			altDeviceJID := altJID
+			altDeviceJID.Device = jid.Device
+			altDeviceList = append(altDeviceList, altDeviceJID)
 		}
 	}
 	newHash := participantListHashV2(newDeviceList)
 	if newHash != expectedNewHash {
-		cli.Log.Debugf("Received own device list change notification %s -> %s, but expected hash was %s", oldHash, newHash, expectedNewHash)
+		cli.Log.Debugf("Received own device list change notification %s -> %s from %s, but expected hash was %s", oldHash, newHash, fromJID, expectedNewHash)
 		delete(cli.userDevicesCache, ownID)
+		delete(cli.userDevicesCache, ownLID)
 	} else {
-		cli.Log.Debugf("Received own device list change notification %s -> %s", oldHash, newHash)
-		cli.userDevicesCache[ownID] = deviceCache{devices: newDeviceList, dhash: expectedNewHash}
+		cli.Log.Debugf("Received own device list change notification %s -> %s from %s", oldHash, newHash, fromJID)
+		cli.userDevicesCache[fromJIDPlain] = deviceCache{devices: newDeviceList, dhash: expectedNewHash}
+		cli.userDevicesCache[altJID] = deviceCache{devices: altDeviceList, dhash: participantListHashV2(altDeviceList)}
 	}
 }
 
@@ -223,7 +337,7 @@ func (cli *Client) handleBlocklist(ctx context.Context, node *waBinary.Node) {
 			Action: events.BlocklistChangeAction(ag.String("action")),
 		}
 		if !ag.OK() {
-			cli.Log.Warnf("Unexpected data in blocklist event child %v: %v", child.XMLString(), ag.Error())
+			cli.Log.Warnf("Unexpected data in blocklist event child %s: %v", &child, ag.Error())
 			continue
 		}
 		evt.Changes = append(evt.Changes, change)
@@ -237,7 +351,7 @@ func (cli *Client) handleAccountSyncNotification(ctx context.Context, node *waBi
 		case "privacy":
 			cli.handlePrivacySettingsNotification(ctx, &child)
 		case "devices":
-			cli.handleOwnDevicesNotification(ctx, &child)
+			cli.handleOwnDevicesNotification(ctx, &child, node.AttrGetter().JID("from"))
 		case "picture":
 			cli.dispatchEvent(&events.Picture{
 				Timestamp: node.AttrGetter().UnixTime("t"),
@@ -252,9 +366,7 @@ func (cli *Client) handleAccountSyncNotification(ctx context.Context, node *waBi
 }
 
 func (cli *Client) handlePrivacyTokenNotification(ctx context.Context, node *waBinary.Node) {
-	ownJID := cli.getOwnID().ToNonAD()
-	ownLID := cli.getOwnLID().ToNonAD()
-	if ownJID.IsEmpty() {
+	if cli.getOwnID().IsEmpty() {
 		cli.Log.Debugf("Ignoring privacy token notification, session was deleted")
 		return
 	}
@@ -264,7 +376,11 @@ func (cli *Client) handlePrivacyTokenNotification(ctx context.Context, node *waB
 		return
 	}
 	parentAG := node.AttrGetter()
-	sender := parentAG.JID("from")
+	sender := parentAG.JID("from").ToNonAD()
+	senderLID := parentAG.OptionalJIDOrEmpty("sender_lid").ToNonAD()
+	if senderLID.IsEmpty() {
+		senderLID = cli.resolveTCTokenStorageLID(ctx, sender)
+	}
 	if !parentAG.OK() {
 		cli.Log.Warnf("privacy_token notification didn't have a sender (%v)", parentAG.Error())
 		return
@@ -273,30 +389,30 @@ func (cli *Client) handlePrivacyTokenNotification(ctx context.Context, node *waB
 		ag := child.AttrGetter()
 		if child.Tag != "token" {
 			cli.Log.Warnf("privacy_token notification contained unexpected <%s> tag", child.Tag)
-		} else if targetUser := ag.JID("jid"); targetUser != ownLID && targetUser != ownJID {
-			// Don't log about own privacy tokens for other users
-			if sender != ownJID && sender != ownLID {
-				cli.Log.Warnf("privacy_token notification contained token for different user %s", targetUser)
-			}
-		} else if tokenType := ag.String("type"); tokenType != "trusted_contact" {
+			continue
+		}
+		if tokenType := ag.String("type"); tokenType != "trusted_contact" {
 			cli.Log.Warnf("privacy_token notification contained unexpected token type %s", tokenType)
-		} else if token, ok := child.Content.([]byte); !ok {
+			continue
+		}
+		token, ok := child.Content.([]byte)
+		if !ok {
 			cli.Log.Warnf("privacy_token notification contained non-binary token")
+			continue
+		}
+		timestamp := ag.UnixTime("t")
+		if !ag.OK() {
+			cli.Log.Warnf("privacy_token notification is missing some fields: %v", ag.Error())
+		}
+		err := cli.Store.PrivacyTokens.PutPrivacyTokens(ctx, store.PrivacyToken{
+			User:      senderLID,
+			Token:     token,
+			Timestamp: timestamp,
+		})
+		if err != nil {
+			cli.Log.Errorf("Failed to save privacy token from %s: %v", senderLID, err)
 		} else {
-			timestamp := ag.UnixTime("t")
-			if !ag.OK() {
-				cli.Log.Warnf("privacy_token notification is missing some fields: %v", ag.Error())
-			}
-			err := cli.Store.PrivacyTokens.PutPrivacyTokens(ctx, store.PrivacyToken{
-				User:      sender,
-				Token:     token,
-				Timestamp: timestamp,
-			})
-			if err != nil {
-				cli.Log.Errorf("Failed to save privacy token from %s: %v", sender, err)
-			} else {
-				cli.Log.Debugf("Stored privacy token from %s (ts: %v)", sender, timestamp)
-			}
+			cli.Log.Debugf("Received privacy token from %s (ts: %v)", senderLID, timestamp)
 		}
 	}
 }
@@ -365,12 +481,17 @@ type newsletterEvent struct {
 	// _on_admin_metadata_update -> id, thread_metadata, messages
 	// _on_metadata_update
 	// _on_state_change -> id, is_requestor, state
+	NotifyAccountReachoutTimelock *events.NotifyAccountReachoutTimelock `json:"xwa2_notify_account_reachout_timelock"`
 }
 
 func (cli *Client) handleMexNotification(ctx context.Context, node *waBinary.Node) {
 	for _, child := range node.GetChildren() {
 		if child.Tag != "update" {
 			continue
+		}
+		mnd := events.MexNotificationData{
+			Timestamp: node.AttrGetter().OptionalUnixTime("t"),
+			OpName:    child.AttrGetter().OptionalString("op_name"),
 		}
 		childData, ok := child.Content.([]byte)
 		if !ok {
@@ -383,11 +504,17 @@ func (cli *Client) handleMexNotification(ctx context.Context, node *waBinary.Nod
 			continue
 		}
 		if wrapper.Data.Join != nil {
+			wrapper.Data.Join.Mex = mnd
 			cli.dispatchEvent(wrapper.Data.Join)
 		} else if wrapper.Data.Leave != nil {
+			wrapper.Data.Leave.Mex = mnd
 			cli.dispatchEvent(wrapper.Data.Leave)
 		} else if wrapper.Data.MuteChange != nil {
+			wrapper.Data.MuteChange.Mex = mnd
 			cli.dispatchEvent(wrapper.Data.MuteChange)
+		} else if wrapper.Data.NotifyAccountReachoutTimelock != nil {
+			wrapper.Data.NotifyAccountReachoutTimelock.Mex = mnd
+			cli.dispatchEvent(wrapper.Data.NotifyAccountReachoutTimelock)
 		}
 	}
 }
@@ -399,9 +526,17 @@ func (cli *Client) handleStatusNotification(ctx context.Context, node *waBinary.
 		cli.Log.Debugf("Status notifcation did not contain child with tag 'set'")
 		return
 	}
-	status, ok := child.Content.([]byte)
-	if !ok {
-		cli.Log.Warnf("Set status notification has unexpected content (%T)", child.Content)
+	// kavtov-fork (55.1-10, class 2): a nil Content is the privacy-gated bare
+	// `<set hash="...">` shape (a legitimate cleared/empty status, matching
+	// WAWebHandleAboutNotification.js) — dispatch an empty UserAbout instead of warning.
+	// Any OTHER non-[]byte, non-nil shape is still genuinely unrecognized and still warns.
+	var status []byte
+	switch content := child.Content.(type) {
+	case []byte:
+		status = content
+	case nil:
+	default:
+		cli.Log.Warnf("Set status notification has unexpected content (%T)", content)
 		return
 	}
 	cli.dispatchEvent(&events.UserAbout{
@@ -412,13 +547,13 @@ func (cli *Client) handleStatusNotification(ctx context.Context, node *waBinary.
 }
 
 func (cli *Client) handleNotification(ctx context.Context, node *waBinary.Node) {
+	var cancelled bool
+	defer cli.maybeDeferredAck(ctx, node)(&cancelled)
 	ag := node.AttrGetter()
 	notifType := ag.String("type")
 	if !ag.OK() {
 		return
 	}
-	var cancelled bool
-	defer cli.maybeDeferredAck(ctx, node)(&cancelled)
 	switch notifType {
 	case "encrypt":
 		go cli.handleEncryptNotification(ctx, node)
@@ -459,6 +594,10 @@ func (cli *Client) handleNotification(ctx context.Context, node *waBinary.Node) 
 		cli.handleMexNotification(ctx, node)
 	case "status":
 		cli.handleStatusNotification(ctx, node)
+	case "passkey_prologue_request":
+		cli.handlePasskeyNotification(ctx, node)
+	case "crsc_continuation":
+		go cli.tryHandlePasskeyContinuationNotification(ctx, node)
 	// Other types: business, disappearing_mode, server, status, pay, psa
 	default:
 		cli.Log.Debugf("Unhandled notification with type %s", notifType)

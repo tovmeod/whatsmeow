@@ -32,15 +32,29 @@ const (
 	NewsletterLinkPrefix            = "https://whatsapp.com/channel/"
 )
 
+func stripQuery(link string) string {
+	if idx := strings.Index(link, "?"); idx > 0 {
+		return link[:idx]
+	}
+	return link
+}
+
+func stripURLPrefix(link string, prefixes ...string) string {
+	for _, prefix := range prefixes {
+		unprefixed, ok := strings.CutPrefix(link, prefix)
+		if ok {
+			return stripQuery(unprefixed)
+		}
+	}
+	return link
+}
+
 // ResolveBusinessMessageLink resolves a business message short link and returns the target JID, business name and
 // text to prefill in the input field (if any).
 //
 // The links look like https://wa.me/message/<code> or https://api.whatsapp.com/message/<code>. You can either provide
 // the full link, or just the <code> part.
 func (cli *Client) ResolveBusinessMessageLink(ctx context.Context, code string) (*types.BusinessMessageLinkTarget, error) {
-	code = strings.TrimPrefix(code, BusinessMessageLinkPrefix)
-	code = strings.TrimPrefix(code, BusinessMessageLinkDirectPrefix)
-
 	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "w:qr",
 		Type:      iqGet,
@@ -48,7 +62,7 @@ func (cli *Client) ResolveBusinessMessageLink(ctx context.Context, code string) 
 		Content: []waBinary.Node{{
 			Tag: "qr",
 			Attrs: waBinary.Attrs{
-				"code": code,
+				"code": stripURLPrefix(code, BusinessMessageLinkPrefix, BusinessMessageLinkDirectPrefix),
 			},
 		}},
 	})
@@ -85,16 +99,13 @@ func (cli *Client) ResolveBusinessMessageLink(ctx context.Context, code string) 
 // The links look like https://wa.me/qr/<code> or https://api.whatsapp.com/qr/<code>. You can either provide
 // the full link, or just the <code> part.
 func (cli *Client) ResolveContactQRLink(ctx context.Context, code string) (*types.ContactQRLinkTarget, error) {
-	code = strings.TrimPrefix(code, ContactQRLinkPrefix)
-	code = strings.TrimPrefix(code, ContactQRLinkDirectPrefix)
-
 	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "w:qr",
 		Type:      iqGet,
 		Content: []waBinary.Node{{
 			Tag: "qr",
 			Attrs: waBinary.Attrs{
-				"code": code,
+				"code": stripURLPrefix(code, ContactQRLinkPrefix, ContactQRLinkDirectPrefix),
 			},
 		}},
 	})
@@ -207,6 +218,8 @@ func (cli *Client) GetUserInfo(ctx context.Context, jids []types.JID) (map[types
 		{Tag: "picture"},
 		{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
 		{Tag: "lid"},
+	}, UsyncQueryExtras{
+		IncludePrivacyToken: true,
 	})
 	if err != nil {
 		return nil, err
@@ -442,6 +455,18 @@ func (cli *Client) GetUserDevicesContext(ctx context.Context, jids []types.JID) 
 	return cli.GetUserDevices(ctx, jids)
 }
 
+// FlushUserDevicesCache removes the given JIDs from the in-memory user-devices cache so the
+// next GetUserDevices call triggers a fresh server usync instead of returning cached devices.
+// kavtov-fork diagnostic helper (sender-key fan-out investigation): lets an operator confirm
+// what a peer's usync query would actually return for an account right now.
+func (cli *Client) FlushUserDevicesCache(jids ...types.JID) {
+	cli.userDevicesCacheLock.Lock()
+	defer cli.userDevicesCacheLock.Unlock()
+	for _, jid := range jids {
+		delete(cli.userDevicesCache, jid)
+	}
+}
+
 // GetUserDevices gets the list of devices that the given user has. The input should be a list of
 // regular JIDs, and the output will be a list of AD JIDs. The local device will not be included in
 // the output even if the user's JID is included in the input. All other devices will be included.
@@ -566,10 +591,10 @@ func (cli *Client) GetProfilePictureInfo(ctx context.Context, jid types.JID, par
 		}
 
 		var pictureContent []waBinary.Node
-		if token, _ := cli.Store.PrivacyTokens.GetPrivacyToken(ctx, jid); token != nil {
+		if token, _ := cli.ensureTCToken(ctx, jid); token != nil {
 			pictureContent = []waBinary.Node{{
 				Tag:     "tctoken",
-				Content: token.Token,
+				Content: token,
 			}}
 		}
 
@@ -830,7 +855,8 @@ func (cli *Client) getFBIDDevices(ctx context.Context, jids []types.JID) ([]type
 }
 
 type UsyncQueryExtras struct {
-	BotListInfo []types.BotListInfo
+	BotListInfo         []types.BotListInfo
+	IncludePrivacyToken bool
 }
 
 func (cli *Client) usync(ctx context.Context, jids []types.JID, mode, context string, query []waBinary.Node, extra ...UsyncQueryExtras) (*waBinary.Node, error) {
@@ -873,6 +899,16 @@ func (cli *Client) usync(ctx context.Context, jids []types.JID, mode, context st
 						Attrs: waBinary.Attrs{"persona_id": personaID},
 					}},
 				}}
+			} else if extras.IncludePrivacyToken {
+				token, err := cli.ensureTCToken(ctx, jid)
+				if err != nil {
+					cli.Log.Warnf("Failed to get privacy token for usync status query to %s: %v", jid, err)
+				} else if len(token) > 0 {
+					userList[i].Content = []waBinary.Node{{
+						Tag:     "tctoken",
+						Content: token,
+					}}
+				}
 			}
 		default:
 			return nil, fmt.Errorf("unknown user server '%s'", jid.Server)

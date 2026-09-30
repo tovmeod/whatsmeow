@@ -8,6 +8,7 @@ package whatsmeow
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -15,6 +16,17 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
+
+// connectionLifecycleEvents counts newly-classified, deterministically-recovered connection
+// lifecycle events -- xmlstreamend (client.go handleXMLStreamEnd) and the 503 stream error
+// below (55.1-12). Both converge on the fork's existing readPump-close -> onDisconnect ->
+// autoReconnect chain (the same mechanism WA's own client relies on -- see the citation on
+// each occurrence); the counter exists for observability, not because a new teardown path was
+// added. Periodically visible, mirrors the newsletterControlEmpty/hostFailover* counters
+// elsewhere in this fork.
+var connectionLifecycleEvents atomic.Uint64
+
+const connectionLifecycleEventsLogEvery = 20
 
 func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 	cli.isLoggedIn.Store(false)
@@ -41,18 +53,39 @@ func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 		cli.expectDisconnect()
 		cli.Log.Infof("Got device removed stream error, sending LoggedOut event and deleting session")
 		go cli.dispatchEvent(&events.LoggedOut{OnConnect: false, Reason: events.ConnectFailureLoggedOut})
-		err := cli.Store.Delete(ctx)
-		if err != nil {
-			cli.Log.Warnf("Failed to delete store after device_removed error: %v", err)
-		}
+		// 55.1-12: background the Store.Delete cascade-DELETE (multi-minute on a large
+		// account, investigation A2) so handleStreamError returns promptly and the
+		// handler-queue watchdog (client.go handlerQueueLoop) stops measuring the deletion's
+		// duration. Mirrors the dispatchEvent goroutine above. The deletion itself is
+		// unchanged -- no table pruning, no scope reduction. context.WithoutCancel: the
+		// handler ctx is tied to this same disconnect's connection context, which is
+		// cancelled right after this case returns, so the delete must outlive it.
+		go func() {
+			if err := cli.Store.Delete(context.WithoutCancel(ctx)); err != nil {
+				cli.Log.Warnf("Failed to delete store after device_removed error: %v", err)
+			}
+		}()
 	case conflictType == "replaced":
 		cli.expectDisconnect()
 		cli.Log.Infof("Got replaced stream error, sending StreamReplaced event")
 		go cli.dispatchEvent(&events.StreamReplaced{})
 	case code == "503":
-		// This seems to happen when the server wants to restart or something.
-		// The disconnection will be emitted as an events.Disconnected and then the auto-reconnect will do its thing.
-		cli.Log.Warnf("Got 503 stream error, assuming automatic reconnect will handle it")
+		// 55.1-12: verified, not assumed. A <stream:error code="503"> is always followed by
+		// the server closing the underlying connection (standard XMPP/WA stream-teardown
+		// semantics -- the stream error IS the close signal). That closure is what
+		// FrameSocket.readPump's conn.Read() observes as a read error, which unconditionally
+		// triggers fs.Close(0) -> OnDisconnect -> cli.onDisconnect -> autoReconnect
+		// (client.go:onDisconnect) -- the exact same chain every other disconnect (EOF,
+		// xmlstreamend, keepalive-forced) already goes through. No separate teardown call is
+		// needed or added; clearResponseWaiters(node) above already unblocked any in-flight
+		// IQ waiter. This shares the xmlstreamend lifecycle counter (client.go
+		// handleXMLStreamEnd) since both are the same verified mechanism.
+		if !cli.isExpectedDisconnect() {
+			if n := connectionLifecycleEvents.Add(1); n%connectionLifecycleEventsLogEvery == 0 {
+				cli.Log.Infof("CONNECTION_LIFECYCLE_HANDLED count=%d", n)
+			}
+			cli.Log.Debugf("Got 503 stream error; recovery reaches autoReconnect via the standard disconnect chain")
+		}
 	case cli.RefreshCAT != nil && (code == events.ConnectFailureCATInvalid.NumberString() || code == events.ConnectFailureCATExpired.NumberString()):
 		cli.Log.Infof("Got %s stream error, refreshing CAT before reconnecting...", code)
 		cli.socketLock.RLock()
@@ -64,7 +97,7 @@ func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 			go cli.dispatchEvent(&events.CATRefreshError{Error: err})
 		}
 	default:
-		cli.Log.Errorf("Unknown stream error: %s", node.XMLString())
+		cli.Log.Errorf("Unknown stream error: %s", node)
 		go cli.dispatchEvent(&events.StreamError{Code: code, Raw: node})
 	}
 }
@@ -131,7 +164,7 @@ func (cli *Client) handleConnectFailure(ctx context.Context, node *waBinary.Node
 			cli.Log.Warnf("Failed to delete store after %d failure: %v", int(reason), err)
 		}
 	} else if reason == events.ConnectFailureTempBanned {
-		cli.Log.Warnf("Temporary ban connect failure: %s", node.XMLString())
+		cli.Log.Warnf("Temporary ban connect failure: %s", node)
 		go cli.dispatchEvent(&events.TemporaryBan{
 			Code:   events.TempBanReason(ag.Int("code")),
 			Expire: time.Duration(ag.Int("expire")) * time.Second,
@@ -150,12 +183,16 @@ func (cli *Client) handleConnectFailure(ctx context.Context, node *waBinary.Node
 	} else if willAutoReconnect {
 		cli.Log.Warnf("Got %d/%s connect failure, assuming automatic reconnect will handle it", int(reason), message)
 	} else {
-		cli.Log.Warnf("Unknown connect failure: %s", node.XMLString())
+		cli.Log.Warnf("Unknown connect failure: %s", node)
 		go cli.dispatchEvent(&events.ConnectFailure{Reason: reason, Message: message, Raw: node})
 	}
 }
 
 func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node) {
+	if !cli.paired.Load() {
+		cli.Log.Warnf("Received connect success without pairing, ignoring")
+		return
+	}
 	cli.Log.Infof("Successfully authenticated")
 	cli.LastSuccessfulConnect = time.Now()
 	cli.AutoReconnectErrors = 0
@@ -177,10 +214,9 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 		} else {
 			cli.Log.Infof("Updated LID to %s", cli.Store.LID)
 		}
+		cli.StoreLIDPNMapping(ctx, cli.Store.GetLID(), cli.Store.GetJID())
 	}
-	// Some users are missing their own LID-PN mapping even though it's already in the device table,
-	// so do this unconditionally for a few months to ensure everyone gets the row.
-	cli.StoreLIDPNMapping(ctx, cli.Store.GetLID(), cli.Store.GetJID())
+	cli.deleteExpiredPrivacyTokens()
 	go func() {
 		if dbCount, err := cli.Store.PreKeys.UploadedPreKeyCount(ctx); err != nil {
 			cli.Log.Errorf("Failed to get number of prekeys in database: %v", err)
@@ -198,6 +234,10 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 		if err != nil {
 			cli.Log.Warnf("Failed to send post-connect passive IQ: %v", err)
 		}
+		// 55.1-02: replay any ack/receipt sends deferred during the disconnected window
+		// (the fork's analog of WA Web's connect-time dangling-receipt passive task) now
+		// that the connection is active again.
+		cli.replayPendingStanzas(ctx)
 		cli.dispatchEvent(&events.Connected{})
 		cli.closeSocketWaitChan()
 	}()

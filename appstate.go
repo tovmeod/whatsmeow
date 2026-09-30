@@ -83,7 +83,6 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		hasMore = patches.HasMorePatches
 		state, err = cli.applyAppStatePatches(ctx, name, state, patches, fullSync, eventsToDispatchPtr)
 		if err != nil {
-			cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
 			return nil, err
 		}
 	}
@@ -149,6 +148,27 @@ func (cli *Client) handleAppStateRecovery(
 	return true
 }
 
+// applyConflictPatches applies server-returned 409-conflict patches from sendAppState
+// while holding cli.appStateSyncLock (class 14 root cause fix, 55.1-10 /
+// 55.1-INVESTIGATION-appstate-connection.md H1). fetchAppState holds the same lock across
+// its own call to applyAppStatePatches (appstate.go:46-47,84); without this, a concurrent
+// notification-driven fetchAppState for the same collection could interleave mutation-MAC
+// ledger writes with sendAppState's conflict-application. The lock is released before this
+// function returns (no defer held by the caller) — sendAppState continues on to the
+// recursive retry and, on other paths, cli.fetchAppState, both of which re-acquire the same
+// non-reentrant mutex and must not find it still held.
+func (cli *Client) applyConflictPatches(
+	ctx context.Context,
+	name appstate.WAPatchName,
+	state appstate.HashState,
+	patches *appstate.PatchList,
+	eventsToDispatch *[]any,
+) (appstate.HashState, error) {
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
+	return cli.applyAppStatePatches(ctx, name, state, patches, false, eventsToDispatch)
+}
+
 func (cli *Client) applyAppStatePatches(
 	ctx context.Context,
 	name appstate.WAPatchName,
@@ -161,6 +181,8 @@ func (cli *Client) applyAppStatePatches(
 	if err != nil {
 		if errors.Is(err, appstate.ErrKeyNotFound) {
 			go cli.requestMissingAppStateKeys(context.WithoutCancel(ctx), patches)
+		} else {
+			cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
 		}
 		return state, fmt.Errorf("failed to decode app state %s patches: %w", name, err)
 	}
@@ -233,6 +255,19 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		logEvt.Any("action", mutation.Action)
 	}
 	logEvt.Msg("Received app state mutation")
+
+	if len(mutation.Index) == 1 && mutation.Index[0] == appstate.IndexNCTSaltSync {
+		var err error
+		if mutation.Operation == waServerSync.SyncdMutation_SET {
+			err = cli.storeNCTSalt(ctx, mutation.Action.GetNctSaltSyncAction().GetSalt())
+		} else if mutation.Operation == waServerSync.SyncdMutation_REMOVE {
+			err = cli.clearNCTSalt(ctx)
+		}
+		if err != nil {
+			cli.Log.Warnf("Failed to update NCT salt from app state mutation: %v", err)
+		}
+		return
+	}
 
 	if mutation.Operation != waServerSync.SyncdMutation_SET {
 		return
@@ -551,9 +586,9 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	if respCollectionAttr.OptionalString("type") == "error" {
 		errorTag, ok := respCollection.GetOptionalChildByTag("error")
 
-		mainErr := fmt.Errorf("%w: %s", ErrAppStateUpdate, respCollection.XMLString())
+		mainErr := fmt.Errorf("%w: %s", ErrAppStateUpdate, &respCollection)
 		if ok {
-			mainErr = fmt.Errorf("%w (%s): %s", ErrAppStateUpdate, patch.Type, errorTag.XMLString())
+			mainErr = fmt.Errorf("%w (%s): %s", ErrAppStateUpdate, patch.Type, &errorTag)
 		}
 		if ok && errorTag.AttrGetter().Int("code") == 409 && allowRetry {
 			zerolog.Ctx(ctx).Warn().Err(mainErr).Msg("Failed to update app state, trying to apply conflicts and retry")
@@ -561,17 +596,18 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
 			if err != nil {
 				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
-			} else if state, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
-				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
-			} else {
-				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
-				go func() {
-					for _, evt := range eventsToDispatch {
-						cli.dispatchEvent(evt)
-					}
-				}()
-				return cli.sendAppState(ctx, patch, false)
 			}
+			state, err = cli.applyConflictPatches(ctx, patch.Type, state, patches, &eventsToDispatch)
+			if err != nil {
+				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
+			}
+			zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
+			go func() {
+				for _, evt := range eventsToDispatch {
+					cli.dispatchEvent(evt)
+				}
+			}()
+			return cli.sendAppState(ctx, patch, false)
 		}
 		return mainErr
 	}

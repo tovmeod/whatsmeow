@@ -26,6 +26,7 @@ import (
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/random"
 	"golang.org/x/net/proxy"
+	"golang.org/x/sync/semaphore"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -69,6 +70,7 @@ type Client struct {
 	socketWait chan struct{}
 
 	isLoggedIn            atomic.Bool
+	paired                atomic.Bool
 	expectedDisconnect    *exsync.Event
 	forceAutoReconnect    atomic.Bool
 	EnableAutoReconnect   bool
@@ -99,9 +101,10 @@ type Client struct {
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
 
-	historySyncNotifications  chan *waE2E.HistorySyncNotification
-	historySyncHandlerStarted atomic.Bool
-	ManualHistorySyncDownload bool
+	historySyncNotifications        chan *waE2E.HistorySyncNotification
+	historySyncHandlerStarted       atomic.Bool
+	ManualHistorySyncDownload       bool
+	DisableManualHistorySyncReceipt bool
 
 	uploadPreKeysLock sync.Mutex
 	lastPreKeyUpload  time.Time
@@ -117,8 +120,27 @@ type Client struct {
 	eventHandlers     []wrappedEventHandler
 	eventHandlersLock sync.RWMutex
 
-	messageRetries     map[string]int
+	// kavtov-fork (35.2-02 D-05/D-08/D-09): bounded (msgID,sender)-keyed retry-attempt store.
+	// Replaces the unbounded messageRetries map[string]int. Keyed by retryAttemptKey so different
+	// senders for the same msgID get independent counts. Bounded by a ring of size retryStoreSKMsgSize
+	// to cap memory growth at ~6000 failures/hr. Value-typed entries (no pointers) per 35.1 GC lesson.
+	// Lazy-init under messageRetriesLock so a bare &Client{} never nil-panics.
+	retryAttempts      map[retryAttemptKey]retryAttemptEntry
+	retryAttemptsList  [retryAttemptsListSize]retryAttemptKey
+	retryAttemptsPtr   int
 	messageRetriesLock sync.Mutex
+
+	// kavtov-fork (35.2-02 D-06): bounded set of message IDs whose content was already
+	// recovered via phone-fetch (handlePlaceholderResendResponse success branch). Used by
+	// registerRetryAttempt to short-circuit retry receipts for attempts #2+ after content
+	// arrives (D-06 short-circuit). Value-typed, lazy-init, bounded ring — same idiom as
+	// retryAttempts above. Guarded by recoveredMsgIDsLock.
+	recoveredMsgIDs     map[string]struct{}
+	recoveredMsgIDsList [recoveredMsgIDsListSize]string
+	recoveredMsgIDsPtr  int
+	recoveredMsgIDsLock sync.Mutex
+
+	retrySema *semaphore.Weighted
 
 	incomingRetryRequestCounter     map[incomingRetryKey]int
 	incomingRetryRequestCounterLock sync.Mutex
@@ -127,6 +149,33 @@ type Client struct {
 	appStateKeyRequestsLock sync.RWMutex
 
 	messageSendLock sync.Mutex
+
+	// kavtov-fork (55.1-02): pending ack/receipt queue for reconnect-durable retry.
+	// sendAck/sendMessageReceipt enqueue the built node here instead of dropping it when
+	// sendNode returns ErrNotConnected (socket down mid-reconnect); handleConnectSuccess
+	// drains and replays the queue in FIFO order once the connection is back up. Mirrors
+	// WA Web's own dangling-receipt replay on connect (55.1-INVESTIGATION-websocket.md
+	// section 4). Bounded (pendingStanzaCap) with oldest-discard + a throttled overflow
+	// ERROR so bounded memory never becomes silent loss. Deduplicated by (tag,id,to) so a
+	// re-enqueue of the same ack/receipt does not grow the queue. Lazy-init under
+	// pendingStanzasLock; bare &Client{} is safe.
+	pendingStanzas                []pendingStanzaEntry
+	pendingStanzasSeen            map[pendingStanzaKey]bool
+	pendingStanzasLock            sync.Mutex
+	pendingStanzasOverflowCount   int
+	pendingStanzasLastOverflowLog time.Time
+
+	// sendNodeFunc, when non-nil, replaces cli.sendNode as the transport used by sendAck,
+	// sendMessageReceipt, and replayPendingStanzas. Tests install it to simulate send
+	// outcomes without a real socket; production code leaves it nil (falls back to
+	// cli.sendNode via sendNodeOrHook).
+	sendNodeFunc func(ctx context.Context, node waBinary.Node) error
+
+	tcTokenSenderTS            map[types.JID]time.Time
+	tcTokenSenderTSLock        sync.Mutex
+	lastTCTokenSenderTSCleanup time.Time
+	tcTokenDBPruneLock         sync.Mutex
+	lastTCTokenDBPrune         time.Time
 
 	privacySettingsCache atomic.Value
 
@@ -139,6 +188,76 @@ type Client struct {
 	recentMessagesList [recentMessagesSize]recentMessageKey
 	recentMessagesPtr  int
 	recentMessagesLock sync.RWMutex
+
+	// kavtov-fork: P2a group sender-key convergence instrument. Bounded in-memory set of
+	// recently-FAILED group decrypt tuples, keyed by the inbound sender's device-qualified
+	// signal address + group JID. Populated on the total-miss path (decryptGroupSenderKey
+	// returning ErrNoSenderKeyForUser); when a later message from the SAME inbound tuple later
+	// decrypts via the KEY path we emit ONE INFO SENDER_KEY_CONVERGED and drop the entry. This is
+	// the only honest convergence signal: it distinguishes genuine group-key recovery from PDO
+	// content-recovery (which lands content with the key still missing). Same ring-buffer idiom as
+	// recentMessages, but dedups on add (tuples repeat heavily under the failure load) and is
+	// sized to the distinct-failing-tuple working set. See debug no-sender-key-recurring ch6 (P2a).
+	failedSenderKeyTuples     map[failedSenderKeyTuple]struct{}
+	failedSenderKeyTuplesList [failedSenderKeyTuplesSize]failedSenderKeyTuple
+	failedSenderKeyTuplesPtr  int
+	failedSenderKeyTuplesLock sync.Mutex
+
+	// kavtov-fork (D-12): per-collection consecutive ErrMismatchingLTHash failure counter.
+	// When the same collection name fails N times in a row, handleAppStateNotification triggers
+	// FetchAppState(fullSync=true) to self-heal the divergence. Uses its own lock — NOT
+	// appStateSyncLock — so the counter is never held across the long FetchAppState fetch.
+	// Collection set is small (bounded by appstate.AllPatchNames, ~10 entries); no ring needed.
+	appStateSyncFailures     map[appstate.WAPatchName]int
+	appStateSyncFailuresLock sync.Mutex
+	// kavtov-fork (D-12 loop fix): per-collection count of fullSync attempts that themselves
+	// failed with ErrMismatchingLTHash. Capped by maxAppStateFullSyncFailures so a permanently
+	// diverged collection stops re-triggering fullSync. Guarded by appStateSyncFailuresLock.
+	appStateFullSyncFailures map[appstate.WAPatchName]int
+	// fetchAppStateFunc is the function used by handleAppStateNotification to call FetchAppState.
+	// Defaults to cli.FetchAppState in NewClient; tests override it with a spy.
+	fetchAppStateFunc func(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error
+
+	// kavtov-fork (perf 260602): SKDM redundancy dedup. WhatsApp re-bundles the SenderKeyDistribution
+	// message with normal group traffic; builder.Process then LoadSenderKey+AddSenderKeyState+
+	// StoreSenderKey unconditionally on each arrival, re-writing the row. The dedup is ITERATION-AWARE
+	// (not keyID-only): SKDM.Create emits the sender's LIVE SenderChainKey iteration, so a re-bundled
+	// SKDM from an active sender can carry a HIGHER iteration — a forward checkpoint that rescues a
+	// recipient who fell >2000 behind (ErrTooFarIntoFuture). This map records, per (sender,group,keyID),
+	// the highest SKDM iteration we have already processed; an arriving SKDM is skipped ONLY when it is
+	// at-or-below that (a true redundant/stale re-broadcast). A higher-iteration SKDM always processes
+	// (never drop a rescue). Bypassed entirely when the tuple is in failedSenderKeyTuples, so a deleted/
+	// lost key re-installs. Restart empties it (first SKDM per keyID re-confirms). Bounded ring idiom.
+	skdmInstalled     map[skdmInstalledKey]uint32
+	skdmInstalledList [skdmInstalledSize]skdmInstalledKey
+	skdmInstalledPtr  int
+	skdmInstalledLock sync.Mutex
+
+	// kavtov-fork (55.1-08, D-11 corrected): per-(sender,group) SKDM parse-fail dedup registry. An
+	// SKDM that fails to parse (55.1-INVESTIGATION-skdm.md: two @lid devices emitting a non-conformant
+	// 32-byte payload -- proven external format, not a fixable libsignal-version gap) stays VISIBLE
+	// and FULLY COUNTED, but re-announcing the identical, already-diagnosed failure as a fresh Error
+	// on every single message forever is spam, not vigilance. First sighting per (sender,group) emits
+	// the full Error diagnostic; every repeat only increments the per-pair count and the package-wide
+	// skdmParseFailTotal (message.go, folded into the periodic SKDM_DEDUP line). Bounded at
+	// skdmParseFailPairsSize; unlike skdmInstalled this is NOT a ring -- on overflow a brand-new pair
+	// is counted (skdmParseFailOverflow) but does not get its own first-occurrence Error, since
+	// today's working set is two senders and the bound exists only to guard a future storm of pairs.
+	skdmParseFailSeen     map[skdmParseFailKey]struct{}
+	skdmParseFailCounts   map[skdmParseFailKey]uint64
+	skdmParseFailOverflow uint64
+	skdmParseFailLock     sync.Mutex
+
+	// kavtov-fork (55.1-07, Task 3): per-sender STALE_PREKEY dedup registry. The fresh-prekey retry
+	// (sendRetryReceipt with forceIncludeIdentity, retry.go:1036-1053) is the verified real recovery
+	// for a sender using a stale one-time prekey ID -- the first occurrence per sender WARNs (the
+	// recovery is in flight, worth seeing); repeats from the SAME sender only advance
+	// stalePrekeyTotal (message.go), keeping a persistently-stuck sender visible via the periodic
+	// aggregate without spamming a WARN on every message. Bounded like skdmParseFailSeen; on
+	// overflow a brand-new sender is counted but does not get its own first-occurrence WARN.
+	stalePrekeySeen     map[string]struct{}
+	stalePrekeyOverflow uint64
+	stalePrekeyLock     sync.Mutex
 
 	sessionRecreateHistory     map[types.JID]time.Time
 	sessionRecreateHistoryLock sync.Mutex
@@ -155,6 +274,18 @@ type Client struct {
 	UseRetryMessageStore bool
 	lastRetryStoreClear  time.Time
 
+	// kavtov-fork (38.5): process-wide claim map for ask-once phone requests.
+	// Injected by the driver (one shared instance across all accounts). nil means
+	// the ask-once gate is disabled (safe: phone request fires unconditionally, same
+	// as before this feature).
+	PhoneRequestClaims *PhoneRequestClaims
+
+	// kavtov-fork (q6h): fleet-wide bot-resend blacklist. Injected by the driver
+	// (one shared instance across all accounts) so a known-bad dispatch bot is
+	// suppressed fleet-wide after botResendBlacklistThreshold total misses. nil
+	// means the feature is off (safe no-op: resend-request stanzas fire as before).
+	BotResendBL *BotResendBlacklist
+
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
 	PrePairCallback func(jid types.JID, platform, businessName string) bool
@@ -162,6 +293,7 @@ type Client struct {
 	// GetClientPayload is called to get the client payload for connecting to the server.
 	// This should NOT be used for WhatsApp (to change the OS name, update fields in store.BaseClientPayload directly).
 	GetClientPayload func() *waWa6.ClientPayload
+	QRClientType     PairClientType
 
 	// Should untrusted identity errors be handled automatically? If true, the stored identity and existing signal
 	// sessions will be removed on untrusted identity errors, and an events.IdentityChange will be dispatched.
@@ -175,7 +307,10 @@ type Client struct {
 
 	BackgroundEventCtx context.Context
 
-	phoneLinkingCache *phoneLinkingCache
+	phoneLinkingCache    atomic.Pointer[phoneLinkingCache]
+	passkeyLinkingCache  atomic.Pointer[passkeyLinkingCache]
+	passkeyHandoffKey    atomic.Pointer[passkeyHandoffKey]
+	passkeySkipHandoffUX atomic.Bool
 
 	uniqueID  string
 	idCounter atomic.Uint64
@@ -217,7 +352,7 @@ const handlerQueueSize = 2048
 //
 // The device store must be set. A default SQL-backed implementation is available in the store/sqlstore package.
 //
-//	container, err := sqlstore.New("sqlite3", "file:yoursqlitefile.db?_foreign_keys=on", nil)
+//	container, err := sqlstore.New(context.Background(), "sqlite3", "file:yoursqlitefile.db?_foreign_keys=on", nil)
 //	if err != nil {
 //		panic(err)
 //	}
@@ -246,7 +381,6 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		uniqueID:           fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
 		responseWaiters:    make(map[string]chan<- *waBinary.Node),
 		eventHandlers:      make([]wrappedEventHandler, 0, 1),
-		messageRetries:     make(map[string]int),
 		handlerQueue:       make(chan *waBinary.Node, handlerQueueSize),
 		appStateProc:       appstate.NewProcessor(deviceStore, log.Sub("AppState")),
 		socketWait:         make(chan struct{}),
@@ -256,13 +390,20 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 
 		historySyncNotifications: make(chan *waE2E.HistorySyncNotification, 32),
 
+		tcTokenSenderTS:  make(map[types.JID]time.Time),
 		groupCache:       make(map[types.JID]*groupMetaCache),
 		userDevicesCache: make(map[types.JID]deviceCache),
 
-		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
-		sessionRecreateHistory: make(map[types.JID]time.Time),
-		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
-		appStateKeyRequests:    make(map[string]time.Time),
+		recentMessagesMap:        make(map[recentMessageKey]RecentMessage, recentMessagesSize),
+		failedSenderKeyTuples:    make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
+		skdmInstalled:            make(map[skdmInstalledKey]uint32, skdmInstalledSize),
+		skdmParseFailSeen:        make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize),
+		skdmParseFailCounts:      make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize),
+		appStateSyncFailures:     make(map[appstate.WAPatchName]int),
+		appStateFullSyncFailures: make(map[appstate.WAPatchName]int),
+		sessionRecreateHistory:   make(map[types.JID]time.Time),
+		GetMessageForRetry:       func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
+		appStateKeyRequests:      make(map[string]time.Time),
 
 		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
 
@@ -271,6 +412,8 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 
 		BackgroundEventCtx: context.Background(),
 	}
+	cli.fetchAppStateFunc = cli.FetchAppState
+	cli.paired.Store(deviceStore.ID != nil)
 	cli.nodeHandlers = map[string]nodeHandler{
 		"message":      cli.handleEncryptedMessage,
 		"appdata":      cli.handleEncryptedMessage,
@@ -403,6 +546,16 @@ func (cli *Client) SetPreLoginHTTPClient(h *http.Client) {
 	cli.preLoginHTTP = h
 }
 
+// SetMaxParallelRetryReceiptHandling sets how many retry receipts can be handled in parallel.
+// Defaults to unlimited. This should only be set before connecting, changing it afterwards can cause data races.
+func (cli *Client) SetMaxParallelRetryReceiptHandling(n int64) {
+	if n <= 0 {
+		cli.retrySema = nil
+	} else {
+		cli.retrySema = semaphore.NewWeighted(n)
+	}
+}
+
 func (cli *Client) getSocketWaitChan() <-chan struct{} {
 	cli.socketLock.RLock()
 	ch := cli.socketWait
@@ -485,6 +638,11 @@ func (cli *Client) ConnectContext(ctx context.Context) error {
 	cli.socketLock.Lock()
 	defer cli.socketLock.Unlock()
 
+	// kavtov-fork (60-05, D-08 #5): this is the explicit/manual connect entry point (Connect()'s
+	// path), distinct from autoReconnect's private connect() wrapper -- reset to the default
+	// USER_ACTIVATED reason here so a stale ERROR_RECONNECT override from a prior autoReconnect
+	// attempt on THIS account's Store doesn't leak into an explicit reconnect.
+	cli.Store.SetConnectReasonOverride(nil)
 	err := cli.unlockedConnect(ctx)
 	if isRetryableConnectError(err) && cli.InitialAutoReconnect && cli.EnableAutoReconnect {
 		cli.Log.Errorf("Initial connection failed but reconnecting in background (%v)", err)
@@ -520,6 +678,9 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 		client = cli.preLoginHTTP
 	}
 	fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), client)
+	// 55.1-12: readPump uses this to classify a routine EOF read-error as handled lifecycle
+	// only when auto-reconnect is actually enabled at the time of the failure.
+	fs.AutoReconnectEnabled = func() bool { return cli.EnableAutoReconnect }
 	if cli.MessengerConfig != nil {
 		fs.URL = cli.MessengerConfig.WebsocketURL
 		fs.HTTPHeaders.Set("Origin", cli.MessengerConfig.BaseURL)
@@ -582,12 +743,32 @@ func (cli *Client) isExpectedDisconnect() bool {
 	return cli.expectedDisconnect.IsSet()
 }
 
+// maxAutoReconnectDelay caps the auto-reconnect backoff (55.1-02). autoReconnectDelay
+// previously grew linearly (AutoReconnectErrors * 2s) with no maximum, so a long-failing
+// account retried at an ever-growing interval. WA Web's own client caps its Fibonacci
+// backoff at 15 minutes (55.1-INVESTIGATION-websocket.md section 3), but a ride-dispatch
+// driver account that CAN reconnect must not wait minutes; a 60s steady-state retry is
+// used instead — the cap value is an engineering choice, the protocol-grounded
+// requirement is only that a cap exists.
+const maxAutoReconnectDelay = 60 * time.Second
+
+// autoReconnectDelayFor computes the auto-reconnect backoff for a given AutoReconnectErrors
+// count, capped at maxAutoReconnectDelay. Extracted from autoReconnect so tests can assert
+// the cap without running the reconnect loop.
+func autoReconnectDelayFor(autoReconnectErrors int) time.Duration {
+	delay := time.Duration(autoReconnectErrors) * 2 * time.Second
+	if delay > maxAutoReconnectDelay {
+		delay = maxAutoReconnectDelay
+	}
+	return delay
+}
+
 func (cli *Client) autoReconnect(ctx context.Context) {
 	if !cli.EnableAutoReconnect || cli.Store.ID == nil {
 		return
 	}
 	for {
-		autoReconnectDelay := time.Duration(cli.AutoReconnectErrors) * 2 * time.Second
+		autoReconnectDelay := autoReconnectDelayFor(cli.AutoReconnectErrors)
 		cli.Log.Debugf("Automatically reconnecting after %v", autoReconnectDelay)
 		cli.AutoReconnectErrors++
 		if cli.expectedDisconnect.WaitTimeoutCtx(ctx, autoReconnectDelay) == nil {
@@ -597,6 +778,10 @@ func (cli *Client) autoReconnect(ctx context.Context) {
 			cli.Log.Debugf("Cancelling automatic reconnect due to context cancellation")
 			return
 		}
+		// kavtov-fork (60-05, D-08 #5): this account's Store, not the caller's -- an auto-reconnect
+		// advertises ERROR_RECONNECT (matching a browser's actual auto-reconnect signal) instead of
+		// always claiming USER_ACTIVATED, the last unclosed fingerprint leg per 60-CONTEXT.md.
+		cli.Store.SetConnectReasonOverride(waWa6.ClientPayload_ERROR_RECONNECT.Enum())
 		err := cli.connect(ctx)
 		if errors.Is(err, ErrAlreadyConnected) {
 			cli.Log.Debugf("Connect() said we're already connected after autoreconnect sleep")
@@ -715,7 +900,7 @@ func (cli *Client) Logout(ctx context.Context) error {
 // All registered event handlers will receive all events. You should use a type switch statement to
 // filter the events you want:
 //
-//	func myEventHandler(evt interface{}) {
+//	func myEventHandler(evt any) {
 //		switch v := evt.(type) {
 //		case *events.Message:
 //			fmt.Println("Received a message!")
@@ -736,7 +921,7 @@ func (cli *Client) Logout(ctx context.Context) error {
 //		mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 //	}
 //
-//	func (mycli *MyClient) myEventHandler(evt interface{}) {
+//	func (mycli *MyClient) myEventHandler(evt any) {
 //		// Handle event and access mycli.WAClient
 //	}
 func (cli *Client) AddEventHandler(handler EventHandler) uint32 {
@@ -761,7 +946,7 @@ func (cli *Client) AddEventHandlerWithSuccessStatus(handler EventHandlerWithSucc
 // event dispatcher holds a read lock on the event handler list, and this method wants a write lock
 // on the same list. Instead run it in a goroutine:
 //
-//	func (mycli *MyClient) myEventHandler(evt interface{}) {
+//	func (mycli *MyClient) myEventHandler(evt any) {
 //		if noLongerWantEvents {
 //			go mycli.WAClient.RemoveEventHandler(mycli.eventHandlerID)
 //		}
@@ -793,6 +978,29 @@ func (cli *Client) RemoveEventHandlers() {
 	cli.eventHandlersLock.Unlock()
 }
 
+// handleXMLStreamEnd processes a received xmlstreamend frame (55.1-12).
+//
+// Sourced from WA Web's own client (~/work/wa_protocol,
+// WAWebCommsHandleLoggedInStanza.js:141-142): its xmlstreamend handler only logs
+// ("Comms.handleStanza received xmlstreamend, return NO_ACK") and does NOT proactively close
+// the socket -- only a handler that explicitly returns "CLOSE_SOCKET" does that
+// (WAComms.js:161-168), and xmlstreamend's handler isn't one of them. WA Web relies on the
+// transport-level close the server sends immediately after to drive the reconnect, via its own
+// deadSocketTimer/onclose plumbing outside handleStanza. The fork's existing
+// conn.Read()-failure -> onDisconnect -> autoReconnect chain (socket/framesocket.go readPump,
+// client.go onDisconnect) IS that same transport-level path, so no new teardown call is added
+// here -- the prior "TODO should we do something else?" is answered: no, this already matches
+// WA Web. Only the observability (counter) and the alarming Warnf were the actual gap.
+func (cli *Client) handleXMLStreamEnd() {
+	if cli.isExpectedDisconnect() {
+		return
+	}
+	if n := connectionLifecycleEvents.Add(1); n%connectionLifecycleEventsLogEvery == 0 {
+		cli.Log.Infof("CONNECTION_LIFECYCLE_HANDLED count=%d", n)
+	}
+	cli.Log.Debugf("Received stream end frame (handled lifecycle; reconnect follows the transport-level close, same as WA Web's own client)")
+}
+
 func (cli *Client) handleFrame(ctx context.Context, data []byte) {
 	decompressed, err := waBinary.Unpack(data)
 	if err != nil {
@@ -806,12 +1014,9 @@ func (cli *Client) handleFrame(ctx context.Context, data []byte) {
 		cli.Log.Debugf("Errored frame hex: %s", hex.EncodeToString(decompressed))
 		return
 	}
-	cli.recvLog.Debugf("%s", node.XMLString())
+	cli.recvLog.Debugf("%s", node)
 	if node.Tag == "xmlstreamend" {
-		if !cli.isExpectedDisconnect() {
-			cli.Log.Warnf("Received stream end frame")
-		}
-		// TODO should we do something else?
+		cli.handleXMLStreamEnd()
 	} else if cli.receiveResponse(ctx, node) {
 		// handled
 	} else if _, ok := cli.nodeHandlers[node.Tag]; ok {
@@ -840,14 +1045,14 @@ Loop:
 	for {
 		select {
 		case node := <-cli.handlerQueue:
-			doneChan := make(chan struct{}, 1)
+			doneChan := make(chan struct{})
 			start := time.Now()
 			go func() {
 				cli.nodeHandlers[node.Tag](evtCtx, node)
 				duration := time.Since(start)
-				doneChan <- struct{}{}
+				close(doneChan)
 				if duration > 5*time.Second {
-					cli.Log.Warnf("Node handling took %s for %s", duration, node.XMLString())
+					cli.Log.Warnf("Node handling took %s for %s", duration, node)
 				}
 			}()
 			ticker.Reset(30 * time.Second)
@@ -857,10 +1062,10 @@ Loop:
 					ticker.Stop()
 					continue Loop
 				case <-ticker.C:
-					cli.Log.Warnf("Node handling is taking long for %s (started %s ago)", node.XMLString(), time.Since(start))
+					cli.Log.Warnf("Node handling is taking long for %s (started %s ago)", node, time.Since(start))
 				}
 			}
-			cli.Log.Warnf("Continuing handling of %s in background as it's taking too long", node.XMLString())
+			cli.Log.Warnf("Continuing handling of %s in background as it's taking too long", node)
 			ticker.Stop()
 		case <-connCtx.Done():
 			cli.Log.Debugf("Closing handler queue loop")
@@ -885,13 +1090,105 @@ func (cli *Client) sendNodeAndGetData(ctx context.Context, node waBinary.Node) (
 		return nil, fmt.Errorf("failed to marshal node: %w", err)
 	}
 
-	cli.sendLog.Debugf("%s", node.XMLString())
+	cli.sendLog.Debugf("%s", &node)
 	return payload, sock.SendFrame(ctx, payload)
 }
 
 func (cli *Client) sendNode(ctx context.Context, node waBinary.Node) error {
 	_, err := cli.sendNodeAndGetData(ctx, node)
 	return err
+}
+
+// sendNodeOrHook sends node via cli.sendNodeFunc if a test has installed one, otherwise via
+// the real cli.sendNode. See the sendNodeFunc field doc.
+func (cli *Client) sendNodeOrHook(ctx context.Context, node waBinary.Node) error {
+	if cli.sendNodeFunc != nil {
+		return cli.sendNodeFunc(ctx, node)
+	}
+	return cli.sendNode(ctx, node)
+}
+
+// pendingStanzaCap bounds the reconnect-durable ack/receipt queue (55.1-02) — far above any
+// observed disconnect window's ack volume.
+const pendingStanzaCap = 10000
+
+// pendingStanzaOverflowLogInterval throttles the queue-full ERROR so a sustained overflow
+// logs periodically instead of once per discarded entry.
+const pendingStanzaOverflowLogInterval = time.Minute
+
+type pendingStanzaKey struct {
+	Tag string
+	ID  string
+	To  string
+}
+
+type pendingStanzaEntry struct {
+	key  pendingStanzaKey
+	node waBinary.Node
+}
+
+func pendingStanzaKeyFromNode(node waBinary.Node) pendingStanzaKey {
+	return pendingStanzaKey{
+		Tag: node.Tag,
+		ID:  fmt.Sprintf("%v", node.Attrs["id"]),
+		To:  fmt.Sprintf("%v", node.Attrs["to"]),
+	}
+}
+
+// enqueuePendingStanza queues an ack/receipt node that failed to send because the socket was
+// down (ErrNotConnected), for replay on the next successful connect (replayPendingStanzas).
+// Deduplicated by (tag,id,to); at pendingStanzaCap the oldest entry is discarded and a
+// throttled ERROR reports the overflow count so bounded memory never becomes silent loss.
+func (cli *Client) enqueuePendingStanza(node waBinary.Node) {
+	key := pendingStanzaKeyFromNode(node)
+	cli.pendingStanzasLock.Lock()
+	defer cli.pendingStanzasLock.Unlock()
+	if cli.pendingStanzasSeen == nil {
+		cli.pendingStanzasSeen = make(map[pendingStanzaKey]bool)
+	}
+	if cli.pendingStanzasSeen[key] {
+		return
+	}
+	if len(cli.pendingStanzas) >= pendingStanzaCap {
+		discarded := cli.pendingStanzas[0]
+		cli.pendingStanzas = cli.pendingStanzas[1:]
+		delete(cli.pendingStanzasSeen, discarded.key)
+		cli.pendingStanzasOverflowCount++
+		if time.Since(cli.pendingStanzasLastOverflowLog) >= pendingStanzaOverflowLogInterval {
+			cli.Log.Errorf("Pending ack/receipt queue full (cap %d): discarded %d oldest entries since last report", pendingStanzaCap, cli.pendingStanzasOverflowCount)
+			cli.pendingStanzasOverflowCount = 0
+			cli.pendingStanzasLastOverflowLog = time.Now()
+		}
+	}
+	cli.pendingStanzas = append(cli.pendingStanzas, pendingStanzaEntry{key: key, node: node})
+	cli.pendingStanzasSeen[key] = true
+}
+
+// replayPendingStanzas drains the pending ack/receipt queue and re-sends each node in FIFO
+// order. Called from handleConnectSuccess once the connection is active again. An entry that
+// hits ErrNotConnected again (connect raced another drop) is re-enqueued along with every
+// entry after it, preserving order, and replay stops there; an entry rejected with any other
+// error is logged (Warnf) and discarded.
+func (cli *Client) replayPendingStanzas(ctx context.Context) {
+	cli.pendingStanzasLock.Lock()
+	pending := cli.pendingStanzas
+	cli.pendingStanzas = nil
+	cli.pendingStanzasSeen = nil
+	cli.pendingStanzasLock.Unlock()
+
+	for i, entry := range pending {
+		err := cli.sendNodeOrHook(ctx, entry.node)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, ErrNotConnected) {
+			for _, remaining := range pending[i:] {
+				cli.enqueuePendingStanza(remaining.node)
+			}
+			return
+		}
+		cli.Log.Warnf("Failed to replay pending %s %s: %v", entry.node.Tag, entry.node.Attrs["id"], err)
+	}
 }
 
 func (cli *Client) dispatchEvent(evt any) (handlerFailed bool) {
@@ -939,9 +1236,13 @@ func (cli *Client) ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageIn
 		Timestamp: time.Unix(int64(webMsg.GetMessageTimestamp()), 0),
 	}
 	if info.IsFromMe {
-		info.Sender = cli.getOwnID().ToNonAD()
-		if info.Sender.IsEmpty() {
-			return nil, ErrNotLoggedIn
+		if webMsg.GetOriginalSelfAuthorUserJIDString() != "" {
+			info.Sender, err = types.ParseJID(webMsg.GetOriginalSelfAuthorUserJIDString())
+		} else {
+			info.Sender = cli.getOwnID().ToNonAD()
+			if info.Sender.IsEmpty() {
+				return nil, ErrNotLoggedIn
+			}
 		}
 	} else if chatJID.Server == types.DefaultUserServer || chatJID.Server == types.HiddenUserServer || chatJID.Server == types.NewsletterServer {
 		info.Sender = chatJID

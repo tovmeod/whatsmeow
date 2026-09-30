@@ -10,11 +10,13 @@ package store
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 
 	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/proto/waWa6"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/util/keys"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -50,6 +52,16 @@ type PreKeyStore interface {
 type SenderKeyStore interface {
 	PutSenderKey(ctx context.Context, group, user string, session []byte) error
 	GetSenderKey(ctx context.Context, group, user string) ([]byte, error)
+	// GetSenderKeyDevices is READ-ONLY (a SELECT; no write, merge, or migration).
+	// It returns the full device-qualified sender_id strings (e.g. "75811323404294_1:0",
+	// "75811323404294_1:5") that exist in (our_jid, group, userBare) so a caller can
+	// rebuild a SenderKeyName per device and let the existing cached LoadSenderKey
+	// fetch each record. userBare is the device-stripped sender user string
+	// (from.SignalAddressUser() form, e.g. "75811323404294_1") — the range query matches
+	// rows with sender_id starting with "<userBare>:". The returned strings are
+	// device-qualified; an empty/nil slice means no candidates exist. Carries forward D-06:
+	// this method never writes, merges, or rewrites any sender_id.
+	GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error)
 }
 
 type AppStateSyncKey struct {
@@ -78,6 +90,13 @@ type AppStateStore interface {
 	PutAppStateMutationMACs(ctx context.Context, name string, version uint64, mutations []AppStateMutationMAC) error
 	DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) error
 	GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error)
+
+	// PutAppStateVersionAndMACs atomically persists the version cursor together with the
+	// removed and added mutation MACs for one app state collection (55.1-10, class 14 root
+	// cause H1: storeMACs was three independent non-transactional statements). Implementations
+	// must make this all-or-nothing: on any error, none of the three writes may have taken
+	// effect (no more cursor-ahead-of-ledger states after a crash or error mid-write).
+	PutAppStateVersionAndMACs(ctx context.Context, name string, version uint64, hash [128]byte, removedMACs [][]byte, addedMACs []AppStateMutationMAC) error
 }
 
 type ContactEntry struct {
@@ -123,6 +142,17 @@ type DeviceContainer interface {
 	DeleteDevice(ctx context.Context, store *Device) error
 }
 
+// SenderKeyInlineRecoverer is the interface for synchronous inline recovery.
+// Defined in package store (not sqlstore) so message.go can call it via
+// cli.Store.InlineRecoverer without importing sqlstore (package-boundary
+// constraint — message.go only imports store, not sqlstore).
+// Implemented by *CachedSenderKeyStore (sqlstore). Set on Device by
+// attachCachedStores. Nil before wiring and in test environments;
+// message.go gates on nil before calling TryInlineRecovery.
+type SenderKeyInlineRecoverer interface {
+	TryInlineRecovery(ctx context.Context, group, targetSenderID, senderBare string, targetKeyID, targetIter uint32) (donorJID string, ok bool, err error)
+}
+
 type MessageSecretInsert struct {
 	Chat   types.JID
 	Sender types.JID
@@ -137,14 +167,22 @@ type MsgSecretStore interface {
 }
 
 type PrivacyToken struct {
-	User      types.JID
-	Token     []byte
-	Timestamp time.Time
+	User            types.JID
+	Token           []byte
+	Timestamp       time.Time
+	SenderTimestamp time.Time
 }
 
 type PrivacyTokenStore interface {
 	PutPrivacyTokens(ctx context.Context, tokens ...PrivacyToken) error
 	GetPrivacyToken(ctx context.Context, user types.JID) (*PrivacyToken, error)
+	DeleteExpiredPrivacyTokens(ctx context.Context, cutoff time.Time) (int64, error)
+}
+
+type NCTSaltStore interface {
+	PutNCTSalt(ctx context.Context, salt []byte) error
+	GetNCTSalt(ctx context.Context) ([]byte, error)
+	DeleteNCTSalt(ctx context.Context) error
 }
 
 type BufferedEvent struct {
@@ -161,6 +199,10 @@ type EventBuffer interface {
 	DeleteOldBufferedHashes(ctx context.Context) error
 
 	GetOutgoingEvent(ctx context.Context, chatJID, altChatJID types.JID, id types.MessageID) (string, []byte, error)
+	// GetOutgoingEventByID looks up a stored outgoing message by ID alone (ignoring chat). Used
+	// to serve own-account/DeviceSentMessage retries, which arrive keyed by our own account
+	// while the message is stored under its destination chat. See getMessageForRetry.
+	GetOutgoingEventByID(ctx context.Context, id types.MessageID) (string, []byte, error)
 	AddOutgoingEvent(ctx context.Context, chatJID types.JID, id types.MessageID, format string, plaintext []byte) error
 	DeleteOldOutgoingEvents(ctx context.Context) error
 }
@@ -193,6 +235,7 @@ type AllSessionSpecificStores interface {
 	ChatSettingsStore
 	MsgSecretStore
 	PrivacyTokenStore
+	NCTSaltStore
 	EventBuffer
 }
 
@@ -226,21 +269,32 @@ type Device struct {
 
 	FacebookUUID uuid.UUID
 
-	Initialized   bool
-	Deleted       bool
-	Identities    IdentityStore
-	Sessions      SessionStore
-	PreKeys       PreKeyStore
-	SenderKeys    SenderKeyStore
-	AppStateKeys  AppStateSyncKeyStore
-	AppState      AppStateStore
-	Contacts      ContactStore
-	ChatSettings  ChatSettingsStore
-	MsgSecrets    MsgSecretStore
-	PrivacyTokens PrivacyTokenStore
-	EventBuffer   EventBuffer
-	LIDs          LIDStore
-	Container     DeviceContainer
+	Initialized bool
+	Deleted     bool
+	Identities  IdentityStore
+	Sessions    SessionStore
+	PreKeys     PreKeyStore
+	SenderKeys  SenderKeyStore
+	// Phase 17.12: inline synchronous cross-account sender-key recovery.
+	// Nil before attachCachedStores wires it. message.go gates on nil before
+	// calling TryInlineRecovery — no-op when not wired (test environments, pre-init).
+	InlineRecoverer SenderKeyInlineRecoverer
+	AppStateKeys    AppStateSyncKeyStore
+	AppState        AppStateStore
+	Contacts        ContactStore
+	ChatSettings    ChatSettingsStore
+	MsgSecrets      MsgSecretStore
+	PrivacyTokens   PrivacyTokenStore
+	NCTSalt         NCTSaltStore
+	EventBuffer     EventBuffer
+	LIDs            LIDStore
+	Container       DeviceContainer
+
+	// connectReasonOverride is scoped per-Device (per WhatsApp account), NOT process-global -- the
+	// kavtov driver runs ~60 accounts in one process (manager.go's
+	// `accounts map[string]*driver.Client`), so a shared override would race across concurrent
+	// connect/reconnect activity on different accounts. See SetConnectReasonOverride.
+	connectReasonOverride atomic.Pointer[waWa6.ClientPayload_ConnectReason]
 }
 
 func (device *Device) GetJID() types.JID {
@@ -259,6 +313,18 @@ func (device *Device) GetLID() types.JID {
 		return types.EmptyJID
 	}
 	return device.LID
+}
+
+// SetConnectReasonOverride sets the ConnectReason for the next client payload built by this
+// Device's getLoginPayload/getRegistrationPayload. Pass nil to clear the override and fall back to
+// BaseClientPayload.ConnectReason (USER_ACTIVATED). Scoped per-Device (per WhatsApp account), NOT
+// process-global -- the kavtov driver runs ~60 accounts in one process (manager.go's
+// `accounts map[string]*driver.Client`), so a shared override would race across concurrent
+// connect/reconnect activity on different accounts. D-08 #5 (60-CONTEXT.md): whatsmeow-fork's
+// autoReconnect calls this with ClientPayload_ERROR_RECONNECT before reconnecting ITS OWN device,
+// matching a browser's actual auto-reconnect signal instead of always claiming USER_ACTIVATED.
+func (device *Device) SetConnectReasonOverride(reason *waWa6.ClientPayload_ConnectReason) {
+	device.connectReasonOverride.Store(reason)
 }
 
 var ErrDeviceDeleted = errors.New("invalid use of deleted device")
@@ -296,6 +362,7 @@ func (device *Device) SetAllStores(store AllSessionSpecificStores) {
 	device.ChatSettings = store
 	device.MsgSecrets = store
 	device.PrivacyTokens = store
+	device.NCTSalt = store
 	device.EventBuffer = store
 }
 

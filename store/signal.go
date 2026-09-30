@@ -84,10 +84,15 @@ func (device *Device) ContainsPreKey(ctx context.Context, preKeyID uint32) (bool
 
 func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalAddress) (*record.Session, error) {
 	addrString := address.String()
+	// Context cache: send-path only (getCachedSession returns nil during decrypts).
+	// Preserve this check — it short-circuits the byte-cache lookup for send-path
+	// contexts (RESEARCH Pitfall 6).
 	if sess := getCachedSession(ctx, addrString); sess != nil {
 		return sess, nil
 	}
 
+	// Fetch raw bytes from byte-cache (CachedSessionStore LRU or DB).
+	// Stage 1: single-tier — no struct cache (D-04a removal).
 	rawSess, err := device.Sessions.GetSession(ctx, addrString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load session with %s: %w", addrString, err)
@@ -95,11 +100,27 @@ func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalA
 	if rawSess == nil {
 		return record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State), nil
 	}
-	sess, err := record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize session with %s: %w", addrString, err)
+
+	// Format detection: byte[0]=0x01 → flat (Stage 3: only valid format).
+	// Stage 3: JSON-read path removed after backfill confirmed zero JSON rows.
+	// A non-flat blob returns a wrapped error — never panics, never silently drops.
+	var structure *record.SessionStructure
+	if len(rawSess) > 0 && rawSess[0] == 0x01 {
+		structure, err = UnpackFlatSession(rawSess)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize session with %s: %w", addrString, err)
+		}
+	} else {
+		// Non-flat blob: JSON-read path removed in Stage 3. All prod rows confirmed flat.
+		var byte0desc string
+		if len(rawSess) == 0 {
+			byte0desc = "empty blob"
+		} else {
+			byte0desc = fmt.Sprintf("byte0=0x%02x", rawSess[0])
+		}
+		return nil, fmt.Errorf("LoadSession: non-flat session blob for %s (%s); JSON read path removed in Stage 3", addrString, byte0desc)
 	}
-	return sess, nil
+	return record.NewSessionFromStructure(structure, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
 }
 
 func (device *Device) GetSubDeviceSessions(ctx context.Context, name string) ([]uint32, error) {
@@ -108,11 +129,20 @@ func (device *Device) GetSubDeviceSessions(ctx context.Context, name string) ([]
 
 func (device *Device) StoreSession(ctx context.Context, address *protocol.SignalAddress, record *record.Session) error {
 	addrString := address.String()
+
+	// Stage 3: write flat bytes via PackFlatSession only. No JSON fallback.
+	// If PackFlatSession refuses (codec bug), return a wrapped error — no silent session loss.
+	structure := record.Structure()
+	flat, ok := PackFlatSession(structure)
+	if !ok {
+		return fmt.Errorf("PackFlatSession refused to encode session with %s: codec bug", addrString)
+	}
+	serialized := flat
+
 	if putCachedSession(ctx, addrString, record) {
 		return nil
 	}
-
-	err := device.Sessions.PutSession(ctx, addrString, record.Serialize())
+	err := device.Sessions.PutSession(ctx, addrString, serialized)
 	if err != nil {
 		return fmt.Errorf("failed to store session with %s: %w", addrString, err)
 	}
@@ -172,7 +202,29 @@ func (device *Device) RemoveSignedPreKey(ctx context.Context, signedPreKeyID uin
 func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName, keyRecord *groupRecord.SenderKey) error {
 	groupID := senderKeyName.GroupID()
 	senderString := senderKeyName.Sender().String()
-	err := device.SenderKeys.PutSenderKey(ctx, groupID, senderString, keyRecord.Serialize())
+
+	// Phase 38.4-03: parsed struct-cache (SKParsed) deleted. The write-through flat
+	// c.cache inside CachedSenderKeyStore.PutSenderKeyStructure is the authoritative
+	// write path. No StoreStruct call here.
+
+	// Phase 17.9: columnar hot path — no Serialize on the per-message write.
+	// Type-assert device.SenderKeys to the fork-local optional interface.
+	// Structure() is JSON-free (in-memory only; no Marshal).
+	// DESIGN OVERRIDE: the columnar path uses a structure-carrying fork-local
+	// interface; whatsmeow's []byte SenderKeyStore is preserved for upstream-merge
+	// compatibility (DESIGN line 64 non-veto; line 11 hard goal).
+	if csk, ok := device.SenderKeys.(SenderKeyColumnarStore); ok {
+		err := csk.PutSenderKeyStructure(ctx, groupID, senderString, keyRecord.Structure())
+		if err != nil {
+			return fmt.Errorf("failed to store sender key from %s for %s: %w", senderString, groupID, err)
+		}
+		return nil
+	}
+
+	// Fallback: store does not implement SenderKeyColumnarStore (legacy / test stores).
+	// This is the ONLY remaining Serialize in StoreSenderKey; fires only for non-columnar stores.
+	serialized := keyRecord.Serialize() // ALLOW-JSON-LEGACY-READ (non-columnar store fallback: fires only on legacy/test stores, not production CachedSenderKeyStore)
+	err := device.SenderKeys.PutSenderKey(ctx, groupID, senderString, serialized)
 	if err != nil {
 		return fmt.Errorf("failed to store sender key from %s for %s: %w", senderString, groupID, err)
 	}
@@ -182,6 +234,28 @@ func (device *Device) StoreSenderKey(ctx context.Context, senderKeyName *protoco
 func (device *Device) LoadSenderKey(ctx context.Context, senderKeyName *protocol.SenderKeyName) (*groupRecord.SenderKey, error) {
 	groupID := senderKeyName.GroupID()
 	senderString := senderKeyName.Sender().String()
+
+	// Phase 38.4-03: parsed struct-cache (SKParsed) deleted. LoadSenderKey now reads
+	// the flat []byte cache directly via GetSenderKeyStructure (cache-aware since
+	// Plan 02). Decode flat bytes → record per decrypt (transient; GC'd immediately —
+	// no pointer-dense graph retained, per the Phase 17.8/17.9 GC decision).
+
+	// 1. Columnar read path (fmt_ver=2 → flat bytes → structure, no JSON).
+	// GetSenderKeyStructure is cache-aware (Plan 02): checks c.cache before DB.
+	if csk, ok := device.SenderKeys.(SenderKeyColumnarStore); ok {
+		structure, err := csk.GetSenderKeyStructure(ctx, groupID, senderString)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load sender key structure from %s for %s: %w", senderString, groupID, err)
+		}
+		if structure == nil {
+			// Absent row: return empty record (recovery invariant — never cache nil).
+			return groupRecord.NewSenderKey(SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState), nil
+		}
+		return groupRecord.NewSenderKeyFromStruct(structure, SignalProtobufSerializer.SenderKeyRecord, SignalProtobufSerializer.SenderKeyState)
+	}
+
+	// 2. Fallback: store does not implement SenderKeyColumnarStore (legacy / test stores).
+	// Use the []byte GetSenderKey + Deserialize path (ALLOW-JSON-LEGACY-READ).
 	rawKey, err := device.SenderKeys.GetSenderKey(ctx, groupID, senderString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load sender key from %s for %s: %w", senderString, groupID, err)

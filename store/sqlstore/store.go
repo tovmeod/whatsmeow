@@ -22,6 +22,9 @@ import (
 	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/exsync"
 
+	"go.mau.fi/libsignal/groups/ratchet"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
+
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/util/keys"
@@ -74,9 +77,8 @@ const (
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllIdentitiesQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
-	deleteIdentityQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
-	getIdentityQuery         = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	deleteIdentityQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	getIdentityQuery    = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
 )
 
 func (s *SQLStore) PutIdentity(ctx context.Context, address string, key [32]byte) error {
@@ -85,7 +87,17 @@ func (s *SQLStore) PutIdentity(ctx context.Context, address string, key [32]byte
 }
 
 func (s *SQLStore) DeleteAllIdentities(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentitiesQuery, s.JID, phone)
+	// kavtov-fork Phase 47.3 amendment 2026-06-25: repointed to deleteAllIdentityKeysQuery
+	// (the canonical, collation-safe LIKE form fixed in D-06). The former
+	// deleteAllIdentitiesQuery used the broken range idiom
+	// (their_id >= $2||':' AND their_id < $2||';') which silently deleted 0 rows
+	// on en_US.utf8 — making the identity-change handler (notification.go:55) a no-op
+	// for ~1 month (ef91440, 2026-05-25).
+	// F11 (Phase 47.3): escape the bound LIKE prefix consistently with
+	// ExistsPNSession and the other delete/migrate queries. phone is pure digits
+	// today (from from.User) — the escaper is a no-op for digits and a
+	// correctness guard for any future LID-form prefix ('_' is a LIKE wildcard).
+	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
 	return err
 }
 
@@ -105,7 +117,37 @@ func (s *SQLStore) IsTrustedIdentity(ctx context.Context, address string, key [3
 	} else if len(existingIdentity) != 32 {
 		return false, ErrInvalidLength
 	}
-	return *(*[32]byte)(existingIdentity) == key, nil
+	existing := *(*[32]byte)(existingIdentity)
+	if existing == key {
+		return true, nil
+	}
+	// D-10: auto-accept rotated identity key; emit one structured audit log.
+	// Per-(sender,key) once semantics come from libsignal's SaveIdentity-after-trust-check
+	// + PutIdentity value-equal skip (cached_identity_store.go) — do not add a dedup cache.
+	// Class 4 (55.1-03): demoted to Debug for consistency with
+	// CachedIdentityStore.logIdentityChanged — same phenomenon (a correctly
+	// trust-on-rotate peer key change). This raw path is unreachable in
+	// production: attachCachedStores (cache_wiring.go) always wraps every
+	// device's Identities via NewCachedIdentityStore, so it never feeds
+	// identityChangedTotal either.
+	s.log.Debugf("IDENTITY_CHANGED address=%s old=%x new=%x", address, existing[:8], key[:8])
+	return true, nil
+}
+
+// getIdentityBytes is a private read accessor used by CachedIdentityStore for populate-on-miss. Not part of the IdentityStore interface.
+func (s *SQLStore) getIdentityBytes(ctx context.Context, address string) (*[32]byte, error) {
+	var existingIdentity []byte
+	err := s.db.QueryRow(ctx, getIdentityQuery, s.JID, address).Scan(&existingIdentity)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	} else if len(existingIdentity) != 32 {
+		return nil, ErrInvalidLength
+	}
+	out := [32]byte{}
+	copy(out[:], existingIdentity)
+	return &out, nil
 }
 
 const (
@@ -117,32 +159,78 @@ const (
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
-	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
+	// deleteAllSessionsQuery removes all PN-form session rows for a (our_jid, pnSignal)
+	// pair. kavtov-fork Phase 47.3 D-06: LIKE $2 || ':%' ESCAPE '\' replaces the
+	// previous range idiom (their_id >= $2||':' AND their_id < $2||';') which
+	// silently returned 0 rows on the prod DB's en_US.utf8 collation — ';' does
+	// not order after ':' there. LIKE matches by character, not collation ordering.
+	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'`
 	deleteSessionQuery     = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
 
+	// migratePNToLIDSessionsQuery copies session rows from PN-format their_id to
+	// LID-format their_id. kavtov-fork Phase 47.3 D-06: LIKE replaces broken range
+	// (see deleteAllSessionsQuery comment above).
+	// F11 (Phase 47.3 fix-forward): the LIKE predicate binds $4 (the
+	// senderKeyLikeEscaper-escaped prefix) so any LIKE metacharacter in the
+	// prefix is treated literally — CONSISTENT with ExistsPNSession and the
+	// delete queries. $2 stays RAW for replace() (a literal substring replace,
+	// not a pattern) — escaping it would replace the escaped form, not the data.
 	migratePNToLIDSessionsQuery = `
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session)
 		SELECT our_jid, replace(their_id, $2, $3), session
 		FROM whatsmeow_sessions
-		WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
+		WHERE our_jid=$1 AND their_id LIKE $4 || ':%' ESCAPE '\'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
-	deleteAllIdentityKeysQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
+	// deleteAllIdentityKeysQuery removes all PN-form identity key rows.
+	// kavtov-fork Phase 47.3 D-06: LIKE replaces broken range idiom.
+	// This is the CANONICAL delete predicate for whatsmeow_identity_keys prefix deletes.
+	// It backs two callers:
+	//   1. deleteAllIdentityKeys() — called by MigratePNToLID's PN→LID migration path.
+	//   2. DeleteAllIdentities() — called by the identity-change handler (notification.go:55)
+	//      when WhatsApp signals a contact's identity key has rotated. The former
+	//      deleteAllIdentitiesQuery (removed Phase 47.3 amendment 2026-06-25) was a duplicate
+	//      of this query using the broken range idiom that silently deleted 0 rows on
+	//      en_US.utf8 (ef91440 regression, 2026-05-25).
+	deleteAllIdentityKeysQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'`
+	// F11: LIKE binds the escaped $4; replace() keeps raw $2 (see sessions query).
 	migratePNToLIDIdentityKeysQuery = `
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity)
 		SELECT our_jid, replace(their_id, $2, $3), identity
 		FROM whatsmeow_identity_keys
-		WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
+		WHERE our_jid=$1 AND their_id LIKE $4 || ':%' ESCAPE '\'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllSenderKeysQuery      = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'`
+	// deleteAllSenderKeysQuery removes all PN-form sender-key rows. Uses sender_id
+	// (not their_id). kavtov-fork Phase 47.3 D-06: LIKE replaces broken range idiom.
+	// whatsmeow_sender_keys has a text_pattern_ops unique index (v18) so this LIKE
+	// on sender_id IS index-seekable (byte-ordered range seek on the text_pattern_ops index).
+	deleteAllSenderKeysQuery = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id LIKE $2 || ':%' ESCAPE '\'`
+	// migratePNToLIDSenderKeysQuery copies sender-key rows from PN-format sender_id
+	// to LID-format sender_id. Post-upgrade-19 the table has only (our_jid, chat_id,
+	// sender_id, sender_key) — the flat bytea is copied as-is. The LID row's sender_key
+	// is the donor row's flat blob; the next write will replace it on ratchet advance.
+	// kavtov-fork Phase 47.3 D-06: LIKE replaces broken range idiom (sender_id column).
+	// F11: LIKE binds the escaped $4; replace() keeps raw $2 (see sessions query).
 	migratePNToLIDSenderKeysQuery = `
 		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
 		SELECT our_jid, chat_id, replace(sender_id, $2, $3), sender_key
 		FROM whatsmeow_sender_keys
-		WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'
-		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
+		WHERE our_jid=$1 AND sender_id LIKE $4 || ':%' ESCAPE '\'
+		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
+			sender_key=excluded.sender_key
 	`
+
+	// existsPNSessionQuery checks whether this account has any session row whose
+	// their_id starts with pnPrefix (e.g. "972515529399:"). Used by
+	// CachedSessionStore.MigratePNToLID to determine whether to take the full
+	// WithFlushBlocked path on the first send (D-02 cheap no-op detection).
+	// pnPrefix is caller-escaped via senderKeyLikeEscaper before binding — required
+	// to treat any LIKE metacharacters in the prefix literally (defensive; PN
+	// prefixes are pure-digit phone strings with no metacharacters, but future
+	// callers may pass other forms).
+	// LIKE + ESCAPE instead of the broken >= ':' AND < ';' range (D-04/D-06).
+	existsPNSessionQuery = `SELECT true FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2 || '%' ESCAPE '\' LIMIT 1`
 )
 
 func (s *SQLStore) GetSession(ctx context.Context, address string) (session []byte, err error) {
@@ -159,6 +247,24 @@ func (s *SQLStore) HasSession(ctx context.Context, address string) (has bool, er
 		err = nil
 	}
 	return
+}
+
+// ExistsPNSession reports whether this account has any session row whose
+// their_id starts with pnPrefix. pnPrefix must be the colon-suffixed PN
+// signal prefix, e.g. "972515529399:" (caller passes pn.SignalAddressUser()+":").
+// The prefix is escaped via senderKeyLikeEscaper before binding to guard against
+// LIKE metacharacters (defensive; PN prefixes are pure digits, but LID-form
+// prefixes contain '_' which is a LIKE wildcard).
+// Returns (false, nil) on sql.ErrNoRows (no rows = prefix not present).
+// Used by CachedSessionStore.MigratePNToLID for D-02 cheap no-op detection.
+func (s *SQLStore) ExistsPNSession(ctx context.Context, pnPrefix string) (bool, error) {
+	escaped := senderKeyLikeEscaper.Replace(pnPrefix)
+	var exists bool
+	err := s.db.QueryRow(ctx, existsPNSessionQuery, s.JID, escaped).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return exists, err
 }
 
 type addressSessionTuple struct {
@@ -226,23 +332,34 @@ func (s *SQLStore) DeleteAllSessions(ctx context.Context, phone string) error {
 }
 
 func (s *SQLStore) deleteAllSessions(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllSessionsQuery, s.JID, phone)
+	// F11 (Phase 47.3): escape the bound LIKE prefix CONSISTENTLY with
+	// ExistsPNSession. Defensive — PN prefixes are pure digits today, but a
+	// LID-form prefix contains '_' (a LIKE wildcard); raw binding would
+	// over-match. Escaping every LIKE query removes the asymmetric footgun.
+	_, err := s.db.Exec(ctx, deleteAllSessionsQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
 	return err
 }
 
 func (s *SQLStore) deleteAllSenderKeys(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllSenderKeysQuery, s.JID, phone)
+	_, err := s.db.Exec(ctx, deleteAllSenderKeysQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
 	return err
 }
 
 func (s *SQLStore) deleteAllIdentityKeys(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, phone)
+	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
 	return err
 }
 
 func (s *SQLStore) DeleteSession(ctx context.Context, address string) error {
 	_, err := s.db.Exec(ctx, deleteSessionQuery, s.JID, address)
 	return err
+}
+
+// IsPNMigrated reports whether MigratePNToLID has already migrated this PN this
+// process, WITHOUT mutating the once-per-process gate. Lets the cached wrapper skip
+// the expensive flush-block on the common already-migrated repeat-send path.
+func (s *SQLStore) IsPNMigrated(pnSignal string) bool {
+	return s.migratedPNSessionsCache.Has(pnSignal)
 }
 
 func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
@@ -252,8 +369,13 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 	}
 	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
 	lidSignal := lid.SignalAddressUser()
+	// F11 (Phase 47.3): $4 is the senderKeyLikeEscaper-escaped prefix bound to the
+	// LIKE predicate in each migrate query; $2 stays RAW (pnSignal) for replace(),
+	// which is a literal substring replace, not a pattern. Escaping the LIKE bind
+	// makes these queries CONSISTENT with ExistsPNSession / the delete queries.
+	escapedPN := senderKeyLikeEscaper.Replace(pnSignal)
 	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		res, err := s.db.Exec(ctx, migratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal)
+		res, err := s.db.Exec(ctx, migratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal, escapedPN)
 		if err != nil {
 			return fmt.Errorf("failed to migrate sessions: %w", err)
 		}
@@ -266,7 +388,7 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 			return fmt.Errorf("failed to delete extra sessions: %w", err)
 		}
 
-		res, err = s.db.Exec(ctx, migratePNToLIDIdentityKeysQuery, s.JID, pnSignal, lidSignal)
+		res, err = s.db.Exec(ctx, migratePNToLIDIdentityKeysQuery, s.JID, pnSignal, lidSignal, escapedPN)
 		if err != nil {
 			return fmt.Errorf("failed to migrate identity keys: %w", err)
 		}
@@ -279,7 +401,7 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 			return fmt.Errorf("failed to delete extra identity keys: %w", err)
 		}
 
-		res, err = s.db.Exec(ctx, migratePNToLIDSenderKeysQuery, s.JID, pnSignal, lidSignal)
+		res, err = s.db.Exec(ctx, migratePNToLIDSenderKeysQuery, s.JID, pnSignal, lidSignal, escapedPN)
 		if err != nil {
 			return fmt.Errorf("failed to migrate sender keys: %w", err)
 		}
@@ -343,30 +465,20 @@ func (s *SQLStore) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.P
 	s.preKeyLock.Lock()
 	defer s.preKeyLock.Unlock()
 
-	res, err := s.db.Query(ctx, getUnuploadedPreKeysQuery, s.JID, count)
+	newKeys, err := scanPreKey.NewRowIter(s.db.Query(ctx, getUnuploadedPreKeysQuery, s.JID, count)).AsList()
 	if err != nil {
 		return nil, fmt.Errorf("failed to query existing prekeys: %w", err)
 	}
-	newKeys := make([]*keys.PreKey, count)
-	var existingCount uint32
-	for res.Next() {
-		var key *keys.PreKey
-		key, err = scanPreKey(res)
-		if err != nil {
-			return nil, err
-		} else if key != nil {
-			newKeys[existingCount] = key
-			existingCount++
-		}
-	}
 
-	if existingCount < uint32(len(newKeys)) {
+	alreadyGeneratedCount := uint32(len(newKeys))
+	if count > alreadyGeneratedCount {
 		var nextKeyID uint32
 		nextKeyID, err = s.getNextPreKeyID(ctx)
 		if err != nil {
 			return nil, err
 		}
-		for i := existingCount; i < count; i++ {
+		newKeys = slices.Grow(newKeys, int(count)-len(newKeys))[:count]
+		for i := alreadyGeneratedCount; i < count; i++ {
 			newKeys[i], err = s.genOnePreKey(ctx, nextKeyID, false)
 			if err != nil {
 				return nil, fmt.Errorf("failed to generate prekey: %w", err)
@@ -378,7 +490,7 @@ func (s *SQLStore) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.P
 	return newKeys, nil
 }
 
-func scanPreKey(row dbutil.Scannable) (*keys.PreKey, error) {
+var scanPreKey = dbutil.ConvertRowFn[*keys.PreKey](func(row dbutil.Scannable) (*keys.PreKey, error) {
 	var priv []byte
 	var id uint32
 	err := row.Scan(&id, &priv)
@@ -393,7 +505,7 @@ func scanPreKey(row dbutil.Scannable) (*keys.PreKey, error) {
 		KeyPair: *keys.NewKeyPairFromPrivateKey(*(*[32]byte)(priv)),
 		KeyID:   id,
 	}, nil
-}
+})
 
 func (s *SQLStore) GetPreKey(ctx context.Context, id uint32) (*keys.PreKey, error) {
 	return scanPreKey(s.db.QueryRow(ctx, getPreKeyQuery, s.JID, id))
@@ -416,15 +528,269 @@ func (s *SQLStore) UploadedPreKeyCount(ctx context.Context) (count int, err erro
 
 const (
 	getSenderKeyQuery = `SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`
+	// getSenderKeyFlatQuery reads only the sender_key bytea. Post-upgrade-19 the table
+	// has only 4 logical columns (our_jid, chat_id, sender_id, sender_key); decoded by
+	// store.UnpackFlat.
+	getSenderKeyFlatQuery = `SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`
+	// putSenderKeyQuery writes a flat bytea row. Post-upgrade-19 there are no columnar
+	// columns; every write is a single sender_key bytea.
 	putSenderKeyQuery = `
 		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
+		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET
+			sender_key=excluded.sender_key
 	`
+	// getSenderKeyDevicesQuery returns all device-qualified sender_id strings for a
+	// (our_jid, chat_id, userBare) triple. kavtov-fork Phase 27: a collation-stable
+	// prefix match. The previous range idiom (sender_id >= $3||':' AND < $3||';')
+	// silently returned 0 rows on the prod DB's en_US.utf8 collation — the ';'
+	// upper bound does not order after ':' there. LIKE matches by character, not
+	// collation ordering, and is portable (PG + SQLite). userBare contains a '_'
+	// (the LID agent suffix) and may contain '%'/'\', all LIKE metacharacters, so
+	// the bound value is escaped caller-side before binding (see GetSenderKeyDevices).
+	getSenderKeyDevicesQuery = `SELECT sender_id FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id LIKE $3 || ':%' ESCAPE '\'`
 )
+
+// senderKeyLikeEscaper escapes the three LIKE metacharacters in a userBare value
+// before it is bound to getSenderKeyDevicesQuery. '\' MUST be replaced first;
+// strings.NewReplacer performs a single left-to-right pass with no re-processing
+// of inserted bytes, so the backslashes added for '%'/'_' are not double-escaped.
+var senderKeyLikeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 func (s *SQLStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
 	_, err := s.db.Exec(ctx, putSenderKeyQuery, s.JID, group, user, session)
 	return err
+}
+
+// GetSenderKeyFlat reads the flat sender_key bytea for one (our_jid, group, user) row.
+// Returns (nil, nil) when the row is absent. Used by the flat read path.
+func (s *SQLStore) GetSenderKeyFlat(ctx context.Context, group, user string) ([]byte, error) {
+	var blob []byte
+	err := s.db.QueryRow(ctx, getSenderKeyFlatQuery, s.JID, group, user).Scan(&blob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return blob, err
+}
+
+// SenderKeyRow is one (group, user, flat-blob) triple to upsert via
+// PutManySenderKeys. Group and User are whatsmeow JID strings drawn from the
+// in-process cache key (not external input); Blob carries the PackFlat-encoded
+// sender-key bytea for a post-upgrade-19 flat write.
+//
+// Phase 17.11-05: Cols *senderKeyColumns removed; replaced with Blob []byte.
+// The flat path packs the structure once at write time and stores a single bytea.
+type SenderKeyRow struct {
+	Group string
+	User  string
+	Blob  []byte // PackFlat-encoded sender_key bytea
+}
+
+// NewSenderKeyRow constructs a SenderKeyRow by encoding the libsignal
+// *SenderKeyStructure into its flat binary form (PackFlat). Intended for test
+// code and migration utilities. Returns a zero-Blob SenderKeyRow if PackFlat
+// fails (structure has 0 states or invalid field lengths).
+func NewSenderKeyRow(group, user string, s *groupRecord.SenderKeyStructure) SenderKeyRow {
+	blob, _ := store.PackFlat(s)
+	return SenderKeyRow{Group: group, User: user, Blob: blob}
+}
+
+// ---------------------------------------------------------------------------
+// senderKeyColumns, decompose, recompose — retained for migration tool compat
+//
+// senderkey_columns.go was deleted in plan 05. These definitions are kept in
+// store.go so that ExportRecompose (used by the migration tool to convert
+// fmt_ver=2 columnar rows) still compiles. The LIVE DRIVER READ PATH no longer
+// uses decompose/recompose — GetSenderKeyStructure now calls store.UnpackFlat.
+// ---------------------------------------------------------------------------
+
+// senderKeyColumns is a position-aligned columnar representation retained for
+// ExportRecompose and the one-time migration tool (migrate_senderkey_flat).
+// Not used by any live driver read or write path after plan 05.
+type senderKeyColumns struct {
+	fmtVer int16
+
+	stKeyID             []int64
+	stChainKeyIteration []int64
+	stChainKey          [][]byte
+	stSigningKeyPublic  [][]byte
+	stSigningKeyPrivate [][]byte
+
+	smkStateIdx  []int32
+	smkIteration []int64
+	smkIV        [][]byte
+	smkCipherKey [][]byte
+	smkSeed      [][]byte
+}
+
+// decompose maps a *SenderKeyStructure to the columnar DTO (migration tool).
+// Not used by the live driver after plan 05.
+func decompose(s *groupRecord.SenderKeyStructure) *senderKeyColumns {
+	n := len(s.SenderKeyStates)
+	c := &senderKeyColumns{
+		fmtVer:              2,
+		stKeyID:             make([]int64, n),
+		stChainKeyIteration: make([]int64, n),
+		stChainKey:          make([][]byte, n),
+		stSigningKeyPublic:  make([][]byte, n),
+		stSigningKeyPrivate: make([][]byte, n),
+	}
+	for i, st := range s.SenderKeyStates {
+		c.stKeyID[i] = int64(st.KeyID)
+		c.stChainKeyIteration[i] = int64(st.SenderChainKey.Iteration)
+		c.stChainKey[i] = st.SenderChainKey.ChainKey
+		c.stSigningKeyPublic[i] = st.SigningKeyPublic
+		c.stSigningKeyPrivate[i] = st.SigningKeyPrivate
+		for _, smk := range st.Keys {
+			c.smkStateIdx = append(c.smkStateIdx, int32(i))
+			c.smkIteration = append(c.smkIteration, int64(smk.Iteration))
+			c.smkIV = append(c.smkIV, smk.IV)
+			c.smkCipherKey = append(c.smkCipherKey, smk.CipherKey)
+			c.smkSeed = append(c.smkSeed, smk.Seed)
+		}
+	}
+	return c
+}
+
+// recompose reconstructs a *SenderKeyStructure from columnar DTO (migration tool).
+// Not used by the live driver after plan 05.
+func recompose(c *senderKeyColumns) *groupRecord.SenderKeyStructure {
+	n := len(c.stKeyID)
+	states := make([]*groupRecord.SenderKeyStateStructure, n)
+	for i := range states {
+		states[i] = &groupRecord.SenderKeyStateStructure{
+			KeyID: uint32(c.stKeyID[i]),
+			SenderChainKey: &ratchet.SenderChainKeyStructure{
+				Iteration: uint32(c.stChainKeyIteration[i]),
+				ChainKey:  c.stChainKey[i],
+			},
+			SigningKeyPublic:  c.stSigningKeyPublic[i],
+			SigningKeyPrivate: c.stSigningKeyPrivate[i],
+		}
+	}
+	for j, stIdx := range c.smkStateIdx {
+		smk := &ratchet.SenderMessageKeyStructure{
+			Iteration: uint32(c.smkIteration[j]),
+			IV:        c.smkIV[j],
+			CipherKey: c.smkCipherKey[j],
+			Seed:      c.smkSeed[j],
+		}
+		states[stIdx].Keys = append(states[stIdx].Keys, smk)
+	}
+	return &groupRecord.SenderKeyStructure{SenderKeyStates: states}
+}
+
+// ExportedSenderKeyColumns carries the columnar sender-key fields in native Go
+// slice types so the migration tool (package main) and test code can pass scanned
+// PG column values to ExportRecompose without naming the unexported senderKeyColumns
+// type or the unexported int64Array / byteaArray / int32Array scanner wrappers.
+//
+// All fields map 1-to-1 to the corresponding senderKeyColumns fields:
+//   - StKeyID              ↔ stKeyID              (one int64 per state)
+//   - StChainKeyIteration  ↔ stChainKeyIteration  (one int64 per state)
+//   - StChainKey           ↔ stChainKey            (one []byte per state)
+//   - StSigningKeyPublic   ↔ stSigningKeyPublic    (one []byte per state)
+//   - StSigningKeyPrivate  ↔ stSigningKeyPrivate   (nil element = NULL = received key)
+//   - SmkStateIdx          ↔ smkStateIdx           (one int32 per skipped key)
+//   - SmkIteration         ↔ smkIteration          (one int64 per skipped key)
+//   - SmkIV                ↔ smkIV                 (one []byte per skipped key)
+//   - SmkCipherKey         ↔ smkCipherKey          (one []byte per skipped key)
+//   - SmkSeed              ↔ smkSeed               (one []byte per skipped key)
+//
+// Intended for test code and migration utilities that need to call ExportRecompose
+// (the fmt_ver=2 decode path) without access to the unexported columnar types.
+type ExportedSenderKeyColumns struct {
+	StKeyID             []int64
+	StChainKeyIteration []int64
+	StChainKey          [][]byte
+	StSigningKeyPublic  [][]byte
+	StSigningKeyPrivate [][]byte // nil element → nil SigningKeyPrivate (received key)
+	SmkStateIdx         []int32
+	SmkIteration        []int64
+	SmkIV               [][]byte
+	SmkCipherKey        [][]byte
+	SmkSeed             [][]byte
+}
+
+// ExportRecompose reconstructs a *groupRecord.SenderKeyStructure from the
+// exported columnar representation. It wraps the unexported recompose() function
+// so the migration tool and test code can decode fmt_ver=2 rows without reaching
+// into unexported sqlstore internals.
+//
+// Source-of-truth mandate: for fmt_ver=2 rows, columns carry the live key state
+// (Phase 17.7 write-back advances them on every ratchet); the sender_key blob was
+// frozen at Phase 17.9 migration time and MUST NOT be used as the decode source.
+// ExportRecompose is the correct decode path for fmt_ver=2; Deserialize(blob) is
+// correct only for fmt_ver=NULL/1.
+//
+// Intended for test code and migration utilities (same audience as NewSenderKeyRow).
+func ExportRecompose(cols *ExportedSenderKeyColumns) *groupRecord.SenderKeyStructure {
+	c := &senderKeyColumns{
+		fmtVer:              2,
+		stKeyID:             cols.StKeyID,
+		stChainKeyIteration: cols.StChainKeyIteration,
+		stChainKey:          cols.StChainKey,
+		stSigningKeyPublic:  cols.StSigningKeyPublic,
+		stSigningKeyPrivate: cols.StSigningKeyPrivate,
+		smkStateIdx:         cols.SmkStateIdx,
+		smkIteration:        cols.SmkIteration,
+		smkIV:               cols.SmkIV,
+		smkCipherKey:        cols.SmkCipherKey,
+		smkSeed:             cols.SmkSeed,
+	}
+	return recompose(c)
+}
+
+// senderKeyBatchChunkSize bounds how many rows go into one multi-row INSERT.
+// 100 rows × 4 params = 400 bind params per statement, far below Postgres'
+// 65535 limit. Post-upgrade-19: 4 columns (our_jid, chat_id, sender_id, sender_key).
+const senderKeyBatchChunkSize = 100
+
+// PutManySenderKeys upserts a batch of sender keys in their flat binary form.
+// Post-upgrade-19: writes a single bytea column (sender_key = PackFlat output).
+// 4 params per row. Each chunk is one statement (atomic). First error stops.
+// An empty or nil slice is a no-op. A row with a nil Blob is skipped.
+func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error {
+	const paramsPerRow = 4
+	for start := 0; start < len(keys); start += senderKeyBatchChunkSize {
+		end := start + senderKeyBatchChunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunk := keys[start:end]
+
+		var qb strings.Builder
+		qb.WriteString("INSERT INTO whatsmeow_sender_keys " +
+			"(our_jid, chat_id, sender_id, sender_key) VALUES ")
+		args := make([]any, 0, len(chunk)*paramsPerRow)
+		rowsAdded := 0
+		for _, row := range chunk {
+			if row.Blob == nil {
+				continue // skip zero-blob rows (PackFlat failed — nothing to write)
+			}
+			if rowsAdded > 0 {
+				qb.WriteByte(',')
+			}
+			n := rowsAdded * paramsPerRow
+			fmt.Fprintf(&qb, "($%d,$%d,$%d,$%d)", n+1, n+2, n+3, n+4)
+			args = append(args,
+				s.JID,     // $1 our_jid
+				row.Group, // $2 chat_id
+				row.User,  // $3 sender_id
+				row.Blob,  // $4 sender_key (PackFlat bytea)
+			)
+			rowsAdded++
+		}
+		if rowsAdded == 0 {
+			continue // entire chunk had nil blobs
+		}
+		qb.WriteString(" ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET " +
+			"sender_key=excluded.sender_key")
+
+		if _, err := s.db.Exec(ctx, qb.String(), args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []byte, err error) {
@@ -433,6 +799,33 @@ func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []
 		err = nil
 	}
 	return
+}
+
+// GetSenderKeyDevices returns the device-qualified sender_id strings (e.g.
+// "75811323404294_1:0", "75811323404294_1:5") that exist for (our_jid, group,
+// userBare). READ-ONLY: this is a SELECT; it never writes, merges, or rewrites
+// any sender_id (D-06 carried forward). The returned strings are consumed by
+// the caller to rebuild a SenderKeyName per device and let the existing cached
+// LoadSenderKey fetch each record.
+func (s *SQLStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
+	// Escape LIKE metacharacters so the prefix match is literal up to the ':' (Phase 27).
+	rows, err := s.db.Query(ctx, getSenderKeyDevicesQuery, s.JID, group, senderKeyLikeEscaper.Replace(userBare))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var devices []string
+	for rows.Next() {
+		var senderID string
+		if err := rows.Scan(&senderID); err != nil {
+			return nil, err
+		}
+		devices = append(devices, senderID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return devices, nil
 }
 
 const (
@@ -452,32 +845,25 @@ func (s *SQLStore) PutAppStateSyncKey(ctx context.Context, id []byte, key store.
 	return err
 }
 
-func (s *SQLStore) GetAllAppStateSyncKeys(ctx context.Context) ([]*store.AppStateSyncKey, error) {
-	rows, err := s.db.Query(ctx, getAllAppStateSyncKeysQuery, s.JID)
+var convertAppStateSyncKeyRow = dbutil.ConvertRowFn[*store.AppStateSyncKey](func(rows dbutil.Scannable) (*store.AppStateSyncKey, error) {
+	var item store.AppStateSyncKey
+	err := rows.Scan(&item.Data, &item.Timestamp, &item.Fingerprint)
 	if err != nil {
 		return nil, err
 	}
-	var out []*store.AppStateSyncKey
-	for rows.Next() {
-		var item store.AppStateSyncKey
-		err = rows.Scan(&item.Data, &item.Timestamp, &item.Fingerprint)
-		if err != nil {
-			return nil, err
-		}
-		if len(item.Data) > 0 {
-			out = append(out, &item)
-		}
-	}
-	return out, rows.Close()
+	return &item, nil
+})
+
+func (s *SQLStore) GetAllAppStateSyncKeys(ctx context.Context) ([]*store.AppStateSyncKey, error) {
+	return convertAppStateSyncKeyRow.NewRowIter(s.db.Query(ctx, getAllAppStateSyncKeysQuery, s.JID)).AsList()
 }
 
 func (s *SQLStore) GetAppStateSyncKey(ctx context.Context, id []byte) (*store.AppStateSyncKey, error) {
-	var key store.AppStateSyncKey
-	err := s.db.QueryRow(ctx, getAppStateSyncKeyQuery, s.JID, id).Scan(&key.Data, &key.Timestamp, &key.Fingerprint)
+	key, err := convertAppStateSyncKeyRow(s.db.QueryRow(ctx, getAppStateSyncKeyQuery, s.JID, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
-	return &key, err
+	return key, err
 }
 
 func (s *SQLStore) GetLatestAppStateSyncKeyID(ctx context.Context) ([]byte, error) {
@@ -569,7 +955,7 @@ func (s *SQLStore) PutAppStateMutationMACs(ctx context.Context, name string, ver
 	})
 }
 
-func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) (err error) {
+func (s *SQLStore) deleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) (err error) {
 	if len(indexMACs) == 0 {
 		return
 	}
@@ -587,6 +973,35 @@ func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, 
 		_, err = s.db.Exec(ctx, deleteAppStateMutationMACsQueryGeneric+"("+strings.Join(queryParts, ",")+")", args...)
 	}
 	return
+}
+
+func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) error {
+	return s.deleteAppStateMutationMACs(ctx, name, indexMACs)
+}
+
+// PutAppStateVersionAndMACs atomically persists the version cursor, the removed mutation
+// MACs, and the added mutation MACs for one app state collection in a single database
+// transaction (55.1-10, class 14 root cause H1: storeMACs was three independent
+// non-transactional statements, letting a crash/error mid-write leave the version cursor
+// ahead of the mutation-MAC ledger, which produces a silent REMOVE-lookup miss on a later
+// patch and a wrong computed LTHash). db.DoTxn reuses an already-open transaction on the
+// context rather than nesting, so this composes safely with putAppStateMutationMACs' own
+// (now redundant but harmless) transaction wrapping.
+func (s *SQLStore) PutAppStateVersionAndMACs(ctx context.Context, name string, version uint64, hash [128]byte, removedMACs [][]byte, addedMACs []store.AppStateMutationMAC) error {
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		if _, err := s.db.Exec(ctx, putAppStateVersionQuery, s.JID, name, version, hash[:]); err != nil {
+			return fmt.Errorf("failed to update app state version in the database: %w", err)
+		}
+		if err := s.deleteAppStateMutationMACs(ctx, name, removedMACs); err != nil {
+			return fmt.Errorf("failed to remove deleted mutation MACs from the database: %w", err)
+		}
+		for slice := range slices.Chunk(addedMACs, mutationBatchSize) {
+			if err := s.putAppStateMutationMACs(ctx, name, version, slice); err != nil {
+				return fmt.Errorf("failed to insert added mutation MACs to the database: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error) {
@@ -797,33 +1212,41 @@ func (s *SQLStore) GetContact(ctx context.Context, user types.JID) (types.Contac
 	return *info, nil
 }
 
-func (s *SQLStore) GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
-	s.contactCacheLock.Lock()
-	defer s.contactCacheLock.Unlock()
-	rows, err := s.db.Query(ctx, getAllContactsQuery, s.JID)
+type contactTuple struct {
+	JID  types.JID
+	Info *types.ContactInfo
+}
+
+var convertContactRow = dbutil.ConvertRowFn[*contactTuple](func(rows dbutil.Scannable) (*contactTuple, error) {
+	var jid types.JID
+	var first, full, push, business, redactedPhone sql.NullString
+	err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error scanning row: %w", err)
 	}
-	output := make(map[types.JID]types.ContactInfo, len(s.contactCache))
-	for rows.Next() {
-		var jid types.JID
-		var first, full, push, business, redactedPhone sql.NullString
-		err = rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone)
-		if err != nil {
-			return nil, fmt.Errorf("error scanning row: %w", err)
-		}
-		info := types.ContactInfo{
+	return &contactTuple{
+		JID: jid,
+		Info: &types.ContactInfo{
 			Found:         true,
 			FirstName:     first.String,
 			FullName:      full.String,
 			PushName:      push.String,
 			BusinessName:  business.String,
 			RedactedPhone: redactedPhone.String,
-		}
-		output[jid] = info
-		s.contactCache[jid] = &info
-	}
-	return output, nil
+		},
+	}, nil
+})
+
+func (s *SQLStore) GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
+	s.contactCacheLock.Lock()
+	defer s.contactCacheLock.Unlock()
+	output := make(map[types.JID]types.ContactInfo, len(s.contactCache))
+	err := convertContactRow.NewRowIter(s.db.Query(ctx, getAllContactsQuery, s.JID)).Iter(func(tuple *contactTuple) (bool, error) {
+		output[tuple.JID] = *tuple.Info
+		s.contactCache[tuple.JID] = tuple.Info
+		return true, nil
+	})
+	return output, err
 }
 
 const (
@@ -932,12 +1355,16 @@ func (s *SQLStore) GetMessageSecret(ctx context.Context, chat, sender types.JID,
 
 const (
 	putPrivacyTokens = `
-		INSERT INTO whatsmeow_privacy_tokens (our_jid, their_jid, token, timestamp)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (our_jid, their_jid) DO UPDATE SET token=EXCLUDED.token, timestamp=EXCLUDED.timestamp
+		INSERT INTO whatsmeow_privacy_tokens (our_jid, their_jid, token, timestamp, sender_timestamp)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (our_jid, their_jid) DO UPDATE SET
+			token=EXCLUDED.token,
+			timestamp=EXCLUDED.timestamp,
+			sender_timestamp=COALESCE(EXCLUDED.sender_timestamp, whatsmeow_privacy_tokens.sender_timestamp)
+		WHERE EXCLUDED.timestamp >= whatsmeow_privacy_tokens.timestamp
 	`
 	getPrivacyToken = `
-		SELECT token, timestamp FROM whatsmeow_privacy_tokens WHERE our_jid=$1 AND (their_jid=$2 OR their_jid=(
+		SELECT token, timestamp, sender_timestamp FROM whatsmeow_privacy_tokens WHERE our_jid=$1 AND (their_jid=$2 OR their_jid=(
 			CASE
 				WHEN $2 LIKE '%@lid'
 					THEN (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid=replace($2, '@lid', ''))
@@ -948,19 +1375,37 @@ const (
 		))
 		ORDER BY timestamp DESC LIMIT 1
 	`
+	deleteExpiredPrivacyTokens = `
+		DELETE FROM whatsmeow_privacy_tokens
+		WHERE our_jid=$1 AND timestamp < $2
+	`
+)
+
+const (
+	putNCTSaltQuery = `
+		INSERT INTO whatsmeow_nct_salt (our_jid, salt) VALUES ($1, $2)
+		ON CONFLICT (our_jid) DO UPDATE SET salt=excluded.salt
+	`
+	getNCTSaltQuery    = `SELECT salt FROM whatsmeow_nct_salt WHERE our_jid=$1`
+	deleteNCTSaltQuery = `DELETE FROM whatsmeow_nct_salt WHERE our_jid=$1`
 )
 
 func (s *SQLStore) PutPrivacyTokens(ctx context.Context, tokens ...store.PrivacyToken) error {
-	args := make([]any, 1+len(tokens)*3)
+	args := make([]any, 1+len(tokens)*4)
 	placeholders := make([]string, len(tokens))
 	args[0] = s.JID
 	for i, token := range tokens {
-		args[i*3+1] = token.User.ToNonAD().String()
-		args[i*3+2] = token.Token
-		args[i*3+3] = token.Timestamp.Unix()
-		placeholders[i] = fmt.Sprintf("($1, $%d, $%d, $%d)", i*3+2, i*3+3, i*3+4)
+		args[i*4+1] = token.User.ToNonAD().String()
+		args[i*4+2] = token.Token
+		args[i*4+3] = token.Timestamp.Unix()
+		if token.SenderTimestamp.IsZero() {
+			args[i*4+4] = nil
+		} else {
+			args[i*4+4] = token.SenderTimestamp.Unix()
+		}
+		placeholders[i] = fmt.Sprintf("($1, $%d, $%d, $%d, $%d)", i*4+2, i*4+3, i*4+4, i*4+5)
 	}
-	query := strings.ReplaceAll(putPrivacyTokens, "($1, $2, $3, $4)", strings.Join(placeholders, ","))
+	query := strings.ReplaceAll(putPrivacyTokens, "($1, $2, $3, $4, $5)", strings.Join(placeholders, ","))
 	_, err := s.db.Exec(ctx, query, args...)
 	return err
 }
@@ -969,15 +1414,52 @@ func (s *SQLStore) GetPrivacyToken(ctx context.Context, user types.JID) (*store.
 	var token store.PrivacyToken
 	token.User = user.ToNonAD()
 	var ts int64
-	err := s.db.QueryRow(ctx, getPrivacyToken, s.JID, token.User).Scan(&token.Token, &ts)
+	var senderTS sql.NullInt64
+	err := s.db.QueryRow(ctx, getPrivacyToken, s.JID, token.User).Scan(&token.Token, &ts, &senderTS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	} else {
 		token.Timestamp = time.Unix(ts, 0)
+		if senderTS.Valid {
+			token.SenderTimestamp = time.Unix(senderTS.Int64, 0)
+		}
 		return &token, nil
 	}
+}
+
+func (s *SQLStore) PutNCTSalt(ctx context.Context, salt []byte) error {
+	_, err := s.db.Exec(ctx, putNCTSaltQuery, s.JID, salt)
+	return err
+}
+
+func (s *SQLStore) GetNCTSalt(ctx context.Context) ([]byte, error) {
+	var salt []byte
+	err := s.db.QueryRow(ctx, getNCTSaltQuery, s.JID).Scan(&salt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	return salt, nil
+}
+
+func (s *SQLStore) DeleteNCTSalt(ctx context.Context) error {
+	_, err := s.db.Exec(ctx, deleteNCTSaltQuery, s.JID)
+	return err
+}
+
+func (s *SQLStore) DeleteExpiredPrivacyTokens(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.Exec(ctx, deleteExpiredPrivacyTokens, s.JID, cutoff.Unix())
+	if err != nil {
+		return 0, err
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
 
 const (
@@ -1036,6 +1518,12 @@ const (
 	getOutgoingEventQuery = `
 		SELECT format, plaintext FROM whatsmeow_retry_buffer WHERE our_jid=$1 AND (chat_jid=$2 OR chat_jid=$3) AND message_id=$4
 	`
+	// kavtov: look up a stored outgoing message by ID alone (ignoring chat_jid). message_id is
+	// per-message unique, so this is safe. Serves own-account/DeviceSentMessage retries that
+	// arrive keyed by our own account while the message is stored under its destination chat.
+	getOutgoingEventByIDQuery = `
+		SELECT format, plaintext FROM whatsmeow_retry_buffer WHERE our_jid=$1 AND message_id=$2 LIMIT 1
+	`
 	addOutgoingEventQuery = `
 		INSERT INTO whatsmeow_retry_buffer (our_jid, chat_jid, message_id, format, plaintext, timestamp)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -1052,12 +1540,20 @@ func (s *SQLStore) GetOutgoingEvent(ctx context.Context, chatJID, altChatJID typ
 	return
 }
 
+func (s *SQLStore) GetOutgoingEventByID(ctx context.Context, id types.MessageID) (format string, result []byte, err error) {
+	err = s.db.QueryRow(ctx, getOutgoingEventByIDQuery, s.JID, id).Scan(&format, &result)
+	return
+}
+
 func (s *SQLStore) AddOutgoingEvent(ctx context.Context, chatJID types.JID, id types.MessageID, format string, plaintext []byte) error {
 	_, err := s.db.Exec(ctx, addOutgoingEventQuery, s.JID, chatJID, id, format, plaintext, time.Now().UnixMilli())
 	return err
 }
 
 func (s *SQLStore) DeleteOldOutgoingEvents(ctx context.Context) error {
-	_, err := s.db.Exec(ctx, deleteOldOutgoingEventsQuery, s.JID, time.Now().Add(-7*24*time.Hour).UnixMilli())
+	// kavtov-fork: retry-message store retention shortened 7d -> 48h to bound
+	// whatsmeow_retry_buffer disk growth on a 63-account fleet (prior disk-bloat history).
+	// 48h still covers a driver's phone being offline a couple days then retrying its backlog.
+	_, err := s.db.Exec(ctx, deleteOldOutgoingEventsQuery, s.JID, time.Now().Add(-48*time.Hour).UnixMilli())
 	return err
 }

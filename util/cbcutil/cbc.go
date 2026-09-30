@@ -34,8 +34,8 @@ func Decrypt(key, iv, ciphertext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
-	} else if len(ciphertext) < aes.BlockSize {
-		return nil, fmt.Errorf("ciphertext is shorter then block size: %d / %d", len(ciphertext), aes.BlockSize)
+	} else if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("ciphertext isn't a multiple of block size: %d / %d", len(ciphertext), aes.BlockSize)
 	}
 
 	cbc := cipher.NewCBCDecrypter(block, iv)
@@ -214,4 +214,62 @@ func EncryptStream(key, iv, macKey []byte, plaintext io.Reader, ciphertext io.Wr
 		return nil, nil, 0, 0, fmt.Errorf("failed to write checksum to file: %w", err)
 	}
 	return plainHasher.Sum(nil), cipherHasher.Sum(nil), uint64(size), uint64(size + extraSize), nil
+}
+
+// DecryptStream decrypts a WhatsApp-media-shaped AES-CBC ciphertext of ciphertextLen bytes from
+// ciphertext, writing the recovered plaintext to plaintext as it goes rather than buffering the
+// full plaintext in memory. Unlike EncryptStream, DecryptStream does not accumulate or compare a
+// MAC over the ciphertext -- verification is entirely the caller's responsibility, typically via
+// an io.TeeReader wrapped around the reader passed in as ciphertext (see media.go's
+// downloadRespToFile). The returned plainHash is the SHA-256 of the recovered plaintext. macKey
+// is accepted for signature symmetry with EncryptStream but is not used internally.
+func DecryptStream(key, iv, macKey []byte, ciphertextLen int64, ciphertext io.Reader, plaintext io.Writer) (plainHash []byte, err error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+	cbc := cipher.NewCBCDecrypter(block, iv)
+
+	plainHasher := sha256.New()
+
+	buf := make([]byte, 32*1024)
+	var held []byte
+	var read int64
+	for read < ciphertextLen {
+		chunkSize := int64(len(buf))
+		if remaining := ciphertextLen - read; remaining < chunkSize {
+			chunkSize = remaining
+		}
+		var n int
+		n, err = io.ReadFull(ciphertext, buf[:chunkSize])
+		if err != nil {
+			return nil, fmt.Errorf("failed to read ciphertext: %w", err)
+		}
+		read += int64(n)
+		chunk := buf[:n]
+		if len(chunk)%aes.BlockSize != 0 {
+			return nil, fmt.Errorf("ciphertext chunk isn't a multiple of block size: %d / %d", len(chunk), aes.BlockSize)
+		}
+		cbc.CryptBlocks(chunk, chunk)
+		if held != nil {
+			if _, err = plaintext.Write(held); err != nil {
+				return nil, fmt.Errorf("failed to write plaintext: %w", err)
+			}
+			plainHasher.Write(held)
+		}
+		held = append([]byte(nil), chunk...)
+	}
+	if len(held) == 0 {
+		return plainHasher.Sum(nil), nil
+	}
+	padLen := int(held[len(held)-1])
+	if padLen > len(held) {
+		return nil, fmt.Errorf("padding is greater then the length: %d / %d", padLen, len(held))
+	}
+	held = held[:len(held)-padLen]
+	if _, err = plaintext.Write(held); err != nil {
+		return nil, fmt.Errorf("failed to write plaintext: %w", err)
+	}
+	plainHasher.Write(held)
+	return plainHasher.Sum(nil), nil
 }

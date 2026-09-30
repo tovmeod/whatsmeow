@@ -1,5 +1,5 @@
--- v0 -> v13 (compatible with v8+): Latest schema
-CREATE TABLE whatsmeow_device (
+-- v0 -> v20 (compatible with v8+): Latest schema
+CREATE TABLE IF NOT EXISTS whatsmeow_device (
 	jid TEXT PRIMARY KEY,
 	lid TEXT,
 
@@ -27,7 +27,7 @@ CREATE TABLE whatsmeow_device (
 	lid_migration_ts BIGINT NOT NULL DEFAULT 0
 );
 
-CREATE TABLE whatsmeow_identity_keys (
+CREATE TABLE IF NOT EXISTS whatsmeow_identity_keys (
 	our_jid  TEXT,
 	their_id TEXT,
 	identity bytea NOT NULL CHECK ( length(identity) = 32 ),
@@ -36,7 +36,7 @@ CREATE TABLE whatsmeow_identity_keys (
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_pre_keys (
+CREATE TABLE IF NOT EXISTS whatsmeow_pre_keys (
 	jid      TEXT,
 	key_id   INTEGER          CHECK ( key_id >= 0 AND key_id < 16777216 ),
 	key      bytea   NOT NULL CHECK ( length(key) = 32 ),
@@ -46,7 +46,7 @@ CREATE TABLE whatsmeow_pre_keys (
 	FOREIGN KEY (jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_sessions (
+CREATE TABLE IF NOT EXISTS whatsmeow_sessions (
 	our_jid  TEXT,
 	their_id TEXT,
 	session  bytea,
@@ -55,17 +55,44 @@ CREATE TABLE whatsmeow_sessions (
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_sender_keys (
-	our_jid    TEXT,
-	chat_id    TEXT,
-	sender_id  TEXT,
+-- whatsmeow_sender_keys: end-state schema at v20.
+-- v18: primary key replaced with a UNIQUE INDEX using text_pattern_ops on sender_id
+--      (turns LIKE sender_id prefix scans into index range seeks; enforces same uniqueness).
+-- v19: sk_keyid0 STORED GENERATED column (KeyID of state[0] from PackFlat bytes [1..4]);
+--      sender_key is NOT NULL (all rows carry flat blobs post-migration).
+-- v20: index is named whatsmeow_sender_keys_pkey (canonical name, no _new suffix).
+-- Columnar columns from v16 are not present: a fresh bootstrap never needed them
+-- (they were an intermediate dual-read phase; v19 drops them on the upgrade path).
+CREATE TABLE IF NOT EXISTS whatsmeow_sender_keys (
+	our_jid    TEXT NOT NULL,
+	chat_id    TEXT NOT NULL,
+	sender_id  TEXT NOT NULL,
 	sender_key bytea NOT NULL,
 
-	PRIMARY KEY (our_jid, chat_id, sender_id),
+	sk_keyid0 INT4 GENERATED ALWAYS AS (
+		(get_byte(sender_key, 1)::int4 << 24) |
+		(get_byte(sender_key, 2)::int4 << 16) |
+		(get_byte(sender_key, 3)::int4 << 8) |
+		get_byte(sender_key, 4)::int4
+	) STORED,
+
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_app_state_sync_keys (
+-- Unique index with text_pattern_ops on sender_id (v18 end-state).
+-- text_pattern_ops enables LIKE prefix seeks (sender_id LIKE bare||':%') on the PK index,
+-- avoiding collation-bound full-group scans. ON CONFLICT column-inference still resolves it.
+-- Named whatsmeow_sender_keys_pkey (v20 canonical name) — no _new suffix on a fresh bootstrap.
+CREATE UNIQUE INDEX IF NOT EXISTS whatsmeow_sender_keys_pkey
+    ON whatsmeow_sender_keys (our_jid, chat_id, sender_id text_pattern_ops);
+
+-- Composite index serving recoveryScanQueryFast: (chat_id, sk_keyid0).
+-- Leading on chat_id (highest selectivity: one group), then sk_keyid0 (equality),
+-- letting PG seek directly to (group, keyID) before applying the sender_id LIKE filter.
+CREATE INDEX IF NOT EXISTS whatsmeow_sender_keys_chat_keyid0_idx
+    ON whatsmeow_sender_keys(chat_id, sk_keyid0);
+
+CREATE TABLE IF NOT EXISTS whatsmeow_app_state_sync_keys (
 	jid         TEXT,
 	key_id      bytea,
 	key_data    bytea  NOT NULL,
@@ -76,7 +103,7 @@ CREATE TABLE whatsmeow_app_state_sync_keys (
 	FOREIGN KEY (jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_app_state_version (
+CREATE TABLE IF NOT EXISTS whatsmeow_app_state_version (
 	jid     TEXT,
 	name    TEXT,
 	version BIGINT NOT NULL,
@@ -86,7 +113,7 @@ CREATE TABLE whatsmeow_app_state_version (
 	FOREIGN KEY (jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_app_state_mutation_macs (
+CREATE TABLE IF NOT EXISTS whatsmeow_app_state_mutation_macs (
 	jid       TEXT,
 	name      TEXT,
 	version   BIGINT,
@@ -97,7 +124,7 @@ CREATE TABLE whatsmeow_app_state_mutation_macs (
 	FOREIGN KEY (jid, name) REFERENCES whatsmeow_app_state_version(jid, name) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_contacts (
+CREATE TABLE IF NOT EXISTS whatsmeow_contacts (
 	our_jid        TEXT,
 	their_jid      TEXT,
 	first_name     TEXT,
@@ -110,7 +137,7 @@ CREATE TABLE whatsmeow_contacts (
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_chat_settings (
+CREATE TABLE IF NOT EXISTS whatsmeow_chat_settings (
 	our_jid       TEXT,
 	chat_jid      TEXT,
 	muted_until   BIGINT  NOT NULL DEFAULT 0,
@@ -121,7 +148,7 @@ CREATE TABLE whatsmeow_chat_settings (
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_message_secrets (
+CREATE TABLE IF NOT EXISTS whatsmeow_message_secrets (
 	our_jid    TEXT,
 	chat_jid   TEXT,
 	sender_jid TEXT,
@@ -132,7 +159,7 @@ CREATE TABLE whatsmeow_message_secrets (
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_privacy_tokens (
+CREATE TABLE IF NOT EXISTS whatsmeow_privacy_tokens (
 	our_jid          TEXT,
 	their_jid        TEXT,
 	token            bytea  NOT NULL,
@@ -141,15 +168,21 @@ CREATE TABLE whatsmeow_privacy_tokens (
 	PRIMARY KEY (our_jid, their_jid)
 );
 
-CREATE INDEX idx_whatsmeow_privacy_tokens_our_jid_timestamp
+CREATE INDEX IF NOT EXISTS idx_whatsmeow_privacy_tokens_our_jid_timestamp
 ON whatsmeow_privacy_tokens (our_jid, timestamp);
 
-CREATE TABLE whatsmeow_lid_map (
+CREATE TABLE IF NOT EXISTS whatsmeow_nct_salt (
+	our_jid TEXT PRIMARY KEY,
+	salt    bytea NOT NULL,
+	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS whatsmeow_lid_map (
 	lid TEXT PRIMARY KEY,
 	pn  TEXT UNIQUE NOT NULL
 );
 
-CREATE TABLE whatsmeow_event_buffer (
+CREATE TABLE IF NOT EXISTS whatsmeow_event_buffer (
 	our_jid          TEXT   NOT NULL,
 	ciphertext_hash  bytea  NOT NULL CHECK ( length(ciphertext_hash) = 32 ),
 	plaintext        bytea,
@@ -159,7 +192,7 @@ CREATE TABLE whatsmeow_event_buffer (
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE whatsmeow_retry_buffer (
+CREATE TABLE IF NOT EXISTS whatsmeow_retry_buffer (
 	our_jid    TEXT   NOT NULL,
 	chat_jid   TEXT   NOT NULL,
 	message_id TEXT   NOT NULL,
@@ -171,4 +204,5 @@ CREATE TABLE whatsmeow_retry_buffer (
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE INDEX whatsmeow_retry_buffer_timestamp_idx ON whatsmeow_retry_buffer (our_jid, timestamp);
+CREATE INDEX IF NOT EXISTS whatsmeow_retry_buffer_timestamp_idx ON whatsmeow_retry_buffer (our_jid, timestamp);
+CREATE INDEX IF NOT EXISTS whatsmeow_retry_buffer_msgid_idx ON whatsmeow_retry_buffer (our_jid, message_id);

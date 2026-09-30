@@ -76,14 +76,10 @@ func (vc WAVersionContainer) ProtoAppVersion() *waWa6.ClientPayload_UserAgent_Ap
 }
 
 // waVersion is the WhatsApp web client version
-var waVersion = WAVersionContainer{2, 3000, 1035682492}
+var waVersion = WAVersionContainer{2, 3000, 1042386815}
 
 // waVersionHash is the md5 hash of a dot-separated waVersion
-var waVersionHash [16]byte
-
-func init() {
-	waVersionHash = waVersion.Hash()
-}
+var waVersionHash = waVersion.Hash()
 
 // GetWAVersion gets the current WhatsApp web client version.
 func GetWAVersion() WAVersionContainer {
@@ -100,6 +96,7 @@ func SetWAVersion(version WAVersionContainer) {
 	}
 	waVersion = version
 	waVersionHash = version.Hash()
+	BaseClientPayload.UserAgent.AppVersion = waVersion.ProtoAppVersion()
 }
 
 var BaseClientPayload = &waWa6.ClientPayload{
@@ -132,10 +129,16 @@ var DeviceProps = &waCompanionReg.DeviceProps{
 		Tertiary:  proto.Uint32(0),
 	},
 	HistorySyncConfig: &waCompanionReg.DeviceProps_HistorySyncConfig{
+		// kavtov-fork (60-05, D-08 #2): the 6 fields below were nil, an obvious non-browser
+		// fingerprint. FullSyncDaysLimit is CITED (wa_protocol docs/spec/history-sync.md SS6); the
+		// other 5 are ASSUMED (not exact-value-verified in the pinned snapshot, only "(set)") --
+		// browser-plausible values chosen to be consistent with the existing StorageQuotaMb ceiling.
+		FullSyncDaysLimit:                        proto.Uint32(365),   // CITED: wa_protocol docs/spec/history-sync.md SS6
+		FullSyncSizeMbLimit:                      proto.Uint32(10240), // ASSUMED: matches StorageQuotaMb ceiling
 		StorageQuotaMb:                           proto.Uint32(10240),
 		InlineInitialPayloadInE2EeMsg:            proto.Bool(true),
-		RecentSyncDaysLimit:                      nil,
-		SupportCallLogHistory:                    proto.Bool(false),
+		RecentSyncDaysLimit:                      proto.Uint32(3), // ASSUMED: conservative recent-sync window
+		SupportCallLogHistory:                    proto.Bool(true),
 		SupportBotUserAgentChatHistory:           proto.Bool(true),
 		SupportCagReactionsAndPolls:              proto.Bool(true),
 		SupportBizHostedMsg:                      proto.Bool(true),
@@ -144,11 +147,14 @@ var DeviceProps = &waCompanionReg.DeviceProps{
 		SupportFbidBotChatHistory:                proto.Bool(true),
 		SupportAddOnHistorySyncMigration:         nil,
 		SupportMessageAssociation:                proto.Bool(true),
-		SupportGroupHistory:                      proto.Bool(false),
-		OnDemandReady:                            nil,
+		SupportGroupHistory:                      proto.Bool(true),
+		OnDemandReady:                            proto.Bool(true),
 		SupportGuestChat:                         nil,
-		CompleteOnDemandReady:                    nil,
-		ThumbnailSyncDaysLimit:                   nil,
+		CompleteOnDemandReady:                    proto.Bool(true),
+		ThumbnailSyncDaysLimit:                   proto.Uint32(60),
+		InitialSyncMaxMessagesPerChat:            proto.Uint32(300), // ASSUMED: conservative per-chat cap
+		SupportManusHistory:                      proto.Bool(true),
+		SupportHatchHistory:                      proto.Bool(true),
 	},
 	PlatformType:    waCompanionReg.DeviceProps_UNKNOWN.Enum(),
 	RequireFullSync: proto.Bool(false),
@@ -165,6 +171,9 @@ func SetOSInfo(name string, version [3]uint32) {
 
 func (device *Device) getRegistrationPayload() *waWa6.ClientPayload {
 	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
+	if reason := device.connectReasonOverride.Load(); reason != nil {
+		payload.ConnectReason = reason
+	}
 	regID := make([]byte, 4)
 	binary.BigEndian.PutUint32(regID, device.RegistrationID)
 	preKeyID := make([]byte, 4)
@@ -187,11 +196,17 @@ func (device *Device) getRegistrationPayload() *waWa6.ClientPayload {
 
 func (device *Device) getLoginPayload() *waWa6.ClientPayload {
 	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
+	if reason := device.connectReasonOverride.Load(); reason != nil {
+		payload.ConnectReason = reason
+	}
 	payload.Username = proto.Uint64(device.ID.UserInt())
 	payload.Device = proto.Uint32(uint32(device.ID.Device))
 	payload.Passive = proto.Bool(true)
 	payload.Pull = proto.Bool(true)
 	payload.LidDbMigrated = proto.Bool(true)
+	if payload.Lc == nil {
+		payload.Lc = proto.Int32(1)
+	}
 	return payload
 }
 

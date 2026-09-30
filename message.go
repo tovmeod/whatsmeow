@@ -17,6 +17,8 @@ import (
 	"io"
 	"runtime/debug"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -36,6 +38,7 @@ import (
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/walltime"
 )
 
 var pbSerializer = store.SignalProtobufSerializer
@@ -44,25 +47,26 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 	info, err := cli.parseMessageInfo(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse message: %v", err)
+		cli.sendAck(ctx, node, NackParsingError)
+		return
+	}
+	if !info.SenderAlt.IsEmpty() {
+		cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
+	} else if !info.RecipientAlt.IsEmpty() {
+		cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
+	}
+	if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
+		go cli.updateBusinessName(ctx, info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
+	}
+	if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
+		go cli.updatePushName(ctx, info.Sender, info.SenderAlt, info, info.PushName)
+	}
+	if info.Sender.Server == types.NewsletterServer {
+		var cancelled bool
+		defer cli.maybeDeferredAck(ctx, node)(&cancelled)
+		cancelled = cli.handlePlaintextMessage(ctx, info, node)
 	} else {
-		if !info.SenderAlt.IsEmpty() {
-			cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
-		} else if !info.RecipientAlt.IsEmpty() {
-			cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
-		}
-		if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
-			go cli.updateBusinessName(ctx, info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
-		}
-		if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
-			go cli.updatePushName(ctx, info.Sender, info.SenderAlt, info, info.PushName)
-		}
-		if info.Sender.Server == types.NewsletterServer {
-			var cancelled bool
-			defer cli.maybeDeferredAck(ctx, node)(&cancelled)
-			cancelled = cli.handlePlaintextMessage(ctx, info, node)
-		} else {
-			cli.decryptMessages(ctx, info, node)
-		}
+		cli.decryptMessages(ctx, info, node)
 	}
 }
 
@@ -254,6 +258,15 @@ func (cli *Client) parseMessageInfo(node *waBinary.Node) (*types.MessageInfo, er
 	return &info, nil
 }
 
+// newsletterControlEmpty counts body-less <plaintext> nodes from a @newsletter sender -- one of
+// the five spec'd byte-free newsletter sub-types (reaction / reaction-revoke / revoke / poll-vote
+// / WAMOEmpty, per 55.1-INVESTIGATION-message-classes.md §2: WA Web's own newsletter SMAX parsers
+// require <plaintext> to structurally exist for every newsletter type but only payload-bearing
+// types require it to carry bytes). Recognized and counted, not silenced.
+var newsletterControlEmpty atomic.Uint64
+
+const newsletterControlEmptyLogEvery = 1000
+
 func (cli *Client) handlePlaintextMessage(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) (handlerFailed bool) {
 	// TODO edits have an additional <meta msg_edit_t="1696321271735" original_msg_t="1696321248"/> node
 	plaintext, ok := node.GetOptionalChildByTag("plaintext")
@@ -263,6 +276,16 @@ func (cli *Client) handlePlaintextMessage(ctx context.Context, info *types.Messa
 	}
 	plaintextBody, ok := plaintext.Content.([]byte)
 	if !ok {
+		if info.Sender.Server == types.NewsletterServer {
+			// kavtov-fork (55.1-06, class 6): a body-less <plaintext> from a newsletter sender is a
+			// legitimate byte-free control event (reaction/reaction-revoke/revoke/poll-vote/
+			// WAMOEmpty) per 55.1-INVESTIGATION-message-classes.md §2 -- not a malformed node.
+			if n := newsletterControlEmpty.Add(1); n%newsletterControlEmptyLogEvery == 0 {
+				cli.Log.Infof("NEWSLETTER_CONTROL_EMPTY count=%d", n)
+			}
+			cli.Log.Debugf("Newsletter control plaintext (no byte content) from %s", info.SourceString())
+			return
+		}
 		cli.Log.Warnf("Plaintext message from %s doesn't have byte content", info.SourceString())
 		return
 	}
@@ -295,13 +318,85 @@ func (cli *Client) migrateSessionStore(ctx context.Context, pn, lid types.JID) {
 	}
 }
 
+// staleMessageVersionTotal counts every decrypt failure classified as a version-0/unparseable
+// prekey message (55.1-07, class 8) -- first-seen and repeat alike, folded into a periodic INFO
+// line so the rate stays observable without a per-event Warnf.
+var staleMessageVersionTotal atomic.Uint64
+
+const staleMessageVersionLogEvery = 1000
+
+// stalePrekeySenderSize bounds the per-sender STALE_PREKEY dedup registry (55.1-07, Task 3),
+// mirroring skdmParseFailPairsSize -- a future-storm guard, not today's shape.
+const stalePrekeySenderSize = 1000
+
+// stalePrekeyTotal counts every STALE_PREKEY occurrence (first-seen and repeat), folded into a
+// periodic INFO line so a persistently-stuck sender stays visible even after its first-occurrence
+// WARN has already fired.
+var stalePrekeyTotal atomic.Uint64
+
+const stalePrekeyLogEvery = 1000
+
+// stalePrekeyShouldWarn reports whether THIS occurrence of a stale-prekey decrypt failure for
+// sender should emit the WARN line. Returns true only on the first-seen sender (which it then
+// records, subject to stalePrekeySenderSize); every later call for the same sender returns false.
+// On overflow (stalePrekeySenderSize distinct senders already recorded) a brand-new sender is
+// counted via stalePrekeyOverflow but does not get its own first-occurrence WARN.
+func (cli *Client) stalePrekeyShouldWarn(sender string) bool {
+	cli.stalePrekeyLock.Lock()
+	defer cli.stalePrekeyLock.Unlock()
+	if cli.stalePrekeySeen == nil {
+		// Lazy init: a bare &Client{} (tests / direct construction) must not nil-panic.
+		cli.stalePrekeySeen = make(map[string]struct{}, stalePrekeySenderSize)
+	}
+	if _, seen := cli.stalePrekeySeen[sender]; seen {
+		return false
+	}
+	if len(cli.stalePrekeySeen) >= stalePrekeySenderSize {
+		cli.stalePrekeyOverflow++
+		return false
+	}
+	cli.stalePrekeySeen[sender] = struct{}{}
+	return true
+}
+
 func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
+	// Phase 17.5.1-04: per-message wall-time observation covers every
+	// exit path (unavailable early-return, success-path ack, error
+	// returns, panics). Quantiles surface alongside cache metrics in
+	// store/sqlstore.cache_wiring.go emitMetricsLoop every 5 minutes.
+	// kavtov-fork: Phase 17.5.3 DEFER-01 fix — wrap in closure so time.Since
+	// evaluates when the deferred call RUNS (function exit), not at defer-setup.
+	// Previously: defer walltime.DecryptHistogram.Observe(time.Since(start)) — this
+	// evaluated time.Since(start) eagerly at the defer statement (nanoseconds
+	// after function entry), making every observation near-zero and the entire
+	// p50/p95/p99 metric meaningless garbage.
+	start := time.Now()
+	defer func() { walltime.DecryptHistogram.Observe(time.Since(start)) }()
+	// upstream merge (2026-06): recover from a decrypt panic and still ack the node so a
+	// panicking message isn't retried forever. Runs before the wall-time defer (LIFO).
+	defer func() {
+		if err := recover(); err != nil {
+			cli.Log.Errorf("Message decryption for %s panicked: %v\n%s", info.ID, err, debug.Stack())
+			cli.sendAck(ctx, node, 0)
+		}
+	}()
 	unavailableNode, ok := node.GetOptionalChildByTag("unavailable")
 	if ok && len(node.GetChildrenByTag("enc")) == 0 {
 		uType := events.UnavailableType(unavailableNode.AttrGetter().String("type"))
-		cli.Log.Warnf("Unavailable message %s from %s (type: %q)", info.ID, info.SourceString(), uType)
+		// kavtov-fork (55.1-06, D-06 Option B, classes 3/9): this placeholder is already fully
+		// handled -- the ack still fires unconditionally below and events.UndecryptableMessage is
+		// still dispatched so the driver's RIDE_REQUEST_TAP_* metrics see it (55.1-INVESTIGATION-
+		// message-classes.md §5: a headless companion never sends PLACEHOLDER_MESSAGE_RESEND at
+		// receipt time -- WA Web's own recovery trigger is UI-viewport-only, so phone-fetch staying
+		// off is protocol-conformant, not just the safer choice). Demoted to Debug: the per-event
+		// WARN was redundant with the already-correct ack+dispatch handling.
+		cli.Log.Debugf("Unavailable message %s from %s (type: %q)", info.ID, info.SourceString(), uType)
 		cli.backgroundIfAsyncAck(func() {
-			cli.immediateRequestMessageFromPhone(ctx, info)
+			// 2026-06-30 incident: gate the unavailable-node phone-fetch behind the same flag as the
+			// decrypt-fail path (see retry.go). Ack still fires unconditionally.
+			if cli.AutomaticMessageRerequestFromPhone {
+				cli.immediateRequestMessageFromPhone(ctx, info)
+			}
 			cli.sendAck(ctx, node, 0)
 		})
 		cli.dispatchEvent(&events.UndecryptableMessage{Info: *info, IsUnavailable: true, UnavailableType: uType})
@@ -326,19 +421,19 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			cli.Log.Warnf("No LID found for %s", info.Sender)
 		}
 	}
-	// Cache sender's session to reduce DB round-trips during decryption.
-	// Same mechanism as send path (send.go:1279-1316).
-	sessionAddr := senderEncryptionJID.SignalAddress().String()
-	if _, cachedCtx, cacheErr := cli.Store.WithCachedSessions(ctx, []string{sessionAddr}); cacheErr != nil {
-		cli.Log.Warnf("Failed to prefetch session for %s: %v", info.SourceString(), cacheErr)
-	} else {
-		ctx = cachedCtx
-		defer func() {
-			if flushErr := cli.Store.PutCachedSessions(ctx); flushErr != nil {
-				cli.Log.Errorf("Failed to flush session cache for %s: %v", info.SourceString(), flushErr)
-			}
-		}()
-	}
+	// D-CACHE-06: DECRYPT no longer prefetches via a context-scope session
+	// cache — the CachedSessionStore wrapper (wired into device.Sessions
+	// by sqlstore.Container.initializeDevice) now serves session reads
+	// from a process-shared LRU.
+	//
+	// Phase 17.5 FIX: the prior ack-after-flush gate (an anonymous-interface
+	// type-assertion against the session-store flush method, formerly
+	// inserted just before the success-path ack) was removed along with the
+	// write-back machinery in cached_session_store.go. The wrapper is now a
+	// strict write-through cache: every PutSession returns only after the
+	// inner store has acknowledged the write, so there is no "pending dirty
+	// state" to drain before acking. D-CACHE-03 is trivially satisfied by
+	// the synchronous write contract.
 	var recognizedStanza, protobufFailed bool
 	var encTypes []string
 	for _, child := range children {
@@ -394,67 +489,15 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		if errors.Is(err, EventAlreadyProcessed) {
 			cli.Log.Debugf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
 			continue
-		} else if errors.Is(err, signalerror.ErrOldCounter) {
-			cli.Log.Warnf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
-			continue
 		} else if err != nil {
-			cli.Log.Warnf("Error decrypting message %s from %s (encTypes=%v, containsDirectMsg=%v): %v", info.ID, info.SourceString(), encTypes, containsDirectMsg, err)
-			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-				return
+			if cli.handleDecryptError(ctx, info, node, ag, encType, encTypes, containsDirectMsg, senderEncryptionJID, err) {
+				continue
 			}
-			// Force include identity (our prekeys) in retry when:
-			// 1. No sender key for group decryption (need SKDM)
-			// 2. No session for pairwise decryption
-			// 3. Sender used an old/invalid prekey ID (critical after data loss/recovery)
-			// 4. No valid sessions (session exists but chain state is invalid)
-			// 5. Sender key state mismatch (have sender key but wrong chain iteration)
-			isUnavailable := (encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser)) ||
-				(encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID)) ||
-				errors.Is(err, signalerror.ErrNoSessionForUser) ||
-				errors.Is(err, signalerror.ErrNoValidSessions) ||
-				errors.Is(err, signalerror.ErrNoOneTimeKeyFound)
-			// Log senders that haven't distributed SKDM to us yet
-			if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser) {
-				cli.Log.Debugf("SENDER_NEEDS_SESSION: sender=%s group=%s containsDirectMsg=%v - sender has not distributed SKDM to us yet", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg)
-			}
-			// Log sender key state mismatch for diagnostics
-			if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID) {
-				cli.Log.Warnf("SENDER_KEY_MISMATCH: sender=%s group=%s containsDirectMsg=%v error=%v", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg, err)
-			}
-			// Log stale prekey ID errors - sender has cached old prekey, retry with fresh prekeys should fix
-			if errors.Is(err, signalerror.ErrNoOneTimeKeyFound) {
-				cli.Log.Warnf("STALE_PREKEY: sender=%s - sender used old prekey ID, sending retry with fresh prekeys", senderEncryptionJID.String())
-			}
-			if encType == "msmsg" {
-				cli.backgroundIfAsyncAck(func() {
-					cli.sendAck(ctx, node, NackMissingMessageSecret)
-				})
-			} else if cli.SynchronousAck {
-				cli.sendRetryReceipt(ctx, node, info, isUnavailable)
-				// TODO this probably isn't supposed to ack
-				cli.sendAck(ctx, node, 0)
-				// Proactively establish session for pairwise session errors
-				if errors.Is(err, signalerror.ErrNoSessionForUser) {
-					go cli.establishSessionWithSender(context.WithoutCancel(ctx), senderEncryptionJID)
-				}
-			} else {
-				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
-				go cli.sendAck(ctx, node, 0)
-				// Proactively establish session for pairwise session errors
-				if errors.Is(err, signalerror.ErrNoSessionForUser) {
-					go cli.establishSessionWithSender(context.WithoutCancel(ctx), senderEncryptionJID)
-				}
-			}
-			cli.dispatchEvent(&events.UndecryptableMessage{
-				Info:            *info,
-				IsUnavailable:   isUnavailable,
-				DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
-			})
 			return
 		}
 		retryCount := ag.OptionalInt("count")
 		cli.cancelDelayedRequestFromPhone(info.ID)
-		cli.clearMessageRetry(info.ID)
+		cli.clearMessageRetrySender(string(info.ID), info.Sender.User)
 
 		var msg waE2E.Message
 		var handlerFailed bool
@@ -515,7 +558,123 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 	return
 }
 
+// handleDecryptError applies the decrypt-error classification and response chain (55.1-07): given
+// the err returned from decryptDM/decryptGroupMsg/decryptBotMessage (already confirmed non-nil and
+// not EventAlreadyProcessed by the caller), it decides the log level, whether to ack, whether to
+// send a retry receipt, and whether to dispatch UndecryptableMessage. Returns true if the
+// decryptMessages loop should continue to the next <enc> child, false if decryptMessages should
+// return immediately (context cancelled, or after handling a genuine decrypt failure). Pure
+// extraction of the prior inline branch chain -- pulled into its own method so the branch-routing
+// rules are unit-testable independent of the specific decrypt error's underlying crypto origin:
+// errors.Is classification behaves identically for a directly-constructed sentinel-wrapped error
+// and a real libsignal one, since Go error identity is location-independent by design.
+func (cli *Client) handleDecryptError(ctx context.Context, info *types.MessageInfo, node *waBinary.Node, ag *waBinary.AttrUtility, encType string, encTypes []string, containsDirectMsg bool, senderEncryptionJID types.JID, err error) (shouldContinue bool) {
+	if errors.Is(err, signalerror.ErrOldCounter) {
+		// kavtov-fork (55.1-07, class 5): WA Web acks an old-counter duplicate delivery
+		// identically to a decrypt success and never retries it
+		// (55.1-INVESTIGATION-message-classes.md §3, the "#1027 case") -- route it through the
+		// same already-processed handling as EventAlreadyProcessed: Debug + continue, no retry.
+		cli.Log.Debugf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
+		return true
+	} else if errors.Is(err, signalerror.ErrOldMessageVersion) {
+		// kavtov-fork (55.1-07, class 8): a version-0 prekey/message is genuinely unparseable --
+		// the "version" is the high nibble of the ciphertext's first byte, so a resend of the
+		// identical bytes yields the identical version (55.1-INVESTIGATION-message-classes.md §4 /
+		// 55.1-RESEARCH.md class 8). Ack so WhatsApp stops redelivering the same unparseable
+		// bytes, dispatch UndecryptableMessage for the metric/loss-tracking leg, and log at Debug
+		// + a bounded counter instead of the generic decrypt-error Warnf. Do NOT send a retry
+		// receipt -- retrying a malformed version can never succeed.
+		if n := staleMessageVersionTotal.Add(1); n%staleMessageVersionLogEvery == 0 {
+			cli.Log.Infof("STALE_MESSAGE_VERSION count=%d", n)
+		}
+		cli.Log.Debugf("Ignoring message %s from %s: stale/unparseable prekey version, acking not retrying: %v", info.ID, info.SourceString(), err)
+		if encType == "msmsg" {
+			cli.backgroundIfAsyncAck(func() {
+				cli.sendAck(ctx, node, NackMissingMessageSecret)
+			})
+		} else if cli.SynchronousAck {
+			cli.sendAck(ctx, node, 0)
+		} else {
+			go cli.sendAck(ctx, node, 0)
+		}
+		cli.dispatchEvent(&events.UndecryptableMessage{
+			Info:            *info,
+			IsUnavailable:   false,
+			DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
+		})
+		return true
+	}
+
+	// kavtov-fork (55.1-07, class 11): status@broadcast content is ephemeral/non-critical and the
+	// existing retry-with-identity below already re-establishes the pairwise session
+	// (55.1-INVESTIGATION-message-classes.md §7) -- demote the classification line to Debug for
+	// this case; the recovery path (isUnavailable + sendRetryReceipt) is unchanged. A non-broadcast
+	// chat with the identical error still warns (D-03 boundary).
+	if info.Chat == types.StatusBroadcastJID && errors.Is(err, signalerror.ErrNoValidSessions) {
+		cli.Log.Debugf("Error decrypting message %s from %s (encTypes=%v, containsDirectMsg=%v): %v", info.ID, info.SourceString(), encTypes, containsDirectMsg, err)
+	} else {
+		cli.Log.Warnf("Error decrypting message %s from %s (encTypes=%v, containsDirectMsg=%v): %v", info.ID, info.SourceString(), encTypes, containsDirectMsg, err)
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	// Force include identity (our prekeys) in retry when:
+	// 1. No sender key for group decryption (need SKDM)
+	// 2. No session for pairwise decryption
+	// 3. Sender used an old/invalid prekey ID (critical after data loss/recovery)
+	// 4. No valid sessions (session exists but chain state is invalid)
+	// 5. Sender key state mismatch (have sender key but wrong chain iteration)
+	isUnavailable := (encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser)) ||
+		(encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID)) ||
+		errors.Is(err, signalerror.ErrNoSessionForUser) ||
+		errors.Is(err, signalerror.ErrNoValidSessions) ||
+		errors.Is(err, signalerror.ErrNoOneTimeKeyFound)
+	// Log senders that haven't distributed SKDM to us yet
+	if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyForUser) {
+		cli.Log.Debugf("SENDER_NEEDS_SESSION: sender=%s group=%s containsDirectMsg=%v - sender has not distributed SKDM to us yet", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg)
+	}
+	// Log sender key state mismatch for diagnostics
+	if encType == "skmsg" && errors.Is(err, signalerror.ErrNoSenderKeyStateForID) {
+		cli.Log.Warnf("SENDER_KEY_MISMATCH: sender=%s group=%s containsDirectMsg=%v error=%v", senderEncryptionJID.String(), info.Chat.String(), containsDirectMsg, err)
+	}
+	// Log stale prekey ID errors - sender has cached old prekey, retry with fresh prekeys should fix.
+	// kavtov-fork (55.1-07, Task 3): the fresh-prekey retry chain is verified real -- isUnavailable
+	// (above) includes ErrNoOneTimeKeyFound, so sendRetryReceipt below fires with
+	// forceIncludeIdentity=true, which calls Store.PreKeys.GenOnePreKey (retry.go:1037) for a
+	// genuinely NEW one-time prekey on every occurrence. First occurrence per sender WARNs
+	// (recovery in flight, worth seeing); repeats from the same sender only advance
+	// stalePrekeyTotal, keeping a persistently-stuck sender visible via the periodic aggregate
+	// without a WARN on every message.
+	if errors.Is(err, signalerror.ErrNoOneTimeKeyFound) {
+		if cli.stalePrekeyShouldWarn(senderEncryptionJID.User) {
+			cli.Log.Warnf("STALE_PREKEY: sender=%s - sender used old prekey ID, sending retry with fresh prekeys", senderEncryptionJID.String())
+		}
+		if n := stalePrekeyTotal.Add(1); n%stalePrekeyLogEvery == 0 {
+			cli.Log.Infof("STALE_PREKEY count=%d", n)
+		}
+	}
+	if encType == "msmsg" {
+		cli.backgroundIfAsyncAck(func() {
+			cli.sendAck(ctx, node, NackMissingMessageSecret)
+		})
+	} else if cli.SynchronousAck {
+		cli.sendRetryReceipt(ctx, node, info, isUnavailable)
+		// TODO this probably isn't supposed to ack
+		cli.sendAck(ctx, node, 0)
+	} else {
+		go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
+		go cli.sendAck(ctx, node, 0)
+	}
+	cli.dispatchEvent(&events.UndecryptableMessage{
+		Info:            *info,
+		IsUnavailable:   isUnavailable,
+		DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
+	})
+	return false
+}
+
 func (cli *Client) clearUntrustedIdentity(ctx context.Context, target types.JID) error {
+	cli.Log.Warnf("IDENTITY_CLEAR target=%s account=%s", target.String(), cli.getOwnID().User)
 	err := cli.Store.Identities.DeleteIdentity(ctx, target.SignalAddress().String())
 	if err != nil {
 		return fmt.Errorf("failed to delete identity: %w", err)
@@ -535,12 +694,20 @@ func (cli *Client) bufferedDecrypt(
 	ciphertext []byte,
 	serverTimestamp time.Time,
 	decrypt func(context.Context) ([]byte, error),
+	extraHashData ...string,
 ) (plaintext []byte, ciphertextHash [32]byte, err error) {
 	if !cli.EnableDecryptedEventBuffer {
 		plaintext, err = decrypt(ctx)
 		return
 	}
-	ciphertextHash = sha256.Sum256(ciphertext)
+	hasher := sha256.New()
+	hasher.Write(ciphertext)
+	for _, part := range extraHashData {
+		hasher.Write([]byte{0})
+		hasher.Write([]byte(part))
+	}
+	hasher.Write([]byte{0, 0})
+	ciphertextHash = *(*[32]byte)(hasher.Sum(nil))
 	var buf *store.BufferedEvent
 	buf, err = cli.Store.EventBuffer.GetBufferedEvent(ctx, ciphertextHash)
 	if err != nil {
@@ -608,7 +775,7 @@ func (cli *Client) decryptDM(ctx context.Context, child *waBinary.Node, from typ
 				pt, innerErr = cipher.DecryptMessage(decryptCtx, preKeyMsg)
 			}
 			return pt, innerErr
-		})
+		}, "prekey", from.String())
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to decrypt prekey message: %w", err)
 		}
@@ -619,7 +786,7 @@ func (cli *Client) decryptDM(ctx context.Context, child *waBinary.Node, from typ
 		}
 		plaintext, ciphertextHash, err = cli.bufferedDecrypt(ctx, content, serverTS, func(decryptCtx context.Context) ([]byte, error) {
 			return cipher.Decrypt(decryptCtx, msg)
-		})
+		}, "normal", from.String())
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to decrypt normal message: %w", err)
 		}
@@ -638,16 +805,19 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 		return nil, nil, fmt.Errorf("message content is not a byte slice")
 	}
 
-	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
-	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
-	cipher := groups.NewGroupCipher(builder, senderKeyName, cli.Store)
 	msg, err := protocol.NewSenderKeyMessageFromBytes(content, pbSerializer.SenderKeyMessage)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse group message: %w", err)
 	}
+	// kavtov-fork: Phase 27 — device-tolerant group sender-key lookup. WhatsApp delivers the SKDM
+	// and the skmsg with inconsistent device numbers for the same sender key; the message keyID
+	// (not the device label) identifies the key. decryptGroupSenderKey tries the sender's stored
+	// device-qualified records (labeled device first) and lets GroupCipher select the state by
+	// keyID + verify the signature (a wrong candidate fails closed). Each candidate decrypts under
+	// its own address, so the ratchet writes back to the correct record. No :0 normalization, no merge.
 	plaintext, ciphertextHash, err := cli.bufferedDecrypt(ctx, content, serverTS, func(decryptCtx context.Context) ([]byte, error) {
-		return cipher.Decrypt(decryptCtx, msg)
-	})
+		return cli.decryptGroupSenderKey(decryptCtx, chat, from, msg)
+	}, "senderkey", chat.String(), from.String())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to decrypt group message: %w", err)
 	}
@@ -656,6 +826,330 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 		return nil, nil, err
 	}
 	return plaintext, &ciphertextHash, nil
+}
+
+// decryptGroupSenderKey performs the Phase-27 device-tolerant group sender-key lookup. It
+// enumerates the sender's stored device-qualified records for the group (a cache-served call —
+// see CachedSenderKeyStore) and attempts decryption against each, trying the labeled device first.
+// libsignal's GroupCipher selects the key state by the message keyID and verifies the signature,
+// so a wrong candidate fails closed (never a mis-decrypt); the winning candidate's ratchet is
+// written back to its own device record by GroupCipher.Decrypt. There is no error-class branching:
+// we try every stored device for the sender and let the keyID pick. Returns ErrNoSenderKeyForUser
+// when no stored device record decrypts the message (so the retry-receipt path is unchanged).
+func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.JID, msg *protocol.SenderKeyMessage) ([]byte, error) {
+	devices, err := cli.Store.SenderKeys.GetSenderKeyDevices(ctx, chat.String(), from.SignalAddressUser())
+	if err != nil {
+		return nil, fmt.Errorf("failed to enumerate sender-key devices: %w", err)
+	}
+	// Try the labeled device first (the common case), then the remaining devices.
+	labeled := from.SignalAddress().String()
+	ordered := make([]string, 0, len(devices))
+	for _, sid := range devices {
+		if sid == labeled {
+			ordered = append(ordered, sid)
+		}
+	}
+	for _, sid := range devices {
+		if sid != labeled {
+			ordered = append(ordered, sid)
+		}
+	}
+	for _, sid := range ordered {
+		sep := strings.LastIndex(sid, ":")
+		if sep < 0 {
+			cli.Log.Debugf("Skipping malformed sender-key id %q (no colon separator)", sid)
+			continue
+		}
+		devID, parseErr := strconv.ParseUint(sid[sep+1:], 10, 32)
+		if parseErr != nil {
+			cli.Log.Debugf("Skipping malformed sender-key id %q (bad device id: %v)", sid, parseErr)
+			continue
+		}
+		name := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(sid[:sep], uint32(devID)))
+		cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
+		plaintext, decErr := cipher.Decrypt(ctx, msg)
+		if decErr == nil {
+			// kavtov-fork (P2a): KEY-path decrypt success. If this inbound tuple was previously a
+			// total miss, this is a genuine per-tuple convergence (NOT PDO content-recovery, which
+			// runs elsewhere and installs no key). Emit ONE INFO and drop the entry.
+			if cli.clearFailedSenderKeyTuple(labeled, chat.String()) {
+				cli.Log.Infof("SENDER_KEY_CONVERGED keypath sender=%s device=%d group=%s prevFailed=true", from.SignalAddressUser(), from.Device, chat.String())
+			}
+			return plaintext, nil
+		}
+		cli.Log.Debugf("Group sender-key candidate %q did not decrypt: %v", sid, decErr)
+	}
+	// Phase 17.12: attempt inline synchronous cross-account donor recovery (D-01, D-02).
+	// SENDERKEY_MISS and recordFailedSenderKeyTuple are ONLY emitted on the fail-open
+	// path to avoid false positives when recovery succeeds (Pitfall 2 / D-07).
+	if cli.Store.InlineRecoverer != nil {
+		donorJID, recovered, recErr := cli.Store.InlineRecoverer.TryInlineRecovery(
+			ctx, chat.String(), labeled, from.SignalAddressUser(), msg.KeyID(), msg.Iteration())
+		if recErr != nil {
+			cli.Log.Warnf("inline recovery error group=%s sender=%s keyID=%d: %v",
+				from.SignalAddressUser(), chat.String(), msg.KeyID(), recErr)
+			// fall through to fail-open (D-07)
+		} else if recovered {
+			// Donor installed — retry decrypt directly under labeled.
+			// MUST NOT call GetSenderKeyDevices: flusher has not ticked; DB row absent;
+			// warm flat c.cache write-through from PutSenderKeyStructureRecovery is the only source. (RESEARCH Constraint 2)
+			sep := strings.LastIndex(labeled, ":")
+			devID, _ := strconv.ParseUint(labeled[sep+1:], 10, 32)
+			name := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(labeled[:sep], uint32(devID)))
+			cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
+			plaintext, decErr := cipher.Decrypt(ctx, msg)
+			if decErr == nil {
+				cli.clearFailedSenderKeyTuple(labeled, chat.String())
+				cli.Log.Infof("SENDER_KEY_RECOVERED donor_jid=%s group=%s sender=%s keyid=%d iter=%d",
+					donorJID, chat.String(), from.SignalAddressUser(), msg.KeyID(), msg.Iteration())
+				return plaintext, nil
+			}
+			// Donor installed but decrypt still failed — fall through to fail-open.
+			// Do NOT call clearFailedSenderKeyTuple (RESEARCH OQ#3).
+			cli.Log.Warnf("inline recovery installed donor but decrypt failed group=%s sender=%s: %v",
+				chat.String(), from.SignalAddressUser(), decErr)
+		}
+	}
+	// D-07: fail-open path (no donor found, query error, or donor-installed-but-failed).
+	// kavtov-fork (P2a): record the failed tuple so a later KEY-path success is
+	// recognizable as convergence (SENDER_KEY_CONVERGED log).
+	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d",
+		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration())
+	cli.recordFailedSenderKeyTuple(labeled, chat.String())
+	// kavtov-fork (38.5): increment per-account blacklist counter for (group, sender).
+	// MUST key on from.User (bare, no agent suffix) to match the check site in
+	// sendRetryReceipt (info.Sender.User). For these @lid bots from == info.Sender, so
+	// using SignalAddressUser() here would add a "_1" suffix the check never sees and the
+	// blacklist would never trip. Emit one log line when the threshold is first crossed.
+	cli.incrementBotResendBlacklist(chat.String(), from.User)
+	return nil, signalerror.ErrNoSenderKeyForUser
+}
+
+// D-14: placeholderResend counters track the empty-vs-ok rate for phone re-request responses.
+// placeholderResendEmpty counts items where GetPlaceholderMessageResendResponse() == nil.
+// placeholderResendOk counts items that successfully set UnavailableRequestID (message recovered).
+// Ratio: empty/(empty+ok) is the empty-rate; >20% indicates investigate sender decline or malformation.
+var (
+	placeholderResendEmpty atomic.Uint64
+	placeholderResendOk    atomic.Uint64
+)
+
+const placeholderLogEvery = 1000
+
+// mediaDeleteOk/mediaDeleteFail count outcomes of the best-effort history-sync media delete
+// (handleHistorySyncNotificationLoop below). This matches WhatsApp Web's own reference client
+// behavior for this exact call (WAWebMmsClientMmsDeleteMdHistorySyncBlob.js): a single
+// fire-and-forget attempt with no retry and no status-code branching -- only the outcome is
+// counted, mirroring the placeholderResend* pattern above.
+var (
+	mediaDeleteOk   atomic.Uint64
+	mediaDeleteFail atomic.Uint64
+)
+
+const mediaDeleteLogEvery = 1000
+
+// recordMediaDeleteOutcome logs and counts the outcome of a single best-effort DeleteMedia
+// call. A failure is a routine, expected outcome of best-effort server-storage housekeeping
+// (e.g. the blob is already gone), so it logs at Debug, not Warn; both outcomes feed a
+// periodic aggregate Infof line so a persistent anomaly stays observable.
+func (cli *Client) recordMediaDeleteOutcome(err error) {
+	if err != nil {
+		cli.Log.Debugf("Failed to delete history sync media from server: %v", err)
+		if n := mediaDeleteFail.Add(1); n%mediaDeleteLogEvery == 0 {
+			cli.Log.Infof("HISTORY_SYNC_MEDIA_DELETE ok=%d fail=%d", mediaDeleteOk.Load(), n)
+		}
+		return
+	}
+	if n := mediaDeleteOk.Add(1); n%mediaDeleteLogEvery == 0 {
+		cli.Log.Infof("HISTORY_SYNC_MEDIA_DELETE ok=%d fail=%d", n, mediaDeleteFail.Load())
+	}
+}
+
+// kavtov-fork (P2a): bounded recently-failed group sender-key tuple set. See client.go field doc.
+// failedSenderKeyTuplesSize caps the set; the failing working set is a few hundred distinct tuples
+// per ~8-min window (~289 sender|group pairs observed, more once device-qualified) against ~0
+// current convergence, so 4096 holds the entire failing population indefinitely until a tuple
+// actually converges. Memory is trivial (a few hundred KB of small structs); err large so the
+// signal this instrument exists to catch is never evicted before it can fire. Eviction is a ring
+// buffer (oldest tuple dropped when full), identical to recentMessages, with dedup on add.
+const failedSenderKeyTuplesSize = 4096
+
+// failedSenderKeyTuple keys the failed-set by the inbound sender's device-qualified signal address
+// (e.g. "34278519877736_1:1") plus the group JID. Keying by the INBOUND device (not the winning
+// stored device) is deliberate: convergence means "a later message from this inbound
+// (sender,device,group) now decrypts", regardless of which stored record supplied the key.
+type failedSenderKeyTuple struct {
+	Sender string // from.SignalAddress().String()
+	Group  string // chat.String()
+}
+
+// recordFailedSenderKeyTuple marks an inbound (sender,device,group) tuple as a total decrypt miss.
+// Dedups on add (the failure load repeats the same tuples heavily) so a duplicate does not consume
+// a ring slot and evict a still-unconverged tuple. Guarded by failedSenderKeyTuplesLock; safe under
+// the concurrent decrypt path.
+func (cli *Client) recordFailedSenderKeyTuple(sender, group string) {
+	key := failedSenderKeyTuple{Sender: sender, Group: group}
+	cli.failedSenderKeyTuplesLock.Lock()
+	defer cli.failedSenderKeyTuplesLock.Unlock()
+	if cli.failedSenderKeyTuples == nil {
+		// Lazy init: the production constructor seeds this, but a bare &Client{} (tests / direct
+		// construction) must not nil-panic on the hot decrypt path.
+		cli.failedSenderKeyTuples = make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize)
+	}
+	if _, exists := cli.failedSenderKeyTuples[key]; exists {
+		return
+	}
+	if old := cli.failedSenderKeyTuplesList[cli.failedSenderKeyTuplesPtr]; old.Sender != "" {
+		delete(cli.failedSenderKeyTuples, old)
+	}
+	cli.failedSenderKeyTuples[key] = struct{}{}
+	cli.failedSenderKeyTuplesList[cli.failedSenderKeyTuplesPtr] = key
+	cli.failedSenderKeyTuplesPtr++
+	if cli.failedSenderKeyTuplesPtr >= len(cli.failedSenderKeyTuplesList) {
+		cli.failedSenderKeyTuplesPtr = 0
+	}
+}
+
+// clearFailedSenderKeyTuple removes an inbound (sender,group) tuple from the failed set and reports
+// whether it was present. A true result means this tuple previously failed and has now decrypted via
+// the KEY path — a genuine per-tuple convergence. The stale ring-list slot is left to be overwritten
+// by the ring (a cleared entry just becomes a no-op delete when its slot recycles).
+func (cli *Client) clearFailedSenderKeyTuple(sender, group string) bool {
+	key := failedSenderKeyTuple{Sender: sender, Group: group}
+	cli.failedSenderKeyTuplesLock.Lock()
+	defer cli.failedSenderKeyTuplesLock.Unlock()
+	if _, exists := cli.failedSenderKeyTuples[key]; !exists {
+		return false
+	}
+	delete(cli.failedSenderKeyTuples, key)
+	return true
+}
+
+// isFailedSenderKeyTuple reports whether an inbound (sender,group) tuple is CURRENTLY in the failed
+// set, WITHOUT mutating it. Read-only by design: clearing on SKDM arrival would suppress the later
+// SENDER_KEY_CONVERGED signal (which fires only when the decrypt-success path sees prevFailed=true),
+// so the SKDM-reception instrument must only PROBE, never clear. Guarded by the same lock as
+// record/clear; safe under the concurrent decrypt + receive paths.
+func (cli *Client) isFailedSenderKeyTuple(sender, group string) bool {
+	key := failedSenderKeyTuple{Sender: sender, Group: group}
+	cli.failedSenderKeyTuplesLock.Lock()
+	defer cli.failedSenderKeyTuplesLock.Unlock()
+	_, exists := cli.failedSenderKeyTuples[key]
+	return exists
+}
+
+// kavtov-fork (perf 260602): SKDM dedup sizing. The installed working set is roughly
+// groups×senders×active-keyID per account; 16384 holds the hot set so the frequently re-bundled
+// SKDMs dedup reliably, while a cold tuple that ring-evicts simply re-processes once (a write we
+// would have done anyway — safe, never a correctness loss). Dedup on add; ring-evict oldest when full.
+const skdmInstalledSize = 16384
+
+// skdmDedupLogEvery samples the periodic SKDM_DEDUP stat line (every Nth event on either the skip or
+// processed path) so the redundant-write slice can be sized from journald without a DB query. Lowered
+// from 1000 to 100 (29-08 gap-closure) so lines appear within minutes even at low skip rates.
+const skdmDedupLogEvery = 100
+
+// skdmInstalledKey keys the dedup set by the INBOUND sender's device-qualified signal address (same
+// keying as the failed-set), the group, and the SKDM's keyID (the per-generation identifier).
+type skdmInstalledKey struct {
+	Sender string // from.SignalAddress().String()
+	Group  string // chat.String()
+	KeyID  uint32 // sdkMsg.ID()
+}
+
+// skdmDedupSkipped / skdmDedupProcessed are process-wide counters: redundant re-broadcasts skipped vs
+// SKDMs actually processed (first installs + forward checkpoints + forced re-processes for failing
+// tuples). skip_pct sizes the redundant-write slice this dedup eliminates.
+var skdmDedupSkipped, skdmDedupProcessed atomic.Uint64
+
+// skdmProcessedIteration returns the highest SKDM iteration already processed for (sender,group,keyID)
+// and whether any has been processed. Read-only; guarded by skdmInstalledLock, safe under the
+// concurrent receive path.
+func (cli *Client) skdmProcessedIteration(sender, group string, keyID uint32) (uint32, bool) {
+	key := skdmInstalledKey{Sender: sender, Group: group, KeyID: keyID}
+	cli.skdmInstalledLock.Lock()
+	defer cli.skdmInstalledLock.Unlock()
+	iter, ok := cli.skdmInstalled[key]
+	return iter, ok
+}
+
+// markSKDMProcessed records that an SKDM at iteration `iter` was processed for (sender,group,keyID),
+// keeping the MAX iteration seen (a later forward checkpoint raises the bar; a stale one never lowers
+// it). A first observation consumes a ring slot and evicts the oldest when full; updating an existing
+// key consumes no slot (dedup-on-add). Guarded by skdmInstalledLock.
+func (cli *Client) markSKDMProcessed(sender, group string, keyID, iter uint32) {
+	key := skdmInstalledKey{Sender: sender, Group: group, KeyID: keyID}
+	cli.skdmInstalledLock.Lock()
+	defer cli.skdmInstalledLock.Unlock()
+	if cli.skdmInstalled == nil {
+		// Lazy init: a bare &Client{} (tests / direct construction) must not nil-panic on receive.
+		cli.skdmInstalled = make(map[skdmInstalledKey]uint32, skdmInstalledSize)
+	}
+	if prev, exists := cli.skdmInstalled[key]; exists {
+		if iter > prev {
+			cli.skdmInstalled[key] = iter
+		}
+		return
+	}
+	if old := cli.skdmInstalledList[cli.skdmInstalledPtr]; old.Sender != "" {
+		delete(cli.skdmInstalled, old)
+	}
+	cli.skdmInstalled[key] = iter
+	cli.skdmInstalledList[cli.skdmInstalledPtr] = key
+	cli.skdmInstalledPtr++
+	if cli.skdmInstalledPtr >= len(cli.skdmInstalledList) {
+		cli.skdmInstalledPtr = 0
+	}
+}
+
+// skdmParseFailPairsSize bounds the per-(sender,group) SKDM parse-fail dedup registry (D-11
+// corrected handling, 55.1-08). Two @lid senders are observed today (55.1-INVESTIGATION-skdm.md);
+// the bound guards against a future storm of distinct non-conformant pairs consuming unbounded
+// memory.
+const skdmParseFailPairsSize = 1000
+
+// skdmParseFailKey keys the per-(sender,group) SKDM parse-fail dedup registry by the BARE sender
+// and group ids (not device-qualified, unlike skdmInstalledKey) -- a non-conformant account
+// sending garbage from a different device is still the same already-diagnosed condition.
+type skdmParseFailKey struct {
+	Sender string // from.User
+	Group  string // chat.User
+}
+
+// skdmParseFailTotal is the process-wide count of every SKDM parse failure (first-seen and
+// repeat), folded into the periodic SKDM_DEDUP line below so the total stays visible on the log
+// surface without a per-event Error for every repeat (D-11 corrected: visible + counted, never
+// silently dropped or downgraded).
+var skdmParseFailTotal atomic.Uint64
+
+// skdmParseFailShouldEmit records one SKDM parse failure for (sender, group) and reports whether
+// THIS occurrence should emit the full Error diagnostic. Every call increments skdmParseFailTotal
+// and the per-pair count regardless of the return value. Returns true only on the first-seen pair
+// (which it then records, subject to skdmParseFailPairsSize); every later call for the same pair
+// returns false. On overflow (skdmParseFailPairsSize distinct pairs already recorded) a brand-new
+// pair is counted via skdmParseFailOverflow but does not get its own first-occurrence Error -- the
+// bound is a future-storm guard, not today's shape (two senders).
+func (cli *Client) skdmParseFailShouldEmit(sender, group string) bool {
+	key := skdmParseFailKey{Sender: sender, Group: group}
+	cli.skdmParseFailLock.Lock()
+	defer cli.skdmParseFailLock.Unlock()
+	if cli.skdmParseFailSeen == nil {
+		// Lazy init: a bare &Client{} (tests / direct construction) must not nil-panic.
+		cli.skdmParseFailSeen = make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize)
+		cli.skdmParseFailCounts = make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize)
+	}
+	skdmParseFailTotal.Add(1)
+	if _, seen := cli.skdmParseFailSeen[key]; seen {
+		cli.skdmParseFailCounts[key]++
+		return false
+	}
+	if len(cli.skdmParseFailSeen) >= skdmParseFailPairsSize {
+		cli.skdmParseFailOverflow++
+		return false
+	}
+	cli.skdmParseFailSeen[key] = struct{}{}
+	cli.skdmParseFailCounts[key] = 1
+	return true
 }
 
 const checkPadding = true
@@ -689,17 +1183,84 @@ func padMessage(plaintext []byte) []byte {
 }
 
 func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat, from types.JID, axolotlSKDM []byte) {
-	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
+	// kavtov-fork: Phase 27 — device-qualified store; the message keyID disambiguates devices; device-tolerant lookup (27-01) finds the record regardless of which device the skmsg is labeled with.
 	senderKeyName := protocol.NewSenderKeyName(chat.String(), from.SignalAddress())
+	// kavtov-fork (STEP 1 instrument): is this arriving SKDM for a tuple that is CURRENTLY stuck (a
+	// prior total decrypt miss recorded by the P2a failed-set)? Keyed IDENTICALLY to the decrypt path
+	// (from.SignalAddress().String() + chat.String(), see decryptGroupSenderKey ~:700/:739). Probe is
+	// read-only; it never clears the tuple (clearing belongs to the convergence success hook). Fires
+	// at most once per arriving SKDM for an already-stuck tuple → low volume, general, no hardcoded
+	// sender. Fills the prod blind spot: successful SKDM receipt is Debug-only (:847), so today an
+	// arriving key for a stuck tuple is invisible. installed=y/n distinguishes "arrived AND processed"
+	// from "arrived but failed to install" (a stuck tuple specifically, not the generic :844 Errorf).
+	wasFailed := cli.isFailedSenderKeyTuple(from.SignalAddress().String(), chat.String())
 	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(axolotlSKDM, pbSerializer.SenderKeyDistributionMessage)
 	if err != nil {
-		cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
+		// kavtov-fork (55.1-08, D-11 corrected): visible + fully counted, not re-announced. The
+		// payload is proven-unparseable external format (55.1-INVESTIGATION-skdm.md: two @lid devices
+		// sending a bare 32-byte value where an SKDM belongs), not a version gap our fork could
+		// recover from -- there is no retry here today and this change must not add one. First
+		// sighting per (sender,group) emits the full diagnostic at the existing Error level with the
+		// existing byte0/verNibble/hex capture (that's what proved the root cause); every repeat only
+		// counts (skdmParseFailTotal, folded into the periodic SKDM_DEDUP line below) -- mirrors the
+		// iteration-aware SKDM dedup a few lines below (skdmProcessedIteration).
+		if cli.skdmParseFailShouldEmit(from.User, chat.User) {
+			cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
+			// 2026-07-01 SKDM debug: capture the raw bytes that fail to parse so we can root-cause the
+			// wire format (they are not otherwise logged). Low volume (~300/day, a couple of @lid senders).
+			// %x = hex; byte0/verNibble expose the libsignal version prefix the parser strips at serialized[0].
+			var skdmByte0 byte
+			if len(axolotlSKDM) > 0 {
+				skdmByte0 = axolotlSKDM[0]
+			}
+			cli.Log.Errorf("SKDM_PARSE_FAIL_BYTES from=%s group=%s len=%d byte0=0x%02x verNibble=%d hex=%x",
+				from, chat, len(axolotlSKDM), skdmByte0, skdmByte0>>4, axolotlSKDM)
+		} else {
+			cli.Log.Debugf("SKDM_PARSE_FAIL_BYTES (repeat, known non-conformant pair) from=%s group=%s len=%d total=%d",
+				from, chat, len(axolotlSKDM), skdmParseFailTotal.Load())
+		}
+		if wasFailed {
+			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=parse", from.SignalAddressUser(), from.Device, chat.String())
+		}
 		return
 	}
+	// kavtov-fork (perf 260602): skip the redundant re-process of an SKDM we have already seen at an
+	// equal-or-higher iteration. builder.Process is LoadSenderKey+AddSenderKeyState+StoreSenderKey
+	// unconditionally; for a re-bundled SKDM that is a duplicate write. The skip is ITERATION-AWARE: a
+	// HIGHER-iteration SKDM (SKDM.Create emits the sender's live chain position) is a forward checkpoint
+	// that rescues a recipient who fell >2000 behind, so it MUST process — only an at-or-below iteration
+	// is a true redundant/stale re-broadcast. The failed-set bypass guarantees recovery is never blocked:
+	// a tuple currently failing to decrypt always re-processes, so a deleted/lost key re-installs.
+	senderStr := from.SignalAddress().String()
+	keyID := sdkMsg.ID()
+	skdmIter := sdkMsg.Iteration()
+	if !wasFailed {
+		if seenIter, ok := cli.skdmProcessedIteration(senderStr, chat.String(), keyID); ok && skdmIter <= seenIter {
+			if n := skdmDedupSkipped.Add(1); n%skdmDedupLogEvery == 0 {
+				cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d parsefail=%d group=%s keyid=%d iter=%d seen=%d", skdmDedupProcessed.Load(), n, skdmParseFailTotal.Load(), chat.String(), keyID, skdmIter, seenIter)
+			}
+			return
+		}
+	}
+	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
 	err = builder.Process(ctx, senderKeyName, sdkMsg)
 	if err != nil {
 		cli.Log.Errorf("Failed to process sender key distribution message from %s for %s: %v", from, chat, err)
+		if wasFailed {
+			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=process", from.SignalAddressUser(), from.Device, chat.String())
+		}
 		return
+	}
+	cli.markSKDMProcessed(senderStr, chat.String(), keyID, skdmIter)
+	// kavtov-fork (29-08 gap-closure): emit SKDM_DEDUP on the processed path every
+	// skdmDedupLogEvery installs so the stat line appears even at near-zero skip rates.
+	// The skip-path line (below wasFailed block) carries group/keyid/iter; this line
+	// records totals only (processed/skipped magnitude without per-event detail).
+	if p := skdmDedupProcessed.Add(1); p%skdmDedupLogEvery == 0 {
+		cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d parsefail=%d", p, skdmDedupSkipped.Load(), skdmParseFailTotal.Load())
+	}
+	if wasFailed {
+		cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=y", from.SignalAddressUser(), from.Device, chat.String())
 	}
 	cli.Log.Debugf("Processed sender key distribution message from %s in %s", senderKeyName.Sender().String(), senderKeyName.GroupID())
 }
@@ -728,11 +1289,45 @@ func (cli *Client) handleHistorySyncNotificationLoop() {
 				cli.Log.Errorf("Failed to download history sync: %v", err)
 			} else {
 				cli.dispatchEvent(&events.HistorySync{Data: blob})
+				err = cli.DeleteMedia(ctx, MediaHistory, notif.GetDirectPath(), notif.GetFileEncSHA256(), notif.GetEncHandle())
+				cli.recordMediaDeleteOutcome(err)
 			}
 		case <-time.After(1 * time.Minute):
 			return
 		}
 	}
+}
+
+// SendHistorySyncServerErrorReceipt sends a history sync server-error receipt, which
+// asks the phone to re-upload the referenced history sync payload.
+func (cli *Client) SendHistorySyncServerErrorReceipt(ctx context.Context, msgID types.MessageID, mediaKey []byte) error {
+	ciphertext, iv, err := encryptMediaRetryReceipt(msgID, mediaKey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt history sync server-error receipt: %w", err)
+	}
+	ownID := cli.getOwnID().ToNonAD()
+	if ownID.IsEmpty() {
+		return ErrNotLoggedIn
+	}
+	err = cli.sendNode(ctx, waBinary.Node{
+		Tag: "receipt",
+		Attrs: waBinary.Attrs{
+			"id":       string(msgID),
+			"type":     "server-error",
+			"to":       ownID,
+			"category": "peer",
+		},
+		Content: []waBinary.Node{
+			{Tag: "encrypt", Content: []waBinary.Node{
+				{Tag: "enc_p", Content: ciphertext},
+				{Tag: "enc_iv", Content: iv},
+			}},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("Failed to send history sync server-error receipt: %w", err)
+	}
+	return nil
 }
 
 // DownloadHistorySync will download and parse the history sync blob from the given history sync notification.
@@ -757,13 +1352,16 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 	}
 	cli.Log.Debugf("Received history sync (type %s, chunk %d, progress %d)", historySync.GetSyncType(), historySync.GetChunkOrder(), historySync.GetProgress())
 	doStorage := func(ctx context.Context) {
+		if err := cli.storeNCTSalt(ctx, historySync.GetNctSalt()); err != nil {
+			cli.Log.Warnf("Failed to store NCT salt from history sync: %v", err)
+		}
+		if len(historySync.GetPhoneNumberToLidMappings()) > 0 {
+			cli.storeHistoricalPNLIDMappings(ctx, historySync.GetPhoneNumberToLidMappings())
+		}
 		if historySync.GetSyncType() == waHistorySync.HistorySync_PUSH_NAME {
 			cli.handleHistoricalPushNames(ctx, historySync.GetPushnames())
 		} else if len(historySync.GetConversations()) > 0 {
 			cli.storeHistoricalMessageSecrets(ctx, historySync.GetConversations())
-		}
-		if len(historySync.GetPhoneNumberToLidMappings()) > 0 {
-			cli.storeHistoricalPNLIDMappings(ctx, historySync.GetPhoneNumberToLidMappings())
 		}
 		if historySync.GlobalSettings != nil {
 			cli.storeGlobalSettings(ctx, historySync.GlobalSettings)
@@ -821,13 +1419,22 @@ func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationR
 	for i, part := range parts {
 		var webMsg waWeb.WebMessageInfo
 		if resp := part.GetPlaceholderMessageResendResponse(); resp == nil {
-			cli.Log.Warnf("Missing response in item #%d of response to %s", i+1, reqID)
+			if n := placeholderResendEmpty.Add(1); n%placeholderLogEvery == 0 {
+				cli.Log.Infof("PLACEHOLDER_RESEND empty=%d ok=%d", n, placeholderResendOk.Load())
+			}
 		} else if err := proto.Unmarshal(resp.GetWebMessageInfoBytes(), &webMsg); err != nil {
 			cli.Log.Warnf("Failed to unmarshal protobuf web message in item #%d of response to %s: %v", i+1, reqID, err)
 		} else if msgEvt, err := cli.ParseWebMessage(types.EmptyJID, &webMsg); err != nil {
 			cli.Log.Warnf("Failed to parse web message info in item #%d of response to %s: %v", i+1, reqID, err)
 		} else {
 			msgEvt.UnavailableRequestID = reqID
+			placeholderResendOk.Add(1)
+			// D-06: record the original message ID as recovered so sendRetryReceipt can
+			// short-circuit further retry receipts for this message (attempts #2+). The ID
+			// is the ORIGINAL failed message's ID (set by ParseWebMessage from the resent
+			// web message protobuf). This insert sits in the same success branch as
+			// placeholderResendOk.Add so the two always agree.
+			cli.recordRecoveredMsgID(msgEvt.Info.ID)
 			ok = !cli.dispatchEvent(msgEvt) && ok
 		}
 	}
@@ -849,7 +1456,14 @@ func (cli *Client) handleProtocolMessage(ctx context.Context, info *types.Messag
 				go cli.handleHistorySyncNotificationLoop()
 			}
 		}
-		go cli.sendProtocolMessageReceipt(ctx, info.ID, types.ReceiptTypeHistorySync)
+		if !(cli.ManualHistorySyncDownload && cli.DisableManualHistorySyncReceipt) {
+			go func() {
+				err := cli.SendProtocolMessageReceipt(ctx, info.ID, types.ReceiptTypeHistorySync)
+				if err != nil {
+					cli.Log.Warnf("Failed to send acknowledgement for protocol message %s: %v", info.ID, err)
+				}
+			}()
+		}
 	}
 
 	if protoMsg.GetLidMigrationMappingSyncMessage() != nil {
@@ -871,7 +1485,12 @@ func (cli *Client) handleProtocolMessage(ctx context.Context, info *types.Messag
 	}
 
 	if info.Category == "peer" {
-		go cli.sendProtocolMessageReceipt(ctx, info.ID, types.ReceiptTypePeerMsg)
+		go func() {
+			err := cli.SendProtocolMessageReceipt(ctx, info.ID, types.ReceiptTypePeerMsg)
+			if err != nil {
+				cli.Log.Warnf("Failed to send acknowledgement for protocol message %s: %v", info.ID, err)
+			}
+		}()
 	}
 	return
 }
@@ -925,15 +1544,18 @@ func (cli *Client) storeHistoricalMessageSecrets(ctx context.Context, conversati
 		if chatJID.IsEmpty() {
 			continue
 		}
-		if chatJID.Server == types.DefaultUserServer && conv.GetTcToken() != nil {
-			ts := conv.GetTcTokenSenderTimestamp()
-			if ts == 0 {
-				ts = conv.GetTcTokenTimestamp()
-			}
+		var chatPN types.JID
+		if chatJID.Server == types.DefaultUserServer {
+			chatPN = chatJID
+		} else if chatJID.Server == types.HiddenUserServer {
+			chatPN, _ = cli.Store.LIDs.GetPNForLID(ctx, chatJID)
+		}
+		if !chatPN.IsEmpty() && conv.GetTcToken() != nil {
 			privacyTokens = append(privacyTokens, store.PrivacyToken{
-				User:      chatJID,
-				Token:     conv.GetTcToken(),
-				Timestamp: time.Unix(int64(ts), 0),
+				User:            chatPN,
+				Token:           conv.GetTcToken(),
+				Timestamp:       time.Unix(int64(conv.GetTcTokenTimestamp()), 0),
+				SenderTimestamp: time.Unix(int64(conv.GetTcTokenSenderTimestamp()), 0),
 			})
 		}
 		for _, msg := range conv.GetMessages() {
@@ -942,7 +1564,7 @@ func (cli *Client) storeHistoricalMessageSecrets(ctx context.Context, conversati
 				msgKey := msg.GetMessage().GetKey()
 				if msgKey.GetFromMe() {
 					senderJID = ownID
-				} else if chatJID.Server == types.DefaultUserServer {
+				} else if chatJID.Server == types.DefaultUserServer || chatJID.Server == types.HiddenUserServer {
 					senderJID = chatJID
 				} else if msgKey.GetParticipant() != "" {
 					senderJID, _ = types.ParseJID(msgKey.GetParticipant())
@@ -1084,9 +1706,10 @@ func (cli *Client) handleDecryptedMessage(ctx context.Context, info *types.Messa
 	return cli.dispatchEvent(evt.UnwrapRaw())
 }
 
-func (cli *Client) sendProtocolMessageReceipt(ctx context.Context, id types.MessageID, msgType types.ReceiptType) {
+// SendProtocolMessageReceipt sends a receipt for a protocol message back to the phone.
+func (cli *Client) SendProtocolMessageReceipt(ctx context.Context, id types.MessageID, msgType types.ReceiptType) error {
 	if len(id) == 0 {
-		return
+		return nil
 	}
 	err := cli.sendNode(ctx, waBinary.Node{
 		Tag: "receipt",
@@ -1098,44 +1721,19 @@ func (cli *Client) sendProtocolMessageReceipt(ctx context.Context, id types.Mess
 		Content: nil,
 	})
 	if err != nil {
-		cli.Log.Warnf("Failed to send acknowledgement for protocol message %s: %v", id, err)
+		return err
 	}
+	return nil
 }
 
-// establishSessionWithSender proactively fetches prekeys and establishes a Signal session.
-// This allows future messages from the sender to be decrypted.
-// Should be called in a goroutine after a decryption failure with ErrNoSessionForUser.
-func (cli *Client) establishSessionWithSender(ctx context.Context, sender types.JID) {
-	cli.sessionRecreateHistoryLock.Lock()
-	lastAttempt, ok := cli.sessionRecreateHistory[sender]
-	if ok && time.Since(lastAttempt) < 5*time.Minute {
-		cli.sessionRecreateHistoryLock.Unlock()
-		cli.Log.Debugf("Skipping session establishment with %s (attempted %s ago)", sender, time.Since(lastAttempt))
-		return
-	}
-	cli.sessionRecreateHistory[sender] = time.Now()
-	cli.sessionRecreateHistoryLock.Unlock()
-
-	cli.Log.Infof("Proactively fetching prekeys to establish session with %s", sender)
-	bundles := cli.fetchPreKeysNoError(ctx, []types.JID{sender})
-	bundle, ok := bundles[sender]
-	if !ok || bundle == nil {
-		cli.Log.Warnf("No prekey bundle received for %s", sender)
-		return
-	}
-	builder := session.NewBuilderFromSignal(cli.Store, sender.SignalAddress(), pbSerializer)
-	err := builder.ProcessBundle(ctx, bundle)
-	if cli.AutoTrustIdentity && errors.Is(err, signalerror.ErrUntrustedIdentity) {
-		cli.Log.Warnf("Got untrusted identity while establishing session with %s, clearing and retrying", sender)
-		if clearErr := cli.clearUntrustedIdentity(ctx, sender); clearErr != nil {
-			cli.Log.Errorf("Failed to clear untrusted identity for %s: %v", sender, clearErr)
-			return
-		}
-		err = builder.ProcessBundle(ctx, bundle)
-	}
-	if err != nil {
-		cli.Log.Warnf("Failed to establish session with %s: %v", sender, err)
-	} else {
-		cli.Log.Infof("Successfully established session with %s", sender)
-	}
-}
+// NOTE: a receiver-side establishSessionWithSender (proactively fetching the peer's
+// prekeys + ProcessBundle on an inbound decrypt failure) was REMOVED 2026-06-16. It
+// was non-conformant and a functional no-op: WA Web's response to an inbound decrypt
+// failure is retry-receipt-only — re-establishment is the SENDER's job, carried by
+// their resend (a receiver-initiated session can't decrypt an already-sent message,
+// and can't produce a missing group sender key). The proactive fetch only burned the
+// peer's one-time prekeys and bloated our pairwise session (PROCESSBUNDLE archives a
+// state each time -> the slow-encrypt root cause). See wa_protocol
+// docs/spec/inbound-decrypt-failure-response.md. Conformant behavior = send the retry
+// receipt and wait for the sender's resend. (The sender-side recreate on an incoming
+// retry request lives in retry.go shouldRecreateSession and is unaffected.)
