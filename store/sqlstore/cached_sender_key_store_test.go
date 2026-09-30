@@ -319,6 +319,44 @@ func TestCachedSenderKeyStore_InterfaceConformance(t *testing.T) {
 	}
 }
 
+func TestSenderKeyDeviceNegativeTTLStartsAtCompletion(t *testing.T) {
+	startedAt := time.Unix(2_000, 0)
+	now := startedAt
+	calls := 0
+	c, _ := newDevicePolicyStore(t, 16, func(context.Context, string, string) ([]string, error) {
+		calls++
+		if calls == 1 {
+			// The first query consumes one minute before authoritative absence.
+			now = startedAt.Add(time.Minute)
+		}
+		return []string{}, nil
+	})
+	c.deviceCache.now = func() time.Time { return now }
+	read := func() {
+		t.Helper()
+		devices, err := c.GetSenderKeyDevices(context.Background(), "empty", "user_1")
+		if err != nil || len(devices) != 0 {
+			t.Fatalf("authoritative empty = %v, %v", devices, err)
+		}
+	}
+	read()
+	now = startedAt.Add(5 * time.Minute)
+	read()
+	if calls != 1 {
+		t.Fatalf("deadline anchored at query start: calls = %d, want 1", calls)
+	}
+	now = startedAt.Add(6*time.Minute - time.Nanosecond)
+	read()
+	if calls != 1 {
+		t.Fatalf("pre-completion-deadline calls = %d, want 1", calls)
+	}
+	now = now.Add(time.Nanosecond)
+	read()
+	if calls != 2 {
+		t.Fatalf("completion deadline equality calls = %d, want 2", calls)
+	}
+}
+
 func TestSenderKeyDeviceNegativeFixedTTL(t *testing.T) {
 	c, inner := newTestCachedSenderKeyStore(t, 16)
 	now := time.Unix(1_000, 0)
