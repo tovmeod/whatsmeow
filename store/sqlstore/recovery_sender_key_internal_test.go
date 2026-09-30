@@ -14,6 +14,8 @@ package sqlstore
 
 import (
 	"context"
+	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -128,11 +130,249 @@ func (r *flatRecoveryRows) Err() error { return nil }
 // though the public recovery API still reports no donor without an error.
 func TestNoDonorCacheMalformed(t *testing.T) {
 	for _, blob := range [][]byte{nil, []byte("malformed-flat")} {
-		_, err := scanFlatRows(&flatRecoveryRows{blobs: [][]byte{blob}}, 1, 5, nil)
-		if err == nil {
+		_, complete, err := scanFlatRows(&flatRecoveryRows{blobs: [][]byte{blob}}, 1, 5, nil)
+		if complete || err != nil {
 			t.Fatal("uncertain all-negative scan must carry non-cacheable evidence")
 		}
 	}
+}
+
+type uncertainRecoveryInner struct {
+	*stubRecoveryInner
+	blobs [][]byte
+}
+
+func (s *uncertainRecoveryInner) findSenderKeyDonorResult(ctx context.Context, group, sender string, keyID, iteration uint32) (*donorSenderKeyState, bool, error) {
+	s.findCalls.Add(1)
+	return scanFlatRows(&flatRecoveryRows{blobs: s.blobs}, keyID, iteration, nil)
+}
+
+func TestNoDonorCacheMalformedRescansAndValidSibling(t *testing.T) {
+	resetNoDonorCacheForTest()
+	t.Cleanup(resetNoDonorCacheForTest)
+	for _, bad := range [][]byte{nil, []byte("bad-flat")} {
+		stub := &stubRecoveryInner{}
+		c := newStubCachedStore(t, stub, nil)
+		uncertain := &uncertainRecoveryInner{stubRecoveryInner: stub, blobs: [][]byte{bad}}
+		c.inner = uncertain
+		for i := 0; i < 2; i++ {
+			_, ok, err := c.TryInlineRecovery(context.Background(), "malformed", "s_1:0", "s_1", 7, 10)
+			if ok || err != nil {
+				t.Fatalf("uncertain miss: ok=%v err=%v", ok, err)
+			}
+		}
+		if stub.findCalls.Load() != 2 {
+			t.Fatal("uncertain absence was cached")
+		}
+		valid, packed := store.PackFlat(&groupRecord.SenderKeyStructure{SenderKeyStates: []*groupRecord.SenderKeyStateStructure{{
+			KeyID: 7, SenderChainKey: &ratchet.SenderChainKeyStructure{Iteration: 5, ChainKey: make([]byte, 32)}, SigningKeyPublic: stubDonor(7, 5).SigningKeyPublic,
+		}}})
+		if !packed {
+			t.Fatal("valid donor fixture failed to pack")
+		}
+		uncertain.blobs = [][]byte{bad, valid}
+		_, ok, err := c.TryInlineRecovery(context.Background(), "malformed", "s_1:0", "s_1", 7, 10)
+		if !ok || err != nil || stub.putCalls.Load() != 1 {
+			t.Fatalf("valid sibling recovery: ok=%v err=%v", ok, err)
+		}
+	}
+}
+
+func assertDonorIdle(t *testing.T) {
+	t.Helper()
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+	if len(donorWaves) != 0 || len(donorFlights) != 0 {
+		t.Fatalf("leaked waves=%d flights=%d", len(donorWaves), len(donorFlights))
+	}
+}
+
+func waitDonorParticipants(t *testing.T, count int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		noDonorCacheMu.Lock()
+		n := 0
+		for _, f := range donorFlights {
+			n += f.participants
+		}
+		noDonorCacheMu.Unlock()
+		if n == count {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatal("participants never admitted")
+}
+
+func TestInlineRecoveryCanceledFollowerAndLeader(t *testing.T) {
+	resetNoDonorCacheForTest()
+	t.Cleanup(resetNoDonorCacheForTest)
+	stub := &stubRecoveryInner{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	c := newStubCachedStore(t, stub, nil)
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	leader := make(chan error, 1)
+	go func() { _, _, err := c.TryInlineRecovery(leaderCtx, "cancel", "s:0", "s", 1, 5); leader <- err }()
+	<-stub.entered
+	followerCtx, cancelFollower := context.WithCancel(context.Background())
+	defer cancelFollower()
+	follower := make(chan error, 1)
+	go func() { _, _, err := c.TryInlineRecovery(followerCtx, "cancel", "s:0", "s", 1, 5); follower <- err }()
+	waitDonorParticipants(t, 2)
+	cancelFollower()
+	if !errors.Is(<-follower, context.Canceled) {
+		t.Fatal("follower cancellation lost")
+	}
+	if stub.findCalls.Load() != 1 {
+		t.Fatal("follower did not coalesce")
+	}
+	cancelLeader()
+	if !errors.Is(<-leader, context.Canceled) {
+		t.Fatal("leader cancellation lost")
+	}
+	assertDonorIdle(t)
+	if noDonorCache.Len() != 0 {
+		t.Fatal("canceled work published absence")
+	}
+	_, _, err := c.TryInlineRecovery(leaderCtx, "cancel", "s:0", "s", 1, 5)
+	if !errors.Is(err, context.Canceled) || stub.findCalls.Load() != 1 {
+		t.Fatal("pre-canceled call started work")
+	}
+}
+
+func TestInlineRecoveryLiveFollowerAfterLeaderCancel(t *testing.T) {
+	resetNoDonorCacheForTest()
+	t.Cleanup(resetNoDonorCacheForTest)
+	stub := &stubRecoveryInner{entered: make(chan struct{}, 2), release: make(chan struct{})}
+	c := newStubCachedStore(t, stub, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	leader := make(chan error, 1)
+	go func() { _, _, err := c.TryInlineRecovery(ctx, "live", "s:0", "s", 1, 5); leader <- err }()
+	<-stub.entered
+	follower := make(chan error, 1)
+	go func() {
+		_, _, err := c.TryInlineRecovery(context.Background(), "live", "s:0", "s", 1, 5)
+		follower <- err
+	}()
+	waitDonorParticipants(t, 2)
+	cancel()
+	if !errors.Is(<-leader, context.Canceled) {
+		t.Fatal("leader error lost")
+	}
+	<-stub.entered // follower performs independent uncached retry
+	close(stub.release)
+	if err := <-follower; err != nil {
+		t.Fatal(err)
+	}
+	assertDonorIdle(t)
+	if noDonorCache.Len() != 0 || stub.findCalls.Load() != 2 {
+		t.Fatal("canceled flight retry publication")
+	}
+}
+
+func TestNoDonorCacheBoundedOverflow(t *testing.T) {
+	resetNoDonorCacheForTest()
+	t.Cleanup(resetNoDonorCacheForTest)
+	donorWorkCapacity = 1
+	stub := &stubRecoveryInner{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	c := newStubCachedStore(t, stub, nil)
+	done := make(chan error, 1)
+	go func() { _, _, err := c.TryInlineRecovery(context.Background(), "held", "s:0", "s", 1, 5); done <- err }()
+	<-stub.entered
+	other := &stubRecoveryInner{donor: stubDonor(1, 2)}
+	o := newStubCachedStore(t, other, nil)
+	_, ok, err := o.TryInlineRecovery(context.Background(), "overflow", "s:0", "s", 1, 5)
+	if !ok || err != nil {
+		t.Fatalf("overflow positive failed: %v", err)
+	}
+	other.donor = nil
+	_, _, _ = o.TryInlineRecovery(context.Background(), "overflow-miss", "s:0", "s", 1, 5)
+	if noDonorCache.Len() != 0 || noDonorCacheOverflow.Load() != 2 {
+		t.Fatal("overflow published or uncounted")
+	}
+	noDonorCacheMu.Lock()
+	if len(donorFlights) != 1 || len(donorWaves) != 1 {
+		t.Error("admission cap exceeded")
+	}
+	noDonorCacheMu.Unlock()
+	close(stub.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	assertDonorIdle(t)
+	if noDonorCacheCapacity != 10000 {
+		t.Fatal("production cap changed")
+	}
+}
+
+func TestNoDonorCacheABAFixedDeadline(t *testing.T) {
+	for _, action := range []string{"expiry", "eviction", "invalidate", "teardown"} {
+		t.Run(action, func(t *testing.T) {
+			resetNoDonorCacheWithCapacityForTest(1)
+			t.Cleanup(resetNoDonorCacheForTest)
+			var clock atomic.Int64
+			clock.Store(time.Now().UnixNano())
+			donorClock = func() time.Time { return time.Unix(0, clock.Load()) }
+			entered, release := make(chan struct{}), make(chan struct{})
+			stub := &stubRecoveryInner{donorForTarget: func(i uint32) *donorSenderKeyState {
+				if i == 5 {
+					close(entered)
+					<-release
+				}
+				return nil
+			}}
+			c := newStubCachedStore(t, stub, nil)
+			done := make(chan error, 1)
+			go func() { _, _, err := c.TryInlineRecovery(context.Background(), "aba", "s:0", "s", 1, 5); done <- err }()
+			<-entered
+			_, _, _ = c.TryInlineRecovery(context.Background(), "aba", "s:0", "s", 1, 10)
+			switch action {
+			case "expiry":
+				clock.Add(int64(noDonorCacheTTL))
+				_, _, _ = c.TryInlineRecovery(context.Background(), "aba", "s:0", "s", 1, 20)
+			case "eviction":
+				_, _, _ = c.TryInlineRecovery(context.Background(), "evict", "s:0", "s", 1, 10)
+			case "invalidate":
+				notifyDonorKeys(stub, "aba", "s", []uint32{1})
+			case "teardown":
+				clearDonorUniverse(stub)
+			}
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if getNoDonorCacheEntry(c.donorKey("aba", "s", 1), 100, donorClock()) {
+				t.Fatal("old completion republished absence")
+			}
+			assertDonorIdle(t)
+			before := stub.findCalls.Load()
+			_, _, _ = c.TryInlineRecovery(context.Background(), "aba", "s:0", "s", 1, 30)
+			if stub.findCalls.Load() != before+1 {
+				t.Fatal("fresh wave did not rescan")
+			}
+			assertDonorIdle(t)
+		})
+	}
+}
+
+func TestNoDonorCacheSQLErrorNotAbsence(t *testing.T) {
+	resetNoDonorCacheForTest()
+	t.Cleanup(resetNoDonorCacheForTest)
+	failure := errors.New("SQL scan failed")
+	stub := &stubRecoveryInner{findErr: failure}
+	c := newStubCachedStore(t, stub, nil)
+	for i := 0; i < 2; i++ {
+		_, _, err := c.TryInlineRecovery(context.Background(), "err", "s:0", "s", 1, 5)
+		if !errors.Is(err, failure) {
+			t.Fatal(err)
+		}
+	}
+	if stub.findCalls.Load() != 2 || noDonorCache.Len() != 0 {
+		t.Fatal("SQL error became absence")
+	}
+	assertDonorIdle(t)
 }
 
 // stubDonor builds a donorSenderKeyState with valid field lengths

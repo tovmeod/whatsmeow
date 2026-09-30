@@ -43,6 +43,12 @@ func resetNoDonorCacheWithCapacityForTest(capacity int) {
 	donorClock = time.Now
 	noDonorCacheSkips.Store(0)
 	noDonorCacheEvictions.Store(0)
+	noDonorCacheQueries.Store(0)
+	noDonorCacheExpired.Store(0)
+	noDonorCacheInvalidations.Store(0)
+	noDonorCacheOverflow.Store(0)
+	donorSFTotal.Store(0)
+	donorSFShared.Store(0)
 }
 
 // backdateNoDonorCache overwrites the stored time for key with a time that is
@@ -331,4 +337,34 @@ func TestNoDonorCacheEvictionRescans(t *testing.T) {
 	if got := stub.findCalls.Load(); got != 4 {
 		t.Errorf("findSenderKeyDonor calls = %d, want 4 because the evicted key re-scans", got)
 	}
+}
+
+func TestNoDonorCacheCapacityAndTelemetry(t *testing.T) {
+	resetNoDonorCacheForTest()
+	t.Cleanup(resetNoDonorCacheForTest)
+	stub := &stubRecoveryInner{}
+	c := newStubCachedStore(t, stub, nil)
+	now := time.Now()
+	donorClock = func() time.Time { return now }
+	for i := uint32(0); i <= noDonorCacheCapacity; i++ {
+		_, _, _ = c.TryInlineRecovery(context.Background(), "capacity", "s:0", "s", i, 5)
+	}
+	if noDonorCache.Len() != noDonorCacheCapacity || noDonorCacheEvictions.Load() != 1 {
+		t.Fatal("negative LRU exceeded its unchanged cap")
+	}
+	key := uint32(noDonorCacheCapacity)
+	_, _, _ = c.TryInlineRecovery(context.Background(), "capacity", "s:0", "s", key, 10)
+	if noDonorCacheSkips.Load() != 1 || noDonorCacheQueries.Load() != noDonorCacheCapacity+1 {
+		t.Fatal("hit/query totals incorrect")
+	}
+	now = now.Add(noDonorCacheTTL)
+	_, _, _ = c.TryInlineRecovery(context.Background(), "capacity", "s:0", "s", key, 20)
+	if noDonorCacheExpired.Load() != 1 || noDonorCacheQueries.Load() != noDonorCacheCapacity+2 {
+		t.Fatal("expiry/query totals incorrect")
+	}
+	notifyDonorKeys(stub, "capacity", "s", []uint32{key})
+	if noDonorCacheInvalidations.Load() != 1 {
+		t.Fatal("invalidation total incorrect")
+	}
+	assertDonorIdle(t)
 }

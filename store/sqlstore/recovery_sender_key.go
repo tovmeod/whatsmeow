@@ -121,9 +121,8 @@ type donorFlight struct {
 
 const noDonorCacheCapacity = 10_000
 
-// noDonorCache is process-wide and bounded. The base key is
-// group|senderBare|keyID; each value records the target-iteration bound of the
-// exact donor query that produced its negative result.
+// One existing process-wide bounded LRU, partitioned by the donor SQL universe.
+// No recipient/target iteration appears in absence identity.
 var (
 	noDonorCacheMu                                                                            sync.Mutex
 	noDonorCache                                                                              = mustNewNoDonorCache(noDonorCacheCapacity)
@@ -199,6 +198,41 @@ func invalidateDonorLocked(key donorQueryKey) {
 	noDonorCacheInvalidations.Add(1)
 }
 
+// notifyDonorKeys is called only once keys are observable in this SQL universe.
+// All accounts share donor SQL eligibility. Match exact bare identities and key
+// IDs; no global flush on unrelated keys. Invalid active waves remain until their
+// participants finish, preventing an old scan from publishing into a new wave.
+func notifyDonorKeys(universe any, group, sender string, keyIDs []uint32) {
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+	for _, id := range keyIDs {
+		invalidateDonorLocked(donorQueryKey{universe, group, senderKeyUserBare(sender), id})
+	}
+}
+
+func clearDonorUniverse(universe any) {
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+	for _, key := range noDonorCache.Keys() {
+		if key.universe == universe {
+			invalidateDonorLocked(key)
+		}
+	}
+	for key, wave := range donorWaves {
+		if key.universe == universe {
+			wave.invalid = true
+		}
+	}
+}
+
+func (c *CachedSenderKeyStore) logDonorPolicy() {
+	if sq, ok := c.inner.(*SQLStore); ok && sq.log != nil {
+		sq.log.Infof("NO_DONOR_CACHE hits=%d queries=%d expired=%d invalidations=%d evictions=%d overflow=%d shared=%d",
+			noDonorCacheSkips.Load(), noDonorCacheQueries.Load(), noDonorCacheExpired.Load(),
+			noDonorCacheInvalidations.Load(), noDonorCacheEvictions.Load(), noDonorCacheOverflow.Load(), donorSFShared.Load())
+	}
+}
+
 // Locks protect only bookkeeping, never SQL, waits, crypto/install or callbacks.
 func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecoveryReader, key donorQueryKey, targetIter uint32) (*donorSenderKeyState, error) {
 	if err := ctx.Err(); err != nil {
@@ -208,9 +242,14 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 	noDonorCacheMu.Lock()
 	if noDonorCacheHitLocked(key, donorClock()) {
 		noDonorCacheMu.Unlock()
+		if noDonorCacheSkips.Load()%donorSFLogEvery == 0 {
+			c.logDonorPolicy()
+		}
 		return nil, nil
 	}
-	donorSFTotal.Add(1)
+	if donorSFTotal.Add(1)%donorSFLogEvery == 0 {
+		defer c.logDonorPolicy()
+	}
 	flight := donorFlights[work]
 	leader := flight == nil
 	if leader && len(donorFlights) >= donorWorkCapacity {
@@ -261,15 +300,24 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 			return flight.donor, flight.err
 		}
 	}
+	// Another target-specific flight may have published absence after admission.
+	// Recheck just before SQL, then release the owner lock for the entire query.
+	noDonorCacheMu.Lock()
+	if noDonorCacheHitLocked(key, donorClock()) {
+		close(flight.done)
+		noDonorCacheMu.Unlock()
+		return nil, nil
+	}
+	noDonorCacheMu.Unlock()
 	noDonorCacheQueries.Add(1)
-	donor, err := r.findSenderKeyDonor(ctx, key.group, key.sender, key.keyID, targetIter)
+	donor, complete, err := readDonor(ctx, r, key, targetIter)
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	}
 	noDonorCacheMu.Lock()
 	flight.donor, flight.err = donor, err
 	now := donorClock()
-	if donor == nil && err == nil && !flight.wave.invalid {
+	if donor == nil && complete && err == nil && !flight.wave.invalid {
 		if flight.wave.deadline.IsZero() {
 			flight.wave.deadline = now.Add(noDonorCacheTTL)
 			if noDonorCache.Add(key, noDonorCacheEntry{expiresAt: flight.wave.deadline}) {
@@ -288,6 +336,18 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 // access it via type-assertion.
 type senderKeyRecoveryReader interface {
 	findSenderKeyDonor(ctx context.Context, group, senderBare string, targetKeyID uint32, targetIter uint32) (*donorSenderKeyState, error)
+}
+
+type senderKeyRecoveryCompleteReader interface {
+	findSenderKeyDonorResult(context.Context, string, string, uint32, uint32) (*donorSenderKeyState, bool, error)
+}
+
+func readDonor(ctx context.Context, r senderKeyRecoveryReader, key donorQueryKey, iteration uint32) (*donorSenderKeyState, bool, error) {
+	if complete, ok := r.(senderKeyRecoveryCompleteReader); ok {
+		return complete.findSenderKeyDonorResult(ctx, key.group, key.sender, key.keyID, iteration)
+	}
+	donor, err := r.findSenderKeyDonor(ctx, key.group, key.sender, key.keyID, iteration)
+	return donor, err == nil, err
 }
 
 // donorSenderKeyState is the recipient-independent crypto state extracted from a
@@ -428,31 +488,36 @@ func scanFlatRows(rows interface {
 	Next() bool
 	Scan(dest ...any) error
 	Err() error
-}, targetKeyID, targetIter uint32, best *donorSenderKeyState) (*donorSenderKeyState, error) {
+}, targetKeyID, targetIter uint32, best *donorSenderKeyState) (*donorSenderKeyState, bool, error) {
+	complete := true
 	for rows.Next() {
 		var (
 			ourJID string
 			blob   []byte
 		)
 		if err := rows.Scan(&ourJID, &blob); err != nil {
-			return best, err
+			return best, false, err
 		}
 		if blob == nil {
+			complete = false
 			continue // NULL blob — skip (should not happen post-upgrade-19)
 		}
 
 		structure, err := store.UnpackFlat(blob)
 		if err != nil {
+			complete = false
 			// Corrupt flat blob in a donor row — skip this row, try others.
 			continue
 		}
 		if structure == nil {
+			complete = false
 			continue
 		}
 
 		// Scan each state for a matching key_id with chain_iter <= targetIter.
 		for _, st := range structure.SenderKeyStates {
 			if st == nil || st.SenderChainKey == nil {
+				complete = false
 				continue
 			}
 			if st.KeyID != targetKeyID {
@@ -489,9 +554,9 @@ func scanFlatRows(rows interface {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return best, err
+		return best, false, err
 	}
-	return best, nil
+	return best, complete, nil
 }
 
 // findSenderKeyDonor scans all rows for (group, senderBare LIKE) across every
@@ -508,23 +573,28 @@ func scanFlatRows(rows interface {
 // All donor rows are PackFlat-encoded. Decode with store.UnpackFlat.
 // Returns (nil, nil) when no qualifying donor exists.
 func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare string, targetKeyID uint32, targetIter uint32) (*donorSenderKeyState, error) {
+	donor, _, err := s.findSenderKeyDonorResult(ctx, group, senderBare, targetKeyID, targetIter)
+	return donor, err
+}
+
+func (s *SQLStore) findSenderKeyDonorResult(ctx context.Context, group, senderBare string, targetKeyID uint32, targetIter uint32) (*donorSenderKeyState, bool, error) {
 	escapedBare := senderKeyLikeEscaper.Replace(senderBare)
 
 	// Fast path: indexed scan on (chat_id, sk_keyid0).
 	// $3 = targetKeyID as int32 (sk_keyid0 is INT4).
 	fastRows, err := s.db.Query(ctx, recoveryScanQueryFast, group, escapedBare, int32(targetKeyID))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	best, err := scanFlatRows(fastRows, targetKeyID, targetIter, nil)
+	best, fastComplete, err := scanFlatRows(fastRows, targetKeyID, targetIter, nil)
 	fastRows.Close()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if best != nil {
 		// Fast path found a qualifying donor — skip the fallback scan.
-		return best, nil
+		return best, fastComplete, nil
 	}
 
 	// Fallback path: LIKE-only scan (covers multi-state donors, state[1+] KeyID match).
@@ -535,17 +605,17 @@ func (s *SQLStore) findSenderKeyDonor(ctx context.Context, group, senderBare str
 	}
 	fbRows, err := s.db.Query(ctx, recoveryScanQuery, group, escapedBare)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer fbRows.Close()
-	fbBest, err := scanFlatRows(fbRows, targetKeyID, targetIter, nil)
+	fbBest, fallbackComplete, err := scanFlatRows(fbRows, targetKeyID, targetIter, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if fbBest != nil {
 		fallbackScanDonorFound.Add(1)
 	}
-	return fbBest, nil
+	return fbBest, fastComplete && fallbackComplete, nil
 }
 
 // TryInlineRecovery is the cross-account recovery entry-point for
