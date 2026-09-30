@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -250,6 +251,13 @@ func TestSenderKeyDeviceNegativeWriteFence(t *testing.T) {
 	}
 	if entry, ok := c.deviceCache.Peek(c.deviceKey("g", "user_1")); ok && len(entry.devices) == 0 {
 		t.Fatal("late absence published")
+	}
+}
+
+func TestSenderKeyDeviceTelemetry(t *testing.T) {
+	c, _ := newTestCachedSenderKeyStore(t, 2)
+	if !reflect.ValueOf(c.deviceCache).MethodByName("Metrics").IsValid() {
+		t.Fatal("shared device cache must expose aggregate policy metrics")
 	}
 }
 
