@@ -203,10 +203,37 @@ func invalidateDonorLocked(key donorQueryKey) {
 // IDs; no global flush on unrelated keys. Invalid active waves remain until their
 // participants finish, preventing an old scan from publishing into a new wave.
 func notifyDonorKeys(universe any, group, sender string, keyIDs []uint32) {
+	observeDonorKeys(universe, group, sender, keyIDs, true)
+}
+
+// Buffered acceptance fences active scans, but keeps absence until the donor
+// query can see SQL. Unknown raw IDs only touch bounded matching resident work.
+func observeDonorKeys(universe any, group, sender string, keyIDs []uint32, committed bool) {
 	noDonorCacheMu.Lock()
 	defer noDonorCacheMu.Unlock()
+	sender = senderKeyUserBare(sender)
+	observe := func(key donorQueryKey) {
+		if committed {
+			invalidateDonorLocked(key)
+		} else if wave := donorWaves[key]; wave != nil {
+			wave.invalid = true
+		}
+	}
+	if keyIDs == nil {
+		for _, key := range noDonorCache.Keys() {
+			if key.universe == universe && key.group == group && key.sender == sender {
+				observe(key)
+			}
+		}
+		for key, wave := range donorWaves {
+			if key.universe == universe && key.group == group && key.sender == sender {
+				wave.invalid = true
+			}
+		}
+		return
+	}
 	for _, id := range keyIDs {
-		invalidateDonorLocked(donorQueryKey{universe, group, senderKeyUserBare(sender), id})
+		observe(donorQueryKey{universe, group, sender, id})
 	}
 }
 

@@ -558,6 +558,9 @@ var senderKeyLikeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 func (s *SQLStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
 	_, err := s.db.Exec(ctx, putSenderKeyQuery, s.JID, group, user, session)
+	if err == nil {
+		s.observeSenderKeyCommit(SenderKeyRow{Group: group, User: user, Blob: session})
+	}
 	return err
 }
 
@@ -583,6 +586,8 @@ type SenderKeyRow struct {
 	Group string
 	User  string
 	Blob  []byte // PackFlat-encoded sender_key bytea
+	// In-hand metadata avoids decoding every buffered ratchet write at commit.
+	keyIDs []uint32
 }
 
 // NewSenderKeyRow constructs a SenderKeyRow by encoding the libsignal
@@ -591,7 +596,55 @@ type SenderKeyRow struct {
 // fails (structure has 0 states or invalid field lengths).
 func NewSenderKeyRow(group, user string, s *groupRecord.SenderKeyStructure) SenderKeyRow {
 	blob, _ := store.PackFlat(s)
-	return SenderKeyRow{Group: group, User: user, Blob: blob}
+	return SenderKeyRow{Group: group, User: user, Blob: blob, keyIDs: senderKeyStructureIDs(s)}
+}
+
+func senderKeyStructureIDs(s *groupRecord.SenderKeyStructure) []uint32 {
+	if s == nil {
+		return nil
+	}
+	ids := make([]uint32, 0, len(s.SenderKeyStates))
+	for _, st := range s.SenderKeyStates {
+		if st != nil && !slices.Contains(ids, st.KeyID) {
+			ids = append(ids, st.KeyID)
+		}
+	}
+	return ids
+}
+
+// One universe-owned observer serves accepted pins and committed SQL rows.
+// It never holds coordination locks over SQL, flusher calls, or decoding.
+func observeSenderKeyWrite(owner *SenderKeyDeviceCache, universe any, account, group, user string, ids []uint32, committed bool) {
+	if owner != nil {
+		dk := deviceQueryKey{universe, account, group, senderKeyUserBare(user)}
+		owner.mu.Lock()
+		if f := owner.flights[dk]; f != nil {
+			f.invalid = true
+		}
+		owner.invalidations.Add(1)
+		if entry, ok := owner.Get(dk); ok {
+			owner.Add(dk, deviceCacheEntry{devices: mergeDeviceSets(entry.devices, []string{user})})
+		}
+		owner.mu.Unlock()
+	}
+	observeDonorKeys(universe, group, user, ids, committed)
+}
+
+func (s *SQLStore) observeSenderKeyCommit(row SenderKeyRow) {
+	ids := row.keyIDs
+	if ids == nil {
+		// Raw callers have no metadata. Decode outside all coordination/DB locks;
+		// malformed/legacy blobs use bounded exact group/sender invalidation.
+		ids = senderKeyBlobIDs(row.Blob)
+	}
+	observeSenderKeyWrite(s.caches.SenderKeyDevices, s.Container, s.JID, row.Group, row.User, ids, true)
+}
+
+func senderKeyBlobIDs(blob []byte) []uint32 {
+	if structure, err := store.UnpackFlat(blob); err == nil {
+		return senderKeyStructureIDs(structure)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +841,13 @@ func (s *SQLStore) PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) e
 
 		if _, err := s.db.Exec(ctx, qb.String(), args...); err != nil {
 			return err
+		}
+		// Each statement is independently committed: notify before the next Exec,
+		// including when a later chunk fails or a newer snapshot stays dirty.
+		for _, row := range chunk {
+			if row.Blob != nil {
+				s.observeSenderKeyCommit(row)
+			}
 		}
 	}
 	return nil

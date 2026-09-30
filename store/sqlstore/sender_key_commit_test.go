@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/util/dbutil"
+	"go.mau.fi/whatsmeow/store"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
@@ -151,5 +153,137 @@ func TestSenderKeyWriteFencesEmptyScan(t *testing.T) {
 	<-done
 	if hasCommitNegative(key) {
 		t.Fatal("empty scan restored absence after committed write")
+	}
+}
+
+func TestSenderKeyCommitUnknownAndSkippedRows(t *testing.T) {
+	resetNoDonorCacheForTest()
+	sq := commitTestStore(t, func([]driver.NamedValue) error { return nil })
+	keys := []donorQueryKey{
+		{sq.Container, "g", "u", 1}, {sq.Container, "g", "u", 2},
+		{sq.Container, "other", "u", 1}, {sq.Container, "g", "other", 1},
+		{sq.Container, "skip", "u", 1}, {new(Container), "g", "u", 1},
+	}
+	for _, key := range keys {
+		seedCommitNegative(key)
+	}
+	if err := sq.PutManySenderKeys(context.Background(), []SenderKeyRow{
+		{Group: "g", User: "u:1", Blob: []byte("malformed")},
+		{Group: "skip", User: "u:1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, key := range keys {
+		if got := hasCommitNegative(key); got != (i >= 2) {
+			t.Errorf("domain %d absence=%v", i, got)
+		}
+	}
+}
+
+func TestSenderKeyWritePaths(t *testing.T) {
+	for _, path := range []string{"legacy", "structure-sync", "structure-buffered", "recovery-sync", "recovery-buffered", "invalid-structure", "invalid-recovery", "sql-single"} {
+		t.Run(path, func(t *testing.T) {
+			resetNoDonorCacheForTest()
+			inner := &stubRecoveryInner{}
+			cs := newStubCachedStore(t, inner, nil)
+			buffered := path == "structure-buffered" || path == "recovery-buffered"
+			if buffered {
+				cs.SetFlusher(NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100))
+			}
+			key := donorQueryKey{inner, "g", "u", 7}
+			seedCommitNegative(key)
+			wave := &donorWave{participants: 1}
+			donorWaves[key] = wave
+			dk := cs.deviceKey("g", "u:1")
+			cs.deviceCache.Add(dk, deviceCacheEntry{expiresAt: time.Now().Add(time.Minute)})
+			structure, err := store.UnpackFlat(testBlob(7, 2))
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch path {
+			case "legacy":
+				err = cs.PutSenderKey(context.Background(), "g", "u:1", testBlob(7, 2))
+			case "structure-sync", "structure-buffered":
+				err = cs.PutSenderKeyStructure(context.Background(), "g", "u:1", structure)
+			case "recovery-sync", "recovery-buffered":
+				var installed bool
+				installed, err = cs.PutSenderKeyStructureRecovery(context.Background(), "g", "u:1", structure, 7)
+				if !installed {
+					t.Fatal("recovery did not install")
+				}
+			case "invalid-structure":
+				err = cs.PutSenderKeyStructure(context.Background(), "g", "u:1", &groupRecord.SenderKeyStructure{})
+			case "invalid-recovery":
+				_, err = cs.PutSenderKeyStructureRecovery(context.Background(), "g", "u:1", &groupRecord.SenderKeyStructure{}, 7)
+			case "sql-single":
+				sq := commitTestStore(t, func([]driver.NamedValue) error { return nil })
+				key = donorQueryKey{sq.Container, "g", "u", 7}
+				seedCommitNegative(key)
+				donorWaves[key] = wave
+				err = sq.PutSenderKey(context.Background(), "g", "u:1", testBlob(7, 2))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hasCommitNegative(key); got != buffered {
+				t.Fatalf("absence=%v, want %v", got, buffered)
+			}
+			if !wave.invalid {
+				t.Fatal("accepted write did not fence active scan")
+			}
+			if path != "sql-single" {
+				entry, ok := cs.deviceCache.Peek(dk)
+				if !ok || len(entry.devices) != 1 {
+					t.Fatalf("device negative not replaced: %+v", entry)
+				}
+			}
+		})
+	}
+}
+
+func TestSenderKeyCommitDelayedDrainKeepsNewPin(t *testing.T) {
+	cs, _ := newTestCachedSenderKeyStore(t, 16)
+	f := NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100)
+	cs.SetFlusher(f)
+	entered, release := make(chan struct{}), make(chan struct{})
+	f.SetOnDrained(func(string, string) { close(entered); <-release })
+	first, _ := store.UnpackFlat(testBlob(7, 2))
+	second, _ := store.UnpackFlat(testBlob(7, 3))
+	if err := cs.PutSenderKeyStructure(context.Background(), "g", "u:1", first); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { f.runFlush(); close(done) }()
+	<-entered
+	if err := cs.PutSenderKeyStructure(context.Background(), "g", "u:1", second); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	<-done
+	cs.cache.Purge()
+	cs.deviceCache.Purge()
+	got, err := cs.GetSenderKeyStructure(context.Background(), "g", "u:1")
+	if err != nil || got == nil || got.SenderKeyStates[0].SenderChainKey.Iteration != 3 {
+		t.Fatalf("newer pin lost after delayed drain: %+v, %v", got, err)
+	}
+	devices, err := cs.GetSenderKeyDevices(context.Background(), "g", "u")
+	if err != nil || len(devices) != 1 || f.DirtyCount() != 1 {
+		t.Fatalf("devices=%v dirty=%d err=%v", devices, f.DirtyCount(), err)
+	}
+}
+
+func TestSenderKeyCommitInlineDrainDoesNotLeavePin(t *testing.T) {
+	cs, _ := newTestCachedSenderKeyStore(t, 16)
+	f := NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100)
+	f.backpressureCap = 0
+	cs.SetFlusher(f)
+	structure, _ := store.UnpackFlat(testBlob(7, 2))
+	if err := cs.PutSenderKeyStructure(context.Background(), "g", "u:1", structure); err != nil {
+		t.Fatal(err)
+	}
+	cs.pinnedMu.Lock()
+	defer cs.pinnedMu.Unlock()
+	if len(cs.pinned) != 0 || len(cs.pinnedBlobs) != 0 || f.DirtyCount() != 0 {
+		t.Fatal("synchronous inline drain left already-committed pins")
 	}
 }

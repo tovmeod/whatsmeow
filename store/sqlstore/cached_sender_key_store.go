@@ -7,6 +7,7 @@
 package sqlstore
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"sync"
@@ -130,10 +131,14 @@ func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 	if f == nil {
 		return
 	}
-	f.SetOnDrained(func(group, user string) {
+	f.onDrainedSnapshot = func(group, user string, blob []byte) {
 		dk := c.deviceKey(group, user)
 		bk := c.key(group, user)
 		c.pinnedMu.Lock()
+		if current := c.pinnedBlobs[bk]; current != nil && !bytes.Equal(current, blob) {
+			c.pinnedMu.Unlock()
+			return // newer acceptance after snapshot removal: keep its pin
+		}
 		if ps := c.pinned[dk]; ps != nil {
 			delete(ps, user)
 			if len(ps) == 0 {
@@ -144,7 +149,7 @@ func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
 		// authoritative for this key; the pinnedBlob safety net is no longer needed.
 		delete(c.pinnedBlobs, bk)
 		c.pinnedMu.Unlock()
-	})
+	}
 }
 
 func (c *CachedSenderKeyStore) key(group, user string) string {
@@ -317,6 +322,7 @@ func (c *CachedSenderKeyStore) putSenderKeyInternal(ctx context.Context, group, 
 
 	// Update device-set index (Phase 27 logic unchanged).
 	c.updateDeviceCache(group, user)
+	c.notifySynchronousWrite(group, user, senderKeyBlobIDs(session))
 
 	return nil
 }
@@ -345,16 +351,14 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 		if sk != nil {
 			legacyBlob = sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
 		}
-		return c.inner.PutSenderKey(ctx, group, user, legacyBlob)
+		return c.putSenderKeyInternal(ctx, group, user, legacyBlob, false)
 	}
 
 	// Derive keyID/iter from the structure (0-state → (0,0)).
 	keyID, iter := extractStructMeta(s)
+	keyIDs := senderKeyStructureIDs(s)
 
 	if c.flusher != nil {
-		// Cipher write-back: enqueue flat blob to flusher (dedup + batched async drain).
-		c.flusher.Enqueue(group, user, blob, keyID, iter, false)
-
 		// Write-through []byte cache so GetSenderKey returns the fresh blob before
 		// the flusher drains (D-03: blob is PackFlat output = byte-identical to DB
 		// sender_key column value; safe to cache directly).
@@ -368,7 +372,9 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 		c.pinnedMu.Unlock()
 
 		// Update device-set index (Phase 27 logic unchanged).
-		c.updateDeviceCache(group, user)
+		c.updateDeviceCacheWithKeyIDs(group, user, keyIDs)
+		// Publish pins before enqueue can synchronously drain under backpressure.
+		c.flusher.enqueueWithKeyIDs(group, user, blob, keyID, iter, false, keyIDs)
 		return nil
 	}
 
@@ -377,7 +383,7 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 	if putMany, ok := c.inner.(interface {
 		PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error
 	}); ok {
-		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Blob: blob}}); err != nil {
+		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Blob: blob, keyIDs: keyIDs}}); err != nil {
 			return err
 		}
 	} else {
@@ -391,14 +397,8 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructure(ctx context.Context, group,
 	// Write-through []byte cache (D-03) on the synchronous fallback path.
 	c.cache.Add(c.key(group, user), copyBytes(blob))
 
-	// Phase 38.4-02: pin the blob on the synchronous fallback path too (no flusher,
-	// but the pin is harmless — onDrained will never fire so it stays until Purge/restart,
-	// which is the correct semantics for a synchronous write: DB is authoritative immediately).
-	c.pinnedMu.Lock()
-	c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
-	c.pinnedMu.Unlock()
-
 	c.updateDeviceCache(group, user)
+	c.notifySynchronousWrite(group, user, keyIDs)
 	return nil
 }
 
@@ -433,7 +433,8 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 		if sk != nil {
 			legacyBlob = sk.Serialize() // ALLOW-JSON-DRAIN-BLOB
 		}
-		return true, c.inner.PutSenderKey(ctx, group, user, legacyBlob)
+		err := c.putSenderKeyInternal(ctx, group, user, legacyBlob, false)
+		return err == nil, err
 	}
 
 	// Derive the flusher Enqueue meta from the DONOR state, not blindly from
@@ -444,6 +445,7 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 	// let the flusher's same-generation dedup silently skip the recovery blob
 	// (donor never reaching DB; re-lost on LRU eviction or restart).
 	keyID, iter := extractStructMeta(s)
+	keyIDs := senderKeyStructureIDs(s)
 	for _, st := range s.SenderKeyStates {
 		if st != nil && st.KeyID == donorKeyID && st.SenderChainKey != nil {
 			keyID, iter = st.KeyID, st.SenderChainKey.Iteration
@@ -506,8 +508,6 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 
 	// Persist: enqueue to the write-back flusher when wired, else write through.
 	if c.flusher != nil {
-		c.flusher.Enqueue(group, user, blob, keyID, iter, false)
-
 		// Write-through []byte cache so GetSenderKey returns the fresh blob before
 		// the flusher drains (D-03). Covers both StoreAccepted and StoreUncacheable —
 		// both paths reach this block (StoreRejectedStale returned early above).
@@ -518,14 +518,15 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 		c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
 		c.pinnedMu.Unlock()
 
-		c.updateDeviceCache(group, user)
+		c.updateDeviceCacheWithKeyIDs(group, user, keyIDs)
+		c.flusher.enqueueWithKeyIDs(group, user, blob, keyID, iter, false, keyIDs)
 		return true, nil
 	}
 
 	if putMany, ok := c.inner.(interface {
 		PutManySenderKeys(ctx context.Context, keys []SenderKeyRow) error
 	}); ok {
-		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Blob: blob}}); err != nil {
+		if err := putMany.PutManySenderKeys(ctx, []SenderKeyRow{{Group: group, User: user, Blob: blob, keyIDs: keyIDs}}); err != nil {
 			return false, err
 		}
 	} else {
@@ -537,13 +538,29 @@ func (c *CachedSenderKeyStore) PutSenderKeyStructureRecovery(ctx context.Context
 	// Write-through []byte cache (D-03) on the synchronous fallback path.
 	c.cache.Add(c.key(group, user), copyBytes(blob))
 
-	// Phase 38.4-02: pin the blob on recovery synchronous fallback path.
-	c.pinnedMu.Lock()
-	c.pinnedBlobs[c.key(group, user)] = copyBytes(blob)
-	c.pinnedMu.Unlock()
-
 	c.updateDeviceCache(group, user)
+	c.notifySynchronousWrite(group, user, keyIDs)
 	return true, nil
+}
+
+// SQLStore already publishes its per-statement commits. Generic synchronous
+// stores become readable on return and use their own universe notification.
+// No flusher will drain these pins, so remove only the device overlay we added.
+func (c *CachedSenderKeyStore) notifySynchronousWrite(group, user string, ids []uint32) {
+	dk := c.deviceKey(group, user)
+	if _, sql := c.inner.(*SQLStore); !sql {
+		observeSenderKeyWrite(c.deviceCache, dk.universe, c.jid, group, user, ids, true)
+	}
+	c.pinnedMu.Lock()
+	if c.pinnedBlobs[c.key(group, user)] != nil {
+		c.pinnedMu.Unlock()
+		return // a concurrent buffered write still needs its pin
+	}
+	delete(c.pinned[dk], user)
+	if len(c.pinned[dk]) == 0 {
+		delete(c.pinned, dk)
+	}
+	c.pinnedMu.Unlock()
 }
 
 // deviceKey keeps account/group/sender boundaries separate and does not collapse
@@ -569,6 +586,10 @@ func (c *CachedSenderKeyStore) pinnedDevices(dk deviceQueryKey) []string {
 // updateDeviceCache fences readers and replaces an existing empty entry before
 // an asynchronous SQL drain. Copy ownership is preserved for every merge.
 func (c *CachedSenderKeyStore) updateDeviceCache(group, user string) {
+	c.updateDeviceCacheWithKeyIDs(group, user, []uint32{})
+}
+
+func (c *CachedSenderKeyStore) updateDeviceCacheWithKeyIDs(group, user string, keyIDs []uint32) {
 	dk := c.deviceKey(group, user)
 	c.pinnedMu.Lock()
 	if c.pinned[dk] == nil {
@@ -576,16 +597,7 @@ func (c *CachedSenderKeyStore) updateDeviceCache(group, user string) {
 	}
 	c.pinned[dk][user] = struct{}{}
 	c.pinnedMu.Unlock()
-	owner := c.deviceCache
-	owner.mu.Lock()
-	defer owner.mu.Unlock()
-	if f := owner.flights[dk]; f != nil {
-		f.invalid = true
-	}
-	owner.invalidations.Add(1)
-	if entry, ok := owner.Get(dk); ok {
-		owner.Add(dk, deviceCacheEntry{devices: mergeDeviceSets(entry.devices, []string{user})})
-	}
+	observeSenderKeyWrite(c.deviceCache, dk.universe, c.jid, group, user, keyIDs, false)
 }
 
 func validDeviceResult(devices []string, sender string) bool {
