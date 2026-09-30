@@ -627,7 +627,9 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 
 // TestInlineDecryptIterationSafeRecovery proves the production recovery path
 // with real sender-key ciphertext: a donor at iteration 10 cannot recover C's
-// target-5 message, but that negative cannot suppress recovery of target 10.
+// target-5 message. Phase 38.10 intentionally suppresses target 10 until the
+// fixed negative expires or a readable write invalidates it. This historical
+// immediate-recovery assertion is the RED fixture for the new outcome cases.
 //
 // B advances by decrypting message 9, which leaves real skipped-key state for
 // messages 0 through 8. C starts with a distinct, older Alice key state. After
