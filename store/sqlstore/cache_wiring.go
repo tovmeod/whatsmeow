@@ -701,14 +701,8 @@ func closeSignalCaches(c *Container) {
 	}
 	c.caches.senderKeyFlushersMu.Unlock()
 	for _, f := range skFlushers {
+		f.retireOwner()
 		f.Stop()
-		f.snapshotMu.Lock()
-		if f.owner != nil {
-			f.owner.retire(nil)
-			f.owner = nil
-		}
-		f.onDrainedSnapshot = nil
-		f.snapshotMu.Unlock()
 	}
 	c.caches.senderKeyFlushersMu.Lock()
 	clear(c.caches.senderKeyFlusherMap)
@@ -755,13 +749,7 @@ func stopAccountSignalCaches(c *Container, jid string) {
 	delete(c.caches.senderKeyFlusherMap, jid)
 	c.caches.senderKeyFlushersMu.Unlock()
 	if f != nil {
-		f.snapshotMu.Lock()
-		if f.owner != nil {
-			f.owner.retire(nil)
-			f.owner = nil
-		}
-		f.onDrainedSnapshot = nil
-		f.snapshotMu.Unlock()
+		f.retireOwner()
 		f.Stop()
 	}
 	c.caches.sessionFlushersMu.Lock()

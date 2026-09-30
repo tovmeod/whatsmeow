@@ -161,6 +161,46 @@ func (f *SenderKeyFlusher) notifyDrained(row SenderKeyRow) {
 	}
 }
 
+// lockOwner takes the current owner's writeMu BEFORE snapshotMu. An inline
+// flush holds writeMu until its snapshot callback completes, so reversing this
+// order would deadlock retirement. Recheck after locking: another attachment
+// can replace the owner while we wait for its writer.
+func (f *SenderKeyFlusher) lockOwner() *CachedSenderKeyStore {
+	for {
+		f.snapshotMu.RLock()
+		owner := f.owner
+		f.snapshotMu.RUnlock()
+		if owner != nil {
+			owner.writeMu.Lock()
+		}
+		f.snapshotMu.Lock()
+		if f.owner == owner {
+			return owner
+		}
+		f.snapshotMu.Unlock()
+		if owner != nil {
+			owner.writeMu.Unlock()
+		}
+	}
+}
+
+func (f *SenderKeyFlusher) unlockOwner(owner *CachedSenderKeyStore) {
+	f.snapshotMu.Unlock()
+	if owner != nil {
+		owner.writeMu.Unlock()
+	}
+}
+
+func (f *SenderKeyFlusher) retireOwner() {
+	owner := f.lockOwner()
+	defer f.unlockOwner(owner)
+	if owner != nil {
+		owner.retireLocked(nil)
+		f.owner = nil
+	}
+	f.onDrainedSnapshot = nil
+}
+
 // crossesBoundary returns true when iter crosses an N-boundary relative to
 // lastFlushed. Design §5: floor(iter/N) > floor(lastFlushed/N).
 func (f *SenderKeyFlusher) crossesBoundary(iter, lastFlushed uint32) bool {

@@ -102,6 +102,12 @@ var errSenderKeyStoreRetired = errors.New("sender-key store owner retired")
 func (c *CachedSenderKeyStore) retire(next *CachedSenderKeyStore) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.retireLocked(next)
+}
+
+// retireLocked requires writeMu. Flusher lifecycle callers also hold snapshotMu
+// after writeMu, so inline drains can finish before overlay ownership changes.
+func (c *CachedSenderKeyStore) retireLocked(next *CachedSenderKeyStore) {
 	if c.deviceCache != nil {
 		c.deviceCache.mu.Lock()
 		defer c.deviceCache.mu.Unlock()
@@ -179,14 +185,15 @@ func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.
 // inside the callback AFTER flusher.mu is released (Task 1 ensures the hook
 // fires outside flusher.mu). The callback does NOT call any flusher method.
 func (c *CachedSenderKeyStore) SetFlusher(f *SenderKeyFlusher) {
-	c.flusher = f
 	if f == nil {
+		c.flusher = nil
 		return
 	}
-	f.snapshotMu.Lock()
-	defer f.snapshotMu.Unlock()
-	if previous := f.owner; previous != nil && previous != c {
-		previous.retire(c)
+	previous := f.lockOwner()
+	defer f.unlockOwner(previous)
+	c.flusher = f
+	if previous != nil && previous != c {
+		previous.retireLocked(c)
 		clearDonorUniverse(c.deviceKey("", "").universe)
 	}
 	f.owner = c

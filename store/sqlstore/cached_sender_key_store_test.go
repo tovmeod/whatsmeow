@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -49,6 +50,142 @@ func TestSenderKeyReinitialization(t *testing.T) {
 	if len(fresh.pinnedDevices(dk)) != 0 || len(old.pinned) != 0 || len(old.pinnedBlobs) != 0 {
 		t.Fatal("drain callback or retired overlay cleanup failed")
 	}
+}
+
+// Pause after a successful inline SQL flush has removed the dirty row, while
+// its writer still owns writeMu and must acquire snapshotMu to unpin.
+func TestSenderKeyInlineFlushRetirement(t *testing.T) {
+	for _, action := range []string{"attach", "delete", "close"} {
+		t.Run(action, func(t *testing.T) {
+			old, inner := newTestCachedSenderKeyStore(t, 16)
+			f := NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100)
+			old.SetFlusher(f)
+			structure, _ := store.UnpackFlat(testBlob(7, 2))
+			if err := old.PutSenderKeyStructure(context.Background(), "g", "sender:2", structure); err != nil {
+				t.Fatal(err)
+			}
+			entered, release := make(chan struct{}), make(chan struct{})
+			f.SetOnDrained(func(_, user string) {
+				if user == "sender:1" {
+					close(entered)
+					<-release
+				}
+			})
+			f.backpressureCap = 0
+			writeDone := make(chan error, 1)
+			go func() { writeDone <- old.PutSenderKeyStructure(context.Background(), "g", "sender:1", structure) }()
+			<-entered
+			fresh := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
+			container := &Container{log: waLog.Noop}
+			container.caches.senderKeyFlusherMap = map[string]*SenderKeyFlusher{old.jid: f}
+			retireDone := make(chan struct{})
+			go func() {
+				defer close(retireDone)
+				switch action {
+				case "attach":
+					fresh.SetFlusher(f)
+				case "delete":
+					stopAccountSignalCaches(container, old.jid)
+				case "close":
+					closeSignalCaches(container)
+				}
+			}()
+			awaitSenderKeyRetirementWait(t)
+			close(release)
+			select {
+			case err := <-writeDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("inline writer deadlocked with owner retirement")
+			}
+			select {
+			case <-retireDone:
+			case <-time.After(time.Second):
+				t.Fatal("owner retirement did not finish")
+			}
+			if !old.retired.Load() {
+				t.Fatal("old owner remains writable")
+			}
+			if action == "attach" {
+				pins := fresh.pinnedDevices(fresh.deviceKey("g", "sender"))
+				if len(pins) != 1 || pins[0] != "sender:2" {
+					t.Fatalf("replacement lost pending pin or retained drained pin: %v", pins)
+				}
+				fresh.cache.Purge()
+				if got, err := fresh.GetSenderKeyStructure(context.Background(), "g", "sender:2"); err != nil || got == nil {
+					t.Fatalf("replacement lost pending blob: %v, %v", got, err)
+				}
+				f.Stop()
+			}
+		})
+	}
+}
+
+func awaitSenderKeyRetirementWait(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		buf := make([]byte, 128<<10)
+		n := runtime.Stack(buf, true)
+		stack := string(buf[:n])
+		if strings.Contains(stack, "(*CachedSenderKeyStore).retire(") || strings.Contains(stack, "(*SenderKeyFlusher).lockOwner(") {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatal("lifecycle did not reach its owner-write barrier")
+}
+
+func TestSenderKeyConcurrentOwnerReplacement(t *testing.T) {
+	old, inner := newTestCachedSenderKeyStore(t, 16)
+	f := NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100)
+	old.SetFlusher(f)
+	structure, _ := store.UnpackFlat(testBlob(7, 2))
+	if err := old.PutSenderKeyStructure(context.Background(), "g", "sender:1", structure); err != nil {
+		t.Fatal(err)
+	}
+	first := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
+	second := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
+	old.writeMu.Lock()
+	done := make(chan struct{}, 2)
+	for _, next := range []*CachedSenderKeyStore{first, second} {
+		go func() { next.SetFlusher(f); done <- struct{}{} }()
+	}
+	// Both attachments have selected the old owner and are waiting for its
+	// writer. The loser must recheck instead of transferring the old empty map.
+	deadline := time.Now().Add(time.Second)
+	for {
+		buf := make([]byte, 128<<10)
+		n := runtime.Stack(buf, true)
+		if strings.Count(string(buf[:n]), "(*SenderKeyFlusher).lockOwner(") >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			old.writeMu.Unlock()
+			t.Fatal("attachments did not reach the write barrier")
+		}
+		runtime.Gosched()
+	}
+	old.writeMu.Unlock()
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent attachment deadlocked")
+		}
+	}
+	f.snapshotMu.RLock()
+	owner := f.owner
+	f.snapshotMu.RUnlock()
+	if owner.retired.Load() || !containsString(owner.pinnedDevices(owner.deviceKey("g", "sender")), "sender:1") {
+		t.Fatal("concurrent replacement lost the live owner or pending overlay")
+	}
+	if !old.retired.Load() || first.retired.Load() == second.retired.Load() {
+		t.Fatal("replacement did not retire exactly the displaced owners")
+	}
+	f.Stop()
 }
 
 func TestSenderKeyTeardownDonorFlights(t *testing.T) {
