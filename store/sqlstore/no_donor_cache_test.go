@@ -187,7 +187,7 @@ func TestNoDonorCacheFoundDonorNotCached(t *testing.T) {
 	}
 }
 
-func TestNoDonorCacheIterationBound(t *testing.T) {
+func TestNoDonorCacheFixedTTLAcrossIterations(t *testing.T) {
 	resetNoDonorCacheForTest()
 	t.Cleanup(resetNoDonorCacheForTest)
 
@@ -229,11 +229,11 @@ func TestNoDonorCacheIterationBound(t *testing.T) {
 	if higherErr != nil {
 		t.Fatalf("target-10 call: %v", higherErr)
 	}
-	if !higherOK {
-		t.Error("target-10 call: want ok=true; target-5 negative must not suppress its eligible donor")
+	if higherOK {
+		t.Error("target-10 call: want ok=false during the fixed target-5 absence window")
 	}
-	if got := stub.findCalls.Load(); got != 2 {
-		t.Errorf("findSenderKeyDonor calls = %d, want 2 because target-10 is outside target-5 coverage", got)
+	if got := stub.findCalls.Load(); got != 1 {
+		t.Errorf("findSenderKeyDonor calls = %d, want 1 across advancing iterations", got)
 	}
 }
 
