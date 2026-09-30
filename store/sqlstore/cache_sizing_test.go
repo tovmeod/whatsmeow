@@ -44,6 +44,7 @@ import (
 //	headroom = 1 - (1942+228)/3200 = 0.322 (32.2% >= 30% OK)
 func TestCacheMemoryBudget(t *testing.T) {
 	const N = 10_000
+	t.Log("local heap/objects and post-churn GC observed; capacity figures are extrapolated; CPU=unmeasured production-runtime=unmeasured")
 
 	// Per-entry fill sizes calibrated to reproduce the pprof-measured per-entry heap
 	// cost when the LRU measureHeapDelta function runs.

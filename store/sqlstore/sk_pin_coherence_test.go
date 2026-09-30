@@ -10,7 +10,7 @@
 //   - EvictThenEnum: device still visible after LRU eviction while write is pending
 //   - DrainUnpins: onDrained fires after Drain, unpin removes pinned entry
 //   - ConcurrentWrites: concurrent writes for different devices both survive in pinned
-//   - EmptyNotCached: empty device-set from inner is NOT cached
+//   - EmptyFixedTTL: successful empty device-set is cached with fixed expiry
 package sqlstore
 
 import (
