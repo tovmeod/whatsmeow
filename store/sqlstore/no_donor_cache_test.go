@@ -24,6 +24,7 @@ package sqlstore
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -41,14 +42,6 @@ func resetNoDonorCacheWithCapacityForTest(capacity int) {
 	donorFlights = make(map[donorWorkKey]*donorFlight)
 	donorWorkCapacity = noDonorCacheCapacity
 	donorClock = time.Now
-	noDonorCacheSkips.Store(0)
-	noDonorCacheEvictions.Store(0)
-	noDonorCacheQueries.Store(0)
-	noDonorCacheExpired.Store(0)
-	noDonorCacheInvalidations.Store(0)
-	noDonorCacheOverflow.Store(0)
-	donorSFTotal.Store(0)
-	donorSFShared.Store(0)
 }
 
 // backdateNoDonorCache overwrites the stored time for key with a time that is
@@ -77,7 +70,7 @@ func TestNoDonorCacheHitSkipsScan(t *testing.T) {
 
 	// Stub returns nil donor (no-donor scenario).
 	stub := &stubRecoveryInner{donor: nil}
-	cs := newStubCachedStore(t, stub, nil)
+	cs := newStubCachedStore(t, stub)
 
 	ctx := context.Background()
 
@@ -120,7 +113,7 @@ func TestNoDonorCacheTTLExpiryRescans(t *testing.T) {
 	)
 
 	stub := &stubRecoveryInner{donor: nil}
-	cs := newStubCachedStore(t, stub, nil)
+	cs := newStubCachedStore(t, stub)
 
 	ctx := context.Background()
 
@@ -162,7 +155,7 @@ func TestNoDonorCacheFoundDonorNotCached(t *testing.T) {
 
 	// Stub returns a valid donor.
 	stub := &stubRecoveryInner{donor: stubDonor(keyID, 10)}
-	cs := newStubCachedStore(t, stub, nil)
+	cs := newStubCachedStore(t, stub)
 
 	ctx := context.Background()
 
@@ -216,7 +209,7 @@ func TestNoDonorCacheFixedTTLAcrossIterations(t *testing.T) {
 			return nil
 		},
 	}
-	cs := newStubCachedStore(t, stub, nil)
+	cs := newStubCachedStore(t, stub)
 
 	_, lowerOK, lowerErr := cs.TryInlineRecovery(context.Background(), group, targetID, senderBare, keyID, 5)
 	if lowerErr != nil {
@@ -263,8 +256,8 @@ func TestNoDonorCacheStoreAndTupleIdentity(t *testing.T) {
 	resetNoDonorCacheForTest()
 	t.Cleanup(resetNoDonorCacheForTest)
 	stub := &stubRecoveryInner{}
-	c := newStubCachedStore(t, stub, nil)
-	otherRecipient := newStubCachedStore(t, stub, nil)
+	c := newStubCachedStore(t, stub)
+	otherRecipient := newStubCachedStore(t, stub)
 	otherRecipient.jid = "other-recipient"
 	ctx := context.Background()
 	_, _, _ = c.TryInlineRecovery(ctx, "g|x", "s_1:0", "s_1", 1, 5)
@@ -284,7 +277,7 @@ func TestNoDonorCacheStoreAndTupleIdentity(t *testing.T) {
 		t.Fatalf("distinct tuple scans=%d want 5", stub.findCalls.Load())
 	}
 	other := &stubRecoveryInner{}
-	secondStore := newStubCachedStore(t, other, nil)
+	secondStore := newStubCachedStore(t, other)
 	_, _, _ = secondStore.TryInlineRecovery(ctx, "g|x", "s_1:0", "s_1", 1, 5)
 	if other.findCalls.Load() != 1 {
 		t.Fatal("second store borrowed absence")
@@ -307,7 +300,7 @@ func TestNoDonorCacheEvictionRescans(t *testing.T) {
 	t.Cleanup(resetNoDonorCacheForTest)
 
 	stub := &stubRecoveryInner{}
-	cs := newStubCachedStore(t, stub, nil)
+	cs := newStubCachedStore(t, stub)
 	const (
 		senderBare = "55512340005_1"
 		targetID   = senderBare + ":0"
@@ -323,9 +316,6 @@ func TestNoDonorCacheEvictionRescans(t *testing.T) {
 			t.Errorf("insert %s: want ok=false for no donor", group)
 		}
 	}
-	if got := noDonorCacheEvictions.Load(); got == 0 {
-		t.Error("want a bounded-cache eviction after inserting three entries into capacity two")
-	}
 
 	_, ok, err := cs.TryInlineRecovery(context.Background(), "evict-a@g.us", targetID, senderBare, keyID, 10)
 	if err != nil {
@@ -339,32 +329,49 @@ func TestNoDonorCacheEvictionRescans(t *testing.T) {
 	}
 }
 
-func TestNoDonorCacheCapacityAndTelemetry(t *testing.T) {
+func TestNoDonorCacheCapacityExpiryAndInvalidation(t *testing.T) {
 	resetNoDonorCacheForTest()
 	t.Cleanup(resetNoDonorCacheForTest)
 	stub := &stubRecoveryInner{}
-	c := newStubCachedStore(t, stub, nil)
+	c := newStubCachedStore(t, stub)
 	now := time.Now()
 	donorClock = func() time.Time { return now }
 	for i := uint32(0); i <= noDonorCacheCapacity; i++ {
 		_, _, _ = c.TryInlineRecovery(context.Background(), "capacity", "s:0", "s", i, 5)
 	}
-	if noDonorCache.Len() != noDonorCacheCapacity || noDonorCacheEvictions.Load() != 1 {
+	if noDonorCache.Len() != noDonorCacheCapacity {
 		t.Fatal("negative LRU exceeded its unchanged cap")
 	}
 	key := uint32(noDonorCacheCapacity)
 	_, _, _ = c.TryInlineRecovery(context.Background(), "capacity", "s:0", "s", key, 10)
-	if noDonorCacheSkips.Load() != 1 || noDonorCacheQueries.Load() != noDonorCacheCapacity+1 {
-		t.Fatal("hit/query totals incorrect")
+	if stub.findCalls.Load() != noDonorCacheCapacity+1 {
+		t.Fatal("live negative did not suppress another donor query")
 	}
 	now = now.Add(noDonorCacheTTL)
 	_, _, _ = c.TryInlineRecovery(context.Background(), "capacity", "s:0", "s", key, 20)
-	if noDonorCacheExpired.Load() != 1 || noDonorCacheQueries.Load() != noDonorCacheCapacity+2 {
-		t.Fatal("expiry/query totals incorrect")
+	if stub.findCalls.Load() != noDonorCacheCapacity+2 {
+		t.Fatal("expired negative did not allow another donor query")
 	}
 	notifyDonorKeys(stub, "capacity", "s", []uint32{key})
-	if noDonorCacheInvalidations.Load() != 1 {
-		t.Fatal("invalidation total incorrect")
+	if getNoDonorCacheEntry(c.donorKey("capacity", "s", key), 0, now) {
+		t.Fatal("observable write left a live negative")
 	}
 	assertDonorIdle(t)
+}
+
+// Cache inspection and reset helpers are compiled only into tests.
+func getNoDonorCacheEntry(key donorQueryKey, _ uint32, now time.Time) bool {
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+	return noDonorCacheHitLocked(key, now)
+}
+
+func removeNoDonorCacheEntry(key string) {
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+	for _, k := range noDonorCache.Keys() {
+		if k.group+"|"+k.sender+"|"+strconv.FormatUint(uint64(k.keyID), 10) == key {
+			invalidateDonorLocked(k)
+		}
+	}
 }

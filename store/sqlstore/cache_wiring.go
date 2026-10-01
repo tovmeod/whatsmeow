@@ -16,7 +16,6 @@ package sqlstore
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"strings"
 	"sync"
@@ -24,11 +23,9 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
 	waLog "go.mau.fi/whatsmeow/util/log"
-	"go.mau.fi/whatsmeow/util/walltime"
 )
 
 // Shared LRU capacities for the signal-store caches. Resolved once at package
@@ -152,83 +149,18 @@ type deviceQueryFlight struct {
 // under mu, and every writer releases pinnedMu before taking mu.
 type SenderKeyDeviceCache struct {
 	*lru.Cache[deviceQueryKey, deviceCacheEntry]
-	mu                                                                                 sync.Mutex
-	flights                                                                            map[deviceQueryKey]*deviceQueryFlight
-	capacity                                                                           int
-	now                                                                                func() time.Time
-	counterEpoch                                                                       string
-	positiveHits, negativeHits, queries, expiries, invalidations, evictions, overflows atomic.Uint64
+	mu       sync.Mutex
+	flights  map[deviceQueryKey]*deviceQueryFlight
+	capacity int
+	now      func() time.Time
 }
 
-// DeviceCacheMetrics contains aggregate totals only: no identity or key labels.
-type DeviceCacheMetrics struct {
-	PositiveHits  uint64 `json:"positive_hits"`
-	NegativeHits  uint64 `json:"empty_hits"`
-	Queries       uint64 `json:"queries"`
-	Expiries      uint64 `json:"expiries"`
-	Invalidations uint64 `json:"invalidations"`
-	Evictions     uint64 `json:"evictions"`
-	Overflows     uint64 `json:"overflows"`
-	Occupancy     int    `json:"occupancy"`
-	Capacity      int    `json:"capacity"`
-}
-
-func (c *SenderKeyDeviceCache) Metrics() DeviceCacheMetrics {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return DeviceCacheMetrics{
-		PositiveHits: c.positiveHits.Load(), NegativeHits: c.negativeHits.Load(), Queries: c.queries.Load(),
-		Expiries: c.expiries.Load(), Invalidations: c.invalidations.Load(), Evictions: c.evictions.Load(), Overflows: c.overflows.Load(),
-		Occupancy: c.Len(), Capacity: c.capacity,
-	}
-}
-
-// A nil metrics payload omits numeric fields: an absent owner is not supported
-// zero activity. Epochs belong to their counter owners, not the enclosing view.
-type DeviceCachePolicyStats struct {
-	CounterEpoch string `json:"counter_epoch,omitempty"`
-	Availability string `json:"availability"`
-	*DeviceCacheMetrics
-}
-
-type SenderKeyPolicyStats struct {
-	DeviceCache DeviceCachePolicyStats `json:"device_cache"`
-	DonorCache  DonorCachePolicyStats  `json:"donor_cache"`
-}
-
-// SenderKeyPolicySnapshot exports aggregate policy evidence only. Donor totals
-// are process-wide (across SQL universes); device totals belong to this shared
-// Container cache. Neither channel includes session writes, identities or SQL.
-// This read does not expire entries, change LRU order or reset counters.
-func (c *Container) SenderKeyPolicySnapshot() SenderKeyPolicyStats {
-	result := SenderKeyPolicyStats{
-		DeviceCache: DeviceCachePolicyStats{Availability: "MISSING"},
-		DonorCache:  DonorCacheSnapshot(),
-	}
-	if c != nil && c.caches.SenderKeyDevices != nil {
-		owner := c.caches.SenderKeyDevices
-		metrics := owner.Metrics()
-		result.DeviceCache = DeviceCachePolicyStats{CounterEpoch: owner.counterEpoch, Availability: "available", DeviceCacheMetrics: &metrics}
-	}
-	return result
-}
-
-func (c *SenderKeyDeviceCache) Add(key deviceQueryKey, entry deviceCacheEntry) bool {
-	evicted := c.Cache.Add(key, entry)
-	if evicted {
-		c.evictions.Add(1)
-	}
-	return evicted
-}
-
-// NewSenderKeyDeviceCache provides one typed shared owner to external tests
-// and Container wiring. It creates no timer or worker goroutine.
 func NewSenderKeyDeviceCache(capacity int) (*SenderKeyDeviceCache, error) {
 	cache, err := lru.New[deviceQueryKey, deviceCacheEntry](capacity)
 	if err != nil {
 		return nil, err
 	}
-	return &SenderKeyDeviceCache{Cache: cache, flights: make(map[deviceQueryKey]*deviceQueryFlight), capacity: capacity, now: time.Now, counterEpoch: rand.Text()}, nil
+	return &SenderKeyDeviceCache{Cache: cache, flights: make(map[deviceQueryKey]*deviceQueryFlight), capacity: capacity, now: time.Now}, nil
 }
 
 // sessionSecondaryIndex is a process-shared secondary index for the Session
@@ -461,12 +393,6 @@ type signalCaches struct {
 	Session   *lru.Cache[string, []byte]
 	Identity  *lru.Cache[string, *[32]byte]
 	SenderKey *lru.Cache[string, []byte]
-	// Phase 29 D-01: process-global singleflight.Group for findSenderKeyDonor.
-	// Coalesces concurrent cross-account donor queries for the same
-	// (group, senderBare, keyID) so N accounts missing the same key run exactly
-	// one donor DB scan. Zero value is ready — no New() call needed.
-	// Passed by pointer to each CachedSenderKeyStore so all accounts share one Group.
-	DonorSF singleflight.Group
 	// kavtov-fork: Phase 27 — device-set index for the device-tolerant group
 	// sender-key lookup. Keyed jid|group|userBare → the device-qualified
 	// sender_id list. Lets GetSenderKeyDevices be answered from cache (0 DB
@@ -695,7 +621,7 @@ func attachCachedStores(c *Container, device *store.Device, innerStore *SQLStore
 	// re-wiring (same JID, same shared db; its dirty-set persists). Only the
 	// first attach for a JID constructs + Start()s it. Check+create under the
 	// mutex so concurrent saves for the same JID can't both create one.
-	senderKeyStore := NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices, &c.caches.DonorSF)
+	senderKeyStore := NewCachedSenderKeyStore(innerStore, jid, c.caches.SenderKey, c.caches.SenderKeyDevices)
 	// WR-02: same post-close guard as the session flusher block above —
 	// never create or hand out a flusher after closeSignalCaches snapshotted
 	// and stopped them; nil flusher = write-through fallback.
@@ -867,10 +793,6 @@ func (c *Container) emitMetricsLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		// Phase 17.5.1-04: decrypt_wall p50/p95/p99/count appended so operators
-		// can correlate cache hit-rate trends with end-to-end decrypt latency
-		// from a single journalctl log line. Quantile estimates are approximate
-		// (bucket-upper-bound resolution); zero-sample histogram formats as 0s.
 		c.log.Infof("%s", formatCacheMetrics(c))
 	}
 }
@@ -911,20 +833,15 @@ func formatCacheMetrics(c *Container) string {
 	// attack/abuse signature is a single address rotating repeatedly).
 	deviceBlock := "sk_devices={not_wired}"
 	if owner := c.caches.SenderKeyDevices; owner != nil {
-		m := owner.Metrics()
-		deviceBlock = fmt.Sprintf("sk_devices={len=%d, cap=%d, positive_hit=%d, negative_hit=%d, query=%d, expiry=%d, invalidation=%d, eviction=%d, overflow=%d}", owner.Len(), owner.capacity, m.PositiveHits, m.NegativeHits, m.Queries, m.Expiries, m.Invalidations, m.Evictions, m.Overflows)
+		deviceBlock = fmt.Sprintf("sk_devices={len=%d, cap=%d}", owner.Len(), owner.capacity)
 	}
 	return fmt.Sprintf(
-		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d, identity_changed=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s %s decrypt_wall={p50=%s, p95=%s, p99=%s, count=%d}",
+		"Cache metrics: sessions={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} identities={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d, identity_changed=%d} sender_keys={len=%d, cap=%d, evictions=%d, capacity_evictions=%d, explicit_removes=%d} %s %s",
 		c.caches.Session.Len(), signalSessionCacheCap, sessEvic, sessCap, sessExp,
 		c.caches.Identity.Len(), signalIdentityCacheCap, idntEvic, idntCap, idntExp, identityChangedTotal.Load(),
 		c.caches.SenderKey.Len(), signalSenderKeyCacheCap, sndkEvic, sndkCap, sndkExp,
 		msgSecBlock,
 		deviceBlock,
-		walltime.DecryptHistogram.Quantile(0.5),
-		walltime.DecryptHistogram.Quantile(0.95),
-		walltime.DecryptHistogram.Quantile(0.99),
-		walltime.DecryptHistogram.Count(),
 	)
 }
 

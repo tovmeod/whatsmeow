@@ -189,26 +189,12 @@ type Client struct {
 	recentMessagesPtr  int
 	recentMessagesLock sync.RWMutex
 
-	// kavtov-fork: P2a group sender-key convergence instrument. Bounded in-memory set of
-	// recently-FAILED group decrypt tuples, keyed by the inbound sender's device-qualified
-	// signal address + group JID. Populated on the total-miss path (decryptGroupSenderKey
-	// returning ErrNoSenderKeyForUser); when a later message from the SAME inbound tuple later
-	// decrypts via the KEY path we emit ONE INFO SENDER_KEY_CONVERGED and drop the entry. This is
-	// the only honest convergence signal: it distinguishes genuine group-key recovery from PDO
-	// content-recovery (which lands content with the key still missing). Same ring-buffer idiom as
-	// recentMessages, but dedups on add (tuples repeat heavily under the failure load) and is
-	// sized to the distinct-failing-tuple working set. See debug no-sender-key-recurring ch6 (P2a).
+	// Bounded failed tuples force fresh SKDM processing despite dedup state.
+	// Cleared only after successful key-path decrypt; keyed by inbound device/group.
 	failedSenderKeyTuples     map[failedSenderKeyTuple]struct{}
 	failedSenderKeyTuplesList [failedSenderKeyTuplesSize]failedSenderKeyTuple
 	failedSenderKeyTuplesPtr  int
 	failedSenderKeyTuplesLock sync.Mutex
-
-	// Aggregate-only exact-message outcomes. The nonce separates Client/store
-	// lifetimes, including replacements using the same account JID. Lazy init
-	// keeps bare test clients safe; bookkeeping never holds a lock across crypto.
-	senderKeyOutcomeNonce [32]byte
-	senderKeyOutcomes     *senderKeyOutcomeTracker
-	senderKeyOutcomesLock sync.Mutex
 
 	// kavtov-fork (D-12): per-collection consecutive ErrMismatchingLTHash failure counter.
 	// When the same collection name fails N times in a row, handleAppStateNotification triggers
@@ -240,20 +226,9 @@ type Client struct {
 	skdmInstalledPtr  int
 	skdmInstalledLock sync.Mutex
 
-	// kavtov-fork (55.1-08, D-11 corrected): per-(sender,group) SKDM parse-fail dedup registry. An
-	// SKDM that fails to parse (55.1-INVESTIGATION-skdm.md: two @lid devices emitting a non-conformant
-	// 32-byte payload -- proven external format, not a fixable libsignal-version gap) stays VISIBLE
-	// and FULLY COUNTED, but re-announcing the identical, already-diagnosed failure as a fresh Error
-	// on every single message forever is spam, not vigilance. First sighting per (sender,group) emits
-	// the full Error diagnostic; every repeat only increments the per-pair count and the package-wide
-	// skdmParseFailTotal (message.go, folded into the periodic SKDM_DEDUP line). Bounded at
-	// skdmParseFailPairsSize; unlike skdmInstalled this is NOT a ring -- on overflow a brand-new pair
-	// is counted (skdmParseFailOverflow) but does not get its own first-occurrence Error, since
-	// today's working set is two senders and the bound exists only to guard a future storm of pairs.
-	skdmParseFailSeen     map[skdmParseFailKey]struct{}
-	skdmParseFailCounts   map[skdmParseFailKey]uint64
-	skdmParseFailOverflow uint64
-	skdmParseFailLock     sync.Mutex
+	// Bound repeated malformed-SKDM error logs without retaining payloads.
+	skdmParseFailSeen map[skdmParseFailKey]struct{}
+	skdmParseFailLock sync.Mutex
 
 	// kavtov-fork (55.1-07, Task 3): per-sender STALE_PREKEY dedup registry. The fresh-prekey retry
 	// (sendRetryReceipt with forceIncludeIdentity, retry.go:1036-1053) is the verified real recovery
@@ -378,21 +353,20 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		Transport: (http.DefaultTransport.(*http.Transport)).Clone(),
 	}
 	cli := &Client{
-		senderKeyOutcomeNonce: newSenderKeyOutcomeNonce(),
-		mediaHTTP:             ptr.Clone(baseHTTPClient),
-		websocketHTTP:         ptr.Clone(baseHTTPClient),
-		preLoginHTTP:          ptr.Clone(baseHTTPClient),
-		Store:                 deviceStore,
-		Log:                   log,
-		recvLog:               log.Sub("Recv"),
-		sendLog:               log.Sub("Send"),
-		uniqueID:              fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
-		responseWaiters:       make(map[string]chan<- *waBinary.Node),
-		eventHandlers:         make([]wrappedEventHandler, 0, 1),
-		handlerQueue:          make(chan *waBinary.Node, handlerQueueSize),
-		appStateProc:          appstate.NewProcessor(deviceStore, log.Sub("AppState")),
-		socketWait:            make(chan struct{}),
-		expectedDisconnect:    exsync.NewEvent(),
+		mediaHTTP:          ptr.Clone(baseHTTPClient),
+		websocketHTTP:      ptr.Clone(baseHTTPClient),
+		preLoginHTTP:       ptr.Clone(baseHTTPClient),
+		Store:              deviceStore,
+		Log:                log,
+		recvLog:            log.Sub("Recv"),
+		sendLog:            log.Sub("Send"),
+		uniqueID:           fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
+		responseWaiters:    make(map[string]chan<- *waBinary.Node),
+		eventHandlers:      make([]wrappedEventHandler, 0, 1),
+		handlerQueue:       make(chan *waBinary.Node, handlerQueueSize),
+		appStateProc:       appstate.NewProcessor(deviceStore, log.Sub("AppState")),
+		socketWait:         make(chan struct{}),
+		expectedDisconnect: exsync.NewEvent(),
 
 		incomingRetryRequestCounter: make(map[incomingRetryKey]int),
 
@@ -406,7 +380,6 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		failedSenderKeyTuples:    make(map[failedSenderKeyTuple]struct{}, failedSenderKeyTuplesSize),
 		skdmInstalled:            make(map[skdmInstalledKey]uint32, skdmInstalledSize),
 		skdmParseFailSeen:        make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize),
-		skdmParseFailCounts:      make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize),
 		appStateSyncFailures:     make(map[appstate.WAPatchName]int),
 		appStateFullSyncFailures: make(map[appstate.WAPatchName]int),
 		sessionRecreateHistory:   make(map[types.JID]time.Time),

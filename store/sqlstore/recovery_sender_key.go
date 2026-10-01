@@ -40,13 +40,8 @@ package sqlstore
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
 	"errors"
-	"strconv"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -55,35 +50,6 @@ import (
 
 	"go.mau.fi/whatsmeow/store"
 )
-
-// D-05 fallback-scan instrumentation counters.
-// fallbackScanEntered counts how often recoveryScanQuery (the LIKE-only fallback
-// path) is entered. fallbackScanDonorFound counts how often it returns a non-nil
-// donor. The ratio fallbackScanDonorFound/fallbackScanEntered is the hit rate of
-// the LIKE-only fallback; a low ratio means the fallback rarely succeeds (most
-// misses are fleet-correlated no-donor cases). Both counters are logged every 500
-// fallback entries so the operator can measure without a prod restart.
-var (
-	fallbackScanEntered    atomic.Uint64
-	fallbackScanDonorFound atomic.Uint64
-)
-
-// D-01 singleflight coalescing counters (Gap 1 / 29-08).
-// donorSFTotal counts every TryInlineRecovery singleflight attempt (each account that
-// enters the sf.Do call, whether or not the call was coalesced). donorSFShared counts
-// the subset where shared=true (the call returned a cached result from a concurrent
-// goroutine — the coalescing benefit). The ratio donorSFShared/donorSFTotal is the
-// coalescing rate; a low ratio means the singleflight coalesces rarely (have=none
-// dominant, no donor to share). Logged every donorSFLogEvery total attempts so the
-// operator can measure collapse magnitude without a prod restart.
-var (
-	donorSFTotal  atomic.Uint64
-	donorSFShared atomic.Uint64
-)
-
-// donorSFLogEvery is the sampling period for the DONOR_SF_COALESCED log line.
-// 100 yields observable lines within minutes given the ~10/min donor-attempt rate.
-const donorSFLogEvery = 100
 
 // Absence suppresses all target iterations until the first completion's fixed
 // deadline. D-08/D-09 accept delayed later recovery and possible original-message
@@ -125,74 +91,17 @@ const noDonorCacheCapacity = 10_000
 // One existing process-wide bounded LRU, partitioned by the donor SQL universe.
 // No recipient/target iteration appears in absence identity.
 var (
-	noDonorCacheMu                                                                            sync.Mutex
-	noDonorCache                                                                              = mustNewNoDonorCache(noDonorCacheCapacity)
-	donorWaves                                                                                = make(map[donorQueryKey]*donorWave)
-	donorFlights                                                                              = make(map[donorWorkKey]*donorFlight)
-	donorWorkCapacity                                                                         = noDonorCacheCapacity
-	donorClock                                                                                = time.Now
-	noDonorCacheQueries, noDonorCacheExpired, noDonorCacheInvalidations, noDonorCacheOverflow atomic.Uint64
+	noDonorCacheMu    sync.Mutex
+	noDonorCache      = mustNewNoDonorCache(noDonorCacheCapacity)
+	donorWaves        = make(map[donorQueryKey]*donorWave)
+	donorFlights      = make(map[donorWorkKey]*donorFlight)
+	donorWorkCapacity = noDonorCacheCapacity
+	donorClock        = time.Now
 )
 
 // noDonorCacheTTL is the time-to-live for negative-donor cache entries.
 // A genuine negative lasts exactly five minutes without sliding on later hits.
 const noDonorCacheTTL = 5 * time.Minute
-
-// noDonorCacheSkips counts how often a miss was served from the negative cache
-// (the donor scan was skipped because a non-expired entry existed). Logged every
-// donorSFLogEvery skips for observability (same cadence as DONOR_SF_COALESCED).
-var noDonorCacheSkips atomic.Uint64
-
-// noDonorCacheEvictions counts bounded-cache evictions. An eviction affects
-// scan volume only: an evicted tuple runs its normal donor query next time.
-var noDonorCacheEvictions atomic.Uint64
-
-// Immutable for the lifetime of the existing process-wide atomic owners.
-var donorCounterEpoch = rand.Text()
-
-type DonorCacheMetrics struct {
-	FallbackScanEntered uint64 `json:"fallback_scan_entered"`
-	FallbackScanFound   uint64 `json:"fallback_scan_found"`
-	SingleflightTotal   uint64 `json:"singleflight_total"`
-	SingleflightShared  uint64 `json:"singleflight_shared"`
-	Queries             uint64 `json:"queries"`
-	NegativeHits        uint64 `json:"negative_hits"`
-	Expiries            uint64 `json:"expiries"`
-	Invalidations       uint64 `json:"invalidations"`
-	Evictions           uint64 `json:"evictions"`
-	Overflows           uint64 `json:"overflows"`
-	Skips               uint64 `json:"skips"`
-	Occupancy           int    `json:"occupancy"`
-	Capacity            int    `json:"capacity"`
-}
-
-type DonorCachePolicyStats struct {
-	CounterEpoch string `json:"counter_epoch"`
-	Availability string `json:"availability"`
-	DonorCacheMetrics
-}
-
-// DonorCacheSnapshot reads the current owners without querying SQL or expiring
-// entries. NegativeHits and Skips describe the same policy decision, so both
-// read the existing skip atomic; they must never be summed as distinct events.
-// Queries count donor searches, whose fast/fallback SQL work is measured by the
-// collector separately. SingleflightShared counts followers, not the leader.
-func DonorCacheSnapshot() DonorCachePolicyStats {
-	noDonorCacheMu.Lock()
-	defer noDonorCacheMu.Unlock()
-	skips := noDonorCacheSkips.Load()
-	return DonorCachePolicyStats{
-		CounterEpoch: donorCounterEpoch, Availability: "available",
-		DonorCacheMetrics: DonorCacheMetrics{
-			FallbackScanEntered: fallbackScanEntered.Load(), FallbackScanFound: fallbackScanDonorFound.Load(),
-			SingleflightTotal: donorSFTotal.Load(), SingleflightShared: donorSFShared.Load(),
-			Queries: noDonorCacheQueries.Load(), NegativeHits: skips, Skips: skips,
-			Expiries: noDonorCacheExpired.Load(), Invalidations: noDonorCacheInvalidations.Load(),
-			Evictions: noDonorCacheEvictions.Load(), Overflows: noDonorCacheOverflow.Load(),
-			Occupancy: noDonorCache.Len(), Capacity: noDonorCacheCapacity,
-		},
-	}
-}
 
 func mustNewNoDonorCache(capacity int) *lru.Cache[donorQueryKey, noDonorCacheEntry] {
 	cache, err := lru.New[donorQueryKey, noDonorCacheEntry](capacity)
@@ -202,12 +111,6 @@ func mustNewNoDonorCache(capacity int) *lru.Cache[donorQueryKey, noDonorCacheEnt
 	return cache
 }
 
-func getNoDonorCacheEntry(key donorQueryKey, _ uint32, now time.Time) bool {
-	noDonorCacheMu.Lock()
-	defer noDonorCacheMu.Unlock()
-	return noDonorCacheHitLocked(key, now)
-}
-
 func noDonorCacheHitLocked(key donorQueryKey, now time.Time) bool {
 	entry, found := noDonorCache.Get(key)
 	if !found {
@@ -215,10 +118,8 @@ func noDonorCacheHitLocked(key donorQueryKey, now time.Time) bool {
 	}
 	if !now.Before(entry.expiresAt) {
 		noDonorCache.Remove(key)
-		noDonorCacheExpired.Add(1)
 		return false
 	}
-	noDonorCacheSkips.Add(1)
 	return true
 }
 
@@ -228,22 +129,12 @@ func (c *CachedSenderKeyStore) donorKey(group, sender string, keyID uint32) dono
 
 // Compatibility for external-package test exports only. Production invalidation
 // uses the complete structured key, never a delimited identity.
-func removeNoDonorCacheEntry(key string) {
-	noDonorCacheMu.Lock()
-	defer noDonorCacheMu.Unlock()
-	for _, k := range noDonorCache.Keys() {
-		if k.group+"|"+k.sender+"|"+strconv.FormatUint(uint64(k.keyID), 10) == key {
-			invalidateDonorLocked(k)
-		}
-	}
-}
 
 func invalidateDonorLocked(key donorQueryKey) {
 	noDonorCache.Remove(key)
 	if wave := donorWaves[key]; wave != nil {
 		wave.invalid = true
 	}
-	noDonorCacheInvalidations.Add(1)
 }
 
 // notifyDonorKeys is called only once keys are observable in this SQL universe.
@@ -306,14 +197,6 @@ func clearDonorUniverse(universe any) {
 	}
 }
 
-func (c *CachedSenderKeyStore) logDonorPolicy() {
-	if sq, ok := c.inner.(*SQLStore); ok && sq.log != nil {
-		sq.log.Infof("NO_DONOR_CACHE hits=%d queries=%d expired=%d invalidations=%d evictions=%d overflow=%d shared=%d",
-			noDonorCacheSkips.Load(), noDonorCacheQueries.Load(), noDonorCacheExpired.Load(),
-			noDonorCacheInvalidations.Load(), noDonorCacheEvictions.Load(), noDonorCacheOverflow.Load(), donorSFShared.Load())
-	}
-}
-
 // Locks protect only bookkeeping, never SQL, waits, crypto/install or callbacks.
 func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecoveryReader, key donorQueryKey, targetIter uint32) (*donorSenderKeyState, error) {
 	if c.retired.Load() {
@@ -330,20 +213,12 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 	}
 	if noDonorCacheHitLocked(key, donorClock()) {
 		noDonorCacheMu.Unlock()
-		if noDonorCacheSkips.Load()%donorSFLogEvery == 0 {
-			c.logDonorPolicy()
-		}
 		return nil, nil
-	}
-	if donorSFTotal.Add(1)%donorSFLogEvery == 0 {
-		defer c.logDonorPolicy()
 	}
 	flight := donorFlights[work]
 	leader := flight == nil
 	if leader && len(donorFlights) >= donorWorkCapacity {
-		noDonorCacheOverflow.Add(1)
 		noDonorCacheMu.Unlock()
-		noDonorCacheQueries.Add(1)
 		return r.findSenderKeyDonor(ctx, key.group, key.sender, key.keyID, targetIter)
 	}
 	if leader {
@@ -354,8 +229,6 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 		}
 		flight = &donorFlight{done: make(chan struct{}), wave: wave}
 		donorFlights[work] = flight
-	} else {
-		donorSFShared.Add(1)
 	}
 	flight.participants++
 	flight.wave.participants++
@@ -382,7 +255,6 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 			}
 			if errors.Is(flight.err, context.Canceled) || errors.Is(flight.err, context.DeadlineExceeded) {
 				// A live follower retries a canceled leader uncached; no publication.
-				noDonorCacheQueries.Add(1)
 				return r.findSenderKeyDonor(ctx, key.group, key.sender, key.keyID, targetIter)
 			}
 			return flight.donor, flight.err
@@ -397,7 +269,6 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 		return nil, nil
 	}
 	noDonorCacheMu.Unlock()
-	noDonorCacheQueries.Add(1)
 	donor, complete, err := readDonor(ctx, r, key, targetIter)
 	if ctx.Err() != nil {
 		err = ctx.Err()
@@ -408,9 +279,7 @@ func (c *CachedSenderKeyStore) lookupDonor(ctx context.Context, r senderKeyRecov
 	if donor == nil && complete && err == nil && !flight.wave.invalid && !c.retired.Load() {
 		if flight.wave.deadline.IsZero() {
 			flight.wave.deadline = now.Add(noDonorCacheTTL)
-			if noDonorCache.Add(key, noDonorCacheEntry{expiresAt: flight.wave.deadline}) {
-				noDonorCacheEvictions.Add(1)
-			}
+			noDonorCache.Add(key, noDonorCacheEntry{expiresAt: flight.wave.deadline})
 		}
 	}
 	close(flight.done)
@@ -456,91 +325,6 @@ type donorSenderKeyState struct {
 	SigningKeyPrivate []byte // nil on received (non-own) keys — preserved
 	// Skipped message keys for this state, if any (forwarded for completeness).
 	SkippedKeys []*ratchet.SenderMessageKeyStructure
-}
-
-// subclassLIDMapQuery checks whatsmeow_lid_map for the sender's identifier.
-// Returns one of: "pn-mapped" (sender resolves as a PN→LID pair),
-// "lid-mapped" (sender resolves as a LID→PN pair), "unmapped" (no entry),
-// or "err" if the query fails (errors are swallowed — diagnostic only).
-//
-// The sender identifier from the Signal address is the user part of a
-// @s.whatsapp.net JID (a phone number string) or a LID user.
-// getLIDForPNQuery / getPNForLIDQuery cover both directions; the first hit wins.
-const subclassLIDMapQuery = `
-	SELECT 'pn-mapped' AS kind FROM whatsmeow_lid_map WHERE pn=$1
-	UNION ALL
-	SELECT 'lid-mapped' AS kind FROM whatsmeow_lid_map WHERE lid=$1
-	LIMIT 1
-`
-
-// subclassKeysElsewhereQuery checks if ANY whatsmeow_sender_keys row exists for
-// (our_jid, sender LIKE prefix) in a DIFFERENT chat. This is the
-// "sender-alive-never-distributed" signature: the sender has shared keys with us
-// elsewhere, but not in this specific group.
-//
-// Uses the same LIKE device-tolerance as the donor scan (sender_id LIKE senderBare||':%').
-// Single indexed EXISTS/LIMIT 1 — read-only, no write.
-const subclassKeysElsewhereQuery = `
-	SELECT EXISTS(
-		SELECT 1 FROM whatsmeow_sender_keys
-		WHERE our_jid=$1
-		  AND chat_id <> $2
-		  AND sender_id LIKE $3 || ':%' ESCAPE '\'
-		LIMIT 1
-	)
-`
-
-// noDonorFields is the result of classifyNoDonor — factored out so tests can
-// assert the field values without triggering the log emission.
-type noDonorFields struct {
-	LIDMap        string // "pn-mapped", "lid-mapped", "unmapped", or "err"
-	KeysElsewhere bool   // true = sender has keys with us in at least one other group
-}
-
-// classifyNoDonor runs two read-only queries against s to classify why no donor
-// was found for a failed decrypt. Errors are swallowed with fallback field
-// values so the fail path never gets slower or fails because of diagnostics.
-//
-//   - ourJID:     the recovering account's own JID string (our_jid in the table)
-//   - group:      the group chat ID (chat_id of the failing decrypt)
-//   - senderBare: the bare Signal-address user (no device suffix, no @server)
-//
-// Not on the hot path — no production caller (D-12 removed the sampled
-// SENDERKEY_SUBCLASS log line this fed); exercised directly by
-// TestSenderKeySubclass / TestClassifyNoDonorLIDMapSuffix via export_test.go.
-func classifyNoDonor(ctx context.Context, s *SQLStore, ourJID, group, senderBare string) noDonorFields {
-	fields := noDonorFields{LIDMap: "err", KeysElsewhere: false}
-
-	// (a) LID-map state: does senderBare appear in whatsmeow_lid_map as either
-	// a PN or a LID?
-	//
-	// LID Signal-address users arrive as "<digits>_<agent>" (e.g.
-	// "238877608562780_1") but whatsmeow_lid_map stores bare digits with no
-	// suffix. Strip everything from the first underscore before querying so
-	// that LID senders are not silently reported as "unmapped".
-	// PN users (pure digits, never contain underscore) are unaffected.
-	// senderBare (original, possibly suffixed) is kept unchanged for section
-	// (b)'s LIKE match against whatsmeow_sender_keys.
-	lidMapKey, _, _ := strings.Cut(senderBare, "_")
-	var lidKind string
-	err := s.db.QueryRow(ctx, subclassLIDMapQuery, lidMapKey).Scan(&lidKind)
-	if errors.Is(err, sql.ErrNoRows) {
-		fields.LIDMap = "unmapped"
-	} else if err == nil {
-		fields.LIDMap = lidKind
-	}
-	// else: fields.LIDMap stays "err"
-
-	// (b) Keys-elsewhere: does this our_jid have ANY sender-key row for senderBare
-	// in a chat_id != group?
-	escapedBare := senderKeyLikeEscaper.Replace(senderBare)
-	err = s.db.QueryRow(ctx, subclassKeysElsewhereQuery, ourJID, group, escapedBare).Scan(&fields.KeysElsewhere)
-	if err != nil {
-		// swallow error; KeysElsewhere stays false (safe conservative default)
-		fields.KeysElsewhere = false
-	}
-
-	return fields
 }
 
 // recoveryScanQueryFast is the indexed fast-path donor query (R8).
@@ -686,11 +470,6 @@ func (s *SQLStore) findSenderKeyDonorResult(ctx context.Context, group, senderBa
 	}
 
 	// Fallback path: LIKE-only scan (covers multi-state donors, state[1+] KeyID match).
-	// D-05: count entries and donor hits so the operator can measure hit-rate post-deploy.
-	if n := fallbackScanEntered.Add(1); n%500 == 0 {
-		s.log.Infof("D05_FALLBACK_SCAN entered=%d donorFound=%d group=%s",
-			n, fallbackScanDonorFound.Load(), group)
-	}
 	fbRows, err := s.db.Query(ctx, recoveryScanQuery, group, escapedBare)
 	if err != nil {
 		return nil, false, err
@@ -699,9 +478,6 @@ func (s *SQLStore) findSenderKeyDonorResult(ctx context.Context, group, senderBa
 	fbBest, fallbackComplete, err := scanFlatRows(fbRows, targetKeyID, targetIter, nil)
 	if err != nil {
 		return nil, false, err
-	}
-	if fbBest != nil {
-		fallbackScanDonorFound.Add(1)
 	}
 	return fbBest, fastComplete && fallbackComplete, nil
 }

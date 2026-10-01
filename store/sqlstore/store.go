@@ -621,7 +621,6 @@ func observeSenderKeyWrite(owner *SenderKeyDeviceCache, universe any, account, g
 		if f := owner.flights[dk]; f != nil {
 			f.invalid = true
 		}
-		owner.invalidations.Add(1)
 		if entry, ok := owner.Get(dk); ok {
 			// A live verified empty is complete; an expired empty is no longer
 			// evidence that SQL contains no siblings. Preserve completeness only

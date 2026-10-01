@@ -75,7 +75,7 @@ func TestSenderKeyInlineFlushRetirement(t *testing.T) {
 			writeDone := make(chan error, 1)
 			go func() { writeDone <- old.PutSenderKeyStructure(context.Background(), "g", "sender:1", structure) }()
 			<-entered
-			fresh := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
+			fresh := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache)
 			container := &Container{log: waLog.Noop}
 			container.caches.senderKeyFlusherMap = map[string]*SenderKeyFlusher{old.jid: f}
 			retireDone := make(chan struct{})
@@ -146,8 +146,8 @@ func TestSenderKeyConcurrentOwnerReplacement(t *testing.T) {
 	if err := old.PutSenderKeyStructure(context.Background(), "g", "sender:1", structure); err != nil {
 		t.Fatal(err)
 	}
-	first := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
-	second := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache, nil)
+	first := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache)
+	second := NewCachedSenderKeyStore(inner, old.jid, old.cache, old.deviceCache)
 	old.writeMu.Lock()
 	done := make(chan struct{}, 2)
 	for _, next := range []*CachedSenderKeyStore{first, second} {
@@ -192,7 +192,7 @@ func TestSenderKeyTeardownDonorFlights(t *testing.T) {
 	stub := &stubRecoveryInner{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	blobs, _ := lru.New[string, []byte](4)
 	devices, _ := NewSenderKeyDeviceCache(4)
-	c := NewCachedSenderKeyStore(stub, "account", blobs, devices, nil)
+	c := NewCachedSenderKeyStore(stub, "account", blobs, devices)
 	key := c.donorKey("g", "sender", 7)
 	done := make(chan struct{})
 	go func() { defer close(done); _, _ = c.lookupDonor(context.Background(), stub, key, 1) }()
@@ -255,7 +255,7 @@ func TestSenderKeyReinitializationFencesDeviceFlight(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); _, _ = c.GetSenderKeyDevices(context.Background(), "g", "sender") }()
 	<-entered
-	fresh := NewCachedSenderKeyStore(inner, c.jid, c.cache, c.deviceCache, nil)
+	fresh := NewCachedSenderKeyStore(inner, c.jid, c.cache, c.deviceCache)
 	c.retire(fresh)
 	if len(c.deviceCache.flights) != 0 {
 		t.Fatal("retirement retained old device flights")
@@ -300,7 +300,7 @@ func newTestCachedSenderKeyStore(t *testing.T, capSize int) (*CachedSenderKeySto
 	}
 	// "test-jid" with no trailing pipe — wrapper's key() prepends the
 	// separator. Matches production format used by Container.initializeDevice.
-	wrapper := NewCachedSenderKeyStore(inner, "test-jid", cache, deviceCache, nil)
+	wrapper := NewCachedSenderKeyStore(inner, "test-jid", cache, deviceCache)
 	return wrapper, inner
 }
 
@@ -408,7 +408,7 @@ func newDevicePolicyStore(t *testing.T, cap int, read func(context.Context, stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewCachedSenderKeyStore(inner, "account", blobs, devices, nil), inner
+	return NewCachedSenderKeyStore(inner, "account", blobs, devices), inner
 }
 
 func TestSenderKeyDeviceNegativeIdentity(t *testing.T) {
@@ -421,10 +421,10 @@ func TestSenderKeyDeviceNegativeIdentity(t *testing.T) {
 	if inner.calls.Load() != 6 {
 		t.Fatalf("identity collision: %d queries", inner.calls.Load())
 	}
-	c2 := NewCachedSenderKeyStore(inner, "other-account", c.cache, c.deviceCache, nil)
+	c2 := NewCachedSenderKeyStore(inner, "other-account", c.cache, c.deviceCache)
 	_, _ = c2.GetSenderKeyDevices(context.Background(), "a", "b|c")
 	other := &devicePolicyInner{fakeSenderKeyStore: newFakeSenderKeyStore(), read: inner.read}
-	c3 := NewCachedSenderKeyStore(other, c.jid, c.cache, c.deviceCache, nil)
+	c3 := NewCachedSenderKeyStore(other, c.jid, c.cache, c.deviceCache)
 	_, _ = c3.GetSenderKeyDevices(context.Background(), "a", "b|c")
 	if inner.calls.Load() != 7 || other.calls.Load() != 1 {
 		t.Fatal("account/store absence leaked")
@@ -551,30 +551,6 @@ func TestSenderKeyDeviceNegativeWriteFence(t *testing.T) {
 	}
 }
 
-func TestSenderKeyDeviceTelemetry(t *testing.T) {
-	c, _ := newDevicePolicyStore(t, 2, func(_ context.Context, group, sender string) ([]string, error) {
-		if group == "positive" {
-			return []string{sender + ":0"}, nil
-		}
-		return []string{}, nil
-	})
-	now := time.Unix(1_000, 0)
-	c.deviceCache.now = func() time.Time { return now }
-	ctx := context.Background()
-	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
-	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
-	now = now.Add(5 * time.Minute)
-	_, _ = c.GetSenderKeyDevices(ctx, "negative", "user_1")
-	_, _ = c.GetSenderKeyDevices(ctx, "positive", "user_1")
-	_, _ = c.GetSenderKeyDevices(ctx, "positive", "user_1")
-	c.updateDeviceCache("negative", "user_1:7")
-	_, _ = c.GetSenderKeyDevices(ctx, "other", "user_1")
-	m := c.deviceCache.Metrics()
-	if m.PositiveHits != 1 || m.NegativeHits != 1 || m.Queries != 4 || m.Expiries != 1 || m.Invalidations != 1 || m.Evictions != 1 || m.Overflows != 0 {
-		t.Fatalf("metrics: %+v", m)
-	}
-}
-
 func TestSenderKeyDeviceCacheCapacity(t *testing.T) {
 	c, inner := newDevicePolicyStore(t, 2, func(_ context.Context, group, sender string) ([]string, error) {
 		if group == "positive" {
@@ -621,7 +597,7 @@ func TestSenderKeyDeviceCacheCapacity(t *testing.T) {
 		c.deviceCache.mu.Unlock()
 		close(release)
 		<-done
-		if inner.calls.Load() != 3 || c.deviceCache.Metrics().Overflows != 2 || len(c.deviceCache.flights) != 0 {
+		if inner.calls.Load() != 3 || len(c.deviceCache.flights) != 0 {
 			t.Fatal("overflow query or cleanup failed")
 		}
 	})

@@ -10,10 +10,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
-	"crypto/hmac"
-	cryptorand "crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -41,7 +38,6 @@ import (
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
-	"go.mau.fi/whatsmeow/util/walltime"
 )
 
 var pbSerializer = store.SignalProtobufSerializer
@@ -363,20 +359,8 @@ func (cli *Client) stalePrekeyShouldWarn(sender string) bool {
 }
 
 func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) {
-	// Phase 17.5.1-04: per-message wall-time observation covers every
-	// exit path (unavailable early-return, success-path ack, error
-	// returns, panics). Quantiles surface alongside cache metrics in
-	// store/sqlstore.cache_wiring.go emitMetricsLoop every 5 minutes.
-	// kavtov-fork: Phase 17.5.3 DEFER-01 fix — wrap in closure so time.Since
-	// evaluates when the deferred call RUNS (function exit), not at defer-setup.
-	// Previously: defer walltime.DecryptHistogram.Observe(time.Since(start)) — this
-	// evaluated time.Since(start) eagerly at the defer statement (nanoseconds
-	// after function entry), making every observation near-zero and the entire
-	// p50/p95/p99 metric meaningless garbage.
-	start := time.Now()
-	defer func() { walltime.DecryptHistogram.Observe(time.Since(start)) }()
 	// upstream merge (2026-06): recover from a decrypt panic and still ack the node so a
-	// panicking message isn't retried forever. Runs before the wall-time defer (LIFO).
+	// panicking message isn't retried forever.
 	defer func() {
 		if err := recover(); err != nil {
 			cli.Log.Errorf("Message decryption for %s panicked: %v\n%s", info.ID, err, debug.Stack())
@@ -457,7 +441,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			decrypted, ciphertextHash, err = cli.decryptDM(ctx, &child, senderEncryptionJID, encType == "pkmsg", info.Timestamp)
 			containsDirectMsg = true
 		} else if info.IsGroup && encType == "skmsg" {
-			decrypted, ciphertextHash, err = cli.decryptGroupMsg(ctx, &child, senderEncryptionJID, info.Chat, info.Timestamp, info.ID)
+			decrypted, ciphertextHash, err = cli.decryptGroupMsg(ctx, &child, senderEncryptionJID, info.Chat, info.Timestamp)
 		} else if encType == "msmsg" && info.Sender.IsBot() {
 			targetSenderJID := info.MsgMetaInfo.TargetSender
 			if targetSenderJID.User == "" {
@@ -802,7 +786,7 @@ func (cli *Client) decryptDM(ctx context.Context, child *waBinary.Node, from typ
 	return plaintext, &ciphertextHash, nil
 }
 
-func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, from types.JID, chat types.JID, serverTS time.Time, ids ...types.MessageID) ([]byte, *[32]byte, error) {
+func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, from types.JID, chat types.JID, serverTS time.Time) ([]byte, *[32]byte, error) {
 	content, ok := child.Content.([]byte)
 	if !ok {
 		return nil, nil, fmt.Errorf("message content is not a byte slice")
@@ -819,7 +803,7 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 	// keyID + verify the signature (a wrong candidate fails closed). Each candidate decrypts under
 	// its own address, so the ratchet writes back to the correct record. No :0 normalization, no merge.
 	plaintext, ciphertextHash, err := cli.bufferedDecrypt(ctx, content, serverTS, func(decryptCtx context.Context) ([]byte, error) {
-		return cli.decryptGroupSenderKey(decryptCtx, chat, from, msg, ids...)
+		return cli.decryptGroupSenderKey(decryptCtx, chat, from, msg)
 	}, "senderkey", chat.String(), from.String())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to decrypt group message: %w", err)
@@ -839,11 +823,7 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 // written back to its own device record by GroupCipher.Decrypt. There is no error-class branching:
 // we try every stored device for the sender and let the keyID pick. Returns ErrNoSenderKeyForUser
 // when no stored device record decrypts the message (so the retry-receipt path is unchanged).
-func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.JID, msg *protocol.SenderKeyMessage, ids ...types.MessageID) ([]byte, error) {
-	var id types.MessageID
-	if len(ids) > 0 {
-		id = ids[0]
-	}
+func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.JID, msg *protocol.SenderKeyMessage) ([]byte, error) {
 	devices, err := cli.Store.SenderKeys.GetSenderKeyDevices(ctx, chat.String(), from.SignalAddressUser())
 	if err != nil {
 		return nil, fmt.Errorf("failed to enumerate sender-key devices: %w", err)
@@ -876,22 +856,15 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 		cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
 		plaintext, decErr := cipher.Decrypt(ctx, msg)
 		if decErr == nil {
-			cli.recordSenderKeyOutcome(chat, from, id, senderKeyKeySuccess, time.Time{})
-			// kavtov-fork (P2a): KEY-path decrypt success. If this inbound tuple was previously a
-			// total miss, this is a genuine per-tuple convergence (NOT PDO content-recovery, which
-			// runs elsewhere and installs no key). Emit ONE INFO and drop the entry.
-			if cli.clearFailedSenderKeyTuple(labeled, chat.String()) {
-				cli.Log.Infof("SENDER_KEY_CONVERGED keypath sender=%s device=%d group=%s prevFailed=true", from.SignalAddressUser(), from.Device, chat.String())
-			}
+			cli.clearFailedSenderKeyTuple(labeled, chat.String())
 			return plaintext, nil
 		}
 		cli.Log.Debugf("Group sender-key candidate %q did not decrypt: %v", sid, decErr)
 	}
 	// Phase 17.12: attempt inline synchronous cross-account donor recovery (D-01, D-02).
-	// SENDERKEY_MISS and recordFailedSenderKeyTuple are ONLY emitted on the fail-open
-	// path to avoid false positives when recovery succeeds (Pitfall 2 / D-07).
+	// Only a terminal failure activates the existing SKDM recovery bypass.
 	if cli.Store.InlineRecoverer != nil {
-		donorJID, recovered, recErr := cli.Store.InlineRecoverer.TryInlineRecovery(
+		_, recovered, recErr := cli.Store.InlineRecoverer.TryInlineRecovery(
 			ctx, chat.String(), labeled, from.SignalAddressUser(), msg.KeyID(), msg.Iteration())
 		if recErr != nil {
 			cli.Log.Warnf("inline recovery error group=%s sender=%s keyID=%d: %v",
@@ -907,10 +880,7 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 			cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
 			plaintext, decErr := cipher.Decrypt(ctx, msg)
 			if decErr == nil {
-				cli.recordSenderKeyOutcome(chat, from, id, senderKeyInlineSuccess, time.Time{})
 				cli.clearFailedSenderKeyTuple(labeled, chat.String())
-				cli.Log.Infof("SENDER_KEY_RECOVERED donor_jid=%s group=%s sender=%s keyid=%d iter=%d",
-					donorJID, chat.String(), from.SignalAddressUser(), msg.KeyID(), msg.Iteration())
 				return plaintext, nil
 			}
 			// Donor installed but decrypt still failed — fall through to fail-open.
@@ -921,11 +891,8 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	}
 	// D-07: fail-open path (no donor found, query error, or donor-installed-but-failed).
 	// kavtov-fork (P2a): record the failed tuple so a later KEY-path success is
-	// recognizable as convergence (SENDER_KEY_CONVERGED log).
-	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d",
-		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration())
+	// eligible for the failed-tuple SKDM recovery bypass.
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
-	cli.recordSenderKeyOutcome(chat, from, id, senderKeyTerminalFailure, time.Time{})
 	// kavtov-fork (38.5): increment per-account blacklist counter for (group, sender).
 	// MUST key on from.User (bare, no agent suffix) to match the check site in
 	// sendRetryReceipt (info.Sender.User). For these @lid bots from == info.Sender, so
@@ -983,310 +950,6 @@ func (cli *Client) recordMediaDeleteOutcome(err error) {
 // signal this instrument exists to catch is never evicted before it can fire. Eviction is a ring
 // buffer (oldest tuple dropped when full), identical to recentMessages, with dedup on add.
 const failedSenderKeyTuplesSize = 4096
-
-// Exact-message telemetry is independent of the tuple-only convergence log.
-// Bounded records contain only HMAC tokens, never their identity preimages.
-const senderKeyOutcomeCapacity = 4096
-const senderKeyOutcomeRetention = 900 * time.Second
-const senderKeyOutcomeCohortSlots = 901
-
-var senderKeyOutcomeSalt = newSenderKeyOutcomeNonce()
-var senderKeyOutcomeEpoch = func() string {
-	token := senderKeyOutcomeToken([]string{"process-epoch"})
-	return hex.EncodeToString(token[:])
-}()
-
-func newSenderKeyOutcomeNonce() (nonce [32]byte) {
-	if _, err := cryptorand.Read(nonce[:]); err != nil {
-		panic(err)
-	}
-	return
-}
-
-func senderKeyOutcomeToken(fields []string) [32]byte {
-	mac := hmac.New(sha256.New, senderKeyOutcomeSalt[:])
-	var size [8]byte
-	for _, field := range fields {
-		binary.BigEndian.PutUint64(size[:], uint64(len(field)))
-		_, _ = mac.Write(size[:])
-		_, _ = mac.Write([]byte(field))
-	}
-	var token [32]byte
-	copy(token[:], mac.Sum(nil))
-	return token
-}
-
-// SenderKeyOutcomeLatency describes elapsed time from a terminal failure.
-type SenderKeyOutcomeLatency struct {
-	Count uint64 `json:"count"`
-	SumMS uint64 `json:"sum_ms"`
-	MaxMS uint64 `json:"max_ms"`
-}
-
-func (latency *SenderKeyOutcomeLatency) observe(elapsed time.Duration) {
-	ms := uint64(max(elapsed.Milliseconds(), 0))
-	latency.Count++
-	latency.SumMS += ms
-	latency.MaxMS = max(latency.MaxMS, ms)
-}
-
-// SenderKeyOutcomeCounts are ciphertext events, deduplicated by exact lineage.
-// Later success never resolves a pending original. Two distinct successes may
-// coexist in one second; exact-ID recovery always takes classification priority.
-type SenderKeyOutcomeCounts struct {
-	OriginalFailures         uint64                  `json:"original_failures"`
-	OriginalRecovered        uint64                  `json:"original_recovered"`
-	SameAttemptInlineSuccess uint64                  `json:"same_attempt_inline_success"`
-	LaterSuccess             uint64                  `json:"later_success"`
-	UnknownUntraced          uint64                  `json:"unknown_untraced"`
-	Evictions                uint64                  `json:"evictions"`
-	Expiries                 uint64                  `json:"expiries"`
-	Duplicates               uint64                  `json:"duplicates"`
-	PendingOriginals         uint64                  `json:"pending_originals"`
-	OriginalLatency          SenderKeyOutcomeLatency `json:"original_latency"`
-	LaterLatency             SenderKeyOutcomeLatency `json:"later_latency"`
-}
-
-// SenderKeyOutcomeCohort exposes only the original failure second and aggregates.
-type SenderKeyOutcomeCohort struct {
-	FailureSecond int64 `json:"failure_second"`
-	SenderKeyOutcomeCounts
-}
-
-// SenderKeyRecoveryStats is the sole exported view of process-local outcomes.
-type SenderKeyRecoveryStats struct {
-	ProcessEpoch string `json:"process_epoch"`
-	Availability string `json:"availability"`
-	SenderKeyOutcomeCounts
-	Occupancy        int                      `json:"occupancy"`
-	Capacity         int                      `json:"capacity"`
-	RetentionSeconds int                      `json:"retention_seconds"`
-	Cohorts          []SenderKeyOutcomeCohort `json:"cohorts"`
-}
-
-type senderKeyOutcomeEvent uint8
-
-const (
-	senderKeyTerminalFailure senderKeyOutcomeEvent = iota
-	senderKeyKeySuccess
-	senderKeyInlineSuccess
-)
-
-type senderKeyOutcomeRecord struct {
-	tuple               [32]byte
-	created             time.Time
-	failureSecond       int64
-	original, recovered bool
-}
-
-type senderKeyOutcomeTracker struct {
-	records     map[[32]byte]senderKeyOutcomeRecord
-	originals   map[[32]byte]map[[32]byte]struct{}
-	ring        [senderKeyOutcomeCapacity][32]byte
-	head, size  int
-	counts      SenderKeyOutcomeCounts
-	cohorts     [senderKeyOutcomeCohortSlots]SenderKeyOutcomeCohort
-	cohortValid [senderKeyOutcomeCohortSlots]bool
-}
-
-func (cli *Client) senderKeyOutcomeTrackerLocked() *senderKeyOutcomeTracker {
-	if cli.senderKeyOutcomes == nil {
-		if cli.senderKeyOutcomeNonce == ([32]byte{}) {
-			cli.senderKeyOutcomeNonce = newSenderKeyOutcomeNonce()
-		}
-		cli.senderKeyOutcomes = &senderKeyOutcomeTracker{
-			records: make(map[[32]byte]senderKeyOutcomeRecord), originals: make(map[[32]byte]map[[32]byte]struct{}),
-		}
-	}
-	return cli.senderKeyOutcomes
-}
-
-func (tracker *senderKeyOutcomeTracker) cohort(second int64) *SenderKeyOutcomeCounts {
-	index := int((second%senderKeyOutcomeCohortSlots + senderKeyOutcomeCohortSlots) % senderKeyOutcomeCohortSlots)
-	if !tracker.cohortValid[index] || tracker.cohorts[index].FailureSecond != second {
-		tracker.cohorts[index] = SenderKeyOutcomeCohort{FailureSecond: second}
-		tracker.cohortValid[index] = true
-	}
-	return &tracker.cohorts[index].SenderKeyOutcomeCounts
-}
-
-func (tracker *senderKeyOutcomeTracker) removeOldest(evicted bool, now time.Time) {
-	token := tracker.ring[tracker.head]
-	record := tracker.records[token]
-	delete(tracker.records, token)
-	tracker.head = (tracker.head + 1) % senderKeyOutcomeCapacity
-	tracker.size--
-	if record.original {
-		delete(tracker.originals[record.tuple], token)
-		if len(tracker.originals[record.tuple]) == 0 {
-			delete(tracker.originals, record.tuple)
-		}
-	}
-	// Never resurrect an expired cohort into a slot now owned by a newer one.
-	var cohort *SenderKeyOutcomeCounts
-	if now.Unix()-record.failureSecond <= 900 {
-		cohort = tracker.cohort(record.failureSecond)
-	}
-	if evicted {
-		tracker.counts.Evictions++
-	} else {
-		tracker.counts.Expiries++
-	}
-	if cohort != nil {
-		if evicted {
-			cohort.Evictions++
-		} else {
-			cohort.Expiries++
-		}
-	}
-	if record.original && !record.recovered {
-		tracker.counts.PendingOriginals--
-		tracker.counts.UnknownUntraced++
-		if cohort != nil {
-			cohort.PendingOriginals--
-			cohort.UnknownUntraced++
-		}
-	}
-}
-
-func (tracker *senderKeyOutcomeTracker) prune(now time.Time) {
-	// Insertion order makes cleanup capacity-bounded, with no common-path scan.
-	// Keep records at the exact inclusive +900s boundary.
-	for tracker.size > 0 && now.After(tracker.records[tracker.ring[tracker.head]].created.Add(senderKeyOutcomeRetention)) {
-		tracker.removeOldest(false, now)
-	}
-}
-
-func (tracker *senderKeyOutcomeTracker) insert(token [32]byte, record senderKeyOutcomeRecord, now time.Time) {
-	if tracker.size == senderKeyOutcomeCapacity {
-		tracker.removeOldest(true, now)
-	}
-	tracker.ring[(tracker.head+tracker.size)%senderKeyOutcomeCapacity] = token
-	tracker.size++
-	tracker.records[token] = record
-	if record.original {
-		if tracker.originals[record.tuple] == nil {
-			tracker.originals[record.tuple] = make(map[[32]byte]struct{})
-		}
-		tracker.originals[record.tuple][token] = struct{}{}
-	}
-}
-
-func (cli *Client) recordSenderKeyOutcome(chat, from types.JID, id types.MessageID, event senderKeyOutcomeEvent, now time.Time) {
-	cli.senderKeyOutcomesLock.Lock()
-	defer cli.senderKeyOutcomesLock.Unlock()
-	if now.IsZero() {
-		now = time.Now()
-	}
-	tracker := cli.senderKeyOutcomeTrackerLocked()
-	tracker.prune(now)
-	if id == "" || cli.Store == nil || cli.Store.GetJID().IsEmpty() {
-		// Missing correlation is never treated as original recovery.
-		if event == senderKeyTerminalFailure {
-			tracker.counts.OriginalFailures++
-			tracker.counts.UnknownUntraced++
-			cohort := tracker.cohort(now.Unix())
-			cohort.OriginalFailures++
-			cohort.UnknownUntraced++
-		} else if event == senderKeyInlineSuccess {
-			tracker.counts.SameAttemptInlineSuccess++
-		}
-		return
-	}
-	fields := []string{string(cli.senderKeyOutcomeNonce[:]), cli.Store.GetJID().String(), from.SignalAddress().String(), chat.String()}
-	tuple := senderKeyOutcomeToken(fields)
-	token := senderKeyOutcomeToken(append(fields, string(id)))
-	if record, found := tracker.records[token]; found {
-		// A later-success dedup record can outlive its original cohort. Do not
-		// resurrect that cohort into a slot occupied by newer failures.
-		var cohort *SenderKeyOutcomeCounts
-		if now.Unix()-record.failureSecond <= 900 {
-			cohort = tracker.cohort(record.failureSecond)
-		}
-		if event != senderKeyTerminalFailure && record.original && !record.recovered {
-			record.recovered = true
-			tracker.records[token] = record
-			tracker.counts.OriginalRecovered++
-			if cohort != nil {
-				cohort.OriginalRecovered++
-			}
-			tracker.counts.PendingOriginals--
-			if cohort != nil {
-				cohort.PendingOriginals--
-			}
-			tracker.counts.OriginalLatency.observe(now.Sub(record.created))
-			if cohort != nil {
-				cohort.OriginalLatency.observe(now.Sub(record.created))
-			}
-		} else {
-			tracker.counts.Duplicates++
-			if cohort != nil {
-				cohort.Duplicates++
-			}
-		}
-		return
-	}
-	if event == senderKeyTerminalFailure {
-		tracker.insert(token, senderKeyOutcomeRecord{tuple: tuple, created: now, failureSecond: now.Unix(), original: true}, now)
-		cohort := tracker.cohort(now.Unix())
-		tracker.counts.OriginalFailures++
-		cohort.OriginalFailures++
-		tracker.counts.PendingOriginals++
-		cohort.PendingOriginals++
-		return
-	}
-	if event == senderKeyInlineSuccess {
-		tracker.insert(token, senderKeyOutcomeRecord{tuple: tuple, created: now, failureSecond: now.Unix()}, now)
-		tracker.counts.SameAttemptInlineSuccess++
-		tracker.cohort(now.Unix()).SameAttemptInlineSuccess++
-		return
-	}
-	// Attribute each distinct later ciphertext to the oldest retained original
-	// on its lineage, without ever resolving that original. Recovered originals
-	// stay indexed so equal-time exact/later callbacks have order-independent totals.
-	var first senderKeyOutcomeRecord
-	var firstToken [32]byte
-	found := false
-	for original := range tracker.originals[tuple] {
-		record := tracker.records[original]
-		if !found || record.created.Before(first.created) || (record.created.Equal(first.created) && bytes.Compare(original[:], firstToken[:]) < 0) {
-			first, firstToken, found = record, original, true
-		}
-	}
-	if found {
-		tracker.insert(token, senderKeyOutcomeRecord{tuple: tuple, created: now, failureSecond: first.failureSecond}, now)
-		cohort := tracker.cohort(first.failureSecond)
-		tracker.counts.LaterSuccess++
-		cohort.LaterSuccess++
-		tracker.counts.LaterLatency.observe(now.Sub(first.created))
-		cohort.LaterLatency.observe(now.Sub(first.created))
-	} else {
-		// Successful delivery must win over a delayed failure callback or a
-		// duplicate ciphertext whose ratchet key has already been consumed.
-		// Keep the same bounded exact-ID state even without a failed lineage.
-		tracker.insert(token, senderKeyOutcomeRecord{tuple: tuple, created: now, failureSecond: now.Unix()}, now)
-	}
-}
-
-// SenderKeyRecoverySnapshot returns detached aggregate diagnostics only.
-func (cli *Client) SenderKeyRecoverySnapshot() SenderKeyRecoveryStats {
-	return cli.senderKeyRecoverySnapshotAt(time.Now())
-}
-
-func (cli *Client) senderKeyRecoverySnapshotAt(now time.Time) SenderKeyRecoveryStats {
-	cli.senderKeyOutcomesLock.Lock()
-	defer cli.senderKeyOutcomesLock.Unlock()
-	tracker := cli.senderKeyOutcomeTrackerLocked()
-	tracker.prune(now)
-	snapshot := SenderKeyRecoveryStats{ProcessEpoch: senderKeyOutcomeEpoch, Availability: "available", SenderKeyOutcomeCounts: tracker.counts,
-		Occupancy: tracker.size, Capacity: senderKeyOutcomeCapacity, RetentionSeconds: 900, Cohorts: make([]SenderKeyOutcomeCohort, 0)}
-	for index, cohort := range tracker.cohorts {
-		if tracker.cohortValid[index] && cohort.FailureSecond <= now.Unix() && now.Unix()-cohort.FailureSecond <= 900 {
-			snapshot.Cohorts = append(snapshot.Cohorts, cohort)
-		}
-	}
-	return snapshot
-}
 
 // failedSenderKeyTuple keys the failed-set by the inbound sender's device-qualified signal address
 // (e.g. "34278519877736_1:1") plus the group JID. Keying by the INBOUND device (not the winning
@@ -1358,11 +1021,6 @@ func (cli *Client) isFailedSenderKeyTuple(sender, group string) bool {
 // would have done anyway — safe, never a correctness loss). Dedup on add; ring-evict oldest when full.
 const skdmInstalledSize = 16384
 
-// skdmDedupLogEvery samples the periodic SKDM_DEDUP stat line (every Nth event on either the skip or
-// processed path) so the redundant-write slice can be sized from journald without a DB query. Lowered
-// from 1000 to 100 (29-08 gap-closure) so lines appear within minutes even at low skip rates.
-const skdmDedupLogEvery = 100
-
 // skdmInstalledKey keys the dedup set by the INBOUND sender's device-qualified signal address (same
 // keying as the failed-set), the group, and the SKDM's keyID (the per-generation identifier).
 type skdmInstalledKey struct {
@@ -1370,11 +1028,6 @@ type skdmInstalledKey struct {
 	Group  string // chat.String()
 	KeyID  uint32 // sdkMsg.ID()
 }
-
-// skdmDedupSkipped / skdmDedupProcessed are process-wide counters: redundant re-broadcasts skipped vs
-// SKDMs actually processed (first installs + forward checkpoints + forced re-processes for failing
-// tuples). skip_pct sizes the redundant-write slice this dedup eliminates.
-var skdmDedupSkipped, skdmDedupProcessed atomic.Uint64
 
 // skdmProcessedIteration returns the highest SKDM iteration already processed for (sender,group,keyID)
 // and whether any has been processed. Read-only; guarded by skdmInstalledLock, safe under the
@@ -1430,19 +1083,6 @@ type skdmParseFailKey struct {
 	Group  string // chat.User
 }
 
-// skdmParseFailTotal is the process-wide count of every SKDM parse failure (first-seen and
-// repeat), folded into the periodic SKDM_DEDUP line below so the total stays visible on the log
-// surface without a per-event Error for every repeat (D-11 corrected: visible + counted, never
-// silently dropped or downgraded).
-var skdmParseFailTotal atomic.Uint64
-
-// skdmParseFailShouldEmit records one SKDM parse failure for (sender, group) and reports whether
-// THIS occurrence should emit the full Error diagnostic. Every call increments skdmParseFailTotal
-// and the per-pair count regardless of the return value. Returns true only on the first-seen pair
-// (which it then records, subject to skdmParseFailPairsSize); every later call for the same pair
-// returns false. On overflow (skdmParseFailPairsSize distinct pairs already recorded) a brand-new
-// pair is counted via skdmParseFailOverflow but does not get its own first-occurrence Error -- the
-// bound is a future-storm guard, not today's shape (two senders).
 func (cli *Client) skdmParseFailShouldEmit(sender, group string) bool {
 	key := skdmParseFailKey{Sender: sender, Group: group}
 	cli.skdmParseFailLock.Lock()
@@ -1450,19 +1090,14 @@ func (cli *Client) skdmParseFailShouldEmit(sender, group string) bool {
 	if cli.skdmParseFailSeen == nil {
 		// Lazy init: a bare &Client{} (tests / direct construction) must not nil-panic.
 		cli.skdmParseFailSeen = make(map[skdmParseFailKey]struct{}, skdmParseFailPairsSize)
-		cli.skdmParseFailCounts = make(map[skdmParseFailKey]uint64, skdmParseFailPairsSize)
 	}
-	skdmParseFailTotal.Add(1)
 	if _, seen := cli.skdmParseFailSeen[key]; seen {
-		cli.skdmParseFailCounts[key]++
 		return false
 	}
 	if len(cli.skdmParseFailSeen) >= skdmParseFailPairsSize {
-		cli.skdmParseFailOverflow++
 		return false
 	}
 	cli.skdmParseFailSeen[key] = struct{}{}
-	cli.skdmParseFailCounts[key] = 1
 	return true
 }
 
@@ -1510,31 +1145,8 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	wasFailed := cli.isFailedSenderKeyTuple(from.SignalAddress().String(), chat.String())
 	sdkMsg, err := protocol.NewSenderKeyDistributionMessageFromBytes(axolotlSKDM, pbSerializer.SenderKeyDistributionMessage)
 	if err != nil {
-		// kavtov-fork (55.1-08, D-11 corrected): visible + fully counted, not re-announced. The
-		// payload is proven-unparseable external format (55.1-INVESTIGATION-skdm.md: two @lid devices
-		// sending a bare 32-byte value where an SKDM belongs), not a version gap our fork could
-		// recover from -- there is no retry here today and this change must not add one. First
-		// sighting per (sender,group) emits the full diagnostic at the existing Error level with the
-		// existing byte0/verNibble/hex capture (that's what proved the root cause); every repeat only
-		// counts (skdmParseFailTotal, folded into the periodic SKDM_DEDUP line below) -- mirrors the
-		// iteration-aware SKDM dedup a few lines below (skdmProcessedIteration).
 		if cli.skdmParseFailShouldEmit(from.User, chat.User) {
 			cli.Log.Errorf("Failed to parse sender key distribution message from %s for %s: %v", from, chat, err)
-			// 2026-07-01 SKDM debug: capture the raw bytes that fail to parse so we can root-cause the
-			// wire format (they are not otherwise logged). Low volume (~300/day, a couple of @lid senders).
-			// %x = hex; byte0/verNibble expose the libsignal version prefix the parser strips at serialized[0].
-			var skdmByte0 byte
-			if len(axolotlSKDM) > 0 {
-				skdmByte0 = axolotlSKDM[0]
-			}
-			cli.Log.Errorf("SKDM_PARSE_FAIL_BYTES from=%s group=%s len=%d byte0=0x%02x verNibble=%d hex=%x",
-				from, chat, len(axolotlSKDM), skdmByte0, skdmByte0>>4, axolotlSKDM)
-		} else {
-			cli.Log.Debugf("SKDM_PARSE_FAIL_BYTES (repeat, known non-conformant pair) from=%s group=%s len=%d total=%d",
-				from, chat, len(axolotlSKDM), skdmParseFailTotal.Load())
-		}
-		if wasFailed {
-			cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=n stage=parse", from.SignalAddressUser(), from.Device, chat.String())
 		}
 		return
 	}
@@ -1550,9 +1162,6 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 	skdmIter := sdkMsg.Iteration()
 	if !wasFailed {
 		if seenIter, ok := cli.skdmProcessedIteration(senderStr, chat.String(), keyID); ok && skdmIter <= seenIter {
-			if n := skdmDedupSkipped.Add(1); n%skdmDedupLogEvery == 0 {
-				cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d parsefail=%d group=%s keyid=%d iter=%d seen=%d", skdmDedupProcessed.Load(), n, skdmParseFailTotal.Load(), chat.String(), keyID, skdmIter, seenIter)
-			}
 			return
 		}
 	}
@@ -1566,16 +1175,7 @@ func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat,
 		return
 	}
 	cli.markSKDMProcessed(senderStr, chat.String(), keyID, skdmIter)
-	// kavtov-fork (29-08 gap-closure): emit SKDM_DEDUP on the processed path every
-	// skdmDedupLogEvery installs so the stat line appears even at near-zero skip rates.
-	// The skip-path line (below wasFailed block) carries group/keyid/iter; this line
-	// records totals only (processed/skipped magnitude without per-event detail).
-	if p := skdmDedupProcessed.Add(1); p%skdmDedupLogEvery == 0 {
-		cli.Log.Infof("SKDM_DEDUP processed=%d skipped=%d parsefail=%d", p, skdmDedupSkipped.Load(), skdmParseFailTotal.Load())
-	}
-	if wasFailed {
-		cli.Log.Infof("SKDM_FOR_FAILED_TUPLE sender=%s device=%d group=%s installed=y", from.SignalAddressUser(), from.Device, chat.String())
-	}
+
 	cli.Log.Debugf("Processed sender key distribution message from %s in %s", senderKeyName.Sender().String(), senderKeyName.GroupID())
 }
 

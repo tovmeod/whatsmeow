@@ -24,7 +24,6 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
-	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
 )
@@ -152,7 +151,7 @@ func TestNoDonorCacheMalformedRescansAndValidSibling(t *testing.T) {
 	t.Cleanup(resetNoDonorCacheForTest)
 	for _, bad := range [][]byte{nil, []byte("bad-flat")} {
 		stub := &stubRecoveryInner{}
-		c := newStubCachedStore(t, stub, nil)
+		c := newStubCachedStore(t, stub)
 		uncertain := &uncertainRecoveryInner{stubRecoveryInner: stub, blobs: [][]byte{bad}}
 		c.inner = uncertain
 		for i := 0; i < 2; i++ {
@@ -209,7 +208,7 @@ func TestInlineRecoveryCanceledFollowerAndLeader(t *testing.T) {
 	resetNoDonorCacheForTest()
 	t.Cleanup(resetNoDonorCacheForTest)
 	stub := &stubRecoveryInner{entered: make(chan struct{}, 1), release: make(chan struct{})}
-	c := newStubCachedStore(t, stub, nil)
+	c := newStubCachedStore(t, stub)
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	defer cancelLeader()
 	leader := make(chan error, 1)
@@ -245,7 +244,7 @@ func TestInlineRecoveryLiveFollowerAfterLeaderCancel(t *testing.T) {
 	resetNoDonorCacheForTest()
 	t.Cleanup(resetNoDonorCacheForTest)
 	stub := &stubRecoveryInner{entered: make(chan struct{}, 2), release: make(chan struct{})}
-	c := newStubCachedStore(t, stub, nil)
+	c := newStubCachedStore(t, stub)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	leader := make(chan error, 1)
@@ -277,19 +276,19 @@ func TestNoDonorCacheBoundedOverflow(t *testing.T) {
 	t.Cleanup(resetNoDonorCacheForTest)
 	donorWorkCapacity = 1
 	stub := &stubRecoveryInner{entered: make(chan struct{}, 1), release: make(chan struct{})}
-	c := newStubCachedStore(t, stub, nil)
+	c := newStubCachedStore(t, stub)
 	done := make(chan error, 1)
 	go func() { _, _, err := c.TryInlineRecovery(context.Background(), "held", "s:0", "s", 1, 5); done <- err }()
 	<-stub.entered
 	other := &stubRecoveryInner{donor: stubDonor(1, 2)}
-	o := newStubCachedStore(t, other, nil)
+	o := newStubCachedStore(t, other)
 	_, ok, err := o.TryInlineRecovery(context.Background(), "overflow", "s:0", "s", 1, 5)
 	if !ok || err != nil {
 		t.Fatalf("overflow positive failed: %v", err)
 	}
 	other.donor = nil
 	_, _, _ = o.TryInlineRecovery(context.Background(), "overflow-miss", "s:0", "s", 1, 5)
-	if noDonorCache.Len() != 0 || noDonorCacheOverflow.Load() != 2 {
+	if noDonorCache.Len() != 0 {
 		t.Fatal("overflow published or uncounted")
 	}
 	noDonorCacheMu.Lock()
@@ -323,7 +322,7 @@ func TestNoDonorCacheABAFixedDeadline(t *testing.T) {
 				}
 				return nil
 			}}
-			c := newStubCachedStore(t, stub, nil)
+			c := newStubCachedStore(t, stub)
 			done := make(chan error, 1)
 			go func() { _, _, err := c.TryInlineRecovery(context.Background(), "aba", "s:0", "s", 1, 5); done <- err }()
 			<-entered
@@ -362,7 +361,7 @@ func TestNoDonorCacheSQLErrorNotAbsence(t *testing.T) {
 	t.Cleanup(resetNoDonorCacheForTest)
 	failure := errors.New("SQL scan failed")
 	stub := &stubRecoveryInner{findErr: failure}
-	c := newStubCachedStore(t, stub, nil)
+	c := newStubCachedStore(t, stub)
 	for i := 0; i < 2; i++ {
 		_, _, err := c.TryInlineRecovery(context.Background(), "err", "s:0", "s", 1, 5)
 		if !errors.Is(err, failure) {
@@ -390,7 +389,7 @@ func stubDonor(keyID, iter uint32) *donorSenderKeyState {
 	}
 }
 
-func newStubCachedStore(t *testing.T, inner *stubRecoveryInner, sf *singleflight.Group) *CachedSenderKeyStore {
+func newStubCachedStore(t *testing.T, inner *stubRecoveryInner) *CachedSenderKeyStore {
 	t.Helper()
 	byteCache, err := lru.New[string, []byte](16)
 	if err != nil {
@@ -400,7 +399,7 @@ func newStubCachedStore(t *testing.T, inner *stubRecoveryInner, sf *singleflight
 	if err != nil {
 		t.Fatalf("lru.New dev: %v", err)
 	}
-	return NewCachedSenderKeyStore(inner, "follower@s.whatsapp.net", byteCache, devCache, sf)
+	return NewCachedSenderKeyStore(inner, "follower@s.whatsapp.net", byteCache, devCache)
 }
 
 func TestInlineRecoveryDifferentIterationsDoNotCoalesce(t *testing.T) {
@@ -414,8 +413,7 @@ func TestInlineRecoveryDifferentIterationsDoNotCoalesce(t *testing.T) {
 		entered: make(chan struct{}, 2),
 		release: make(chan struct{}),
 	}
-	var sf singleflight.Group
-	cs := newStubCachedStore(t, stub, &sf)
+	cs := newStubCachedStore(t, stub)
 
 	const (
 		group      = "iteration-domain@g.us"
@@ -472,7 +470,7 @@ func TestInlineRecoveryDifferentIterationsDoNotCoalesce(t *testing.T) {
 // existing state for the KeyID.
 func TestInlineRecoveryForwardOnlyFollowerGuard(t *testing.T) {
 	stub := &stubRecoveryInner{donor: stubDonor(7, 50)}
-	cs := newStubCachedStore(t, stub, nil)
+	cs := newStubCachedStore(t, stub)
 
 	// Caller's target (20) is BEHIND the donor (50): forward-only must reject.
 	donorJID, ok, err := cs.TryInlineRecovery(context.Background(), "wr04group@g.us", "555_1:0", "555_1", 7, 20)
@@ -518,8 +516,7 @@ func TestInlineRecoveryCoalescedFollowerForwardOnly(t *testing.T) {
 		entered: make(chan struct{}, 2),
 		release: make(chan struct{}),
 	}
-	var sf singleflight.Group
-	cs := newStubCachedStore(t, stub, &sf)
+	cs := newStubCachedStore(t, stub)
 
 	const (
 		group      = "wr04coalesce@g.us"
@@ -873,7 +870,7 @@ func TestInlineRecoveryMergeCapsStatesAndDonorKeys(t *testing.T) {
 	}
 
 	stub := &stubRecoveryInner{donor: donor, existing: existingBlob}
-	cs := newStubCachedStore(t, stub, nil)
+	cs := newStubCachedStore(t, stub)
 
 	_, recovered, err := cs.TryInlineRecovery(context.Background(), "skcapgroup@g.us", "777_1:0", "777_1", 7, 100)
 	if err != nil {
@@ -963,7 +960,7 @@ func TestPutSenderKeyStructureRecoveryBackwardOnlyGate(t *testing.T) {
 		t.Fatal("PackFlat(existing) rejected the seed structure")
 	}
 	stub := &stubRecoveryInner{existing: existingBlob}
-	cs := newStubCachedStore(t, stub, nil)
+	cs := newStubCachedStore(t, stub)
 	// Seed the cache with the existing blob (mirrors what GetSenderKeyStructure
 	// returns from cache after a previous write).
 	cs.cache.Add(cs.key(group, user), existingBlob)
@@ -986,7 +983,7 @@ func TestPutSenderKeyStructureRecoveryBackwardOnlyGate(t *testing.T) {
 	// --- Case 2: FORWARD DONOR ACCEPTED ---
 	// Fresh donor: keyID=7, iter=60 — strictly advances.
 	stub2 := &stubRecoveryInner{existing: existingBlob}
-	cs2 := newStubCachedStore(t, stub2, nil)
+	cs2 := newStubCachedStore(t, stub2)
 	cs2.cache.Add(cs2.key(group, user), existingBlob)
 
 	freshDonorStruct := &groupRecord.SenderKeyStructure{
@@ -1014,7 +1011,7 @@ func TestPutSenderKeyStructureRecoveryBackwardOnlyGate(t *testing.T) {
 		t.Fatal("PackFlat(existingMulti) rejected the seed structure")
 	}
 	stub3 := &stubRecoveryInner{existing: existingMultiBlob}
-	cs3 := newStubCachedStore(t, stub3, nil)
+	cs3 := newStubCachedStore(t, stub3)
 	cs3.cache.Add(cs3.key(group, user), existingMultiBlob)
 
 	// Incoming: donor keyID=7 iter=60 (strictly advances) + foreign keyID=8
