@@ -1260,6 +1260,11 @@ func (cli *Client) recordSenderKeyOutcome(chat, from types.JID, id types.Message
 		cohort.LaterSuccess++
 		tracker.counts.LaterLatency.observe(now.Sub(first.created))
 		cohort.LaterLatency.observe(now.Sub(first.created))
+	} else {
+		// Successful delivery must win over a delayed failure callback or a
+		// duplicate ciphertext whose ratchet key has already been consumed.
+		// Keep the same bounded exact-ID state even without a failed lineage.
+		tracker.insert(token, senderKeyOutcomeRecord{tuple: tuple, created: now, failureSecond: now.Unix()}, now)
 	}
 }
 

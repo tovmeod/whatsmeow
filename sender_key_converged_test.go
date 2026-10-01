@@ -91,6 +91,41 @@ func outcomeFixture() (*Client, types.JID, types.JID) {
 	return cli, types.JID{User: "private-group", Server: types.GroupServer}, types.JID{User: "private-sender", Server: types.HiddenUserServer, Device: 2}
 }
 
+func TestSenderKeyOutcomeDeliveredCipherDuplicate(t *testing.T) {
+	ctx := context.Background()
+	cli, chat, sender := outcomeFixture()
+	skdm, ciphertext := aliceCrypto(ctx, t, chat.String(), []byte("delivered original"))
+	cli.handleSenderKeyDistributionMessage(ctx, chat, sender, skdm)
+	node := &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: ciphertext}
+	if cli.EnableDecryptedEventBuffer {
+		t.Fatal("fixture must exercise production's disabled decrypted-event buffer")
+	}
+	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now(), "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now(), "delivered"); err == nil {
+		t.Fatal("duplicate must still follow the existing consumed-ratchet failure path")
+	}
+	got := cli.SenderKeyRecoverySnapshot()
+	if got.OriginalFailures != 0 || got.PendingOriginals != 0 || got.Duplicates != 1 {
+		t.Fatalf("already delivered ciphertext became an unresolved original: %+v", got)
+	}
+}
+
+func TestSenderKeyOutcomeSuccessPrecedesDelayedFailure(t *testing.T) {
+	for _, success := range []senderKeyOutcomeEvent{senderKeyKeySuccess, senderKeyInlineSuccess} {
+		cli, chat, sender := outcomeFixture()
+		now := time.Unix(1000, 0)
+		cli.recordSenderKeyOutcome(chat, sender, "exact", success, now)
+		// Callback order can differ from event time; retain success precedence.
+		cli.recordSenderKeyOutcome(chat, sender, "exact", senderKeyTerminalFailure, now.Add(-time.Millisecond))
+		got := cli.senderKeyRecoverySnapshotAt(now)
+		if got.OriginalFailures != 0 || got.PendingOriginals != 0 || got.Duplicates != 1 {
+			t.Fatalf("success precedence failed: %+v", got)
+		}
+	}
+}
+
 func TestSenderKeyOutcomeOriginalLaterDistinctCiphertext(t *testing.T) {
 	ctx := context.Background()
 	cli, chat, sender := outcomeFixture()
