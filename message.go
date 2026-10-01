@@ -10,7 +10,10 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"crypto/hmac"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -454,7 +457,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			decrypted, ciphertextHash, err = cli.decryptDM(ctx, &child, senderEncryptionJID, encType == "pkmsg", info.Timestamp)
 			containsDirectMsg = true
 		} else if info.IsGroup && encType == "skmsg" {
-			decrypted, ciphertextHash, err = cli.decryptGroupMsg(ctx, &child, senderEncryptionJID, info.Chat, info.Timestamp)
+			decrypted, ciphertextHash, err = cli.decryptGroupMsg(ctx, &child, senderEncryptionJID, info.Chat, info.Timestamp, info.ID)
 		} else if encType == "msmsg" && info.Sender.IsBot() {
 			targetSenderJID := info.MsgMetaInfo.TargetSender
 			if targetSenderJID.User == "" {
@@ -799,7 +802,7 @@ func (cli *Client) decryptDM(ctx context.Context, child *waBinary.Node, from typ
 	return plaintext, &ciphertextHash, nil
 }
 
-func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, from types.JID, chat types.JID, serverTS time.Time) ([]byte, *[32]byte, error) {
+func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, from types.JID, chat types.JID, serverTS time.Time, ids ...types.MessageID) ([]byte, *[32]byte, error) {
 	content, ok := child.Content.([]byte)
 	if !ok {
 		return nil, nil, fmt.Errorf("message content is not a byte slice")
@@ -816,7 +819,7 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 	// keyID + verify the signature (a wrong candidate fails closed). Each candidate decrypts under
 	// its own address, so the ratchet writes back to the correct record. No :0 normalization, no merge.
 	plaintext, ciphertextHash, err := cli.bufferedDecrypt(ctx, content, serverTS, func(decryptCtx context.Context) ([]byte, error) {
-		return cli.decryptGroupSenderKey(decryptCtx, chat, from, msg)
+		return cli.decryptGroupSenderKey(decryptCtx, chat, from, msg, ids...)
 	}, "senderkey", chat.String(), from.String())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to decrypt group message: %w", err)
@@ -836,7 +839,11 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 // written back to its own device record by GroupCipher.Decrypt. There is no error-class branching:
 // we try every stored device for the sender and let the keyID pick. Returns ErrNoSenderKeyForUser
 // when no stored device record decrypts the message (so the retry-receipt path is unchanged).
-func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.JID, msg *protocol.SenderKeyMessage) ([]byte, error) {
+func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.JID, msg *protocol.SenderKeyMessage, ids ...types.MessageID) ([]byte, error) {
+	var id types.MessageID
+	if len(ids) > 0 {
+		id = ids[0]
+	}
 	devices, err := cli.Store.SenderKeys.GetSenderKeyDevices(ctx, chat.String(), from.SignalAddressUser())
 	if err != nil {
 		return nil, fmt.Errorf("failed to enumerate sender-key devices: %w", err)
@@ -869,6 +876,7 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 		cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
 		plaintext, decErr := cipher.Decrypt(ctx, msg)
 		if decErr == nil {
+			cli.recordSenderKeyOutcome(chat, from, id, senderKeyKeySuccess, time.Time{})
 			// kavtov-fork (P2a): KEY-path decrypt success. If this inbound tuple was previously a
 			// total miss, this is a genuine per-tuple convergence (NOT PDO content-recovery, which
 			// runs elsewhere and installs no key). Emit ONE INFO and drop the entry.
@@ -899,6 +907,7 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 			cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
 			plaintext, decErr := cipher.Decrypt(ctx, msg)
 			if decErr == nil {
+				cli.recordSenderKeyOutcome(chat, from, id, senderKeyInlineSuccess, time.Time{})
 				cli.clearFailedSenderKeyTuple(labeled, chat.String())
 				cli.Log.Infof("SENDER_KEY_RECOVERED donor_jid=%s group=%s sender=%s keyid=%d iter=%d",
 					donorJID, chat.String(), from.SignalAddressUser(), msg.KeyID(), msg.Iteration())
@@ -916,6 +925,7 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	cli.Log.Warnf("SENDERKEY_MISS sender=%s group=%s need_keyid=%d need_iter=%d",
 		from.SignalAddressUser(), chat.String(), msg.KeyID(), msg.Iteration())
 	cli.recordFailedSenderKeyTuple(labeled, chat.String())
+	cli.recordSenderKeyOutcome(chat, from, id, senderKeyTerminalFailure, time.Time{})
 	// kavtov-fork (38.5): increment per-account blacklist counter for (group, sender).
 	// MUST key on from.User (bare, no agent suffix) to match the check site in
 	// sendRetryReceipt (info.Sender.User). For these @lid bots from == info.Sender, so
@@ -973,6 +983,305 @@ func (cli *Client) recordMediaDeleteOutcome(err error) {
 // signal this instrument exists to catch is never evicted before it can fire. Eviction is a ring
 // buffer (oldest tuple dropped when full), identical to recentMessages, with dedup on add.
 const failedSenderKeyTuplesSize = 4096
+
+// Exact-message telemetry is independent of the tuple-only convergence log.
+// Bounded records contain only HMAC tokens, never their identity preimages.
+const senderKeyOutcomeCapacity = 4096
+const senderKeyOutcomeRetention = 900 * time.Second
+const senderKeyOutcomeCohortSlots = 901
+
+var senderKeyOutcomeSalt = newSenderKeyOutcomeNonce()
+var senderKeyOutcomeEpoch = func() string {
+	token := senderKeyOutcomeToken([]string{"process-epoch"})
+	return hex.EncodeToString(token[:])
+}()
+
+func newSenderKeyOutcomeNonce() (nonce [32]byte) {
+	if _, err := cryptorand.Read(nonce[:]); err != nil {
+		panic(err)
+	}
+	return
+}
+
+func senderKeyOutcomeToken(fields []string) [32]byte {
+	mac := hmac.New(sha256.New, senderKeyOutcomeSalt[:])
+	var size [8]byte
+	for _, field := range fields {
+		binary.BigEndian.PutUint64(size[:], uint64(len(field)))
+		_, _ = mac.Write(size[:])
+		_, _ = mac.Write([]byte(field))
+	}
+	var token [32]byte
+	copy(token[:], mac.Sum(nil))
+	return token
+}
+
+// SenderKeyOutcomeLatency describes elapsed time from a terminal failure.
+type SenderKeyOutcomeLatency struct {
+	Count uint64 `json:"count"`
+	SumMS uint64 `json:"sum_ms"`
+	MaxMS uint64 `json:"max_ms"`
+}
+
+func (latency *SenderKeyOutcomeLatency) observe(elapsed time.Duration) {
+	ms := uint64(max(elapsed.Milliseconds(), 0))
+	latency.Count++
+	latency.SumMS += ms
+	latency.MaxMS = max(latency.MaxMS, ms)
+}
+
+// SenderKeyOutcomeCounts are ciphertext events, deduplicated by exact lineage.
+// Later success never resolves a pending original. Two distinct successes may
+// coexist in one second; exact-ID recovery always takes classification priority.
+type SenderKeyOutcomeCounts struct {
+	OriginalFailures         uint64                  `json:"original_failures"`
+	OriginalRecovered        uint64                  `json:"original_recovered"`
+	SameAttemptInlineSuccess uint64                  `json:"same_attempt_inline_success"`
+	LaterSuccess             uint64                  `json:"later_success"`
+	UnknownUntraced          uint64                  `json:"unknown_untraced"`
+	Evictions                uint64                  `json:"evictions"`
+	Expiries                 uint64                  `json:"expiries"`
+	Duplicates               uint64                  `json:"duplicates"`
+	PendingOriginals         uint64                  `json:"pending_originals"`
+	OriginalLatency          SenderKeyOutcomeLatency `json:"original_latency"`
+	LaterLatency             SenderKeyOutcomeLatency `json:"later_latency"`
+}
+
+// SenderKeyOutcomeCohort exposes only the original failure second and aggregates.
+type SenderKeyOutcomeCohort struct {
+	FailureSecond int64 `json:"failure_second"`
+	SenderKeyOutcomeCounts
+}
+
+// SenderKeyRecoveryStats is the sole exported view of process-local outcomes.
+type SenderKeyRecoveryStats struct {
+	ProcessEpoch string `json:"process_epoch"`
+	Availability string `json:"availability"`
+	SenderKeyOutcomeCounts
+	Occupancy        int                      `json:"occupancy"`
+	Capacity         int                      `json:"capacity"`
+	RetentionSeconds int                      `json:"retention_seconds"`
+	Cohorts          []SenderKeyOutcomeCohort `json:"cohorts"`
+}
+
+type senderKeyOutcomeEvent uint8
+
+const (
+	senderKeyTerminalFailure senderKeyOutcomeEvent = iota
+	senderKeyKeySuccess
+	senderKeyInlineSuccess
+)
+
+type senderKeyOutcomeRecord struct {
+	tuple               [32]byte
+	created             time.Time
+	failureSecond       int64
+	original, recovered bool
+}
+
+type senderKeyOutcomeTracker struct {
+	records     map[[32]byte]senderKeyOutcomeRecord
+	originals   map[[32]byte]map[[32]byte]struct{}
+	ring        [senderKeyOutcomeCapacity][32]byte
+	head, size  int
+	counts      SenderKeyOutcomeCounts
+	cohorts     [senderKeyOutcomeCohortSlots]SenderKeyOutcomeCohort
+	cohortValid [senderKeyOutcomeCohortSlots]bool
+}
+
+func (cli *Client) senderKeyOutcomeTrackerLocked() *senderKeyOutcomeTracker {
+	if cli.senderKeyOutcomes == nil {
+		if cli.senderKeyOutcomeNonce == ([32]byte{}) {
+			cli.senderKeyOutcomeNonce = newSenderKeyOutcomeNonce()
+		}
+		cli.senderKeyOutcomes = &senderKeyOutcomeTracker{
+			records: make(map[[32]byte]senderKeyOutcomeRecord), originals: make(map[[32]byte]map[[32]byte]struct{}),
+		}
+	}
+	return cli.senderKeyOutcomes
+}
+
+func (tracker *senderKeyOutcomeTracker) cohort(second int64) *SenderKeyOutcomeCounts {
+	index := int((second%senderKeyOutcomeCohortSlots + senderKeyOutcomeCohortSlots) % senderKeyOutcomeCohortSlots)
+	if !tracker.cohortValid[index] || tracker.cohorts[index].FailureSecond != second {
+		tracker.cohorts[index] = SenderKeyOutcomeCohort{FailureSecond: second}
+		tracker.cohortValid[index] = true
+	}
+	return &tracker.cohorts[index].SenderKeyOutcomeCounts
+}
+
+func (tracker *senderKeyOutcomeTracker) removeOldest(evicted bool, now time.Time) {
+	token := tracker.ring[tracker.head]
+	record := tracker.records[token]
+	delete(tracker.records, token)
+	tracker.head = (tracker.head + 1) % senderKeyOutcomeCapacity
+	tracker.size--
+	if record.original {
+		delete(tracker.originals[record.tuple], token)
+		if len(tracker.originals[record.tuple]) == 0 {
+			delete(tracker.originals, record.tuple)
+		}
+	}
+	// Never resurrect an expired cohort into a slot now owned by a newer one.
+	var cohort *SenderKeyOutcomeCounts
+	if now.Unix()-record.failureSecond <= 900 {
+		cohort = tracker.cohort(record.failureSecond)
+	}
+	if evicted {
+		tracker.counts.Evictions++
+	} else {
+		tracker.counts.Expiries++
+	}
+	if cohort != nil {
+		if evicted {
+			cohort.Evictions++
+		} else {
+			cohort.Expiries++
+		}
+	}
+	if record.original && !record.recovered {
+		tracker.counts.PendingOriginals--
+		tracker.counts.UnknownUntraced++
+		if cohort != nil {
+			cohort.PendingOriginals--
+			cohort.UnknownUntraced++
+		}
+	}
+}
+
+func (tracker *senderKeyOutcomeTracker) prune(now time.Time) {
+	// Insertion order makes cleanup capacity-bounded, with no common-path scan.
+	// Keep records at the exact inclusive +900s boundary.
+	for tracker.size > 0 && now.After(tracker.records[tracker.ring[tracker.head]].created.Add(senderKeyOutcomeRetention)) {
+		tracker.removeOldest(false, now)
+	}
+}
+
+func (tracker *senderKeyOutcomeTracker) insert(token [32]byte, record senderKeyOutcomeRecord, now time.Time) {
+	if tracker.size == senderKeyOutcomeCapacity {
+		tracker.removeOldest(true, now)
+	}
+	tracker.ring[(tracker.head+tracker.size)%senderKeyOutcomeCapacity] = token
+	tracker.size++
+	tracker.records[token] = record
+	if record.original {
+		if tracker.originals[record.tuple] == nil {
+			tracker.originals[record.tuple] = make(map[[32]byte]struct{})
+		}
+		tracker.originals[record.tuple][token] = struct{}{}
+	}
+}
+
+func (cli *Client) recordSenderKeyOutcome(chat, from types.JID, id types.MessageID, event senderKeyOutcomeEvent, now time.Time) {
+	cli.senderKeyOutcomesLock.Lock()
+	defer cli.senderKeyOutcomesLock.Unlock()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	tracker := cli.senderKeyOutcomeTrackerLocked()
+	tracker.prune(now)
+	if id == "" || cli.Store == nil || cli.Store.GetJID().IsEmpty() {
+		// Missing correlation is never treated as original recovery.
+		if event == senderKeyTerminalFailure {
+			tracker.counts.OriginalFailures++
+			tracker.counts.UnknownUntraced++
+			cohort := tracker.cohort(now.Unix())
+			cohort.OriginalFailures++
+			cohort.UnknownUntraced++
+		} else if event == senderKeyInlineSuccess {
+			tracker.counts.SameAttemptInlineSuccess++
+		}
+		return
+	}
+	fields := []string{string(cli.senderKeyOutcomeNonce[:]), cli.Store.GetJID().String(), from.SignalAddress().String(), chat.String()}
+	tuple := senderKeyOutcomeToken(fields)
+	token := senderKeyOutcomeToken(append(fields, string(id)))
+	if record, found := tracker.records[token]; found {
+		// A later-success dedup record can outlive its original cohort. Do not
+		// resurrect that cohort into a slot occupied by newer failures.
+		var cohort *SenderKeyOutcomeCounts
+		if now.Unix()-record.failureSecond <= 900 {
+			cohort = tracker.cohort(record.failureSecond)
+		}
+		if event != senderKeyTerminalFailure && record.original && !record.recovered {
+			record.recovered = true
+			tracker.records[token] = record
+			tracker.counts.OriginalRecovered++
+			if cohort != nil {
+				cohort.OriginalRecovered++
+			}
+			tracker.counts.PendingOriginals--
+			if cohort != nil {
+				cohort.PendingOriginals--
+			}
+			tracker.counts.OriginalLatency.observe(now.Sub(record.created))
+			if cohort != nil {
+				cohort.OriginalLatency.observe(now.Sub(record.created))
+			}
+		} else {
+			tracker.counts.Duplicates++
+			if cohort != nil {
+				cohort.Duplicates++
+			}
+		}
+		return
+	}
+	if event == senderKeyTerminalFailure {
+		tracker.insert(token, senderKeyOutcomeRecord{tuple: tuple, created: now, failureSecond: now.Unix(), original: true}, now)
+		cohort := tracker.cohort(now.Unix())
+		tracker.counts.OriginalFailures++
+		cohort.OriginalFailures++
+		tracker.counts.PendingOriginals++
+		cohort.PendingOriginals++
+		return
+	}
+	if event == senderKeyInlineSuccess {
+		tracker.insert(token, senderKeyOutcomeRecord{tuple: tuple, created: now, failureSecond: now.Unix()}, now)
+		tracker.counts.SameAttemptInlineSuccess++
+		tracker.cohort(now.Unix()).SameAttemptInlineSuccess++
+		return
+	}
+	// Attribute each distinct later ciphertext to the oldest retained original
+	// on its lineage, without ever resolving that original. Recovered originals
+	// stay indexed so equal-time exact/later callbacks have order-independent totals.
+	var first senderKeyOutcomeRecord
+	var firstToken [32]byte
+	found := false
+	for original := range tracker.originals[tuple] {
+		record := tracker.records[original]
+		if !found || record.created.Before(first.created) || (record.created.Equal(first.created) && bytes.Compare(original[:], firstToken[:]) < 0) {
+			first, firstToken, found = record, original, true
+		}
+	}
+	if found {
+		tracker.insert(token, senderKeyOutcomeRecord{tuple: tuple, created: now, failureSecond: first.failureSecond}, now)
+		cohort := tracker.cohort(first.failureSecond)
+		tracker.counts.LaterSuccess++
+		cohort.LaterSuccess++
+		tracker.counts.LaterLatency.observe(now.Sub(first.created))
+		cohort.LaterLatency.observe(now.Sub(first.created))
+	}
+}
+
+// SenderKeyRecoverySnapshot returns detached aggregate diagnostics only.
+func (cli *Client) SenderKeyRecoverySnapshot() SenderKeyRecoveryStats {
+	return cli.senderKeyRecoverySnapshotAt(time.Now())
+}
+
+func (cli *Client) senderKeyRecoverySnapshotAt(now time.Time) SenderKeyRecoveryStats {
+	cli.senderKeyOutcomesLock.Lock()
+	defer cli.senderKeyOutcomesLock.Unlock()
+	tracker := cli.senderKeyOutcomeTrackerLocked()
+	tracker.prune(now)
+	snapshot := SenderKeyRecoveryStats{ProcessEpoch: senderKeyOutcomeEpoch, Availability: "available", SenderKeyOutcomeCounts: tracker.counts,
+		Occupancy: tracker.size, Capacity: senderKeyOutcomeCapacity, RetentionSeconds: 900, Cohorts: make([]SenderKeyOutcomeCohort, 0)}
+	for index, cohort := range tracker.cohorts {
+		if tracker.cohortValid[index] && cohort.FailureSecond <= now.Unix() && now.Unix()-cohort.FailureSecond <= 900 {
+			snapshot.Cohorts = append(snapshot.Cohorts, cohort)
+		}
+	}
+	return snapshot
+}
 
 // failedSenderKeyTuple keys the failed-set by the inbound sender's device-qualified signal address
 // (e.g. "34278519877736_1:1") plus the group JID. Keying by the INBOUND device (not the winning

@@ -26,12 +26,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.mau.fi/libsignal/groups"
+	"go.mau.fi/libsignal/protocol"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -63,18 +67,281 @@ func TestSenderKeyOutcomeOriginalLater(t *testing.T) {
 	skdm, ciphertext := aliceCrypto(ctx, t, chat.String(), []byte("exact original"))
 	cli := newTestClient(newFakeSenderKeyStore())
 	node := &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: ciphertext}
-	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now()); err == nil {
+	account := types.JID{User: "outcome-account", Server: types.DefaultUserServer, Device: 3}
+	cli.Store.ID = &account
+	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now(), "original"); err == nil {
 		t.Fatal("original must fail before its sender key arrives")
 	}
 	if snapshot := outcomeSnapshot(t, cli); snapshot["original_failures"] != float64(1) {
 		t.Fatalf("expected one terminal original failure, got %v", snapshot)
 	}
 	cli.handleSenderKeyDistributionMessage(ctx, chat, sender, skdm)
-	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now()); err != nil {
+	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now(), "original"); err != nil {
 		t.Fatal(err)
 	}
 	if snapshot := outcomeSnapshot(t, cli); snapshot["original_recovered"] != float64(1) || snapshot["later_success"] != float64(0) {
 		t.Fatalf("exact original retry must recover only the original, got %v", snapshot)
+	}
+}
+
+func outcomeFixture() (*Client, types.JID, types.JID) {
+	cli := newTestClient(newFakeSenderKeyStore())
+	account := types.JID{User: "private-account", Server: types.DefaultUserServer, Device: 3}
+	cli.Store.ID = &account
+	return cli, types.JID{User: "private-group", Server: types.GroupServer}, types.JID{User: "private-sender", Server: types.HiddenUserServer, Device: 2}
+}
+
+func TestSenderKeyOutcomeOriginalLaterDistinctCiphertext(t *testing.T) {
+	ctx := context.Background()
+	cli, chat, sender := outcomeFixture()
+	alice := newAliceSenderKeyStore()
+	name := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress("alice", 0))
+	builder := groups.NewGroupSessionBuilder(alice, pbSerializer)
+	skdm, err := builder.Create(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher := groups.NewGroupCipher(builder, name, alice)
+	encrypt := func(text string) *waBinary.Node {
+		message, err := cipher.Encrypt(ctx, []byte(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: message.(*protocol.SenderKeyMessage).SignedSerialize()}
+	}
+	original, later := encrypt("failed original"), encrypt("different later ciphertext")
+	if _, _, err = cli.decryptGroupMsg(ctx, original, sender, chat, time.Now(), "original"); err == nil {
+		t.Fatal("expected miss")
+	}
+	cli.handleSenderKeyDistributionMessage(ctx, chat, sender, skdm.Serialize())
+	if _, _, err = cli.decryptGroupMsg(ctx, later, sender, chat, time.Now(), "later"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := cli.SenderKeyRecoverySnapshot()
+	if snapshot.OriginalRecovered != 0 || snapshot.LaterSuccess != 1 || snapshot.PendingOriginals != 1 {
+		t.Fatalf("later ciphertext falsely resolved original: %+v", snapshot)
+	}
+	// The skipped key still supports the existing explicit-original retry.
+	if _, _, err = cli.decryptGroupMsg(ctx, original, sender, chat, time.Now(), "original"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot = cli.SenderKeyRecoverySnapshot()
+	if snapshot.OriginalRecovered != 1 || snapshot.LaterSuccess != 1 || snapshot.PendingOriginals != 0 {
+		t.Fatalf("original/later classifications merged: %+v", snapshot)
+	}
+}
+
+func TestSenderKeyOutcomeCorrelation(t *testing.T) {
+	now := time.Unix(1000, 0)
+	for _, dimension := range []string{"nonce", "account", "device", "group", "unicode", "delimiter"} {
+		t.Run(dimension, func(t *testing.T) {
+			cli, chat, sender := outcomeFixture()
+			id := types.MessageID("exact\x00é|raw")
+			cli.recordSenderKeyOutcome(chat, sender, id, senderKeyTerminalFailure, now)
+			originalNonce, originalAccount := cli.senderKeyOutcomeNonce, *cli.Store.ID
+			successChat, successSender, successID := chat, sender, id
+			switch dimension {
+			case "nonce":
+				cli.senderKeyOutcomeNonce = newSenderKeyOutcomeNonce()
+			case "account":
+				other := originalAccount
+				other.User += "other"
+				cli.Store.ID = &other
+			case "device":
+				successSender.Device++
+			case "group":
+				successChat.User += "other"
+			case "unicode":
+				successID = "exact\x00e\u0301|raw"
+			case "delimiter":
+				successID = "exact|\x00éraw"
+			}
+			cli.recordSenderKeyOutcome(successChat, successSender, successID, senderKeyKeySuccess, now.Add(time.Second))
+			snapshot := cli.senderKeyRecoverySnapshotAt(now.Add(time.Second))
+			if snapshot.OriginalRecovered != 0 || snapshot.PendingOriginals != 1 {
+				t.Fatalf("cross-lineage original match: %+v", snapshot)
+			}
+			cli.senderKeyOutcomeNonce, cli.Store.ID = originalNonce, &originalAccount
+			cli.recordSenderKeyOutcome(chat, sender, id, senderKeyKeySuccess, now.Add(2*time.Second))
+			if got := cli.senderKeyRecoverySnapshotAt(now.Add(2 * time.Second)); got.OriginalRecovered != 1 {
+				t.Fatalf("exact ID did not recover: %+v", got)
+			}
+		})
+	}
+	if senderKeyOutcomeToken([]string{"ab", "c"}) == senderKeyOutcomeToken([]string{"a", "bc"}) {
+		t.Fatal("length-prefix encoding is ambiguous")
+	}
+	cli, _, _ := outcomeFixture()
+	other, _, _ := outcomeFixture()
+	_ = cli.SenderKeyRecoverySnapshot()
+	_ = other.SenderKeyRecoverySnapshot()
+	if cli.senderKeyOutcomeNonce == other.senderKeyOutcomeNonce {
+		t.Fatal("client/store lifetimes share a nonce")
+	}
+	data, _ := json.Marshal(cli.SenderKeyRecoverySnapshot())
+	for _, raw := range []string{"private-account", "private-group", "private-sender", "exact", "nonce", "token"} {
+		if strings.Contains(string(data), raw) {
+			t.Fatalf("snapshot leaks %q: %s", raw, data)
+		}
+	}
+}
+
+func TestSenderKeyOutcomeCorrelationEpoch(t *testing.T) {
+	if os.Getenv("SENDER_KEY_EPOCH_CHILD") == "1" {
+		fmt.Println(senderKeyOutcomeEpoch)
+		return
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(self, "-test.run=^TestSenderKeyOutcomeCorrelationEpoch$")
+	command.Env = append(os.Environ(), "SENDER_KEY_EPOCH_CHILD=1")
+	data, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), senderKeyOutcomeEpoch) {
+		t.Fatal("new process reused the old process_epoch")
+	}
+}
+
+type outcomeInlineRecoverer struct {
+	cli          *Client
+	chat, sender types.JID
+	skdm         []byte
+}
+
+func (recoverer *outcomeInlineRecoverer) TryInlineRecovery(ctx context.Context, _, _, _ string, _, _ uint32) (string, bool, error) {
+	recoverer.cli.handleSenderKeyDistributionMessage(ctx, recoverer.chat, recoverer.sender, recoverer.skdm)
+	return "test-donor", true, nil
+}
+
+func TestSenderKeyOutcomeOriginalLaterInline(t *testing.T) {
+	cli, chat, sender := outcomeFixture()
+	ctx := context.Background()
+	skdm, ciphertext := aliceCrypto(ctx, t, chat.String(), []byte("inline rescue"))
+	cli.Store.InlineRecoverer = &outcomeInlineRecoverer{cli: cli, chat: chat, sender: sender, skdm: skdm}
+	node := &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: ciphertext}
+	if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now(), "inline"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := cli.SenderKeyRecoverySnapshot()
+	if snapshot.SameAttemptInlineSuccess != 1 || snapshot.OriginalFailures != 0 || snapshot.OriginalRecovered != 0 || snapshot.LaterSuccess != 0 {
+		t.Fatalf("same-attempt donor success classified as terminal/later: %+v", snapshot)
+	}
+}
+
+func TestSenderKeyOutcomeRetention(t *testing.T) {
+	cli, chat, sender := outcomeFixture()
+	start := time.Unix(1000, 0)
+	cli.recordSenderKeyOutcome(chat, sender, "start", senderKeyTerminalFailure, start)
+	cli.recordSenderKeyOutcome(chat, sender, "end-minus-one", senderKeyTerminalFailure, start.Add(299*time.Second))
+	cli.recordSenderKeyOutcome(chat, sender, "end", senderKeyTerminalFailure, start.Add(300*time.Second))
+	snapshot := cli.senderKeyRecoverySnapshotAt(start.Add(900 * time.Second))
+	selected := uint64(0)
+	for _, cohort := range snapshot.Cohorts {
+		if cohort.FailureSecond >= start.Unix() && cohort.FailureSecond < start.Unix()+300 {
+			selected += cohort.OriginalFailures
+		}
+	}
+	if selected != 2 || snapshot.PendingOriginals != 3 || snapshot.Expiries != 0 {
+		t.Fatalf("300s/900s adjacency failed: %+v", snapshot)
+	}
+	cli.recordSenderKeyOutcome(chat, sender, "start", senderKeyKeySuccess, start.Add(900*time.Second))
+	snapshot = cli.senderKeyRecoverySnapshotAt(start.Add(900*time.Second + time.Nanosecond))
+	if snapshot.OriginalRecovered != 1 || snapshot.Expiries != 1 || snapshot.UnknownUntraced != 0 {
+		t.Fatalf("inclusive follow-up lost recovery: %+v", snapshot)
+	}
+	snapshot = cli.senderKeyRecoverySnapshotAt(start.Add(1201 * time.Second))
+	if snapshot.Occupancy != 0 || snapshot.PendingOriginals != 0 || snapshot.UnknownUntraced != 2 || len(snapshot.Cohorts) != 0 {
+		t.Fatalf("expiry claims loss or retains stale cohorts: %+v", snapshot)
+	}
+	cli, chat, sender = outcomeFixture()
+	for i := 0; i <= senderKeyOutcomeCapacity; i++ {
+		cli.recordSenderKeyOutcome(chat, sender, types.MessageID(fmt.Sprint(i)), senderKeyTerminalFailure, start)
+	}
+	snapshot = cli.senderKeyRecoverySnapshotAt(start)
+	if snapshot.Occupancy != senderKeyOutcomeCapacity || snapshot.Evictions != 1 || snapshot.UnknownUntraced != 1 || snapshot.PendingOriginals != senderKeyOutcomeCapacity {
+		t.Fatalf("capacity eviction not bounded/unknown: %+v", snapshot)
+	}
+}
+
+func TestSenderKeyOutcomeDuplicate(t *testing.T) {
+	cli, chat, sender := outcomeFixture()
+	now := time.Unix(1000, 0)
+	for i := 0; i < 2; i++ {
+		cli.recordSenderKeyOutcome(chat, sender, "original", senderKeyTerminalFailure, now)
+	}
+	for i := 0; i < 2; i++ {
+		cli.recordSenderKeyOutcome(chat, sender, "later", senderKeyKeySuccess, now.Add(time.Second))
+	}
+	for i := 0; i < 2; i++ {
+		cli.recordSenderKeyOutcome(chat, sender, "original", senderKeyInlineSuccess, now.Add(time.Second))
+	}
+	snapshot := cli.senderKeyRecoverySnapshotAt(now.Add(time.Second))
+	if snapshot.OriginalFailures != 1 || snapshot.OriginalRecovered != 1 || snapshot.LaterSuccess != 1 || snapshot.Duplicates != 3 || snapshot.SameAttemptInlineSuccess != 0 {
+		t.Fatalf("duplicate/inline retry classified incorrectly: %+v", snapshot)
+	}
+	cli.recordSenderKeyOutcome(chat, sender, "new-inline", senderKeyInlineSuccess, now.Add(2*time.Second))
+	snapshot = cli.senderKeyRecoverySnapshotAt(now.Add(2 * time.Second))
+	if snapshot.OriginalFailures != 1 || snapshot.SameAttemptInlineSuccess != 1 || snapshot.LaterSuccess != 1 {
+		t.Fatalf("initial inline rescue creates terminal failure: %+v", snapshot)
+	}
+}
+
+func TestSenderKeyOutcomeConcurrent(t *testing.T) {
+	cli, chat, sender := outcomeFixture()
+	now := time.Unix(1000, 0)
+	cli.recordSenderKeyOutcome(chat, sender, "original", senderKeyTerminalFailure, now)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cli.recordSenderKeyOutcome(chat, sender, "later", senderKeyKeySuccess, now.Add(time.Second))
+			cli.recordSenderKeyOutcome(chat, sender, "original", senderKeyKeySuccess, now.Add(time.Second))
+			_ = cli.senderKeyRecoverySnapshotAt(now.Add(time.Second))
+		}()
+	}
+	wg.Wait()
+	snapshot := cli.senderKeyRecoverySnapshotAt(now.Add(time.Second))
+	if snapshot.OriginalRecovered != 1 || snapshot.LaterSuccess != 1 || snapshot.Duplicates != 198 || snapshot.PendingOriginals != 0 {
+		t.Fatalf("parallel exact-ID classification not deterministic: %+v", snapshot)
+	}
+}
+
+type outcomeLockedStore struct {
+	mu sync.Mutex
+	*fakeSenderKeyStore
+}
+
+func (store *outcomeLockedStore) GetSenderKeyDevices(ctx context.Context, group, sender string) ([]string, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.fakeSenderKeyStore.GetSenderKeyDevices(ctx, group, sender)
+}
+
+func TestSenderKeyOutcomeConcurrentDecrypts(t *testing.T) {
+	cli, chat, sender := outcomeFixture()
+	cli.Store.SenderKeys = &outcomeLockedStore{fakeSenderKeyStore: newFakeSenderKeyStore()}
+	ctx := context.Background()
+	_, ciphertext := aliceCrypto(ctx, t, chat.String(), []byte("parallel terminal miss"))
+	node := &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: ciphertext}
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := cli.decryptGroupMsg(ctx, node, sender, chat, time.Now(), "same-original"); err == nil {
+				t.Error("unexpected decrypt without a key")
+			}
+		}()
+	}
+	wg.Wait()
+	snapshot := cli.SenderKeyRecoverySnapshot()
+	if snapshot.OriginalFailures != 1 || snapshot.Duplicates != 63 || snapshot.PendingOriginals != 1 {
+		t.Fatalf("parallel decrypt callbacks double-count: %+v", snapshot)
 	}
 }
 

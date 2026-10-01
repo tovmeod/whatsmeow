@@ -203,6 +203,13 @@ type Client struct {
 	failedSenderKeyTuplesPtr  int
 	failedSenderKeyTuplesLock sync.Mutex
 
+	// Aggregate-only exact-message outcomes. The nonce separates Client/store
+	// lifetimes, including replacements using the same account JID. Lazy init
+	// keeps bare test clients safe; bookkeeping never holds a lock across crypto.
+	senderKeyOutcomeNonce [32]byte
+	senderKeyOutcomes     *senderKeyOutcomeTracker
+	senderKeyOutcomesLock sync.Mutex
+
 	// kavtov-fork (D-12): per-collection consecutive ErrMismatchingLTHash failure counter.
 	// When the same collection name fails N times in a row, handleAppStateNotification triggers
 	// FetchAppState(fullSync=true) to self-heal the divergence. Uses its own lock — NOT
@@ -371,20 +378,21 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		Transport: (http.DefaultTransport.(*http.Transport)).Clone(),
 	}
 	cli := &Client{
-		mediaHTTP:          ptr.Clone(baseHTTPClient),
-		websocketHTTP:      ptr.Clone(baseHTTPClient),
-		preLoginHTTP:       ptr.Clone(baseHTTPClient),
-		Store:              deviceStore,
-		Log:                log,
-		recvLog:            log.Sub("Recv"),
-		sendLog:            log.Sub("Send"),
-		uniqueID:           fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
-		responseWaiters:    make(map[string]chan<- *waBinary.Node),
-		eventHandlers:      make([]wrappedEventHandler, 0, 1),
-		handlerQueue:       make(chan *waBinary.Node, handlerQueueSize),
-		appStateProc:       appstate.NewProcessor(deviceStore, log.Sub("AppState")),
-		socketWait:         make(chan struct{}),
-		expectedDisconnect: exsync.NewEvent(),
+		senderKeyOutcomeNonce: newSenderKeyOutcomeNonce(),
+		mediaHTTP:             ptr.Clone(baseHTTPClient),
+		websocketHTTP:         ptr.Clone(baseHTTPClient),
+		preLoginHTTP:          ptr.Clone(baseHTTPClient),
+		Store:                 deviceStore,
+		Log:                   log,
+		recvLog:               log.Sub("Recv"),
+		sendLog:               log.Sub("Send"),
+		uniqueID:              fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
+		responseWaiters:       make(map[string]chan<- *waBinary.Node),
+		eventHandlers:         make([]wrappedEventHandler, 0, 1),
+		handlerQueue:          make(chan *waBinary.Node, handlerQueueSize),
+		appStateProc:          appstate.NewProcessor(deviceStore, log.Sub("AppState")),
+		socketWait:            make(chan struct{}),
+		expectedDisconnect:    exsync.NewEvent(),
 
 		incomingRetryRequestCounter: make(map[incomingRetryKey]int),
 
