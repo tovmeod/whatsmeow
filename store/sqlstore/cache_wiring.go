@@ -16,6 +16,7 @@ package sqlstore
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"strings"
 	"sync"
@@ -155,16 +156,61 @@ type SenderKeyDeviceCache struct {
 	flights                                                                            map[deviceQueryKey]*deviceQueryFlight
 	capacity                                                                           int
 	now                                                                                func() time.Time
+	counterEpoch                                                                       string
 	positiveHits, negativeHits, queries, expiries, invalidations, evictions, overflows atomic.Uint64
 }
 
 // DeviceCacheMetrics contains aggregate totals only: no identity or key labels.
 type DeviceCacheMetrics struct {
-	PositiveHits, NegativeHits, Queries, Expiries, Invalidations, Evictions, Overflows uint64
+	PositiveHits  uint64 `json:"positive_hits"`
+	NegativeHits  uint64 `json:"empty_hits"`
+	Queries       uint64 `json:"queries"`
+	Expiries      uint64 `json:"expiries"`
+	Invalidations uint64 `json:"invalidations"`
+	Evictions     uint64 `json:"evictions"`
+	Overflows     uint64 `json:"overflows"`
+	Occupancy     int    `json:"occupancy"`
+	Capacity      int    `json:"capacity"`
 }
 
 func (c *SenderKeyDeviceCache) Metrics() DeviceCacheMetrics {
-	return DeviceCacheMetrics{c.positiveHits.Load(), c.negativeHits.Load(), c.queries.Load(), c.expiries.Load(), c.invalidations.Load(), c.evictions.Load(), c.overflows.Load()}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return DeviceCacheMetrics{
+		PositiveHits: c.positiveHits.Load(), NegativeHits: c.negativeHits.Load(), Queries: c.queries.Load(),
+		Expiries: c.expiries.Load(), Invalidations: c.invalidations.Load(), Evictions: c.evictions.Load(), Overflows: c.overflows.Load(),
+		Occupancy: c.Len(), Capacity: c.capacity,
+	}
+}
+
+// A nil metrics payload omits numeric fields: an absent owner is not supported
+// zero activity. Epochs belong to their counter owners, not the enclosing view.
+type DeviceCachePolicyStats struct {
+	CounterEpoch string `json:"counter_epoch,omitempty"`
+	Availability string `json:"availability"`
+	*DeviceCacheMetrics
+}
+
+type SenderKeyPolicyStats struct {
+	DeviceCache DeviceCachePolicyStats `json:"device_cache"`
+	DonorCache  DonorCachePolicyStats  `json:"donor_cache"`
+}
+
+// SenderKeyPolicySnapshot exports aggregate policy evidence only. Donor totals
+// are process-wide (across SQL universes); device totals belong to this shared
+// Container cache. Neither channel includes session writes, identities or SQL.
+// This read does not expire entries, change LRU order or reset counters.
+func (c *Container) SenderKeyPolicySnapshot() SenderKeyPolicyStats {
+	result := SenderKeyPolicyStats{
+		DeviceCache: DeviceCachePolicyStats{Availability: "MISSING"},
+		DonorCache:  DonorCacheSnapshot(),
+	}
+	if c != nil && c.caches.SenderKeyDevices != nil {
+		owner := c.caches.SenderKeyDevices
+		metrics := owner.Metrics()
+		result.DeviceCache = DeviceCachePolicyStats{CounterEpoch: owner.counterEpoch, Availability: "available", DeviceCacheMetrics: &metrics}
+	}
+	return result
 }
 
 func (c *SenderKeyDeviceCache) Add(key deviceQueryKey, entry deviceCacheEntry) bool {
@@ -182,7 +228,7 @@ func NewSenderKeyDeviceCache(capacity int) (*SenderKeyDeviceCache, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &SenderKeyDeviceCache{Cache: cache, flights: make(map[deviceQueryKey]*deviceQueryFlight), capacity: capacity, now: time.Now}, nil
+	return &SenderKeyDeviceCache{Cache: cache, flights: make(map[deviceQueryKey]*deviceQueryFlight), capacity: capacity, now: time.Now, counterEpoch: rand.Text()}, nil
 }
 
 // sessionSecondaryIndex is a process-shared secondary index for the Session

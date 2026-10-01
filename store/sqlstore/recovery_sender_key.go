@@ -40,6 +40,7 @@ package sqlstore
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"strconv"
@@ -145,6 +146,53 @@ var noDonorCacheSkips atomic.Uint64
 // noDonorCacheEvictions counts bounded-cache evictions. An eviction affects
 // scan volume only: an evicted tuple runs its normal donor query next time.
 var noDonorCacheEvictions atomic.Uint64
+
+// Immutable for the lifetime of the existing process-wide atomic owners.
+var donorCounterEpoch = rand.Text()
+
+type DonorCacheMetrics struct {
+	FallbackScanEntered uint64 `json:"fallback_scan_entered"`
+	FallbackScanFound   uint64 `json:"fallback_scan_found"`
+	SingleflightTotal   uint64 `json:"singleflight_total"`
+	SingleflightShared  uint64 `json:"singleflight_shared"`
+	Queries             uint64 `json:"queries"`
+	NegativeHits        uint64 `json:"negative_hits"`
+	Expiries            uint64 `json:"expiries"`
+	Invalidations       uint64 `json:"invalidations"`
+	Evictions           uint64 `json:"evictions"`
+	Overflows           uint64 `json:"overflows"`
+	Skips               uint64 `json:"skips"`
+	Occupancy           int    `json:"occupancy"`
+	Capacity            int    `json:"capacity"`
+}
+
+type DonorCachePolicyStats struct {
+	CounterEpoch string `json:"counter_epoch"`
+	Availability string `json:"availability"`
+	DonorCacheMetrics
+}
+
+// DonorCacheSnapshot reads the current owners without querying SQL or expiring
+// entries. NegativeHits and Skips describe the same policy decision, so both
+// read the existing skip atomic; they must never be summed as distinct events.
+// Queries count donor searches, whose fast/fallback SQL work is measured by the
+// collector separately. SingleflightShared counts followers, not the leader.
+func DonorCacheSnapshot() DonorCachePolicyStats {
+	noDonorCacheMu.Lock()
+	defer noDonorCacheMu.Unlock()
+	skips := noDonorCacheSkips.Load()
+	return DonorCachePolicyStats{
+		CounterEpoch: donorCounterEpoch, Availability: "available",
+		DonorCacheMetrics: DonorCacheMetrics{
+			FallbackScanEntered: fallbackScanEntered.Load(), FallbackScanFound: fallbackScanDonorFound.Load(),
+			SingleflightTotal: donorSFTotal.Load(), SingleflightShared: donorSFShared.Load(),
+			Queries: noDonorCacheQueries.Load(), NegativeHits: skips, Skips: skips,
+			Expiries: noDonorCacheExpired.Load(), Invalidations: noDonorCacheInvalidations.Load(),
+			Evictions: noDonorCacheEvictions.Load(), Overflows: noDonorCacheOverflow.Load(),
+			Occupancy: noDonorCache.Len(), Capacity: noDonorCacheCapacity,
+		},
+	}
+}
 
 func mustNewNoDonorCache(capacity int) *lru.Cache[donorQueryKey, noDonorCacheEntry] {
 	cache, err := lru.New[donorQueryKey, noDonorCacheEntry](capacity)

@@ -65,9 +65,8 @@ func TestSenderKeyPolicySnapshotSQLDonorFallback(t *testing.T) {
 	}
 	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
 	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
-	t.Cleanup(cleanupA)
-	t.Cleanup(cleanupB)
 	container := sqlstore.NewWithDB(db, "postgres", nil)
+	t.Cleanup(func() { cleanupB(); cleanupA(); _ = container.Close() })
 	snapshot := func() map[string]map[string]any {
 		t.Helper()
 		method := reflect.ValueOf(container).MethodByName("SenderKeyPolicySnapshot")
@@ -84,7 +83,11 @@ func TestSenderKeyPolicySnapshotSQLDonorFallback(t *testing.T) {
 		}
 		return result
 	}
-	cs := newRecoveryTestStoreB(t, db)
+	jidA, _ := types.ParseJID(recoveryTestJIDA)
+	jidB, _ := types.ParseJID(recoveryTestJIDB)
+	blobs, _ := lru.New[string, []byte](256)
+	devices, _ := sqlstore.NewSenderKeyDeviceCache(256)
+	cs := sqlstore.NewCachedSenderKeyStore(sqlstore.NewSQLStore(container, jidB), recoveryTestJIDB, blobs, devices, nil)
 	const group, sender = "phase96-policy@g.us", "private_policy_sender_1"
 	const keyID = uint32(9642)
 	defer sqlstore.DeleteNoDonorCacheEntry(group, sender, keyID)
@@ -104,7 +107,7 @@ func TestSenderKeyPolicySnapshotSQLDonorFallback(t *testing.T) {
 	// A donor with the requested ID in state[1] exercises the real fallback.
 	structure := buildDonorStructure(keyID+1, 2, 0x31)
 	structure.SenderKeyStates = append(structure.SenderKeyStates, buildDonorStructure(keyID, 3, 0x32).SenderKeyStates...)
-	if err = newSeedStoreA(t, db).PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{sqlstore.NewSenderKeyRow(group, sender+":7", structure)}); err != nil {
+	if err = sqlstore.NewSQLStore(container, jidA).PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{sqlstore.NewSenderKeyRow(group, sender+":7", structure)}); err != nil {
 		t.Fatal(err)
 	}
 	_, ok, err := cs.TryInlineRecovery(ctx, group, sender+":0", sender, keyID, 5)

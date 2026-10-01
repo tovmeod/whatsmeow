@@ -73,7 +73,9 @@ func TestSenderKeyDeviceCacheMetricsPolicy(t *testing.T) {
 	read("other-group")
 	read("evict-group")
 	last := policySnapshotJSON(t, container)["device_cache"]
-	if last["queries"] != float64(inner.devicesCalls.Load()) || last["queries"] != float64(4) || last["expiries"] != float64(1) || last["positive_hits"] != float64(1) || last["invalidations"] != float64(1) || last["evictions"] != float64(1) || last["overflows"] != float64(0) || last["occupancy"] != float64(2) || last["counter_epoch"] != first["counter_epoch"] {
+	// Acceptance fences the enumeration, then the observable write invalidates
+	// it again. These are two existing owner events, not two database queries.
+	if last["queries"] != float64(inner.devicesCalls.Load()) || last["queries"] != float64(4) || last["expiries"] != float64(1) || last["positive_hits"] != float64(1) || last["invalidations"] != float64(2) || last["evictions"] != float64(1) || last["overflows"] != float64(0) || last["occupancy"] != float64(2) || last["counter_epoch"] != first["counter_epoch"] {
 		t.Fatalf("policy decisions or direct gauges incorrect: %v", last)
 	}
 }
@@ -105,6 +107,83 @@ func TestSenderKeyPolicySnapshotAvailabilityAndEpoch(t *testing.T) {
 		if strings.Contains(string(data), forbidden) {
 			t.Fatalf("policy leaked %q: %s", forbidden, data)
 		}
+	}
+}
+
+func TestSenderKeyDeviceCacheMetricsConcurrent(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	c, inner := newDevicePolicyStore(t, 2, func(context.Context, string, string) ([]string, error) {
+		close(entered)
+		<-release
+		return []string{}, nil
+	})
+	container := &Container{}
+	container.caches.SenderKeyDevices = c.deviceCache
+	const workers = 12
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.GetSenderKeyDevices(context.Background(), "private-group", "private-sender")
+			if err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	<-entered
+	awaitDeviceParticipants(t, c, workers)
+	for range 5 {
+		_ = policySnapshotJSON(t, container)
+	}
+	close(release)
+	wg.Wait()
+	result := policySnapshotJSON(t, container)["device_cache"]
+	if result["queries"] != float64(1) || result["empty_hits"] != float64(0) || inner.calls.Load() != 1 {
+		t.Fatalf("flight followers multiplied query/cache decisions: %v", result)
+	}
+	// Concurrent cached reads and snapshots remain read-only except for the
+	// actual hit decisions; snapshots themselves contribute no cache hits.
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.GetSenderKeyDevices(context.Background(), "private-group", "private-sender")
+			if err != nil {
+				t.Error(err)
+			}
+			_ = policySnapshotJSON(t, container)
+		}()
+	}
+	wg.Wait()
+	result = policySnapshotJSON(t, container)["device_cache"]
+	if result["queries"] != float64(1) || result["empty_hits"] != float64(workers) || result["occupancy"] != float64(1) {
+		t.Fatalf("concurrent totals changed: %v", result)
+	}
+}
+
+func TestSenderKeyDeviceCacheMetricsOverflow(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	c, inner := newDevicePolicyStore(t, 1, func(_ context.Context, group, _ string) ([]string, error) {
+		if group == "blocked" {
+			close(entered)
+			<-release
+		}
+		return []string{}, nil
+	})
+	container := &Container{}
+	container.caches.SenderKeyDevices = c.deviceCache
+	done := make(chan struct{})
+	go func() { _, _ = c.GetSenderKeyDevices(context.Background(), "blocked", "user"); close(done) }()
+	<-entered
+	for range 2 {
+		_, _ = c.GetSenderKeyDevices(context.Background(), "overflow", "user")
+	}
+	result := policySnapshotJSON(t, container)["device_cache"]
+	close(release)
+	<-done
+	if result["overflows"] != float64(2) || result["queries"] != float64(3) || result["occupancy"] != float64(0) || result["capacity"] != float64(1) || inner.calls.Load() != 3 {
+		t.Fatalf("overflow failed open or accumulated gauges: %v", result)
 	}
 }
 
