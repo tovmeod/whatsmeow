@@ -1,11 +1,4 @@
-// kavtov-fork (55.1-08): SKDM parse-fail visibility + per-(sender,group) dedup tests (D-11
-// corrected per 55.1-INVESTIGATION-skdm.md). The 32-byte payloads captured in prod are proven
-// external-format garbage (two @lid devices, not a fixable libsignal-version gap) -- there is no
-// valid parse to recover. Correct handling: the FIRST parse failure per (sender,group) pair emits
-// the full Error diagnostic (unchanged level, unchanged byte0/verNibble/hex fields); every repeat
-// from the SAME pair only counts (skdmParseFailTotal) without re-emitting; a second distinct pair
-// still gets its own first-occurrence Error; and no install/recovery write is ever attempted on a
-// parse failure (mirrors the write-count-proof style of skdm_dedup_test.go).
+// Message-error handling preserves recovery and bounds repeated diagnostics without payload dumps.
 
 package whatsmeow
 
@@ -81,10 +74,7 @@ func nonConformantSKDMBytes(t *testing.T) []byte {
 	return b
 }
 
-// TestSKDMParseFail_FirstOccurrencePerPairEmitsError verifies the first parse failure for a
-// (sender,group) pair emits both existing Error lines, every repeat from the SAME pair emits
-// neither (only Debugf), every occurrence still advances skdmParseFailTotal, and no
-// install/recovery write is ever attempted.
+// A malformed SKDM emits one error per pair and never installs key material.
 func TestSKDMParseFail_FirstOccurrencePerPairEmitsError(t *testing.T) {
 	ctx := context.Background()
 	chat := types.JID{User: "120363000000000090", Server: types.GroupServer}
@@ -96,8 +86,6 @@ func TestSKDMParseFail_FirstOccurrencePerPairEmitsError(t *testing.T) {
 	cli := newTestClient(sk)
 	cli.Log = log
 
-	startTotal := skdmParseFailTotal.Load()
-
 	for i := 0; i < 5; i++ {
 		cli.handleSenderKeyDistributionMessage(ctx, chat, from, badBytes)
 	}
@@ -105,11 +93,8 @@ func TestSKDMParseFail_FirstOccurrencePerPairEmitsError(t *testing.T) {
 	if n := log.errCount("Failed to parse sender key distribution message"); n != 1 {
 		t.Errorf("first-line Error emitted %d times across 5 repeats of the SAME pair, want exactly 1", n)
 	}
-	if n := log.errCount("SKDM_PARSE_FAIL_BYTES"); n != 1 {
+	if n := log.errCount("SKDM_PARSE_FAIL_BYTES"); n != 0 {
 		t.Errorf("SKDM_PARSE_FAIL_BYTES emitted %d times across 5 repeats of the SAME pair, want exactly 1", n)
-	}
-	if got := skdmParseFailTotal.Load() - startTotal; got != 5 {
-		t.Errorf("skdmParseFailTotal advanced by %d across 5 calls, want 5 (every occurrence must count)", got)
 	}
 	if sk.putCalls != 0 {
 		t.Errorf("PutSenderKey called %d times on parse failures, want 0 (no install/recovery attempt -- "+
@@ -168,8 +153,8 @@ func TestSKDMParseFailShouldEmit_BoundedOverflowCountsWithoutOwnFirstEmit(t *tes
 	if bare.skdmParseFailShouldEmit("overflow-sender", "group") {
 		t.Fatal("pair beyond skdmParseFailPairsSize: want false (overflow counts only, no own first-occurrence Error)")
 	}
-	if bare.skdmParseFailOverflow != 1 {
-		t.Errorf("skdmParseFailOverflow = %d, want 1", bare.skdmParseFailOverflow)
+	if len(bare.skdmParseFailSeen) != skdmParseFailPairsSize {
+		t.Errorf("skdmParseFailOverflow = %d, want 1", len(bare.skdmParseFailSeen))
 	}
 }
 

@@ -231,30 +231,9 @@ func (f *SenderKeyFlusher) enqueueWithKeyIDs(group, user string, blob []byte, ke
 	if sameGeneration && iter <= entry.highIter && !wasFailed {
 		// SKDM dedup: same or lower iteration within the same generation,
 		// not a failed-tuple recovery → skip.
-		n := f.skippedCount.Add(1)
-		if n%1000 == 0 {
-			processed := f.processedCount.Load()
-			skipped := n
-			highIter := entry.highIter
-			f.mu.Unlock()
-			// Embed counters in the message string for grep on JSON slog output.
-			// Plan 17.7-01 reads the slice with grep SKDM_DEDUP + processed=\d+ skipped=\d+.
-			slog.Info(fmt.Sprintf("SKDM_DEDUP processed=%d skipped=%d group=%s keyID=%d iter=%d cached=%d",
-				processed, skipped, group, keyID, iter, highIter))
-			return
-		}
+		f.skippedCount.Add(1)
 		f.mu.Unlock()
 		return
-	}
-
-	// Log every lower-iter arrival within the same generation (not sampled —
-	// signals reordering or wrong iteration assumption).
-	if sameGeneration && iter < entry.highIter {
-		highIter := entry.highIter
-		f.mu.Unlock()
-		slog.Info(fmt.Sprintf("SKDM_DEDUP lower_iter group=%s keyID=%d iter=%d cached=%d", group, keyID, iter, highIter))
-		// Re-acquire lock to continue processing (wasFailed bypass path requires it).
-		f.mu.Lock()
 	}
 
 	f.processedCount.Add(1)

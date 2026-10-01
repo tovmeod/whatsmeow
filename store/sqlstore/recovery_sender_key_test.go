@@ -97,7 +97,7 @@ func newRecoveryTestStoreB(t *testing.T, db *sql.DB) *sqlstore.CachedSenderKeySt
 
 	byteCache, _ := lru.New[string, []byte](256)
 	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
-	return sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+	return sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache)
 }
 
 // buildDonorStructure builds a SenderKeyStructure with one state: the given
@@ -647,7 +647,7 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		innerB := sqlstore.NewSQLStore(containerB, flatJIDB)
 		byteCache, _ := lru.New[string, []byte](256)
 		devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
-		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache, nil)
+		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache)
 
 		targetSenderID := flatBareUser + ":0"
 		_, ok, err := csB.TryInlineRecovery(ctx, flatGroup, targetSenderID, flatBareUser, fastTargetKeyID, fastTargetIter)
@@ -720,7 +720,7 @@ func TestRecoveryScanQueryFlat(t *testing.T) {
 		innerB := sqlstore.NewSQLStore(containerB, flatJIDB)
 		byteCache, _ := lru.New[string, []byte](256)
 		devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
-		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache, nil)
+		csB := sqlstore.NewCachedSenderKeyStore(innerB, flatTestJIDB, byteCache, devCache)
 
 		targetSenderID := flatBareUser + ":0"
 		_, ok, err := csB.TryInlineRecovery(ctx, flatGroup, targetSenderID, flatBareUser, fallbackTarget, fallbackTargetIter)
@@ -874,7 +874,7 @@ func TestInlineRecoveryCacheResidentRace(t *testing.T) {
 
 	byteCache, _ := lru.New[string, []byte](256)
 	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
-	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache)
 
 	// Wire a flusher that is NOT started (attached-not-drained = stale DB window).
 	flusher := sqlstore.NewSenderKeyFlusher(innerB, nil, 0)
@@ -1032,103 +1032,6 @@ func TestInlineRecoveryIterationGuard(t *testing.T) {
 		t.Errorf("DB row iteration = %d, want 100 (must not be downgraded by donor iter=50)", iterFromBlob)
 	}
 	t.Logf("PASS: iteration guard fired — TryInlineRecovery returned (empty, false, nil), DB row preserved at iter=%d", iterFromBlob)
-}
-
-// TestSenderKeySubclass verifies the D-03/999.19 classifyNoDonor helper (the
-// SENDERKEY_SUBCLASS classifier). It seeds a sender-key row for the recovering
-// account (B) in a DIFFERENT group than the failing one, then calls ClassifyNoDonor
-// and asserts keys_elsewhere=true (the "sender-alive-never-distributed" signature).
-//
-// Also verifies the nothing-anywhere case: no rows for B at all → keys_elsewhere=false.
-//
-// The test does NOT assert the log emission — it exercises only the classifier
-// helper that feeds the log (per plan: factor the classification into a testable
-// unexported function, keep the log emission at the call site).
-func TestSenderKeySubclass(t *testing.T) {
-	db, err := sql.Open("pgx", batchTestDSN())
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-	if err := db.PingContext(context.Background()); err != nil {
-		db.Close()
-		t.Skipf("test Postgres not reachable: %v", err)
-	}
-
-	const (
-		subclassJIDB = "17799990020@s.whatsapp.net" // account under test
-		failGroup    = "subclass_fail_group@g.us"   // the group where the key is missing
-		otherGroup   = "subclass_other_group@g.us"  // a different group for keys_elsewhere
-		senderBare   = "55512340099_sub"
-		senderID     = senderBare + ":0"
-	)
-
-	cleanupB := insertRecoveryTestDevice(t, db, subclassJIDB)
-	t.Cleanup(func() {
-		cleanupB()
-		db.Close()
-	})
-
-	// Build the SQLStore for account B directly (classifyNoDonor takes *SQLStore).
-	jidB, err := types.ParseJID(subclassJIDB)
-	if err != nil {
-		t.Fatalf("ParseJID B: %v", err)
-	}
-	containerB := sqlstore.NewWithDB(db, "postgres", nil)
-	innerB := sqlstore.NewSQLStore(containerB, jidB)
-
-	ctx := context.Background()
-
-	// Clean up any leftover rows.
-	_, _ = db.ExecContext(ctx,
-		`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id IN ($2,$3)`,
-		subclassJIDB, failGroup, otherGroup)
-
-	// Arm 1: nothing-anywhere — no rows for B anywhere.
-	// Expected: keys_elsewhere=false.
-	t.Run("nothing_anywhere", func(t *testing.T) {
-		fields := sqlstore.ClassifyNoDonor(ctx, innerB, subclassJIDB, failGroup, senderBare)
-		if fields.KeysElsewhere {
-			t.Error("nothing-anywhere arm: expected keys_elsewhere=false, got true")
-		}
-		t.Logf("nothing-anywhere arm: PASS — lidmap=%s keys_elsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
-	})
-
-	// Arm 2: keys_elsewhere=true — B has a sender-key row for senderBare in
-	// otherGroup (a different chat) but NOT in failGroup.
-	t.Run("keys_elsewhere_true", func(t *testing.T) {
-		// Seed B's row in otherGroup.
-		keysElsewhereStruct := buildDonorStructure(99, 1, 0xAB)
-		insertFlatBlobRow(t, db, subclassJIDB, otherGroup, senderID, keysElsewhereStruct)
-		t.Cleanup(func() {
-			_, _ = db.ExecContext(ctx,
-				`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2`,
-				subclassJIDB, otherGroup)
-		})
-
-		fields := sqlstore.ClassifyNoDonor(ctx, innerB, subclassJIDB, failGroup, senderBare)
-		if !fields.KeysElsewhere {
-			t.Error("keys-elsewhere arm: expected keys_elsewhere=true (row in otherGroup), got false")
-		}
-		t.Logf("keys-elsewhere arm: PASS — lidmap=%s keys_elsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
-	})
-
-	// Arm 3: row in the SAME failGroup does NOT set keys_elsewhere=true.
-	// (keys_elsewhere is for OTHER chats only.)
-	t.Run("same_group_no_keys_elsewhere", func(t *testing.T) {
-		sameGroupStruct := buildDonorStructure(88, 2, 0xCD)
-		insertFlatBlobRow(t, db, subclassJIDB, failGroup, senderID, sameGroupStruct)
-		t.Cleanup(func() {
-			_, _ = db.ExecContext(ctx,
-				`DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2`,
-				subclassJIDB, failGroup)
-		})
-
-		fields := sqlstore.ClassifyNoDonor(ctx, innerB, subclassJIDB, failGroup, senderBare)
-		if fields.KeysElsewhere {
-			t.Error("same-group arm: expected keys_elsewhere=false (only row is in failGroup), got true")
-		}
-		t.Logf("same-group arm: PASS — lidmap=%s keys_elsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
-	})
 }
 
 // buildMultiStateStructure builds a SenderKeyStructure with two states:
@@ -1453,7 +1356,7 @@ func TestInlineRecoveryDonorMerge(t *testing.T) {
 		innerBSeed := sqlstore.NewSQLStore(containerB, jidB)
 		byteCache, _ := lru.New[string, []byte](256)
 		devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
-		csBSeed := sqlstore.NewCachedSenderKeyStore(innerBSeed, recoveryTestJIDB, byteCache, devCache, nil)
+		csBSeed := sqlstore.NewCachedSenderKeyStore(innerBSeed, recoveryTestJIDB, byteCache, devCache)
 		// No flusher → write-through mode (warms the flat c.cache + writes DB).
 
 		// Seed K1@20 via PutSenderKeyStructure (write-through: writes DB + warms cache).
@@ -1609,7 +1512,7 @@ func TestInlineRecoveryDonorPrependedAndFlushed(t *testing.T) {
 	innerB := sqlstore.NewSQLStore(containerB, jidB)
 	byteCache, _ := lru.New[string, []byte](256)
 	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
-	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache)
 
 	flusher := sqlstore.NewSenderKeyFlusher(innerB, waLog.Noop, 0)
 	csB.SetFlusher(flusher)
@@ -1787,7 +1690,7 @@ func TestInlineRecoveryUncacheableMergeStillPersists(t *testing.T) {
 	innerB := sqlstore.NewSQLStore(containerB, jidB)
 	byteCache, _ := lru.New[string, []byte](256)
 	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
-	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache)
 
 	// Warm the flat cache with the (cacheable) 6-state existing structure via the
 	// write-through path so the post-recovery cache replacement is observable.
@@ -1921,7 +1824,7 @@ func TestInlineRecoveryCacheOnlyGenerationSurvives(t *testing.T) {
 	innerB := sqlstore.NewSQLStore(containerB, jidB)
 	byteCache, _ := lru.New[string, []byte](256)
 	devCache, _ := sqlstore.NewSenderKeyDeviceCache(256)
-	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache, nil)
+	csB := sqlstore.NewCachedSenderKeyStore(innerB, recoveryTestJIDB, byteCache, devCache)
 
 	flusher := sqlstore.NewSenderKeyFlusher(innerB, waLog.Noop, 0)
 	csB.SetFlusher(flusher)
@@ -2143,87 +2046,4 @@ func TestInlineRecoveryMergeKeepsExistingSkippedKeys(t *testing.T) {
 	}
 	t.Logf("WR-05: merged K@%d at state[0] with skipped iterations %v",
 		kState.SenderChainKey.Iteration, iters)
-}
-
-// TestClassifyNoDonorLIDMapSuffix is the regression test for the agent-suffix
-// stripping fix in classifyNoDonor.
-//
-// LID Signal-address users arrive as "<digits>_<agent>" (e.g. "238877608562780_1")
-// but whatsmeow_lid_map stores bare digits with no suffix. Before the fix,
-// subclassLIDMapQuery received the unsuffixed form verbatim and always returned
-// "unmapped" for LID senders — corrupting the SENDERKEY_SUBCLASS diagnostic field.
-//
-// Two arms:
-//   - lid_mapped: senderBare="238877608562780_1" (LID with agent suffix);
-//     lid_map row has lid="238877608562780"; expected LIDMap="lid-mapped"
-//   - pn_mapped: senderBare="972501234567" (pure PN, no underscore);
-//     lid_map row has pn="972501234567"; expected LIDMap="pn-mapped"
-func TestClassifyNoDonorLIDMapSuffix(t *testing.T) {
-	db, err := sql.Open("pgx", batchTestDSN())
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-	if err := db.PingContext(context.Background()); err != nil {
-		db.Close()
-		t.Skipf("test Postgres not reachable: %v", err)
-	}
-
-	const (
-		classifyTestJID = "17799990030@s.whatsapp.net"
-		testLID         = "238877608562780"
-		testPN          = "972501234567"
-		testSenderLID   = testLID + "_1" // LID Signal-address with agent suffix
-		testGroup       = "classifylidmap_test@g.us"
-	)
-
-	cleanupDev := insertRecoveryTestDevice(t, db, classifyTestJID)
-	t.Cleanup(func() {
-		cleanupDev()
-		db.Close()
-	})
-
-	// Seed a single whatsmeow_lid_map row covering both arms.
-	ctx := context.Background()
-	_, err = db.ExecContext(ctx,
-		`INSERT INTO whatsmeow_lid_map (lid, pn) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-		testLID, testPN,
-	)
-	if err != nil {
-		t.Fatalf("seed whatsmeow_lid_map: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = db.ExecContext(context.Background(),
-			`DELETE FROM whatsmeow_lid_map WHERE lid=$1`, testLID)
-	})
-
-	// Build the SQLStore for the test account.
-	jid, err := types.ParseJID(classifyTestJID)
-	if err != nil {
-		t.Fatalf("ParseJID: %v", err)
-	}
-	classifyContainer := sqlstore.NewWithDB(db, "postgres", nil)
-	classifyStore := sqlstore.NewSQLStore(classifyContainer, jid)
-
-	// lid_mapped arm: senderBare carries the agent suffix "_1"; the lid_map row
-	// has the bare lid "238877608562780". After the fix, classifyNoDonor strips
-	// the suffix and finds the row as "lid-mapped".
-	t.Run("lid_mapped", func(t *testing.T) {
-		fields := sqlstore.ClassifyNoDonor(ctx, classifyStore, classifyTestJID, testGroup, testSenderLID)
-		if fields.LIDMap != "lid-mapped" {
-			t.Errorf("lid_mapped arm: LIDMap = %q, want %q (agent-suffix strip missing or broken)",
-				fields.LIDMap, "lid-mapped")
-		}
-		t.Logf("lid_mapped arm: LIDMap=%s KeysElsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
-	})
-
-	// pn_mapped arm: senderBare is a plain PN (no underscore). The lid_map row
-	// has pn="972501234567". Expected: "pn-mapped".
-	t.Run("pn_mapped", func(t *testing.T) {
-		fields := sqlstore.ClassifyNoDonor(ctx, classifyStore, classifyTestJID, testGroup, testPN)
-		if fields.LIDMap != "pn-mapped" {
-			t.Errorf("pn_mapped arm: LIDMap = %q, want %q",
-				fields.LIDMap, "pn-mapped")
-		}
-		t.Logf("pn_mapped arm: LIDMap=%s KeysElsewhere=%t", fields.LIDMap, fields.KeysElsewhere)
-	})
 }

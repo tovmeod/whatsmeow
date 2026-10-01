@@ -81,7 +81,7 @@ func buildTestDevice(t *testing.T, lruCap int) *testDeviceHandles {
 	// Build the CachedSenderKeyStore. jid string must match device.ID.String()
 	// so that c.key(group,user) == the cache key used inside the store.
 	jidStr := jid.String()
-	skStore := NewCachedSenderKeyStore(fakeSK, jidStr, skCache, devCache, nil)
+	skStore := NewCachedSenderKeyStore(fakeSK, jidStr, skCache, devCache)
 
 	// Attach a non-Started flusher so write-back enqueues don't spawn goroutines.
 	flushStore := &mockFlushStore{}

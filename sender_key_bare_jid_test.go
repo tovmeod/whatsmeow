@@ -520,7 +520,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	innerB := sqlstore.NewSQLStore(containerB, jidBParsed)
 	byteB, _ := lru.New[string, []byte](256)
 	devB, _ := sqlstore.NewSenderKeyDeviceCache(256)
-	csBStore := sqlstore.NewCachedSenderKeyStore(innerB, inlineTestJIDB, byteB, devB, nil)
+	csBStore := sqlstore.NewCachedSenderKeyStore(innerB, inlineTestJIDB, byteB, devB)
 
 	// Phase 38.4-03: the parsed struct cache is deleted. The flat c.cache
 	// write-through inside PutSenderKeyStructure is the single sender-key cache;
@@ -565,7 +565,7 @@ func TestInlineDecryptEquivalence(t *testing.T) {
 	innerC := sqlstore.NewSQLStore(containerC, jidCParsed)
 	byteC, _ := lru.New[string, []byte](256)
 	devC, _ := sqlstore.NewSenderKeyDeviceCache(256)
-	csC := sqlstore.NewCachedSenderKeyStore(innerC, inlineTestJIDC, byteC, devC, nil)
+	csC := sqlstore.NewCachedSenderKeyStore(innerC, inlineTestJIDC, byteC, devC)
 
 	deviceC := &store.Device{
 		SenderKeys:      csC,
@@ -682,7 +682,7 @@ func TestInlineDecryptIterationSafeRecovery(t *testing.T) {
 			t.Fatalf("lru.New device cache: %v", cacheErr)
 		}
 		inner := sqlstore.NewSQLStore(testContainer, parsed)
-		cached := sqlstore.NewCachedSenderKeyStore(inner, jid, byteCache, deviceCache, nil)
+		cached := sqlstore.NewCachedSenderKeyStore(inner, jid, byteCache, deviceCache)
 		return &store.Device{SenderKeys: cached, InlineRecoverer: cached, Log: waLog.Noop, ID: &parsed}, cached, parsed
 	}
 	deviceB, cachedB, _ := newCachedDevice(inlineTestJIDB)

@@ -56,7 +56,7 @@ for package, test in sorted(skipped):
 PY
 }
 
-sqlstore_tests=(TestRecoveryScanQueryFlat TestInlineRecoveryIterationGuard TestInlineRecoveryMergeKeepsExistingSkippedKeys TestInlineCipherOriginalUnreplayedIdle TestInlineCipherOriginalRecoveredByExistingRetry TestInlineCipherRetainedSkippedKey TestInlineCipherPermanentlyLostOriginal TestInlineCipherObservableWriteInvalidation TestSenderKeyLocalQueryCost TestCacheMemoryBudget)
+sqlstore_tests=(TestRecoveryScanQueryFlat TestInlineRecoveryIterationGuard TestInlineRecoveryMergeKeepsExistingSkippedKeys TestInlineCipherOriginalUnreplayedIdle TestInlineCipherOriginalRecoveredByExistingRetry TestInlineCipherRetainedSkippedKey TestInlineCipherPermanentlyLostOriginal TestInlineCipherObservableWriteInvalidation TestCacheMemoryBudget)
 sqlstore_pattern="$(IFS='|'; echo "${sqlstore_tests[*]}")"
 (cd "${fork_root}" && go test -json ./store/sqlstore -run "^(${sqlstore_pattern})$" -count=1) | tee "${log_dir}/sqlstore.json"
 check_events "${log_dir}/sqlstore.json" "${sqlstore_tests[@]}"

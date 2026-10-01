@@ -43,7 +43,7 @@ func TestPutAppStateVersionAndMACs_AtomicOnFailure(t *testing.T) {
 	}
 
 	badMAC := store.AppStateMutationMAC{
-		IndexMAC: []byte{0x01, 0x02},        // wrong length — schema requires 32 bytes
+		IndexMAC: []byte{0x01, 0x02}, // wrong length — schema requires 32 bytes
 		ValueMAC: bytes.Repeat([]byte{0x03}, 32),
 	}
 	err = s.PutAppStateVersionAndMACs(ctx, name, 5, hash, nil, []store.AppStateMutationMAC{badMAC})

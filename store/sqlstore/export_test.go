@@ -11,17 +11,8 @@
 package sqlstore
 
 import (
-	"context"
 	"strconv"
 )
-
-// NoDonorFields is the exported alias for noDonorFields used by external tests.
-type NoDonorFields = noDonorFields
-
-// ClassifyNoDonor exposes the unexported classifyNoDonor for external test packages.
-func ClassifyNoDonor(ctx context.Context, s *SQLStore, ourJID, group, senderBare string) NoDonorFields {
-	return classifyNoDonor(ctx, s, ourJID, group, senderBare)
-}
 
 // DeleteNoDonorCacheEntry removes a single entry from the negative-donor cache.
 // Test-only: allows DB-backed integration tests (package sqlstore_test) to

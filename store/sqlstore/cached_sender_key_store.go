@@ -16,7 +16,6 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
-	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
 )
@@ -58,13 +57,6 @@ type CachedSenderKeyStore struct {
 	// by PutSenderKey only when a genuinely new device appears (see PutSenderKey).
 	deviceCache *SenderKeyDeviceCache
 
-	// Phase 29 D-01: pointer to the process-global singleflight.Group for
-	// findSenderKeyDonor coalescing. Shared by all CachedSenderKeyStore instances
-	// (passed from signalCaches.DonorSF). May be nil in unit-test contexts that
-	// construct the store without a Container — the nil path calls findSenderKeyDonor
-	// directly (no coalescing but correct behaviour).
-	sf *singleflight.Group
-
 	// Phase 17.7-03: write-back flusher. May be nil before Start() wiring
 	// (will fall back to write-through when nil, preserving backward compat).
 	flusher *SenderKeyFlusher
@@ -90,8 +82,6 @@ type CachedSenderKeyStore struct {
 	// Guarded by pinnedMu (same lock as pinned — single lock, no new contention).
 	// Unpinned inside the EXISTING SetFlusher onDrained closure (no second hook).
 	pinnedBlobs map[string][]byte
-
-	hits, misses uint64
 }
 
 var errSenderKeyStoreRetired = errors.New("sender-key store owner retired")
@@ -161,16 +151,13 @@ var _ store.SenderKeyColumnarStore = (*CachedSenderKeyStore)(nil)
 
 // NewCachedSenderKeyStore constructs a wrapper over inner. jid is the device
 // JID (used as cache-key prefix). cache is a shared LRU constructed by the
-// Container. sf is a pointer to the process-global singleflight.Group for
-// findSenderKeyDonor coalescing (passed from signalCaches.DonorSF); nil is
-// accepted for test contexts that do not wire a Container.
-func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte], deviceCache *SenderKeyDeviceCache, sf *singleflight.Group) *CachedSenderKeyStore {
+// Container. Donor queries share the existing bounded donor-flight owner.
+func NewCachedSenderKeyStore(inner store.SenderKeyStore, jid string, cache *lru.Cache[string, []byte], deviceCache *SenderKeyDeviceCache) *CachedSenderKeyStore {
 	return &CachedSenderKeyStore{
 		inner:       inner,
 		jid:         jid,
 		cache:       cache,
 		deviceCache: deviceCache,
-		sf:          sf,
 		pinned:      make(map[deviceQueryKey]map[string]struct{}),
 		pinnedBlobs: make(map[string][]byte),
 	}
@@ -222,13 +209,6 @@ func (c *CachedSenderKeyStore) key(group, user string) string {
 	return c.jid + "|" + group + "|" + user
 }
 
-// Stats returns (hits, misses) for test observability and for the
-// Container's emitMetricsLoop.
-func (c *CachedSenderKeyStore) Stats() (hits, misses uint64) {
-	return atomic.LoadUint64(&c.hits),
-		atomic.LoadUint64(&c.misses)
-}
-
 // Purge clears the entire cache. The SenderKeyStore interface has no
 // DeleteAll* method; Purge is exposed here for tests that want to reset
 // state without recreating the wrapper.
@@ -260,12 +240,10 @@ func (c *CachedSenderKeyStore) GetSenderKey(ctx context.Context, group, user str
 	}
 	k := c.key(group, user)
 	if v, ok := c.cache.Get(k); ok {
-		atomic.AddUint64(&c.hits, 1)
 		// Return a copy so the caller cannot mutate the cached slice
 		// (Phase 17.5 FIX CR-06: prior code returned the internal slice).
 		return copyBytes(v), nil
 	}
-	atomic.AddUint64(&c.misses, 1)
 	v, err := c.inner.GetSenderKey(ctx, group, user)
 	if err == nil && v != nil {
 		// Do NOT cache nil (Pitfall 5 from sessions wrapper) — a future
@@ -305,7 +283,6 @@ func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group,
 
 	// Cache-aware read: check the write-through flat c.cache first.
 	if v, ok := c.cache.Get(k); ok {
-		atomic.AddUint64(&c.hits, 1)
 		if s, err := store.UnpackFlat(v); err == nil {
 			return s, nil
 		}
@@ -325,8 +302,6 @@ func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group,
 		}
 		// Corrupt pinned blob: fall through to DB.
 	}
-
-	atomic.AddUint64(&c.misses, 1)
 
 	r, ok := c.inner.(senderKeyFlatReader)
 	if !ok {
@@ -722,15 +697,8 @@ func (c *CachedSenderKeyStore) cachedDevicesLocked(dk deviceQueryKey) ([]string,
 	}
 	if len(entry.devices) == 0 && !owner.now().Before(entry.expiresAt) {
 		owner.Remove(dk)
-		owner.expiries.Add(1)
 		return nil, false
 	}
-	if len(entry.devices) == 0 {
-		owner.negativeHits.Add(1)
-	} else {
-		owner.positiveHits.Add(1)
-	}
-	atomic.AddUint64(&c.hits, 1)
 	return mergeDeviceSets(entry.devices, c.pinnedDevices(dk)), true
 }
 
@@ -756,7 +724,6 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 		owner.mu.Unlock()
 		return devices, nil
 	}
-	atomic.AddUint64(&c.misses, 1)
 	flight := owner.flights[dk]
 	if flight != nil && !flight.invalid && !(flight.completed && !flight.expiresAt.IsZero() && !owner.now().Before(flight.expiresAt)) {
 		flight.participants++
@@ -774,7 +741,6 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 			owner.mu.Unlock()
 			c.releaseDeviceFlight(dk, flight)
 			if err != nil && ctx.Err() == nil && (err == context.Canceled || err == context.DeadlineExceeded) {
-				owner.queries.Add(1)
 				devices, err = c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
 				return c.mergeKnownDevices(dk, devices), err
 			}
@@ -782,15 +748,12 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 		}
 	}
 	if flight != nil || len(owner.flights) >= owner.capacity {
-		owner.overflows.Add(1)
-		owner.queries.Add(1)
 		owner.mu.Unlock()
 		devices, err := c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
 		return c.mergeKnownDevices(dk, devices), err
 	}
 	flight = &deviceQueryFlight{done: make(chan struct{}), participants: 1}
 	owner.flights[dk] = flight
-	owner.queries.Add(1)
 	owner.mu.Unlock()
 	devices, err := c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
 	completedAt := owner.now()

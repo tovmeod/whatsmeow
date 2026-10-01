@@ -23,12 +23,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
-	"golang.org/x/sync/singleflight"
 
 	"go.mau.fi/whatsmeow/store"
 )
@@ -110,99 +108,11 @@ func buildDonorStructureFromState(d *donorSenderKeyState) *groupRecord.SenderKey
 	}
 }
 
-// ---- TestSingleFlightDonorCoalesces ------------------------------------------
-
-// TestSingleFlightDonorCoalesces proves that N concurrent goroutines sharing one
-// singleflight.Group and the same (group, senderBare, keyID) key result in exactly
-// ONE invocation of the donor function — the leader runs; N-1 followers block and
-// share the returned *donorSenderKeyState.
-//
-// The fake donor blocks until all N goroutines have entered Do, then releases.
-// This guarantees that all followers are in-flight concurrently (not sequential),
-// making the coalescing assertion meaningful under the race detector.
-func TestSingleFlightDonorCoalesces(t *testing.T) {
-	const N = 5
-	const group = "12200000000-1234567890@g.us"
-	const senderBare = "972501234567"
-	const keyID = uint32(42)
-
-	var (
-		sf             singleflight.Group
-		donorCallCount atomic.Int64
-		// release unblocks all goroutines waiting inside the fake donor.
-		release = make(chan struct{})
-		// entered counts how many goroutines have entered the fake donor.
-		entered atomic.Int64
-		// allIn is closed once all N goroutines are inside Do (only the leader
-		// actually enters the fake; followers block in singleflight.Do itself).
-		// We use a WaitGroup to wait for all goroutines to call Do before
-		// closing release.
-		calledDo sync.WaitGroup
-	)
-	calledDo.Add(N)
-
-	sfKey := group + "|" + senderBare + "|" + strconv.FormatUint(uint64(keyID), 10)
-	donor := buildTestDonorState(keyID, 10)
-
-	fakeDonor := func() (any, error) {
-		donorCallCount.Add(1)
-		entered.Add(1)
-		// Block until the test releases, giving followers time to arrive at Do.
-		<-release
-		return donor, nil
-	}
-
-	results := make([]*donorSenderKeyState, N)
-	var wg sync.WaitGroup
-	wg.Add(N)
-	for i := 0; i < N; i++ {
-		i := i
-		go func() {
-			defer wg.Done()
-			calledDo.Done() // signal that this goroutine is about to call Do
-			v, err, _ := sf.Do(sfKey, fakeDonor)
-			if err != nil {
-				t.Errorf("goroutine %d: sf.Do: %v", i, err)
-				return
-			}
-			if v == nil {
-				t.Errorf("goroutine %d: sf.Do returned nil", i)
-				return
-			}
-			results[i] = v.(*donorSenderKeyState)
-		}()
-	}
-
-	// Wait for all goroutines to call (or be very close to calling) Do,
-	// then give singleflight a moment to coalesce them, then release.
-	calledDo.Wait()
-	time.Sleep(5 * time.Millisecond) // let followers enter singleflight.Do
-	close(release)
-	wg.Wait()
-
-	// Exactly one donor call (the leader; N-1 followers shared its result).
-	if got := donorCallCount.Load(); got != 1 {
-		t.Errorf("donor called %d times, want 1 (coalescing broken)", got)
-	}
-
-	// Every goroutine received a non-nil result pointing to the same donor.
-	for i, r := range results {
-		if r == nil {
-			t.Errorf("goroutine %d: got nil result", i)
-			continue
-		}
-		if r.KeyID != donor.KeyID || r.Iteration != donor.Iteration {
-			t.Errorf("goroutine %d: got {KeyID=%d, Iter=%d}, want {KeyID=%d, Iter=%d}",
-				i, r.KeyID, r.Iteration, donor.KeyID, donor.Iteration)
-		}
-	}
-}
-
 // ---- TestSingleFlightPerAccountInstall ---------------------------------------
 
 // TestSingleFlightPerAccountInstall proves that N accounts each independently
 // call PutSenderKeyStructure into their own distinct per-account store after
-// receiving the shared *donorSenderKeyState from singleflight.Do. No cross-
+// receiving the same eligible donor state. No cross-
 // account state is written: each account installs a copy into its own cache
 // keyed by its own JID.
 func TestSingleFlightPerAccountInstall(t *testing.T) {
@@ -228,13 +138,13 @@ func TestSingleFlightPerAccountInstall(t *testing.T) {
 		inner := newFakePutCountingStore()
 		byteCache, _ := lru.New[string, []byte](256)
 		devCache, _ := NewSenderKeyDeviceCache(256)
-		// No singleflight wired — each account runs PutSenderKeyStructure independently.
-		cs := NewCachedSenderKeyStore(inner, jid, byteCache, devCache, nil)
+		// Each account runs PutSenderKeyStructure independently.
+		cs := NewCachedSenderKeyStore(inner, jid, byteCache, devCache)
 		accounts[i] = account{cs: cs, inner: inner}
 	}
 
 	// Each account independently installs the shared donor structure into its own
-	// store — this simulates what happens after singleflight.Do returns the shared
+	// store — each account must independently install the shared
 	// *donorSenderKeyState to N followers.
 	ctx := context.Background()
 	var wg sync.WaitGroup

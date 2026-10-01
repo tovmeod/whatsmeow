@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,7 +32,6 @@ func TestInlineCipherOriginalRecoveredByExistingRetry(t *testing.T) {
 func TestInlineCipherRetainedSkippedKey(t *testing.T)          { runInlineCipherOutcome(t, "skipped") }
 func TestInlineCipherPermanentlyLostOriginal(t *testing.T)     { runInlineCipherOutcome(t, "loss") }
 func TestInlineCipherObservableWriteInvalidation(t *testing.T) { runInlineCipherOutcome(t, "write") }
-func TestSenderKeyLocalQueryCost(t *testing.T)                 { runInlineCipherOutcome(t, "cost") }
 
 type aliceSenderKeyStore struct {
 	keys map[*protocol.SenderKeyName]*groupRecord.SenderKey
@@ -131,16 +131,11 @@ func runInlineCipherOutcome(t *testing.T, mode string) {
 			t.Fatalf("lru.New device cache: %v", cacheErr)
 		}
 		inner := NewSQLStore(testContainer, parsed)
-		cached := NewCachedSenderKeyStore(inner, jid, byteCache, deviceCache, nil)
+		cached := NewCachedSenderKeyStore(inner, jid, byteCache, deviceCache)
 		return &store.Device{SenderKeys: cached, InlineRecoverer: cached, Log: waLog.Noop, ID: &parsed}, cached, parsed
 	}
 	deviceB, cachedB, _ := newCachedDevice(inlineTestJIDB)
 	deviceC, cachedC, _ := newCachedDevice(inlineTestJIDC)
-	if mode == "cost" {
-		measureInlineSQLCost(t, ctx, cachedC)
-		resetNoDonorCacheForTest()
-		donorClock = func() time.Time { return now }
-	}
 
 	aliceAddr := protocol.NewSignalAddress("alice", 0)
 	aliceName := protocol.NewSenderKeyName(group, aliceAddr)
@@ -241,9 +236,6 @@ func runInlineCipherOutcome(t *testing.T, mode string) {
 			t.Fatalf("live negative target-%d unexpectedly decrypted %q", target, got)
 		}
 	}
-	if queries := noDonorCacheQueries.Load(); queries != 1 {
-		t.Fatalf("live window donor scans=%d, want 1", queries)
-	}
 	// Expiry with no incoming message or retry is entirely passive.
 	if mode != "write" && mode != "loss" {
 		now = now.Add(5 * time.Minute)
@@ -252,7 +244,7 @@ func runInlineCipherOutcome(t *testing.T, mode string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(stillLegacy.SenderKeyStates) != 1 || noDonorCacheQueries.Load() != 1 {
+	if len(stillLegacy.SenderKeyStates) != 1 {
 		t.Fatal("expiry replayed an original or ran a donor scan while idle")
 	}
 	t.Log("original-unreplayed: idle time did not install, retry, emit plaintext or run donor SQL")
@@ -277,7 +269,7 @@ func runInlineCipherOutcome(t *testing.T, mode string) {
 		jidD, _ := types.ParseJID("17799990043@s.whatsapp.net")
 		byteD, _ := lru.New[string, []byte](256)
 		devD, _ := NewSenderKeyDeviceCache(256)
-		cachedD := NewCachedSenderKeyStore(NewSQLStore(independent, jidD), jidD.String(), byteD, devD, nil)
+		cachedD := NewCachedSenderKeyStore(NewSQLStore(independent, jidD), jidD.String(), byteD, devD)
 		deviceD := &store.Device{SenderKeys: cachedD, Log: waLog.Noop, ID: &jidD}
 		if _, ok, err := cachedD.TryInlineRecovery(ctx, group, labeled, senderBare, currentKeyID, 10); err != nil || !ok {
 			t.Fatalf("counterfactual immediate original recovery: %t, %v", ok, err)
@@ -304,7 +296,6 @@ func runInlineCipherOutcome(t *testing.T, mode string) {
 		now = now.Add(5 * time.Minute)
 		laterTarget = 12
 	}
-	queryStart := time.Now()
 	donorJID, recovered, recoveryErr := cachedC.TryInlineRecovery(ctx, group, labeled, senderBare, currentKeyID, laterTarget)
 	if recoveryErr != nil {
 		t.Fatalf("target-10 TryInlineRecovery: %v", recoveryErr)
@@ -357,14 +348,6 @@ func runInlineCipherOutcome(t *testing.T, mode string) {
 	} else if mode == "skipped" {
 		t.Log("retained-skipped-key: explicit original 4 decrypt succeeded separately from later 10")
 	}
-	wantQueries := uint64(2)
-	if mode == "loss" {
-		wantQueries++
-	} // independent counterfactual scan
-	if got := noDonorCacheQueries.Load(); got != wantQueries {
-		t.Fatalf("donor scans=%d, want %d", got, wantQueries)
-	}
-	t.Logf("local observed donor_scans=%d live_window_scans=1 suppressed_targets=2 recovery_and_crypto_elapsed=%s; SQL-only elapsed=unmeasured CPU=unmeasured production-runtime=unmeasured; later-message-decrypted target=%d", noDonorCacheQueries.Load(), time.Since(queryStart), laterTarget)
 	// Keep cachedB referenced so this test documents that B's real cached store
 	// is the donor row selected by TryInlineRecovery through shared PostgreSQL.
 	if cachedB == nil {
@@ -375,43 +358,14 @@ func runInlineCipherOutcome(t *testing.T, mode string) {
 
 // Both arms use the same account, empty group, sender and key. Wall time
 // includes SQL round trips and decoding; it is not server SQL execution time.
-func measureInlineSQLCost(t *testing.T, ctx context.Context, cached *CachedSenderKeyStore) {
-	t.Helper()
-	const calls = 100
-	const group, sender = "phase3810_identical_empty_fixture@g.us", "missing"
-	inner := cached.inner.(*SQLStore)
-	start := time.Now()
-	for i := 0; i < calls; i++ {
-		if devices, err := inner.GetSenderKeyDevices(ctx, group, sender); err != nil || len(devices) != 0 {
-			t.Fatalf("raw devices=%v, %v", devices, err)
-		}
-		if donor, err := inner.findSenderKeyDonor(ctx, group, sender, 42, uint32(i)); err != nil || donor != nil {
-			t.Fatalf("raw donor=%v, %v", donor, err)
-		}
-	}
-	rawElapsed := time.Since(start)
-	deviceBefore, donorBefore := cached.deviceCache.Metrics().Queries, noDonorCacheQueries.Load()
-	start = time.Now()
-	for i := 0; i < calls; i++ {
-		if devices, err := cached.GetSenderKeyDevices(ctx, group, sender); err != nil || len(devices) != 0 {
-			t.Fatalf("cached devices=%v, %v", devices, err)
-		}
-		if donor, ok, err := cached.TryInlineRecovery(ctx, group, sender+":0", sender, 42, uint32(i)); err != nil || ok || donor != "" {
-			t.Fatalf("cached donor=%q, %t, %v", donor, ok, err)
-		}
-	}
-	cachedElapsed := time.Since(start)
-	deviceQueries := cached.deviceCache.Metrics().Queries - deviceBefore
-	donorScans := noDonorCacheQueries.Load() - donorBefore
-	if deviceQueries != 1 || donorScans != 1 {
-		t.Fatalf("live window devices=%d donors=%d, want one each", deviceQueries, donorScans)
-	}
-	t.Logf("local identical fixture calls=%d raw_device_SQL_calls=%d raw_donor_scans=%d raw_SQL_call_wall=%s cached_device_SQL_calls=%d cached_donor_scans=%d cached_lookup_wall=%s; server_SQL_execution=unmeasured CPU=unmeasured production-runtime=unmeasured", calls, calls, calls, rawElapsed, deviceQueries, donorScans, cachedElapsed)
+
+type benchmarkNegativeStore struct {
+	stubRecoveryInner
+	deviceCalls atomic.Int32
 }
 
-type benchmarkNegativeStore struct{ stubRecoveryInner }
-
-func (*benchmarkNegativeStore) GetSenderKeyDevices(context.Context, string, string) ([]string, error) {
+func (s *benchmarkNegativeStore) GetSenderKeyDevices(context.Context, string, string) ([]string, error) {
+	s.deviceCalls.Add(1)
 	return []string{}, nil // authoritative successful empty, rather than malformed nil
 }
 
@@ -421,7 +375,7 @@ func BenchmarkSenderKeyFixedNegativeHits(b *testing.B) {
 	inner := &benchmarkNegativeStore{}
 	cache, _ := lru.New[string, []byte](16)
 	devices, _ := NewSenderKeyDeviceCache(16)
-	cached := NewCachedSenderKeyStore(inner, "bench", cache, devices, nil)
+	cached := NewCachedSenderKeyStore(inner, "bench", cache, devices)
 	ctx := context.Background()
 	if _, err := cached.GetSenderKeyDevices(ctx, "group", "sender"); err != nil {
 		b.Fatal(err)
@@ -440,9 +394,9 @@ func BenchmarkSenderKeyFixedNegativeHits(b *testing.B) {
 		}
 	}
 	b.StopTimer()
-	if inner.findCalls.Load() != 1 || devices.Metrics().Queries != 1 {
-		b.Fatalf("hits repeated database work: donor=%d device=%d", inner.findCalls.Load(), devices.Metrics().Queries)
+	if inner.findCalls.Load() != 1 || inner.deviceCalls.Load() != 1 {
+		b.Fatalf("hits repeated database work: donor=%d device=%d", inner.findCalls.Load(), inner.deviceCalls.Load())
 	}
 	b.ReportMetric(float64(inner.findCalls.Load())/float64(b.N), "donor-scans/op")
-	b.ReportMetric(float64(devices.Metrics().Queries)/float64(b.N), "device-queries/op")
+	b.ReportMetric(float64(inner.deviceCalls.Load())/float64(b.N), "device-queries/op")
 }

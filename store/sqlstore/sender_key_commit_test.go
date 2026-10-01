@@ -120,7 +120,7 @@ func TestSenderKeyColdWritePreservesPersistedSiblings(t *testing.T) {
 						return &senderKeyDeviceRows{devices}, nil
 					})
 					blobs, _ := lru.New[string, []byte](16)
-					cs := NewCachedSenderKeyStore(sq, sq.JID, blobs, sq.caches.SenderKeyDevices, nil)
+					cs := NewCachedSenderKeyStore(sq, sq.JID, blobs, sq.caches.SenderKeyDevices)
 					ctx := context.Background()
 					if cacheState == "evicted" {
 						if _, err := cs.GetSenderKeyDevices(ctx, "g", "sender"); err != nil {
@@ -198,7 +198,7 @@ func TestSenderKeyColdWriteDuringStaleEnumeration(t *testing.T) {
 					return &senderKeyDeviceRows{[]string{"sender:0", "sender:1"}}, nil
 				})
 			blobs, _ := lru.New[string, []byte](16)
-			cs := NewCachedSenderKeyStore(sq, sq.JID, blobs, sq.caches.SenderKeyDevices, nil)
+			cs := NewCachedSenderKeyStore(sq, sq.JID, blobs, sq.caches.SenderKeyDevices)
 			oldResult := make(chan []string, 1)
 			go func() {
 				devices, _ := cs.GetSenderKeyDevices(context.Background(), "g", "sender")
@@ -325,7 +325,7 @@ func TestSenderKeyWriteFencesEmptyScan(t *testing.T) {
 	resetNoDonorCacheForTest()
 	sq := commitTestStore(t, func([]driver.NamedValue) error { return nil })
 	inner := &stubRecoveryInner{entered: make(chan struct{}, 1), release: make(chan struct{})}
-	cs := newStubCachedStore(t, inner, nil)
+	cs := newStubCachedStore(t, inner)
 	key := donorQueryKey{sq.Container, "g", "u", 7}
 	done := make(chan struct{})
 	go func() { _, _ = cs.lookupDonor(context.Background(), inner, key, 5); close(done) }()
@@ -369,7 +369,7 @@ func TestSenderKeyWritePaths(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			resetNoDonorCacheForTest()
 			inner := &stubRecoveryInner{}
-			cs := newStubCachedStore(t, inner, nil)
+			cs := newStubCachedStore(t, inner)
 			buffered := path == "structure-buffered" || path == "recovery-buffered"
 			if buffered {
 				cs.SetFlusher(NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100))

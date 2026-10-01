@@ -1,102 +1,17 @@
-// kavtov-fork: P2a SENDER_KEY_CONVERGED convergence-instrument safety tests.
-//
-// The P2a instrument (commit a1ce682) is the load-bearing signal we will trust,
-// after deploy, to decide whether the skmsg establish-session fix (a, e66dfae)
-// actually helped: we read POSITIVE per-(sender,device,group) SENDER_KEY_CONVERGED
-// lines, never a raw log-rate drop. If the instrument's bookkeeping were buggy and
-// silently never fired, we would deploy, see zero CONVERGED lines, and wrongly
-// conclude the fix failed. So the bookkeeping MUST be proven correct BEFORE deploy.
-//
-// These tests cover two layers:
-//   1. The bookkeeping methods in isolation (recordFailedSenderKeyTuple /
-//      clearFailedSenderKeyTuple): fire-once, device granularity, dedup-on-add,
-//      ring eviction, lazy-init. Each behavioral case is constructed so that
-//      removing the behavior under test (the dedup early-return, the eviction
-//      delete) makes the test go RED -- a green that still passes when the
-//      behavior is broken would be exactly the false confidence we must avoid.
-//   2. The WIRING (end-to-end): a real group skmsg that first misses (records the
-//      tuple) then, after the sender key is stored, decrypts via the KEY path and
-//      emits the SENDER_KEY_CONVERGED INFO. This proves message.go actually calls
-//      the bookkeeping on the live decrypt path -- "silently never fires" is a
-//      wiring failure the isolated method tests cannot catch.
+// Failed tuples force SKDM recovery past stale dedup state; successful decrypts clear them.
 
 package whatsmeow
 
 import (
 	"context"
 	"fmt"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
-	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
-// --- capturing logger -------------------------------------------------------
-
-// captureLogger records every Infof message so a test can assert that the
-// SENDER_KEY_CONVERGED line was emitted on the real decrypt path. It implements
-// the full waLog.Logger interface. Concurrency-safe because the decrypt path may
-// log from goroutines, though the wiring test below drives it synchronously.
-type captureLogger struct {
-	mu   sync.Mutex
-	info []string
-}
-
-func (c *captureLogger) Infof(msg string, args ...interface{}) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.info = append(c.info, fmt.Sprintf(msg, args...))
-}
-func (c *captureLogger) Warnf(string, ...interface{})  {}
-func (c *captureLogger) Errorf(string, ...interface{}) {}
-func (c *captureLogger) Debugf(string, ...interface{}) {}
-func (c *captureLogger) Sub(string) waLog.Logger       { return c }
-
-func (c *captureLogger) infoContaining(substr string) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	n := 0
-	for _, m := range c.info {
-		if strings.Contains(m, substr) {
-			n++
-		}
-	}
-	return n
-}
-
-// infoMatchingAll counts INFO lines that contain ALL of the given substrings.
-// Used to scope an assertion to a specific log line (e.g. the SENDER_KEY_CONVERGED
-// line) rather than counting a substring (like "device=1") across every INFO line,
-// which would conflate it with other instruments that share the field (e.g. the
-// STEP 1 SKDM_FOR_FAILED_TUPLE line).
-func (c *captureLogger) infoMatchingAll(substrs ...string) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	n := 0
-	for _, m := range c.info {
-		all := true
-		for _, s := range substrs {
-			if !strings.Contains(m, s) {
-				all = false
-				break
-			}
-		}
-		if all {
-			n++
-		}
-	}
-	return n
-}
-
-// --- core bookkeeping tests -------------------------------------------------
-
-// Case 1: clear returns FALSE for a tuple that was never recorded. No
-// false-positive convergence: a SENDER_KEY_CONVERGED line must never fire for a
-// tuple that never failed.
 func TestConvergeClearUnrecordedReturnsFalse(t *testing.T) {
 	cli := newTestClient(newFakeSenderKeyStore())
 	if cli.clearFailedSenderKeyTuple("75811323404294_1:1", "120363000000000000@g.us") {
@@ -218,26 +133,7 @@ func TestConvergeBareClientNoNilPanic(t *testing.T) {
 	}
 }
 
-// --- end-to-end wiring test -------------------------------------------------
-
-// Case (preferred): WIRING. Proves message.go actually calls the bookkeeping on
-// the real decrypt path and emits the INFO -- the isolated method tests above
-// cannot catch a missing/wrong call site (the "silently never fires" risk the
-// instrument exists to guard against).
-//
-// Flow on one client with a real group skmsg:
-//  1. decryptGroupMsg with an EMPTY store -> total miss (ErrNoSenderKeyForUser);
-//     decryptGroupSenderKey records the inbound tuple.
-//  2. handleSenderKeyDistributionMessage stores the sender's key for the group.
-//  3. decryptGroupMsg again with the SAME skmsg -> KEY-path decrypt success;
-//     decryptGroupSenderKey clears the previously-failing tuple and logs
-//     SENDER_KEY_CONVERGED.
-//
-// The iteration-0 skmsg decrypts on the second pass because the first total-miss
-// touched no key state (mirrors TestGroupSenderKeySameDeviceControl plus a leading
-// miss). Using a capturing logger sidesteps reverse-engineering the exact bare-vs-
-// device-qualified `labeled` string; we assert on the emitted INFO directly.
-func TestConvergeEndToEndKeyPathEmitsConverged(t *testing.T) {
+func TestFailedSenderKeyTupleClearedAfterKeyPathRecovery(t *testing.T) {
 	ctx := context.Background()
 	chat := types.JID{User: "120363000000000099", Server: types.GroupServer}
 	sender := types.JID{User: "75811323404294", Server: types.HiddenUserServer, Device: 1}
@@ -245,10 +141,7 @@ func TestConvergeEndToEndKeyPathEmitsConverged(t *testing.T) {
 	plaintext := []byte("converged via key path")
 	skdmBytes, skmsgBytes := aliceCrypto(ctx, t, chat.String(), plaintext)
 
-	log := &captureLogger{}
 	cli := newTestClient(newFakeSenderKeyStore())
-	cli.Log = log
-	cli.Store.Log = log
 
 	skmsgNode := &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: skmsgBytes}
 
@@ -256,8 +149,8 @@ func TestConvergeEndToEndKeyPathEmitsConverged(t *testing.T) {
 	// assert the error class here; the point is that the miss path ran and that no
 	// CONVERGED fired on a first-ever miss.)
 	_, _, _ = cli.decryptGroupMsg(ctx, skmsgNode, sender, chat, time.Now())
-	if n := log.infoContaining("SENDER_KEY_CONVERGED"); n != 0 {
-		t.Fatalf("CONVERGED fired on the first miss (n=%d); it must fire only on a later success", n)
+	if !cli.isFailedSenderKeyTuple(sender.SignalAddress().String(), chat.String()) {
+		t.Fatal("terminal failure did not activate the inbound-device SKDM recovery bypass")
 	}
 
 	// Store the sender key for the group.
@@ -266,10 +159,6 @@ func TestConvergeEndToEndKeyPathEmitsConverged(t *testing.T) {
 	// miss, so handleSenderKeyDistributionMessage must emit exactly one
 	// SKDM_FOR_FAILED_TUPLE line with installed=y carrying the inbound device (=1).
 	// This positively exercises the new instrument on the live receive path.
-	if n := log.infoMatchingAll("SKDM_FOR_FAILED_TUPLE", "installed=y", "device=1"); n != 1 {
-		t.Fatalf("expected exactly one SKDM_FOR_FAILED_TUPLE installed=y device=1 line for the "+
-			"stuck tuple, got %d; the STEP 1 instrument is NOT wired to handleSenderKeyDistributionMessage", n)
-	}
 
 	// Pass 2: same skmsg now decrypts via the KEY path -> CONVERGED.
 	pt, _, err := cli.decryptGroupMsg(ctx, skmsgNode, sender, chat, time.Now())
@@ -279,26 +168,7 @@ func TestConvergeEndToEndKeyPathEmitsConverged(t *testing.T) {
 	if string(pt) != string(plaintext) {
 		t.Fatalf("decrypted plaintext mismatch: got %q want %q", pt, plaintext)
 	}
-	if n := log.infoContaining("SENDER_KEY_CONVERGED"); n != 1 {
-		t.Fatalf("expected exactly one SENDER_KEY_CONVERGED line after key-path recovery, got %d; "+
-			"the instrument is NOT wired to the live decrypt path", n)
-	}
-	// The live path must preserve the INBOUND device (Device=1), NOT collapse it
-	// to :0. decryptGroupMsg passes `from` verbatim to decryptGroupSenderKey
-	// (message.go: "No :0 normalization" -- Phase 27 removed the bare-:0 collapse),
-	// so labeled := from.SignalAddress().String() and the logged device must be 1.
-	// If a future change re-introduced ToNonAD()/:0 normalization on the sender
-	// before this call, every inbound device would collapse to :0 and the set would
-	// degrade to per-(sender,group) -- breaking the per-(sender,device,group) claim.
-	// Asserting device=1 on the CONVERGED line specifically locks that in (scoped to
-	// the CONVERGED line so the SKDM_FOR_FAILED_TUPLE line, which also carries
-	// device=1, does not inflate the count).
-	if log.infoMatchingAll("SENDER_KEY_CONVERGED", "device=1") != 1 {
-		t.Fatalf("CONVERGED line did not carry the inbound device (device=1); " +
-			"the sender device was normalized (e.g. to :0) before decryptGroupSenderKey, " +
-			"degrading the set to per-(sender,group)")
-	}
-	if log.infoMatchingAll("SENDER_KEY_CONVERGED", "device=0") != 0 {
-		t.Fatal("CONVERGED logged device=0 for a Device=1 inbound; :0 normalization regressed")
+	if cli.isFailedSenderKeyTuple(sender.SignalAddress().String(), chat.String()) {
+		t.Fatal("successful key-path decrypt left the inbound failed-tuple recovery bypass active")
 	}
 }
