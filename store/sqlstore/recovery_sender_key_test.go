@@ -38,6 +38,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
@@ -51,6 +52,70 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+func TestSenderKeyPolicySnapshotSQLDonorFallback(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("pgx", batchTestDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err = db.PingContext(ctx); err != nil {
+		t.Fatal("owned PostgreSQL required for policy tracer")
+	}
+	cleanupA := insertRecoveryTestDevice(t, db, recoveryTestJIDA)
+	cleanupB := insertRecoveryTestDevice(t, db, recoveryTestJIDB)
+	t.Cleanup(cleanupA)
+	t.Cleanup(cleanupB)
+	container := sqlstore.NewWithDB(db, "postgres", nil)
+	snapshot := func() map[string]map[string]any {
+		t.Helper()
+		method := reflect.ValueOf(container).MethodByName("SenderKeyPolicySnapshot")
+		if !method.IsValid() {
+			t.Fatal("Container policy snapshot missing for SQL donor evidence")
+		}
+		data, err := json.Marshal(method.Call(nil)[0].Interface())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]map[string]any
+		if err = json.Unmarshal(data, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	cs := newRecoveryTestStoreB(t, db)
+	const group, sender = "phase96-policy@g.us", "private_policy_sender_1"
+	const keyID = uint32(9642)
+	defer sqlstore.DeleteNoDonorCacheEntry(group, sender, keyID)
+	before := snapshot()["donor_cache"]
+	for range 2 {
+		_, ok, err := cs.TryInlineRecovery(ctx, group, sender+":0", sender, keyID, 5)
+		if ok || err != nil {
+			t.Fatalf("no-donor SQL result changed: %v %v", ok, err)
+		}
+	}
+	miss := snapshot()["donor_cache"]
+	for _, field := range []string{"queries", "fallback_scan_entered", "negative_hits", "skips"} {
+		if miss[field].(float64)-before[field].(float64) != 1 {
+			t.Fatalf("one SQL miss and one suppression must increment %s once: %v -> %v", field, before, miss)
+		}
+	}
+	// A donor with the requested ID in state[1] exercises the real fallback.
+	structure := buildDonorStructure(keyID+1, 2, 0x31)
+	structure.SenderKeyStates = append(structure.SenderKeyStates, buildDonorStructure(keyID, 3, 0x32).SenderKeyStates...)
+	if err = newSeedStoreA(t, db).PutManySenderKeys(ctx, []sqlstore.SenderKeyRow{sqlstore.NewSenderKeyRow(group, sender+":7", structure)}); err != nil {
+		t.Fatal(err)
+	}
+	_, ok, err := cs.TryInlineRecovery(ctx, group, sender+":0", sender, keyID, 5)
+	if !ok || err != nil {
+		t.Fatalf("observable donor must still recover: %v %v", ok, err)
+	}
+	found := snapshot()["donor_cache"]
+	if found["fallback_scan_found"].(float64)-miss["fallback_scan_found"].(float64) != 1 || found["queries"].(float64)-miss["queries"].(float64) != 1 {
+		t.Fatalf("real fallback donor not separately attributed: %v -> %v", miss, found)
+	}
+}
 
 // recovery test JIDs — two separate accounts
 const (
