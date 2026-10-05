@@ -111,6 +111,19 @@ func (cli *Client) getRecentMessage(to types.JID, id types.MessageID) RecentMess
 	return cli.recentMessagesMap[recentMessageKey{to, id}]
 }
 
+// hasRecentMessageID checks every chat in the bounded cache, including alternate
+// and self-account sources. It does not remove or alter ordinary retry payloads.
+func (cli *Client) hasRecentMessageID(id types.MessageID) bool {
+	cli.recentMessagesLock.RLock()
+	defer cli.recentMessagesLock.RUnlock()
+	for key := range cli.recentMessagesMap {
+		if key.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // shouldWrapDeviceSentRetry reports whether an outgoing-message retry should be re-wrapped
 // as a DeviceSentMessage. This is true for own-account (IsFromMe) DM retries, but NOT for
 // peer messages (msg.isPeer): peer messages must be re-sent with PEER framing instead

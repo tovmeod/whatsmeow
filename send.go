@@ -9,6 +9,7 @@ package whatsmeow
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -38,6 +39,8 @@ import (
 )
 
 const WebMessageIDPrefix = "3EB0"
+
+var ErrNoAutoRetryWithCustomID = errors.New("automatic retry suppression requires a generated message ID")
 
 // GenerateMessageID generates a random string that can be used as a message ID on WhatsApp.
 //
@@ -175,6 +178,15 @@ type GroupSendDebug struct {
 type SendRequestExtra struct {
 	// The message ID to use when sending. If this is not provided, a random message ID will be generated
 	ID types.MessageID
+	// DisableAutoRetry omits this send from the recent/durable retry sources and
+	// returns disconnected uncertainty instead of resending on a replacement socket.
+	// Requires UseRetryMessageStore and EventBuffer, a generated ID, and a non-peer
+	// message whose content does not replace that ID. A later explicit attempt may
+	// duplicate an already transmitted message. This does not retract a write or
+	// provide cancellation/recipient-delivery proof. Keep the durable retry store
+	// enabled; an external payload source or later ordinary reuse of this ID changes
+	// the guarantee. Default false preserves ordinary retry behavior.
+	DisableAutoRetry bool
 	// JID of the bot to be invoked (optional)
 	InlineBotJID types.JID
 	// Should the message be sent as a peer message (protocol messages to your own devices, e.g. app state key requests)
@@ -236,6 +248,21 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		err = ErrNotLoggedIn
 		return
 	}
+	if req.DisableAutoRetry {
+		if req.ID != "" {
+			err = ErrNoAutoRetryWithCustomID
+			return
+		}
+		if req.Peer || !cli.UseRetryMessageStore || cli.Store.EventBuffer == nil {
+			err = errors.New("automatic retry suppression requires a non-peer send with a durable retry store")
+			return
+		}
+		if to.Server == types.NewsletterServer && (message.EditedMessage != nil ||
+			message.ProtocolMessage != nil && message.ProtocolMessage.GetType() == waE2E.ProtocolMessage_REVOKE) {
+			err = ErrNoAutoRetryWithCustomID
+			return
+		}
+	}
 
 	if req.Timeout == 0 {
 		req.Timeout = defaultRequestTimeout
@@ -252,6 +279,37 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		}
 	}
 	resp.ID = req.ID
+
+	// Selected sends validate sources before any optional preparation can write
+	// to the network. Reuse the existing send lock rather than introducing an
+	// independent retry-policy registry or lock.
+	sendLockHeld := false
+	releaseSendLock := func() {
+		if sendLockHeld {
+			cli.messageSendLock.Unlock()
+			sendLockHeld = false
+		}
+	}
+	defer releaseSendLock()
+	if req.DisableAutoRetry {
+		queueStart := time.Now()
+		cli.messageSendLock.Lock()
+		resp.DebugTimings.Queue = time.Since(queueStart)
+		sendLockHeld = true
+		if cli.hasRecentMessageID(req.ID) {
+			err = errors.New("generated message ID already exists in recent retry cache")
+			return
+		}
+		_, _, lookupErr := cli.Store.EventBuffer.GetOutgoingEventByID(ctx, req.ID)
+		if !errors.Is(lookupErr, sql.ErrNoRows) {
+			if lookupErr == nil {
+				err = errors.New("generated message ID already exists in durable retry store")
+			} else {
+				err = fmt.Errorf("failed to check generated message ID in retry store: %w", lookupErr)
+			}
+			return
+		}
+	}
 
 	isInlineBotMode := false
 
@@ -402,23 +460,20 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	// Sending multiple messages at a time can cause weird issues and makes it harder to retry safely
 	// This is also required for the session prefetching that makes group sends faster
 	// (everything will explode if you send a message to the same user twice in parallel)
-	cli.messageSendLock.Lock()
-	resp.DebugTimings.Queue = time.Since(start)
-	sendLockHeld := true
-	releaseSendLock := func() {
-		if sendLockHeld {
-			cli.messageSendLock.Unlock()
-			sendLockHeld = false
-		}
+	if !sendLockHeld {
+		cli.messageSendLock.Lock()
+		resp.DebugTimings.Queue = time.Since(start)
+		sendLockHeld = true
 	}
-	defer releaseSendLock()
 
 	// kavtov: always store outgoing messages for retry. Peer messages (req.Peer) are
 	// kept in the in-memory ring only (addRecentMessage skips the DB write when isPeer)
 	// and re-served with PEER framing on a retry receipt — see retry.go handleRetryReceipt.
-	err = cli.addRecentMessage(ctx, to, req.ID, message, nil, req.Peer)
-	if err != nil {
-		return
+	if !req.DisableAutoRetry {
+		err = cli.addRecentMessage(ctx, to, req.ID, message, nil, req.Peer)
+		if err != nil {
+			return
+		}
 	}
 
 	if message.GetMessageContextInfo().GetMessageSecret() != nil {
@@ -480,6 +535,10 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	resp.DebugTimings.Resp = time.Since(start)
 	if isDisconnectNode(respNode) {
+		if req.DisableAutoRetry {
+			err = &DisconnectedError{Action: "message send", Node: respNode}
+			return
+		}
 		start = time.Now()
 		respNode, err = cli.retryFrame(ctx, "message send", req.ID, data, respNode, 0)
 		resp.DebugTimings.Retry = time.Since(start)
