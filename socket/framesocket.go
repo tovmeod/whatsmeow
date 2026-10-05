@@ -144,6 +144,10 @@ func (fs *FrameSocket) Context() context.Context {
 }
 
 func (fs *FrameSocket) SendFrame(data []byte) error {
+	return fs.sendFrame(fs.cancelCtx, data)
+}
+
+func (fs *FrameSocket) sendFrame(ctx context.Context, data []byte) error {
 	conn := fs.conn.Load()
 	if conn == nil {
 		return ErrSocketClosed
@@ -172,7 +176,7 @@ func (fs *FrameSocket) SendFrame(data []byte) error {
 	// Copy actual frame data
 	copy(wholeFrame[headerLength+FrameLengthSize:], data)
 
-	return conn.Write(fs.cancelCtx, websocket.MessageBinary, wholeFrame)
+	return conn.Write(ctx, websocket.MessageBinary, wholeFrame)
 }
 
 func (fs *FrameSocket) frameComplete() {

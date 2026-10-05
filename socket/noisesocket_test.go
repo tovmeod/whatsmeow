@@ -173,6 +173,46 @@ func (c *lifecycleDelayedCancel) AfterFunc(fn func()) func() bool {
 }
 
 func TestNoiseSocketWriteLifecycle(t *testing.T) {
+	t.Run("pre_cancel_and_stop_do_not_consume_nonce", func(t *testing.T) {
+		ns, _, _, drained := lifecycleSocket(t, false)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := ns.SendFrame(ctx, []byte("cancelled")); !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+		if ns.writeCounter != 0 || ns.destroyed.Load() {
+			t.Fatal("pre-encryption cancellation consumed or retired a nonce")
+		}
+		ns.Stop(false, true)
+		if err := ns.SendFrame(context.Background(), []byte("stopped")); !errors.Is(err, ErrSocketClosed) {
+			t.Fatal(err)
+		}
+		if ns.writeCounter != 0 {
+			t.Fatal("stopped session consumed nonce")
+		}
+		ns.fs.Close(0)
+		if got := lifecycleAwait(t, drained); got != 0 {
+			t.Fatalf("actual peer writes=%d", got)
+		}
+	})
+	t.Run("oversized_frame_retires_with_disconnect", func(t *testing.T) {
+		ns, _, _, drained := lifecycleSocket(t, false)
+		disconnected := make(chan bool, 1)
+		ns.fs.OnDisconnect = func(_ context.Context, remote bool) { disconnected <- remote }
+		if err := ns.SendFrame(context.Background(), make([]byte, FrameMaxSize)); !errors.Is(err, ErrFrameTooLarge) {
+			t.Fatalf("original frame error lost: %v", err)
+		}
+		lifecycleRetired(t, ns)
+		if !lifecycleAwait(t, disconnected) {
+			t.Fatal("force-close disconnect observation lost")
+		}
+		if ns.writeCounter != 1 {
+			t.Fatal("failed nonce was reused")
+		}
+		if got := lifecycleAwait(t, drained); got != 0 {
+			t.Fatalf("actual peer writes=%d", got)
+		}
+	})
 	t.Run("delayed_callback_positive_completion", func(t *testing.T) {
 		ns, wire, frames, drained := lifecycleSocket(t, false)
 		ctx := &lifecycleDelayedCancel{Context: context.Background(), done: make(chan struct{}), callbacks: make(chan struct{})}
