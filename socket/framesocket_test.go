@@ -5,10 +5,38 @@
 package socket
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"io"
 	"testing"
 )
+
+func TestFrameSocketSendFrameContext(t *testing.T) {
+	ns, wire, frames, drained := lifecycleSocket(t, false)
+	close(wire.release)
+	ns.fs.Header = []byte("header")
+	// Keep the public handshake API and one-time header byte compatibility.
+	if err := ns.fs.SendFrame([]byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ns.fs.SendFrame([]byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if got := lifecycleAwait(t, frames); !bytes.Equal(got, []byte("header\x00\x00\x03one")) {
+		t.Fatalf("first frame=%x", got)
+	}
+	if got := lifecycleAwait(t, frames); !bytes.Equal(got, []byte("\x00\x00\x03two")) {
+		t.Fatalf("second frame=%x", got)
+	}
+	ns.Stop(true, true)
+	if err := ns.SendFrame(context.Background(), []byte("closed")); err == nil {
+		t.Fatal("stopped Noise session accepted a send")
+	}
+	if got := lifecycleAwait(t, drained); got != 2 {
+		t.Fatalf("actual peer writes=%d", got)
+	}
+}
 
 func TestFrameSocket_IsRoutineEOF_EOFWithAutoReconnectEnabled(t *testing.T) {
 	if !isRoutineEOF(io.EOF, func() bool { return true }) {
