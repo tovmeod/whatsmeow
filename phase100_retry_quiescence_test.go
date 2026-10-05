@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,15 +35,8 @@ import (
 //go:linkname phase100NewNoiseSocket go.mau.fi/whatsmeow/socket.newNoiseSocket
 func phase100NewNoiseSocket(context.Context, *socket.FrameSocket, cipher.AEAD, cipher.AEAD, socket.FrameHandler, socket.DisconnectHandler) (*socket.NoiseSocket, error)
 
-// RED bootstrap: today's source runs the ordinary call, so assertions fail on
-// actual payload availability/retransmission rather than a missing field.
 func phase100SelectedExtra() SendRequestExtra {
-	extra := SendRequestExtra{Timeout: time.Second}
-	field := reflect.ValueOf(&extra).Elem().FieldByName("DisableAutoRetry")
-	if field.IsValid() {
-		field.SetBool(true)
-	}
-	return extra
+	return SendRequestExtra{Timeout: time.Second, DisableAutoRetry: true}
 }
 
 type phase100RetryBuffer struct {
@@ -177,7 +169,7 @@ func phase100Await[T any](t *testing.T, ch <-chan T) T {
 		return zero
 	}
 }
-func phase100Peer(t *testing.T) *phase100RetryPeer {
+func phase100Peer(t *testing.T, decorate ...func(cipher.AEAD) cipher.AEAD) *phase100RetryPeer {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	block, err := aes.NewCipher(make([]byte, 32))
@@ -235,7 +227,11 @@ func phase100Peer(t *testing.T) *phase100RetryPeer {
 		t.Fatal(err)
 	}
 	p.wire = phase100Await(t, tr.wire)
-	p.ns, err = phase100NewNoiseSocket(ctx, p.fs, key, key, func(context.Context, []byte) {}, func(context.Context, *socket.NoiseSocket, bool) {})
+	writeKey := key
+	if len(decorate) > 0 {
+		writeKey = decorate[0](key)
+	}
+	p.ns, err = phase100NewNoiseSocket(ctx, p.fs, writeKey, key, func(context.Context, []byte) {}, func(context.Context, *socket.NoiseSocket, bool) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,6 +306,42 @@ func phase100CollisionIDs(cli *Client) []string {
 		ids = append(ids, WebMessageIDPrefix+strings.ToUpper(hex.EncodeToString(hash[:9])))
 	}
 	return ids
+}
+
+type phase100RetryDelayedCancel struct {
+	context.Context
+	done, callbacks chan struct{}
+	cancelled       atomic.Bool
+}
+
+func (c *phase100RetryDelayedCancel) Done() <-chan struct{} { return c.done }
+func (c *phase100RetryDelayedCancel) Err() error {
+	if c.cancelled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+func (c *phase100RetryDelayedCancel) AfterFunc(fn func()) func() bool {
+	var stopped atomic.Bool
+	go func() {
+		<-c.done
+		<-c.callbacks
+		if !stopped.Load() {
+			fn()
+		}
+	}()
+	return func() bool { return !stopped.Swap(true) }
+}
+
+type phase100RetryPausedCipher struct {
+	cipher.AEAD
+	paused, resume chan struct{}
+}
+
+func (k *phase100RetryPausedCipher) Seal(dst, nonce, plaintext, additional []byte) []byte {
+	close(k.paused)
+	<-k.resume
+	return k.AEAD.Seal(dst, nonce, plaintext, additional)
 }
 
 func TestPhase100NoAutoRetry(t *testing.T) {
@@ -542,6 +574,96 @@ func TestPhase100NoAutoRetry(t *testing.T) {
 		p.finish(t, 1, 0, 0)
 		if b.writes != 0 || len(cli.recentMessagesMap) != 0 {
 			t.Error("closed selected send retained retry payload")
+		}
+	})
+	t.Run("selected_disconnect_while_write_inflight", func(t *testing.T) {
+		b := &phase100RetryBuffer{rows: make(map[recentMessageKey][]byte)}
+		cli, original, replacement := phase100RetryClient(b), phase100Peer(t), phase100Peer(t)
+		phase100Install(cli, original)
+		close(replacement.wire.release)
+		done := phase100Start(cli, context.Background(), phase100SelectedExtra(), phase100Payload())
+		phase100Await(t, original.wire.entered)
+		phase100Install(cli, replacement)
+		cli.clearResponseWaiters(xmlStreamEndNode)
+		if original.wire.completions.Load() != 0 {
+			t.Fatal("original Write unexpectedly completed")
+		}
+		close(original.wire.release)
+		phase100Await(t, original.frames)
+		result := phase100Await(t, done)
+		var disconnected *DisconnectedError
+		if !errors.As(result.err, &disconnected) {
+			t.Fatalf("in-flight disconnect lost uncertainty: %v", result.err)
+		}
+		original.finish(t, 1, 1, 1)
+		replacement.finish(t, 0, 0, 0)
+	})
+	t.Run("selected_delayed_callback_positive_write", func(t *testing.T) {
+		b := &phase100RetryBuffer{rows: make(map[recentMessageKey][]byte)}
+		cli, p := phase100RetryClient(b), phase100Peer(t)
+		phase100Install(cli, p)
+		ctx := &phase100RetryDelayedCancel{Context: context.Background(), done: make(chan struct{}), callbacks: make(chan struct{})}
+		defer close(ctx.callbacks)
+		done := phase100Start(cli, ctx, phase100SelectedExtra(), phase100Payload())
+		phase100Await(t, p.wire.entered)
+		ctx.cancelled.Store(true)
+		close(ctx.done)
+		select {
+		case result := <-done:
+			t.Fatalf("operation returned before original Write: %v", result.err)
+		case <-time.After(20 * time.Millisecond):
+		}
+		close(p.wire.release)
+		phase100Await(t, p.frames)
+		result := phase100Await(t, done)
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("completed Write plus canceled ACK wait must remain uncertain: %v", result.err)
+		}
+		p.finish(t, 1, 1, 1)
+		if b.writes != 0 || len(cli.recentMessagesMap) != 0 {
+			t.Fatal("delayed callback selected payload retained")
+		}
+	})
+	t.Run("selected_cancel_after_noise_precheck", func(t *testing.T) {
+		b := &phase100RetryBuffer{rows: make(map[recentMessageKey][]byte)}
+		paused := &phase100RetryPausedCipher{paused: make(chan struct{}), resume: make(chan struct{})}
+		p := phase100Peer(t, func(key cipher.AEAD) cipher.AEAD { paused.AEAD = key; return paused })
+		cli := phase100RetryClient(b)
+		phase100Install(cli, p)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := phase100Start(cli, ctx, phase100SelectedExtra(), phase100Payload())
+		phase100Await(t, paused.paused)
+		cancel()
+		close(paused.resume)
+		result := phase100Await(t, done)
+		if !errors.Is(result.err, context.Canceled) || p.ns.IsConnected() {
+			t.Fatalf("precheck race did not retire exact socket: %v", result.err)
+		}
+		p.finish(t, 0, 0, 0)
+		if b.writes != 0 || len(cli.recentMessagesMap) != 0 {
+			t.Fatal("precheck selected payload retained")
+		}
+	})
+	t.Run("ordinary_alternate_sources_positive", func(t *testing.T) {
+		b := &phase100RetryBuffer{rows: make(map[recentMessageKey][]byte)}
+		cli := phase100RetryClient(b)
+		lids := cli.Store.LIDs.(*phase100LIDs)
+		for _, original := range []types.JID{lids.pn, lids.lid} {
+			id := "old-ordinary-" + original.Server
+			if err := cli.addRecentMessage(context.Background(), original, id, phase100Payload(), nil, false); err != nil {
+				t.Fatal(err)
+			}
+			for _, lookup := range []*Client{cli, phase100RetryClient(b)} {
+				for _, chat := range []types.JID{lids.pn, lids.lid, cli.getOwnID()} {
+					receipt := &events.Receipt{}
+					receipt.Chat, receipt.Sender = chat, lids.pn
+					msg, err := lookup.getMessageForRetry(context.Background(), receipt, id, time.Time{})
+					if err != nil || msg == nil || !proto.Equal(msg.wa, phase100Payload()) {
+						t.Fatalf("ordinary exact/alternate/durable/self-ID recovery failed: chat=%s err=%v", chat, err)
+					}
+				}
+			}
 		}
 	})
 }
