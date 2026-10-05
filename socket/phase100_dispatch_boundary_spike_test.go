@@ -1,6 +1,7 @@
 package socket
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -16,7 +17,7 @@ import (
 )
 
 // Test-only AEAD wrapper pauses inside the real SendFrame after ctx.Err,
-// before encryption, goroutine launch, FrameSocket.SendFrame and Conn.Write.
+// before encryption, synchronous FrameSocket.sendFrame and Conn.Write.
 // It delegates to real AES-GCM; no copied send implementation or source overlay.
 type phase100PausedCipher struct {
 	cipher.AEAD
@@ -45,6 +46,41 @@ func (c *phase100DelayedContext) Deadline() (time.Time, bool) {
 }
 
 func TestPhase100DispatchBoundarySpike(t *testing.T) {
+	t.Run("normal_send_positive_control", func(t *testing.T) {
+		ns, wire, frames, drained := lifecycleSocket(t, false)
+		first, second := make(chan error, 1), make(chan error, 1)
+		go func() { first <- ns.SendFrame(context.Background(), []byte("first control")) }()
+		lifecycleAwait(t, wire.entered)
+		go func() { second <- ns.SendFrame(context.Background(), []byte("second control")) }()
+		select {
+		case <-first:
+			t.Fatal("first returned before physical completion")
+		case <-second:
+			t.Fatal("second bypassed write serialization")
+		case <-time.After(20 * time.Millisecond):
+		}
+		close(wire.release)
+		if err := lifecycleAwait(t, first); err != nil {
+			t.Fatal(err)
+		}
+		if err := lifecycleAwait(t, second); err != nil {
+			t.Fatal(err)
+		}
+		for i, plaintext := range []string{"first control", "second control"} {
+			frame := lifecycleAwait(t, frames)
+			want := ns.writeKey.Seal(nil, generateIV(uint32(i)), []byte(plaintext), nil)
+			if !bytes.Equal(frame, append([]byte{0, 0, byte(len(want))}, want...)) {
+				t.Fatal("normal peer frames changed or reordered")
+			}
+		}
+		if wire.completed.Load() != 2 {
+			t.Fatal("physical write not complete on return")
+		}
+		ns.fs.Close(0)
+		if writes := lifecycleAwait(t, drained); writes != 2 {
+			t.Fatalf("observer positive control: writes=%d", writes)
+		}
+	})
 	for _, candidate := range []string{"baseline", "absolute_snapshot", "connection_teardown"} {
 		t.Run(candidate, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -95,7 +131,9 @@ func TestPhase100DispatchBoundarySpike(t *testing.T) {
 					close(pausedKey.resume)
 				}
 			}()
-			ns := &NoiseSocket{fs: fs, writeKey: pausedKey}
+			ns := &NoiseSocket{fs: fs, writeKey: pausedKey, stopConsumer: make(chan struct{})}
+			operation, stopOperation := context.WithCancel(context.Background())
+			defer stopOperation()
 			delayed := &phase100DelayedContext{Context: context.Background(), deadline: time.Now().Add(time.Hour)}
 			done := make(chan error, 1)
 			go func() {
@@ -106,7 +144,11 @@ func TestPhase100DispatchBoundarySpike(t *testing.T) {
 						return
 					}
 				}
-				done <- ns.SendFrame(delayed, []byte("local synthetic payload"))
+				var sendCtx context.Context = operation
+				if candidate == "absolute_snapshot" {
+					sendCtx = delayed
+				}
+				done <- ns.SendFrame(sendCtx, []byte("local synthetic payload"))
 			}()
 			select {
 			case <-pausedKey.paused:
@@ -127,19 +169,20 @@ func TestPhase100DispatchBoundarySpike(t *testing.T) {
 			if candidate == "connection_teardown" {
 				fs.Close(0)
 			}
+			stopOperation()
 			// This fork-only ordering marker is NOT a database revoke.
 			t.Log("revocation marker set while live worker is paused after guard")
 			close(pausedKey.resume)
+			var sendErr error
 			select {
-			case err := <-done:
-				if candidate != "connection_teardown" && err != nil {
-					t.Fatal(err)
-				}
-				if candidate == "connection_teardown" && err == nil {
-					t.Fatal("closed socket unexpectedly wrote")
-				}
+			case sendErr = <-done:
 			case <-ctx.Done():
 				t.Fatal("worker did not complete")
+			}
+			if sendErr != nil {
+				lifecycleRetired(t, ns)
+			} else if candidate != "absolute_snapshot" {
+				t.Fatal("cancelled/closed operation unexpectedly succeeded")
 			}
 			var writes int
 			select {
@@ -150,20 +193,17 @@ func TestPhase100DispatchBoundarySpike(t *testing.T) {
 			if writes < 0 {
 				t.Fatal("peer fixture failed")
 			}
-			t.Logf("candidate=%s frame_admissions_after_marker=%d actual_peer_writes=%d", candidate, ns.writeCounter, writes)
-			if candidate == "baseline" {
-				if writes != 1 || ns.writeCounter != 1 {
-					t.Fatal("baseline counterexample absent")
-				}
-				return
+			wantWrites := 0
+			if sendErr == nil {
+				wantWrites = 1
 			}
-			// The privacy boundary is the actual outbound write. Encryption and
-			// counter advancement on a closed socket cannot disclose the payload.
-			// Keep admissions diagnostic; teardown is only this narrow case,
-			// not proof of the broader reconnect/quiescence protocol.
-			if writes != 0 {
-				t.Errorf("mandatory post-check pre-write pause FAIL: frame admissions=%d actual writes=%d; want zero actual writes", ns.writeCounter, writes)
+			t.Logf("bounded library candidate=%s frame_admissions=%d actual_peer_writes=%d positive_write_completion=%v global_protocol=FAIL", candidate, ns.writeCounter, writes, sendErr == nil)
+			if writes != wantWrites || ns.writeCounter != 1 {
+				t.Fatalf("physical completion mismatch: admissions=%d writes=%d error=%v", ns.writeCounter, writes, sendErr)
 			}
+			// A delayed timer permits a positively completed write, never a
+			// cancellation ACK. Marker is no database revoke. Reconnect, prepared
+			// retry, exact-owner, clock, admin/reaper, pool and Ride locks are unproved.
 		})
 	}
 }
