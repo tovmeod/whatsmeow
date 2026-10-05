@@ -80,7 +80,9 @@ func (ns *NoiseSocket) Stop(disconnect, allowOnDisconnect bool) {
 	if ns.destroyed.CompareAndSwap(false, true) {
 		close(ns.stopConsumer)
 		if !allowOnDisconnect {
+			ns.fs.lock.Lock()
 			ns.fs.OnDisconnect = nil
+			ns.fs.lock.Unlock()
 		}
 		if disconnect {
 			ns.fs.Close(websocket.StatusNormalClosure)
@@ -91,22 +93,30 @@ func (ns *NoiseSocket) Stop(disconnect, allowOnDisconnect bool) {
 func (ns *NoiseSocket) SendFrame(ctx context.Context, plaintext []byte) error {
 	ns.writeLock.Lock()
 	defer ns.writeLock.Unlock()
+	if ns.destroyed.Load() {
+		return ErrSocketClosed
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	// Don't reuse plaintext slice for storage as it may be needed for retries
 	ciphertext := ns.writeKey.Seal(nil, generateIV(ns.writeCounter), plaintext, nil)
 	ns.writeCounter++
-	doneChan := make(chan error, 1)
-	go func() {
-		doneChan <- ns.fs.SendFrame(ciphertext)
-	}()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case retErr := <-doneChan:
-		return retErr
+	err := ns.fs.sendFrame(ctx, ciphertext)
+	if err != nil {
+		ns.retireAfterWriteFailure()
 	}
+	return err
+}
+
+// Once Seal consumes a nonce, any write error makes this session unusable.
+// Keep disconnect observation and force-close only this FrameSocket; callers
+// receive the original write result after the synchronous write has returned.
+func (ns *NoiseSocket) retireAfterWriteFailure() {
+	if ns.destroyed.CompareAndSwap(false, true) {
+		close(ns.stopConsumer)
+	}
+	ns.fs.Close(0)
 }
 
 func (ns *NoiseSocket) receiveEncryptedFrame(ctx context.Context, ciphertext []byte) {
