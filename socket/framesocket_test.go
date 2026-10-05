@@ -16,6 +16,14 @@ func TestFrameSocketSendFrameContext(t *testing.T) {
 	ns, wire, frames, drained := lifecycleSocket(t, false)
 	close(wire.release)
 	ns.fs.Header = []byte("header")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := ns.fs.sendFrame(ctx, []byte("cancelled")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("original operation context lost: %v", err)
+	}
+	if wire.completed.Load() != 0 || !ns.IsConnected() {
+		t.Fatal("pre-cancelled Frame operation wrote or retired a nonce-free session")
+	}
 	// Keep the public handshake API and one-time header byte compatibility.
 	if err := ns.fs.SendFrame([]byte("one")); err != nil {
 		t.Fatal(err)
