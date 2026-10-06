@@ -251,6 +251,11 @@ type Client struct {
 	// PreRetryCallback is called before a retry receipt is accepted.
 	// If it returns false, the accepting will be cancelled and the retry receipt will be ignored.
 	PreRetryCallback func(receipt *events.Receipt, id types.MessageID, retryCount int, msg *waE2E.Message) bool
+	// RetryContext can give a retry its own cancellable operation lifetime.
+	// A non-nil error rejects the retry before accessing its payload. finish is
+	// called after all retry work returns, including the physical socket write.
+	// Nil preserves the normal retry behavior.
+	RetryContext func(context.Context, *events.Receipt, types.MessageID, int) (context.Context, func(error), error)
 	// Should whatsmeow store recently sent messages in the database so that retry receipts can be accepted
 	// even if the process is restarted? If false, only the in-memory cache and GetMessageForRetry will be used.
 	UseRetryMessageStore bool
