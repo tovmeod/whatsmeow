@@ -361,7 +361,7 @@ func (cli *Client) tryHandleRetryReceipt(ctx context.Context, receipt *events.Re
 }
 
 // handleRetryReceipt handles an incoming retry receipt for an outgoing message.
-func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Receipt, node *waBinary.Node) error {
+func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Receipt, node *waBinary.Node) (retryErr error) {
 	retryChild, ok := node.GetOptionalChildByTag("retry")
 	if !ok {
 		return &ElementMissingError{Tag: "retry", In: "retry receipt"}
@@ -372,6 +372,16 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 	retryCount := ag.Int("count")
 	if !ag.OK() {
 		return ag.Error()
+	}
+	if cli.RetryContext != nil {
+		var finish func(error)
+		ctx, finish, retryErr = cli.RetryContext(ctx, receipt, messageID, retryCount)
+		if retryErr != nil {
+			return retryErr
+		}
+		if finish != nil {
+			defer func() { finish(retryErr) }()
+		}
 	}
 	// Process prekey bundle BEFORE checking if message exists.
 	// This ensures we establish a session with the requester even if we can't
