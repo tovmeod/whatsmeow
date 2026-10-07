@@ -8,9 +8,67 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
+
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+func TestFrameSocketProcessDataFragmented(t *testing.T) {
+	payloads := [][]byte{[]byte("four"), []byte("following"), {}, []byte("last")}
+	var stream []byte
+	for _, payload := range payloads {
+		length := len(payload)
+		stream = append(stream, byte(length>>16), byte(length>>8), byte(length))
+		stream = append(stream, payload...)
+	}
+
+	cases := []struct {
+		name   string
+		chunks [][]byte
+	}{
+		{name: "complete_frames", chunks: [][]byte{stream}},
+		{name: "empty_chunks", chunks: [][]byte{nil, stream, nil}},
+	}
+	// Include every header/payload split and continuation carrying the next
+	// frame. In particular, prefix + two bytes of a four-byte payload used
+	// to record an offset of five and panic on the continuation.
+	for split := 1; split < len(stream); split++ {
+		cases = append(cases, struct {
+			name   string
+			chunks [][]byte
+		}{fmt.Sprintf("split_%d", split), [][]byte{stream[:split], stream[split:]}})
+	}
+	var singleBytes [][]byte
+	for i := range stream {
+		singleBytes = append(singleBytes, stream[i:i+1])
+	}
+	cases = append(cases, struct {
+		name   string
+		chunks [][]byte
+	}{"byte_at_a_time", singleBytes})
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &FrameSocket{log: waLog.Noop, Frames: make(chan []byte, len(payloads)+1)}
+			for _, chunk := range tc.chunks {
+				fs.processData(chunk)
+			}
+			if got := len(fs.Frames); got != len(payloads) {
+				t.Fatalf("completed frames=%d, want %d", got, len(payloads))
+			}
+			for i, want := range payloads {
+				if got := <-fs.Frames; !bytes.Equal(got, want) {
+					t.Fatalf("frame %d=%x, want %x", i, got, want)
+				}
+			}
+			if fs.incoming != nil || fs.partialHeader != nil || fs.incomingLength != 0 || fs.receivedLength != 0 {
+				t.Fatal("completed stream retained partial frame state")
+			}
+		})
+	}
+}
 
 func TestFrameSocketSendFrameContext(t *testing.T) {
 	ns, wire, frames, drained := lifecycleSocket(t, false)
