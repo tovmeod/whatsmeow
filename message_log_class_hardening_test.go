@@ -770,7 +770,8 @@ func (l *outcomeCapture) debugCount(substr string) int {
 // download_hostfailover_test.go).
 func newMediaDeleteClient(log waLog.Logger, status int) *Client {
 	cli := &Client{
-		Log: log,
+		Store: &store.Device{},
+		Log:   log,
 		mediaHTTP: &http.Client{Transport: &multiHostTransport{byHost: map[string]hostRoundTripFunc{
 			"media.example.test": func(req *http.Request) (*http.Response, error) {
 				return errorResponse(status), nil

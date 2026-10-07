@@ -49,8 +49,11 @@ func (cli *Client) DownloadToFile(ctx context.Context, msg DownloadableMessage, 
 	if len(msg.GetDirectPath()) == 0 {
 		return ErrNoURLPresent
 	}
+	encSHA256 := msg.GetFileEncSHA256()
+	mediaKey := msg.GetMediaKey()
+	// A media key still requires authenticated decryption when the optional encrypted checksum is absent.
 	return cli.DownloadMediaWithPathToFile(
-		ctx, msg.GetDirectPath(), msg.GetFileEncSHA256(), msg.GetFileSHA256(), msg.GetMediaKey(),
+		ctx, msg.GetDirectPath(), encSHA256, msg.GetFileSHA256(), mediaKey,
 		mediaType, mediaTypeToMMSType[mediaType], false, file,
 	)
 }
@@ -122,7 +125,7 @@ func (cli *Client) downloadAndDecryptToFile(
 ) error {
 	iv, cipherKey, macKey, _ := getMediaKeys(mediaKey, appInfo)
 	hasher := sha256.New()
-	if mac, err := cli.downloadPossiblyEncryptedMediaWithRetriesToFile(ctx, url, fileEncSHA256, file); err != nil {
+	if mac, err := cli.downloadPossiblyEncryptedMediaWithRetriesToFile(ctx, url, fileEncSHA256, mediaKey != nil, file); err != nil {
 		return err
 	} else if mediaKey == nil && fileEncSHA256 == nil && mac == nil {
 		// Unencrypted media, just check the hash and return
@@ -154,9 +157,9 @@ func (cli *Client) downloadAndDecryptToFile(
 	return nil
 }
 
-func (cli *Client) downloadPossiblyEncryptedMediaWithRetriesToFile(ctx context.Context, url string, checksum []byte, file File) (mac []byte, err error) {
+func (cli *Client) downloadPossiblyEncryptedMediaWithRetriesToFile(ctx context.Context, url string, checksum []byte, encrypted bool, file File) (mac []byte, err error) {
 	for retryNum := 0; retryNum < 5; retryNum++ {
-		if checksum == nil {
+		if !encrypted && checksum == nil {
 			_, _, err = cli.downloadMediaToFile(ctx, url, file)
 		} else {
 			mac, err = cli.downloadEncryptedMediaToFile(ctx, url, checksum, file)
