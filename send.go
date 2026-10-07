@@ -130,6 +130,9 @@ type SendResponse struct {
 	// This is currently not reliable in all cases.
 	Sender types.JID
 
+	// The chat JID the message was actually sent to.
+	Chat types.JID
+
 	// GroupDebug carries the actual outbound stanza structure for group/broadcast
 	// sends -- nil for all other sends. Populated as soon as the send reaches node
 	// assembly, even if the send later fails during or after the ack wait.
@@ -336,8 +339,12 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 
 	if isBotMode {
 		if message.MessageContextInfo.BotMetadata == nil {
+			personaID := "867051314767696$760019659443059"
+			if to == types.MuseJID {
+				personaID = "1807055946647697$1"
+			}
 			message.MessageContextInfo.BotMetadata = &waAICommon.BotMetadata{
-				PersonaID: proto.String("867051314767696$760019659443059"),
+				PersonaID: proto.String(personaID),
 			}
 		}
 
@@ -413,7 +420,11 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		resp.DebugTimings.GetParticipants = time.Since(start)
 	} else if to.Server == types.HiddenUserServer {
 		ownID = cli.getOwnLID()
-	} else if to.Server == types.DefaultUserServer && cli.Store.LIDMigrationTimestamp > 0 && !req.Peer {
+		extraParams.peerRecipientPN, err = cli.Store.LIDs.GetPNForLID(ctx, to)
+		if err != nil {
+			cli.Log.Warnf("Failed to get peer recipient PN for %s: %v", to, err)
+		}
+	} else if to.Server == types.DefaultUserServer && !req.Peer {
 		start := time.Now()
 		var toLID types.JID
 		toLID, err = cli.Store.LIDs.GetLIDForPN(ctx, to)
@@ -422,6 +433,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			return
 		} else if toLID.IsEmpty() {
 			var info map[types.JID]types.UserInfo
+			cli.Log.Debugf("LID for %s not found, fetching user info", to)
 			info, err = cli.GetUserInfo(ctx, []types.JID{to})
 			if err != nil {
 				err = fmt.Errorf("failed to get user info for %s to fill LID cache: %w", to, err)
@@ -432,7 +444,8 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			}
 		}
 		resp.DebugTimings.LIDFetch = time.Since(start)
-		cli.Log.Debugf("Replacing SendMessage destination with LID as migration timestamp is set %s -> %s", to, toLID)
+		cli.Log.Debugf("Replacing SendMessage destination with LID %s -> %s", to, toLID)
+		extraParams.peerRecipientPN = to
 		to = toLID
 		ownID = cli.getOwnLID()
 	}
@@ -455,6 +468,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 
 	resp.Sender = ownID
+	resp.Chat = to
 
 	start := time.Now()
 	// Sending multiple messages at a time can cause weird issues and makes it harder to retry safely
@@ -860,6 +874,7 @@ type nodeExtraParams struct {
 	metaNode        *waBinary.Node
 	additionalNodes *[]waBinary.Node
 	addressingMode  types.AddressingMode
+	peerRecipientPN types.JID
 }
 
 // buildSendDebugEmittedDevices walks a built message node's <participants>
@@ -1005,9 +1020,16 @@ func (cli *Client) sendDM(
 		return "", nil, err
 	}
 
+	recipientPlaintext := messagePlaintext
+	if to == types.MuseJID {
+		recipientPlaintext, err = cli.encryptWASAMessage(ctx, to, id, message)
+		if err != nil {
+			return "", nil, err
+		}
+	}
 	node, allDevices, encryptionIdentities, err := cli.prepareMessageNode(
 		ctx, to, id, message, []types.JID{to, ownID.ToNonAD()},
-		messagePlaintext, deviceSentMessagePlaintext, timings, extraParams,
+		recipientPlaintext, deviceSentMessagePlaintext, timings, extraParams,
 	)
 	if err != nil {
 		return "", nil, err
@@ -1355,6 +1377,9 @@ func (cli *Client) prepareMessageNode(
 		"id":   id,
 		"type": msgType,
 		"to":   to,
+	}
+	if !extraParams.peerRecipientPN.IsEmpty() {
+		attrs["peer_recipient_pn"] = extraParams.peerRecipientPN
 	}
 	// TODO this is a very hacky hack for announcement group messages, why is it pn anyway?
 	if extraParams.addressingMode != "" {

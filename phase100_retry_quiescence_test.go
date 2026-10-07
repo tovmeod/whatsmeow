@@ -33,7 +33,7 @@ import (
 )
 
 //go:linkname phase100NewNoiseSocket go.mau.fi/whatsmeow/socket.newNoiseSocket
-func phase100NewNoiseSocket(context.Context, *socket.FrameSocket, cipher.AEAD, cipher.AEAD, socket.FrameHandler, socket.DisconnectHandler) (*socket.NoiseSocket, error)
+func phase100NewNoiseSocket(*socket.FrameSocket, cipher.AEAD, cipher.AEAD, socket.FrameHandler, socket.DisconnectHandler) (*socket.NoiseSocket, error)
 
 func phase100SelectedExtra() SendRequestExtra {
 	return SendRequestExtra{Timeout: time.Second, DisableAutoRetry: true}
@@ -231,7 +231,7 @@ func phase100Peer(t *testing.T, decorate ...func(cipher.AEAD) cipher.AEAD) *phas
 	if len(decorate) > 0 {
 		writeKey = decorate[0](key)
 	}
-	p.ns, err = phase100NewNoiseSocket(ctx, p.fs, writeKey, key, func(context.Context, []byte) {}, func(context.Context, *socket.NoiseSocket, bool) {})
+	p.ns, err = phase100NewNoiseSocket(p.fs, writeKey, key, func(context.Context, []byte) {}, func(context.Context, *socket.NoiseSocket, bool) {})
 	if err != nil {
 		t.Fatal(err)
 	}
