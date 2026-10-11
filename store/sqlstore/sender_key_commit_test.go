@@ -21,6 +21,7 @@ import (
 
 // This connector has no network or DSN: each test owns the entire SQL surface.
 type senderKeyCommitConnector struct {
+	tx    driver.Tx
 	exec  func([]driver.NamedValue) error
 	query func(context.Context, string, []driver.NamedValue) (driver.Rows, error)
 }
@@ -41,8 +42,13 @@ type senderKeyCommitConn struct{ c *senderKeyCommitConnector }
 func (*senderKeyCommitConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("ExecContext only")
 }
-func (*senderKeyCommitConn) Close() error              { return nil }
-func (*senderKeyCommitConn) Begin() (driver.Tx, error) { return nil, errors.New("no transactions") }
+func (*senderKeyCommitConn) Close() error { return nil }
+func (c *senderKeyCommitConn) Begin() (driver.Tx, error) {
+	if c.c.tx != nil {
+		return c.c.tx, nil
+	}
+	return nil, errors.New("no transactions")
+}
 func (c *senderKeyCommitConn) ExecContext(_ context.Context, _ string, args []driver.NamedValue) (driver.Result, error) {
 	if err := c.c.exec(args); err != nil {
 		return nil, err

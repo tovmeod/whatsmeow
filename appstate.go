@@ -638,11 +638,11 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
 			}
 			zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
-			go func() {
+			cli.runAsyncProtocol(func() {
 				for _, evt := range eventsToDispatch {
 					cli.dispatchEvent(evt)
 				}
-			}()
+			})
 			return cli.sendAppState(ctx, patch, false)
 		}
 		return mainErr
@@ -651,11 +651,11 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}
-	go func() {
+	cli.runAsyncProtocol(func() {
 		for _, evt := range eventsToDispatch {
 			cli.dispatchEvent(evt)
 		}
-	}()
+	})
 
 	return nil
 }

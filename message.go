@@ -56,10 +56,14 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 		cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
 	}
 	if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
-		go cli.updateBusinessName(ctx, info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
+		cli.runAsyncProtocol(func() {
+			cli.updateBusinessName(context.WithoutCancel(ctx), info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
+		})
 	}
 	if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
-		go cli.updatePushName(ctx, info.Sender, info.SenderAlt, info, info.PushName)
+		cli.runAsyncProtocol(func() {
+			cli.updatePushName(context.WithoutCancel(ctx), info.Sender, info.SenderAlt, info, info.PushName)
+		})
 	}
 	if info.Sender.Server == types.NewsletterServer {
 		var cancelled bool
@@ -1227,7 +1231,7 @@ func (cli *Client) handleHistorySyncNotificationLoop() {
 		// and the atomic variable being updated. If yes, restart the loop.
 		if len(cli.historySyncNotifications) > 0 && cli.historySyncHandlerStarted.CompareAndSwap(false, true) {
 			cli.Log.Warnf("New history sync notifications appeared after loop stopped, restarting loop...")
-			go cli.handleHistorySyncNotificationLoop()
+			cli.runAsyncProtocol(cli.handleHistorySyncNotificationLoop)
 		}
 	}()
 	ctx := cli.BackgroundEventCtx
@@ -1241,6 +1245,10 @@ func (cli *Client) handleHistorySyncNotificationLoop() {
 				cli.dispatchEvent(&events.HistorySync{Data: blob, Notification: notif})
 				err = cli.DeleteMedia(ctx, MediaHistory, notif.GetDirectPath(), notif.GetFileEncSHA256(), notif.GetEncHandle())
 				cli.recordMediaDeleteOutcome(err)
+			}
+		case <-cli.expectedDisconnect.GetChan():
+			if len(cli.historySyncNotifications) == 0 {
+				return
 			}
 		case <-time.After(1 * time.Minute):
 			return
@@ -1323,7 +1331,7 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 	if synchronousStorage {
 		doStorage(ctx)
 	} else {
-		go doStorage(context.WithoutCancel(ctx))
+		cli.runAsyncProtocol(func() { doStorage(context.WithoutCancel(ctx)) })
 	}
 	return &historySync, nil
 }
@@ -1332,35 +1340,46 @@ func (cli *Client) handleAppStateSyncKeyShare(ctx context.Context, keys *waE2E.A
 	onlyResyncIfNotSynced := true
 
 	cli.Log.Debugf("Got %d new app state keys", len(keys.GetKeys()))
-	cli.appStateKeyRequestsLock.RLock()
 	for _, key := range keys.GetKeys() {
 		marshaledFingerprint, err := proto.Marshal(key.GetKeyData().GetFingerprint())
 		if err != nil {
 			cli.Log.Errorf("Failed to marshal fingerprint of app state sync key %X", key.GetKeyID().GetKeyID())
 			continue
 		}
+		cli.appStateKeyRequestsLock.RLock()
 		_, isReRequest := cli.appStateKeyRequests[hex.EncodeToString(key.GetKeyID().GetKeyID())]
+		cli.appStateKeyRequestsLock.RUnlock()
 		if isReRequest {
 			onlyResyncIfNotSynced = false
 		}
-		err = cli.Store.AppStateKeys.PutAppStateSyncKey(ctx, key.GetKeyID().GetKeyID(), store.AppStateSyncKey{
-			Data:        key.GetKeyData().GetKeyData(),
-			Fingerprint: marshaledFingerprint,
-			Timestamp:   key.GetKeyData().GetTimestamp(),
+		cli.storeAppStateKeyRetained(ctx, key.GetKeyID().GetKeyID(), store.AppStateSyncKey{
+			Data: key.GetKeyData().GetKeyData(), Fingerprint: marshaledFingerprint, Timestamp: key.GetKeyData().GetTimestamp(),
 		})
-		if err != nil {
-			cli.Log.Errorf("Failed to store app state sync key %X: %v", key.GetKeyID().GetKeyID(), err)
-			continue
-		}
 		cli.Log.Debugf("Received app state sync key %X (ts: %d)", key.GetKeyID().GetKeyID(), key.GetKeyData().GetTimestamp())
 	}
-	cli.appStateKeyRequestsLock.RUnlock()
 
 	for _, name := range appstate.AllPatchNames {
 		err := cli.FetchAppState(ctx, name, false, onlyResyncIfNotSynced)
 		if err != nil {
 			cli.Log.Errorf("Failed to do initial fetch of app state %s: %v", name, err)
 		}
+	}
+}
+
+// Once an app-state key share is accepted, a failed attempt retains the key
+// in its joined handler. Cancellation of the connection never cancels retries.
+func (cli *Client) storeAppStateKeyRetained(ctx context.Context, id []byte, key store.AppStateSyncKey) {
+	backoff := 100 * time.Millisecond
+	for {
+		attemptCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		err := cli.Store.AppStateKeys.PutAppStateSyncKey(attemptCtx, id, key)
+		cancel()
+		if err == nil {
+			return
+		}
+		cli.Log.Errorf("Retaining app state sync key %X after write failure: %v", id, err)
+		time.Sleep(backoff)
+		backoff = min(backoff*2, 5*time.Second)
 	}
 }
 
@@ -1406,7 +1425,7 @@ func (cli *Client) handleProtocolMessage(ctx context.Context, info *types.Messag
 		if !cli.ManualHistorySyncDownload {
 			cli.historySyncNotifications <- protoMsg.HistorySyncNotification
 			if cli.historySyncHandlerStarted.CompareAndSwap(false, true) {
-				go cli.handleHistorySyncNotificationLoop()
+				cli.runAsyncProtocol(cli.handleHistorySyncNotificationLoop)
 			}
 		}
 		if !(cli.ManualHistorySyncDownload && cli.DisableManualHistorySyncReceipt) {
@@ -1434,7 +1453,7 @@ func (cli *Client) handleProtocolMessage(ctx context.Context, info *types.Messag
 	}
 
 	if protoMsg.GetAppStateSyncKeyShare() != nil {
-		go cli.handleAppStateSyncKeyShare(context.WithoutCancel(ctx), protoMsg.AppStateSyncKeyShare)
+		cli.handleAppStateSyncKeyShare(context.WithoutCancel(ctx), protoMsg.AppStateSyncKeyShare)
 	}
 
 	if info.Category == "peer" {

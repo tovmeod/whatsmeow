@@ -26,6 +26,7 @@ type NoiseSocket struct {
 	writeLock    sync.Mutex
 	destroyed    atomic.Bool
 	stopConsumer chan struct{}
+	consumerDone chan struct{}
 }
 
 type DisconnectHandler func(ctx context.Context, socket *NoiseSocket, remote bool)
@@ -43,6 +44,7 @@ func newNoiseSocket(
 		readKey:      readKey,
 		onFrame:      frameHandler,
 		stopConsumer: make(chan struct{}),
+		consumerDone: make(chan struct{}),
 	}
 	fs.OnDisconnect = func(ctx context.Context, remote bool) {
 		disconnectHandler(ctx, ns, remote)
@@ -52,6 +54,7 @@ func newNoiseSocket(
 }
 
 func (ns *NoiseSocket) consumeFrames(ctx context.Context, frames <-chan []byte) {
+	defer close(ns.consumerDone)
 	if ctx == nil {
 		// ctx being nil implies the connection already closed somehow
 		return
@@ -68,6 +71,9 @@ func (ns *NoiseSocket) consumeFrames(ctx context.Context, frames <-chan []byte) 
 		}
 	}
 }
+
+// ConsumerDone closes after the final accepted frame has reached its handler.
+func (ns *NoiseSocket) ConsumerDone() <-chan struct{} { return ns.consumerDone }
 
 func generateIV(count uint32) []byte {
 	iv := make([]byte, 12)

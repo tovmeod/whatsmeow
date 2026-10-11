@@ -30,6 +30,40 @@ import (
 // SenderKeyStructure ↔ []byte (for read-back verification).
 var pbSerializer = serialize.NewProtoBufSerializer()
 
+func TestBatchUpsertSessionsChunkedAtomic(t *testing.T) {
+	s, _ := newBatchTestStore(t)
+	ctx := context.Background()
+	sessions := make(map[string][]byte)
+	for i := 0; i < 251; i++ {
+		sessions[fmt.Sprintf("bulk-%03d:0", i)] = []byte("original")
+	}
+	if err := s.PutManySessions(ctx, sessions); err != nil {
+		t.Fatal(err)
+	}
+	for addr := range sessions {
+		blob, err := s.GetSession(ctx, addr)
+		if err != nil || string(blob) != "original" {
+			t.Fatalf("round trip %s: %q %v", addr, blob, err)
+		}
+		sessions[addr] = []byte("new")
+	}
+	// The invalid row sorts into the second chunk. Its failure must roll back
+	// the first chunk as well, preserving every original ratchet state.
+	sessions["zz-invalid\x00:0"] = []byte("invalid text address")
+	if err := s.PutManySessions(ctx, sessions); err == nil {
+		t.Fatal("invalid second chunk committed")
+	}
+	for addr := range sessions {
+		if addr == "zz-invalid\x00:0" {
+			continue
+		}
+		blob, err := s.GetSession(ctx, addr)
+		if err != nil || string(blob) != "original" {
+			t.Fatalf("partial transaction survived for %s: %q %v", addr, blob, err)
+		}
+	}
+}
+
 // testDSN is the dockerized Postgres test DB applied by
 // kavtov-driver-go/scripts/setup-test-db.sh (which also applies the fork's
 // 00-latest-schema.sql, creating the whatsmeow_* tables). Overridable via

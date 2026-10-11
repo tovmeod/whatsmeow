@@ -128,8 +128,8 @@ func TestCR02AckAfterFlush(t *testing.T) {
 		t.Fatalf("CR-02: store.calls = %d, want 1 (error was injected on first call)", n)
 	}
 
-	// Second runFlush() — no error → must succeed and clear the dirty-set.
-	f.runFlush()
+	// Retry after the shared backoff — must commit before clearing dirty state.
+	f.Drain()
 
 	if n := f.DirtyCount(); n != 0 {
 		t.Fatalf("CR-02: DirtyCount after successful retry = %d, want 0", n)

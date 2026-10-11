@@ -310,11 +310,33 @@ func (s *SQLStore) GetManySessions(ctx context.Context, addresses []string) (map
 	return result, nil
 }
 
+// PutManySessions writes up to 250 rows per SQL statement in one transaction.
+// Sorting addresses keeps lock acquisition stable across accounts and retries.
 func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
+	if len(sessions) == 0 {
+		return nil
+	}
+	addresses := make([]string, 0, len(sessions))
+	for addr := range sessions {
+		addresses = append(addresses, addr)
+	}
+	slices.Sort(addresses)
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for addr, sess := range sessions {
-			err := s.PutSession(ctx, addr, sess)
-			if err != nil {
+		for start := 0; start < len(addresses); start += 250 {
+			chunk := addresses[start:min(start+250, len(addresses))]
+			var query strings.Builder
+			query.WriteString("INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES ")
+			args := make([]any, 0, len(chunk)*3)
+			for i, addr := range chunk {
+				if i > 0 {
+					query.WriteByte(',')
+				}
+				n := i * 3
+				fmt.Fprintf(&query, "($%d,$%d,$%d)", n+1, n+2, n+3)
+				args = append(args, s.JID, addr, sessions[addr])
+			}
+			query.WriteString(" ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session")
+			if _, err := s.db.Exec(ctx, query.String(), args...); err != nil {
 				return err
 			}
 		}

@@ -61,15 +61,21 @@ type deviceCache struct {
 
 // Client contains everything necessary to connect to and interact with the WhatsApp web API.
 type Client struct {
-	Store   *store.Device
-	Log     waLog.Logger
-	recvLog waLog.Logger
-	sendLog waLog.Logger
+	nodeProgressMu sync.Mutex
+	nodeQueued     atomic.Int64
+	nodeActive     atomic.Int64
+	nodeOldest     atomic.Int64
+	Store          *store.Device
+	Log            waLog.Logger
+	recvLog        waLog.Logger
+	sendLog        waLog.Logger
 
-	socket           *socket.NoiseSocket
-	socketLock       sync.RWMutex
-	socketWait       chan struct{}
-	handlerQueueWait chan struct{}
+	socket               *socket.NoiseSocket
+	socketLock           sync.RWMutex
+	socketWait           chan struct{}
+	handlerQueueWait     chan struct{}
+	asyncProtocolWG      sync.WaitGroup
+	asyncProtocolPending atomic.Int64
 
 	isLoggedIn            atomic.Bool
 	paired                atomic.Bool
@@ -663,6 +669,20 @@ func (cli *Client) connect(ctx context.Context) error {
 }
 
 func (cli *Client) unlockedConnect(ctx context.Context) error {
+	if cli.socket != nil && cli.socket.IsConnected() {
+		return ErrAlreadyConnected
+	}
+	if cli.asyncProtocolPending.Load() != 0 {
+		return fmt.Errorf("previous protocol work is still draining")
+	}
+	if cli.handlerQueueWait != nil {
+		select {
+		case <-cli.handlerQueueWait:
+			cli.handlerQueueWait = nil
+		default:
+			return fmt.Errorf("previous connection is still draining")
+		}
+	}
 	if cli.Store.Deleted {
 		return store.ErrDeviceDeleted
 	}
@@ -702,7 +722,7 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 	closeWait := make(chan struct{})
 	cli.handlerQueueWait = closeWait
 	go cli.keepAliveLoop(ctx, fs.Context())
-	go cli.handlerQueueLoop(ctx, fs.Context(), queue, closeWait)
+	go cli.handlerQueueLoop(ctx, fs.Context(), queue, closeWait, cli.socket.ConsumerDone())
 	return nil
 }
 
@@ -823,14 +843,22 @@ func (cli *Client) IsConnected() bool {
 // This will not emit any events, the Disconnected event is only used when the
 // connection is closed by the server or a network error.
 func (cli *Client) Disconnect() {
+	cli.disconnectTransport()
+}
+
+// Capture the accepted connection under the same lock that stops its transport.
+// A concurrent reconnect must not replace the queue between capture and stop.
+func (cli *Client) disconnectTransport() <-chan struct{} {
 	if cli == nil {
-		return
+		return nil
 	}
 	cli.socketLock.Lock()
 	cli.expectDisconnect()
+	wait := cli.handlerQueueWait
 	cli.unlockedDisconnect()
 	cli.socketLock.Unlock()
 	cli.clearDelayedMessageRequests()
+	return wait
 }
 
 // ResetConnection disconnects from the WhatsApp web websocket and forces an automatic reconnection.
@@ -1038,56 +1066,66 @@ func (cli *Client) handleFrame(ctx context.Context, data []byte, queue chan *waB
 	} else if cli.receiveResponse(ctx, node) {
 		// handled
 	} else if _, ok := cli.nodeHandlers[node.Tag]; ok {
-		select {
-		case queue <- node:
-		case <-ctx.Done():
-		default:
-			cli.Log.Warnf("Handler queue is full, message ordering is no longer guaranteed")
-			go func() {
-				select {
-				case queue <- node:
-				case <-ctx.Done():
-				}
-			}()
-		}
+		cli.nodeProgressMu.Lock()
+		cli.nodeQueued.Add(1)
+		cli.nodeOldest.CompareAndSwap(0, time.Now().UnixNano())
+		cli.nodeProgressMu.Unlock()
+		// The frame is already decoded and accepted. Bound intake here; shutdown
+		// joins this consumer while the handler loop drains, so cancellation cannot
+		// discard this final handoff or spawn an unbounded number of senders.
+		queue <- node
+
 	} else if node.Tag != "ack" {
 		cli.Log.Debugf("Didn't handle WhatsApp node %s", node.Tag)
 	}
 }
 
-func (cli *Client) handlerQueueLoop(evtCtx, connCtx context.Context, queue chan *waBinary.Node, closeWait chan struct{}) {
+func (cli *Client) handlerQueueLoop(evtCtx, connCtx context.Context, queue chan *waBinary.Node, closeWait chan struct{}, producers ...<-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 	ticker.Stop()
 	cli.Log.Debugf("Starting handler queue loop")
+	var accepted sync.WaitGroup
+	producerDone := make(chan struct{})
+	close(producerDone)
+	var intakeDone <-chan struct{} = producerDone
+	if len(producers) > 0 {
+		intakeDone = producers[0]
+	}
 	defer func() {
-	Loop:
+		accepted.Wait()
 		for {
 			select {
 			case node := <-queue:
-				// Make sure stream errors are handled even after disconnection so the appropriate auto-reconnect is done.
-				// Everything else
-				if node.Tag == "stream:error" {
-					cli.Log.Debugf("Handling stream:error node in handler queue loop after context cancellation")
-					cli.handleStreamError(evtCtx, node)
+				cli.runAcceptedNode(context.WithoutCancel(evtCtx), node)
+			case <-intakeDone:
+				// The producer has finished its final handoff; now empty means drained.
+				for {
+					select {
+					case node := <-queue:
+						cli.runAcceptedNode(context.WithoutCancel(evtCtx), node)
+					default:
+						close(closeWait)
+						return
+					}
 				}
-			default:
-				break Loop
 			}
 		}
-		close(closeWait)
 	}()
 Loop:
 	for {
 		select {
 		case node := <-queue:
 			if connCtx.Err() != nil {
-				cli.Log.Debugf("Closing handler queue loop before node handling")
+				cli.runAcceptedNode(context.WithoutCancel(evtCtx), node)
 				return
 			}
 			doneChan := make(chan struct{})
 			start := time.Now()
+			accepted.Add(1)
 			go func() {
-				cli.nodeHandlers[node.Tag](evtCtx, node)
+				defer accepted.Done()
+				cli.runAcceptedNode(context.WithoutCancel(evtCtx), node)
 				duration := time.Since(start)
 				close(doneChan)
 				if duration > 5*time.Second {
@@ -1095,7 +1133,7 @@ Loop:
 				}
 			}()
 			ticker.Reset(30 * time.Second)
-			for range 10 {
+			for {
 				select {
 				case <-doneChan:
 					ticker.Stop()
@@ -1108,8 +1146,6 @@ Loop:
 					cli.Log.Warnf("Node handling is taking long for %s (started %s ago)", node, time.Since(start))
 				}
 			}
-			cli.Log.Warnf("Continuing handling of %s in background as it's taking too long", node)
-			ticker.Stop()
 		case <-connCtx.Done():
 			cli.Log.Debugf("Closing handler queue loop")
 			return
@@ -1368,4 +1404,81 @@ func (cli *Client) sendUnifiedSession() {
 	if err != nil {
 		cli.Log.Debugf("Failed to send unified_session telemetry: %v", err)
 	}
+}
+
+// DisconnectAndDrain joins accepted protocol nodes after disconnecting the transport.
+// A deadline only bounds this caller's wait; it never discards accepted state.
+func (cli *Client) DisconnectAndDrain(ctx context.Context) error {
+	if cli == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		wait := cli.disconnectTransport()
+		if wait != nil {
+			<-wait
+		}
+		cli.asyncProtocolWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// HandlerStatus provides nonblocking pressure/diagnostics while socket shutdown is joining work.
+func (cli *Client) HandlerStatus() (pending, active int64, age time.Duration) {
+	if cli == nil {
+		return
+	}
+	cli.nodeProgressMu.Lock()
+	defer cli.nodeProgressMu.Unlock()
+	active = cli.nodeActive.Load() + cli.asyncProtocolPending.Load()
+	pending = cli.nodeQueued.Load() + active
+	if pending > 0 {
+		if since := cli.nodeOldest.Load(); since != 0 {
+			age = time.Since(time.Unix(0, since))
+		}
+	}
+	return
+}
+
+func (cli *Client) runAcceptedNode(ctx context.Context, node *waBinary.Node) {
+	cli.nodeProgressMu.Lock()
+	cli.nodeQueued.Add(-1)
+	cli.nodeActive.Add(1)
+	cli.nodeOldest.CompareAndSwap(0, time.Now().UnixNano())
+	cli.nodeProgressMu.Unlock()
+	defer func() {
+		cli.nodeProgressMu.Lock()
+		defer cli.nodeProgressMu.Unlock()
+		if cli.nodeActive.Add(-1) == 0 && cli.nodeQueued.Load() == 0 && cli.asyncProtocolPending.Load() == 0 {
+			cli.nodeOldest.Store(0)
+		}
+	}()
+	cli.nodeHandlers[node.Tag](ctx, node)
+}
+
+// Register before spawning, while the accepted parent still owns a node/work
+// count. Shutdown joins these jobs before fencing application callbacks.
+func (cli *Client) runAsyncProtocol(fn func()) {
+	cli.asyncProtocolWG.Add(1)
+	cli.nodeProgressMu.Lock()
+	cli.asyncProtocolPending.Add(1)
+	cli.nodeOldest.CompareAndSwap(0, time.Now().UnixNano())
+	cli.nodeProgressMu.Unlock()
+	go func() {
+		defer cli.asyncProtocolWG.Done()
+		defer func() {
+			cli.nodeProgressMu.Lock()
+			defer cli.nodeProgressMu.Unlock()
+			if cli.asyncProtocolPending.Add(-1) == 0 && cli.nodeQueued.Load() == 0 && cli.nodeActive.Load() == 0 {
+				cli.nodeOldest.Store(0)
+			}
+		}()
+		fn()
+	}()
 }

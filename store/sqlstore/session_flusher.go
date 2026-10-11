@@ -163,7 +163,10 @@ type sessionDirtyEntry struct {
 // channel — the blocking IS the backpressure (design §9). No DB write ever
 // happens off the writer goroutine.
 type SessionFlusher struct {
-	log waLog.Logger
+	progress   writeProgress
+	retry      writeRetry
+	activeWork atomic.Int64
+	log        waLog.Logger
 
 	// db is the widened writer interface: the writer goroutine performs flush
 	// (PutManySessions), delete (DeleteSession / DeleteAllSessions), and migrate
@@ -173,7 +176,6 @@ type SessionFlusher struct {
 	cap             int    // max dirty-set entries (KAVTOV_FLUSH_SESSION_CAP)
 	boundaryN       uint32 // advance-count boundary (KAVTOV_FLUSH_SESSION_N)
 	backpressureCap int    // synchronous relief above this size
-	dropCap         int    // drop coldest above this size when DB is failing
 
 	// rwmu guards the dirty map. The writer holds rwmu.Lock() only for brief
 	// in-memory passes (snapshot, clear, delete); EnqueueAndMirror holds
@@ -206,10 +208,6 @@ type SessionFlusher struct {
 
 	flushInterval time.Duration // injectable for tests; default 5s
 
-	// drainDeadline bounds Drain's PutManySessions retry loop on shutdown (F2).
-	// Default drainTotalDeadline (30s); injectable shorter for tests.
-	drainDeadline time.Duration
-
 	// migrateDispatches counts how many workMigratePNPrefix work items have been
 	// dispatched to the writer (Phase 47.3 F12 — replaces the permanently-zero
 	// withFlushBlockedCalls probe). The no-op MigratePNToLID path (Branch-2 /
@@ -223,13 +221,6 @@ type SessionFlusher struct {
 
 // workChBuffer is the workCh buffer size (design §11/§12.1 discretion item).
 const workChBuffer = 256
-
-// drainTotalDeadline bounds Drain()'s PutManySessions retry loop on shutdown so
-// a DB-down-at-shutdown cannot wedge Stop()/Container.Close() until systemd
-// SIGKILL (Phase 47.3 F2). On exhaustion Drain logs and returns so shutdown
-// completes (the unflushed dirty-set is the bounded crash-loss INV-7 already
-// accepts).
-const drainTotalDeadline = 30 * time.Second
 
 // errFlusherStopped is returned to a producer whose synchronous work item could
 // not be dispatched to (or completed by) the writer because the flusher is
@@ -292,14 +283,12 @@ func NewSessionFlusher(db sessionWriterStore, log waLog.Logger, cap int) *Sessio
 		cap:             cap,
 		boundaryN:       n,
 		backpressureCap: cap / 5,
-		dropCap:         cap * 2 / 5,
 		dirty:           make(map[string]*sessionDirtyEntry, 1024),
 		workCh:          make(chan writeWork, workChBuffer),
 		flushCh:         make(chan struct{}, 1),
 		abortCh:         make(chan struct{}),
 		stopCh:          make(chan struct{}),
 		flushInterval:   time.Duration(tms) * time.Millisecond,
-		drainDeadline:   drainTotalDeadline,
 	}
 }
 
@@ -363,7 +352,21 @@ func (f *SessionFlusher) Enqueue(address string, blob []byte) {
 // work item is sent to the writer and this call blocks on its done channel —
 // the blocking IS the backpressure. NO DB write happens on this goroutine.
 func (f *SessionFlusher) EnqueueAndMirror(address string, blob []byte, mirror func()) {
-	f.rwmu.Lock()
+	for {
+		f.rwmu.Lock()
+		_, exists := f.dirty[address]
+		if exists || len(f.dirty) < f.cap {
+			break
+		}
+		f.rwmu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := f.dispatchSync(writeWork{kind: workFlushSync, ctx: ctx, done: make(chan error, 1)})
+		cancel()
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	f.progress.markPending()
 
 	entry, exists := f.dirty[address]
 	var adv uint32
@@ -408,22 +411,14 @@ func (f *SessionFlusher) EnqueueAndMirror(address string, blob []byte, mirror fu
 	// dirty-set. rwmu is NOT held here, so no deadlock with the writer's
 	// snapshot/clear. NO DB write happens on this goroutine (design §9).
 	//
-	// Phase 47.3 F6/F9: the relief work item runs reliefFlush in the writer,
-	// which guarantees the dirty-set ends at or below backpressureCap even under
-	// DB-write failure (it drops coldest down to backpressureCap, not merely
-	// dropCap). The writer signals the relief error on done; we log and return —
-	// we do NOT loop re-dispatching a full-batch flush against a failing DB
-	// (that was the throughput-collapse amplification). A single relief per
-	// over-cap Enqueue is sufficient because reliefFlush already brings the
-	// dirty-set below the threshold.
+	// The writer shares one retry backoff across timer and pressure requests.
+	// Failures retain the dirty set; new distinct keys block at the hard cap.
 	if needsRelief {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := f.dispatchSync(writeWork{kind: workFlushSync, ctx: ctx, done: make(chan error, 1)}); err != nil {
-			// Relief failed (DB down or shutting down). reliefFlush has already
-			// bounded the dirty-set via the drop path; do NOT re-dispatch.
-			f.log.Errorf("SessionFlusher backpressure relief failed addr=%s: %v", address, err)
-		}
+		// The writer logs actual failed SQL attempts. A deferred pressure request
+		// during shared backoff must not amplify failure into a log/IO storm.
+		_ = f.dispatchSync(writeWork{kind: workFlushSync, ctx: ctx, done: make(chan error, 1)})
 	}
 }
 
@@ -584,21 +579,14 @@ func (f *SessionFlusher) clearStaleLocked(advAt map[string]uint32) {
 			}
 		}
 	}
-}
-
-// dropColdestLocked removes one entry from the dirty-set (pseudo-random map
-// iteration). Must be called with rwmu.Lock() held.
-func (f *SessionFlusher) dropColdestLocked() {
-	for addr, e := range f.dirty {
-		f.log.Errorf("SessionFlusher DROP dirty entry (catastrophe) addr=%s advCount=%d", addr, e.advCount)
-		delete(f.dirty, addr)
-		return
+	if len(f.dirty) == 0 {
+		f.progress.since.Store(0)
 	}
 }
 
 // runFlush drains the dirty-set once. Called from the writer goroutine ONLY.
 // No lock is held across the DB write (design §5). A failed batch retains dirty
-// state (retried next cycle / drop coldest above dropCap). Does NOT retry.
+// state, with shared backoff limiting failed database attempts.
 func (f *SessionFlusher) runFlush() {
 	// Step 1: snapshot under a brief write lock.
 	f.rwmu.Lock()
@@ -616,17 +604,10 @@ func (f *SessionFlusher) runFlush() {
 
 	// Step 2: DB write — NO lock held.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	err := f.db.PutManySessions(ctx, batch)
+	err := f.writeSessions(ctx, batch)
 	cancel()
 
 	if err != nil {
-		f.log.Errorf("SessionFlusher batch flush failed (%d rows): %v", len(batch), err)
-		// Bound memory under DB-write failure (INV-8): drop coldest above dropCap.
-		f.rwmu.Lock()
-		for len(f.dirty) > f.dropCap {
-			f.dropColdestLocked()
-		}
-		f.rwmu.Unlock()
 		return
 	}
 
@@ -644,11 +625,11 @@ func (f *SessionFlusher) runFlush() {
 // other work item (design §9 — total single-writer invariant). No lock is held
 // across any DB I/O call.
 func (f *SessionFlusher) processWork(work writeWork) {
+	f.activeWork.Add(1)
+	defer f.activeWork.Add(-1)
 	switch work.kind {
 	case workFlushSync:
-		// Backpressure relief: bound the dirty-set to <= backpressureCap even
-		// under DB-write failure (Phase 47.3 F6/F9). The producer
-		// (EnqueueAndMirror) blocks on done and gets the relief error.
+		// Pressure relief retains dirty entries if the database cannot commit.
 		err := f.reliefFlush()
 		if work.done != nil {
 			work.done <- err
@@ -707,17 +688,7 @@ func (f *SessionFlusher) processWork(work writeWork) {
 	}
 }
 
-// reliefFlush is the backpressure-relief flush (Phase 47.3 F6/F9). Unlike
-// runFlush (the periodic/N-boundary flush, which on DB failure drops only to
-// dropCap), reliefFlush GUARANTEES the dirty-set ends at or below
-// backpressureCap on return — that is what makes the relief actually relieve.
-// On a successful DB write it clears the snapshot generation (CR-02 guard) and
-// returns nil. On DB-write failure it drops coldest entries down to
-// backpressureCap (bounding memory AND guaranteeing the producer's needsRelief
-// condition is false next time) and returns the DB error so the producer can
-// log it — without the producer re-dispatching a full-batch flush against the
-// failing DB (the throughput-collapse amplification the review flagged).
-// Writer goroutine only; no lock held across the DB write.
+// reliefFlush attempts an ordered batch and retains every dirty entry on failure.
 func (f *SessionFlusher) reliefFlush() error {
 	// Step 1: snapshot under a brief write lock.
 	f.rwmu.Lock()
@@ -735,19 +706,10 @@ func (f *SessionFlusher) reliefFlush() error {
 
 	// Step 2: DB write — NO lock held.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	err := f.db.PutManySessions(ctx, batch)
+	err := f.writeSessions(ctx, batch)
 	cancel()
 
 	if err != nil {
-		f.log.Errorf("SessionFlusher relief flush failed (%d rows): %v", len(batch), err)
-		// Drop coldest down to backpressureCap so the relief actually relieves
-		// (NOT merely to dropCap, which stays above backpressureCap and re-arms
-		// the producer's needsRelief on the very next Enqueue — F6/F9).
-		f.rwmu.Lock()
-		for len(f.dirty) > f.backpressureCap {
-			f.dropColdestLocked()
-		}
-		f.rwmu.Unlock()
 		return err
 	}
 
@@ -783,7 +745,7 @@ func (f *SessionFlusher) processMigratePNPrefix(work writeWork) {
 	// Step 2: flush PN-prefix entries to the DB FIRST — NO lock held — so the
 	// migration's SELECT copies the freshest ratchet state to the LID key.
 	if len(pnBatch) > 0 {
-		if err := f.db.PutManySessions(ctx, pnBatch); err != nil {
+		if err := f.writeSessions(ctx, pnBatch); err != nil {
 			work.done <- fmt.Errorf("pre-migrate flush: %w", err)
 			return
 		}
@@ -841,8 +803,7 @@ func (f *SessionFlusher) workCtx(_ context.Context) (context.Context, context.Ca
 }
 
 // Drain processes pending work items, then flushes the entire dirty-set
-// synchronously, retrying PutManySessions on transient failure UP TO a total
-// deadline (Phase 47.3 F2). Called during Stop() AFTER the writer goroutine has
+// synchronously, retaining and retrying failed batches. Called during Stop() AFTER the writer goroutine has
 // exited (no concurrent writer — Drain runs the passes directly).
 //
 // F1: it drains pending work items in a loop until workCh is empty — and each
@@ -851,10 +812,6 @@ func (f *SessionFlusher) workCtx(_ context.Context) (context.Context, context.Ca
 // NEVER silently lost. After this Drain returns, Stop closes abortCh so any
 // producer that races a send into the now-orphaned workCh returns
 // errFlusherStopped instead of hanging.
-//
-// F2: the dirty-set flush retry is bounded by drainTotalDeadline — on a
-// DB-down-at-shutdown it logs the un-drained count and returns so
-// Stop()/Container.Close() completes instead of wedging until SIGKILL.
 func (f *SessionFlusher) Drain() {
 	// Drain ALL pending work items the writer did not process before stopCh
 	// fired (design §12.5, F1). Loop until workCh is empty — processWork
@@ -869,7 +826,6 @@ func (f *SessionFlusher) Drain() {
 	}
 
 flushLoop:
-	deadline := time.Now().Add(f.drainDeadline)
 	for {
 		f.rwmu.Lock()
 		if len(f.dirty) == 0 {
@@ -886,20 +842,10 @@ flushLoop:
 		f.rwmu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := f.db.PutManySessions(ctx, batch)
+		err := f.writeSessions(ctx, batch)
 		cancel()
 
 		if err != nil {
-			if time.Now().After(deadline) {
-				// F2: bound the retry. Give up so shutdown completes; the
-				// un-drained dirty-set is the bounded crash-loss INV-7 accepts.
-				f.rwmu.Lock()
-				lost := len(f.dirty)
-				f.rwmu.Unlock()
-				f.log.Errorf("SessionFlusher Drain abandoned after %s: DB still failing, %d dirty entries unflushed at shutdown: %v", f.drainDeadline, lost, err)
-				return
-			}
-			f.log.Errorf("SessionFlusher Drain batch failed (%d rows): %v — retrying", len(batch), err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -961,4 +907,18 @@ func (f *SessionFlusher) Stop() {
 		// rather than waiting on a done channel no writer will ever signal.
 		close(f.abortCh)
 	})
+}
+
+func (f *SessionFlusher) writeSessions(ctx context.Context, batch map[string][]byte) error {
+	if err := f.retry.waiting(); err != nil {
+		return err
+	}
+	started := f.progress.begin()
+	err := f.db.PutManySessions(ctx, batch)
+	f.progress.end(started, err)
+	if err != nil {
+		f.log.Errorf("SessionFlusher SQL batch failed (%d rows); retained for retry: %v", len(batch), err)
+	}
+	f.retry.record(err)
+	return err
 }

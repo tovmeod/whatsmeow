@@ -18,8 +18,6 @@ package sqlstore
 import (
 	"bytes"
 	"context"
-	"fmt"
-	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -60,8 +58,8 @@ type dirtyEntry struct {
 //  3. Synchronous drain on shutdown (Drain / Stop)
 //
 // Backpressure (design §6):
-//   - dirty-set > backpressureCap → inline synchronous write on enqueue
-//   - dirty-set > dropCap AND DB failing → drop coldest + slog.Error
+//   - pressure relief flushes an ordered batch
+//   - at capacity, new keys wait for space; failures never discard dirty keys
 type SenderKeyFlusher struct {
 	store flushSenderKeyBatch
 	log   waLog.Logger
@@ -70,7 +68,6 @@ type SenderKeyFlusher struct {
 	cap             int    // max dirty-set entries (KAVTOV_FLUSH_SENDERKEY_CAP)
 	boundaryN       uint32 // iteration boundary N (KAVTOV_FLUSH_SENDERKEY_N)
 	backpressureCap int    // dirty-set size above which inline sync write fires
-	dropCap         int    // dirty-set size above which drop+log fires on DB failure
 
 	// onDrained is called AFTER each successful DB commit, ONCE per dirty-set
 	// entry that was ACTUALLY deleted from f.dirty (NOT once per snapshotted
@@ -85,8 +82,11 @@ type SenderKeyFlusher struct {
 	snapshotMu sync.RWMutex
 	owner      *CachedSenderKeyStore
 
-	mu    sync.Mutex
-	dirty map[string]*dirtyEntry // key = "<group>|<user>"
+	flushMu  sync.Mutex // Orders snapshots, database commits, and pressure relief.
+	progress writeProgress
+	retry    writeRetry
+	mu       sync.Mutex
+	dirty    map[string]*dirtyEntry // key = "<group>|<user>"
 
 	// flush signal: a non-blocking send wakes the flusher goroutine early.
 	flushCh chan struct{}
@@ -128,7 +128,6 @@ func NewSenderKeyFlusher(store flushSenderKeyBatch, log waLog.Logger, cap int) *
 		cap:             cap,
 		boundaryN:       n,
 		backpressureCap: cap / 5,
-		dropCap:         cap * 2 / 5,
 		dirty:           make(map[string]*dirtyEntry, 1024),
 		flushCh:         make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
@@ -223,8 +222,18 @@ func (f *SenderKeyFlusher) Enqueue(group, user string, blob []byte, keyID, iter 
 
 func (f *SenderKeyFlusher) enqueueWithKeyIDs(group, user string, blob []byte, keyID, iter uint32, wasFailed bool, keyIDs []uint32) {
 	k := group + "|" + user
-
-	f.mu.Lock()
+	for {
+		f.mu.Lock()
+		_, exists := f.dirty[k]
+		if exists || len(f.dirty) < f.cap {
+			break
+		}
+		f.mu.Unlock()
+		if !f.runFlush() {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	f.progress.markPending()
 
 	entry, exists := f.dirty[k]
 	sameGeneration := exists && entry.keyID == keyID
@@ -278,115 +287,43 @@ func (f *SenderKeyFlusher) enqueueWithKeyIDs(group, user string, blob []byte, ke
 	}
 }
 
-// flushOneSynchronous performs a single-row synchronous write (inline backpressure path).
+// flushOneSynchronous flushes the latest dirty batch for pressure relief.
 // Removes the entry from the dirty-set on success. On failure, retains dirty state.
 // Must NOT be called while f.mu is held.
 func (f *SenderKeyFlusher) flushOneSynchronous(group, user string, blob []byte, iter uint32) {
 	f.flushOneWithKeyIDs(group, user, blob, iter, nil)
 }
 
-func (f *SenderKeyFlusher) flushOneWithKeyIDs(group, user string, blob []byte, iter uint32, keyIDs []uint32) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	row := SenderKeyRow{Group: group, User: user, Blob: blob, keyIDs: keyIDs}
-	err := f.store.PutManySenderKeys(ctx, []SenderKeyRow{row})
-	if err != nil {
-		slog.Error(fmt.Sprintf("SenderKeyFlusher inline flush failed group=%s user=%s iter=%d: %v", group, user, iter, err))
-
-		// Catastrophe path: if dirty-set is still huge and DB is failing, drop coldest.
-		f.mu.Lock()
-		if len(f.dirty) > f.dropCap {
-			f.dropColdestLocked()
-		}
-		f.mu.Unlock()
-		return
-	}
-
-	// On success, clear the entry from dirty-set.
-	k := group + "|" + user
-	f.mu.Lock()
-	deleted := false
-	if e, ok := f.dirty[k]; ok && e.highIter == iter && bytes.Equal(e.blob, blob) {
-		e.lastFlushed = iter
-		delete(f.dirty, k)
-		deleted = true
-	}
-	f.mu.Unlock()
-
-	// Fire onDrained ONLY on a confirmed delete (entry gone from the dirty-set =>
-	// the committed blob is authoritative for this device). A concurrent Enqueue
-	// that advanced highIter leaves deleted=false and the entry dirty — do NOT
-	// unpin (its newer key is not yet in the DB). Reached only on success: the
-	// error path returned early above. Invoked outside f.mu (lock-ordering rule).
-	if deleted {
-		f.notifyDrained(row)
-	}
-}
-
-// dropColdestLocked removes one entry from the dirty-set (the first one
-// encountered in map iteration — Go map iteration is pseudo-random, approximating
-// cold-entry removal). Must be called with f.mu held.
-func (f *SenderKeyFlusher) dropColdestLocked() {
-	for k, e := range f.dirty {
-		slog.Error(fmt.Sprintf("SenderKeyFlusher DROP dirty entry (catastrophe) group=%s user=%s highIter=%d",
-			e.group, e.user, e.highIter))
-		delete(f.dirty, k)
-		return
-	}
+func (f *SenderKeyFlusher) flushOneWithKeyIDs(_ string, _ string, _ []byte, _ uint32, _ []uint32) {
+	// Snapshot the latest dirty state under the same writer lock as background flushes.
+	// Never submit the producer's potentially superseded single-row snapshot.
+	f.runFlush()
 }
 
 // Drain flushes the entire dirty-set synchronously. Blocks until all dirty
 // entries have been written to the DB (retrying on transient failure) or the
 // dirty-set is empty. Called during Container.Close via Stop().
 func (f *SenderKeyFlusher) Drain() {
-	for {
-		f.mu.Lock()
-		if len(f.dirty) == 0 {
-			f.mu.Unlock()
-			return
-		}
-		// Snapshot under lock; release before calling DB.
-		rows := make([]SenderKeyRow, 0, len(f.dirty))
-		snaps := make(map[string]senderKeyFlushSnap, len(f.dirty))
-		for k, e := range f.dirty {
-			rows = append(rows, SenderKeyRow{Group: e.group, User: e.user, Blob: e.blob, keyIDs: e.keyIDs})
-			snaps[k] = senderKeyFlushSnap{keyID: e.keyID, iter: e.highIter, blob: e.blob}
-		}
-		f.mu.Unlock()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := f.store.PutManySenderKeys(ctx, rows)
-		cancel()
-
-		if err != nil {
-			f.log.Errorf("SenderKeyFlusher Drain batch failed (%d rows): %v — retrying", len(rows), err)
+	for f.DirtyCount() > 0 {
+		if !f.runFlush() {
 			time.Sleep(100 * time.Millisecond)
-			continue
 		}
-
-		// CR-02 staleness guard (35.2-09 follow-up) — see runFlush.
-		f.mu.Lock()
-		drainedKeys := clearFlushedSenderKeysLocked(f.dirty, snaps)
-		drained := len(rows)
-		f.mu.Unlock()
-
-		for _, k := range drainedKeys {
-			group, user, _ := strings.Cut(k, "|")
-			f.notifyDrained(SenderKeyRow{Group: group, User: user, Blob: snaps[k].blob})
-		}
-
-		f.log.Infof("flush: drained %d on shutdown", drained)
 	}
 }
 
 // runFlush drains the dirty-set once. Called from the async goroutine on
 // ticker tick or flushCh signal. A failed batch retains dirty state (retried
 // next cycle). Unlike Drain(), it does not retry.
-func (f *SenderKeyFlusher) runFlush() {
+func (f *SenderKeyFlusher) runFlush() bool {
+	f.flushMu.Lock()
+	defer f.flushMu.Unlock()
+	if f.retry.waiting() != nil {
+		return false
+	}
 	f.mu.Lock()
 	if len(f.dirty) == 0 {
 		f.mu.Unlock()
-		return
+		return true
 	}
 	rows := make([]SenderKeyRow, 0, len(f.dirty))
 	snaps := make(map[string]senderKeyFlushSnap, len(f.dirty))
@@ -397,12 +334,15 @@ func (f *SenderKeyFlusher) runFlush() {
 	f.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	started := f.progress.begin()
 	err := f.store.PutManySenderKeys(ctx, rows)
+	f.progress.end(started, err)
+	f.retry.record(err)
 	cancel()
 
 	if err != nil {
 		f.log.Errorf("SenderKeyFlusher batch flush failed (%d rows): %v", len(rows), err)
-		return
+		return false
 	}
 
 	// CR-02 staleness guard (35.2-09 follow-up): only clear an entry if no
@@ -414,6 +354,9 @@ func (f *SenderKeyFlusher) runFlush() {
 	// newer ratchet state existed nowhere durable.
 	f.mu.Lock()
 	drainedKeys := clearFlushedSenderKeysLocked(f.dirty, snaps)
+	if len(f.dirty) == 0 {
+		f.progress.since.Store(0)
+	}
 	f.mu.Unlock()
 
 	// Fire onDrained for ONLY the entries actually deleted (CR-02-safe).
@@ -422,6 +365,7 @@ func (f *SenderKeyFlusher) runFlush() {
 		group, user, _ := strings.Cut(k, "|")
 		f.notifyDrained(SenderKeyRow{Group: group, User: user, Blob: snaps[k].blob})
 	}
+	return true
 }
 
 // senderKeyFlushSnap records the (keyID, highIter) generation of a dirty
