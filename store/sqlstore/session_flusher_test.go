@@ -1424,51 +1424,48 @@ func TestFailurePath_CancelledCallerCtxStillDeletes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestFailurePath_BackpressureUnderDBFailure (F6/F9)
-// Under sustained DB-write failure, backpressure relief must NOT report
-// "relieved" while the dirty-set is still over backpressureCap, and must bound
-// the dirty-set below backpressureCap via the drop path (no unbounded
-// re-dispatch / amplification against a failing DB). The pre-fix relief flush
-// dropped only to dropCap (40%, still above the 20% backpressureCap) yet
-// signalled done<-nil, so every later Enqueue re-dispatched a full-batch flush.
+// Sustained write failure retains every session and blocks new addresses at
+// capacity; recovery permits the blocked producer to finish and drain.
 // ---------------------------------------------------------------------------
 
 func TestFailurePath_BackpressureUnderDBFailure(t *testing.T) {
 	store := newFailableSessionStore()
-	// cap=10 -> backpressureCap=2, dropCap=4. The relief drop path must bring the
-	// dirty-set to <= backpressureCap (2) under DB failure, not merely <= dropCap.
 	f := newSessionFlusherForTest(store, 10, 5000*time.Second)
 	f.boundaryN = 1 << 30
 	f.Start()
-	defer f.Stop()
-
-	store.setPutFail(true) // every flush fails
-
-	// Drive enough distinct writes to repeatedly cross backpressureCap. Each
-	// over-cap Enqueue dispatches a workFlushSync; the relief flush fails (DB
-	// down) and must drop the dirty-set below backpressureCap rather than
-	// signalling relieved while still over cap.
-	for i := 0; i < 60; i++ {
-		f.Enqueue(fmt.Sprintf("bpf-%d:0", i), []byte("v"))
+	store.setPutFail(true)
+	done := make(chan struct{})
+	defer func() { store.setPutFail(false); <-done; f.Stop() }()
+	go func() {
+		for i := 0; i < 60; i++ {
+			f.Enqueue(fmt.Sprintf("bpf-%d:0", i), []byte("v"))
+		}
+		close(done)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for f.DirtyCount() < 10 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-
-	// After the failing-DB backpressure storm, the dirty-set must be bounded at
-	// or below backpressureCap (relief actually relieved). The pre-fix code
-	// latched at dropCap (4) > backpressureCap (2).
-	if dc := f.DirtyCount(); dc > f.backpressureCap {
-		t.Fatalf("dirty-set = %d after backpressure relief under DB failure, want <= backpressureCap (%d) — relief signalled relieved while still over cap (F6/F9)", dc, f.backpressureCap)
+	if f.DirtyCount() != 10 {
+		t.Fatalf("pending=%d; failure must retain the full bounded backlog", f.DirtyCount())
 	}
-
-	// The DB stayed down the whole time, so nothing should have persisted.
-	if store.putCalls.Load() == 0 {
-		t.Fatal("no relief flush was ever attempted — backpressure path not exercised (test setup)")
+	select {
+	case <-done:
+		t.Fatal("producer did not backpressure at capacity")
+	default:
 	}
-
-	// Heal the DB so the deferred Stop()'s Drain does not have to burn the full
-	// F2 deadline retrying a down DB (keeps the test fast; the F2 bound itself is
-	// covered by TestFailurePath_ShutdownWithPendingDelete's Drain path and the
-	// drainTotalDeadline logic).
 	store.setPutFail(false)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("producer failed to resume after recovery")
+	}
+	f.Stop()
+	for i := 0; i < 60; i++ {
+		if !store.has(fmt.Sprintf("bpf-%d:0", i)) {
+			t.Fatalf("lost session %d", i)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,40 +1536,35 @@ func TestFailurePath_MigrateGateRaceDoesNotStrandPN(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestFailurePath_DrainBoundedUnderDBDown (F2)
-// Drain's PutManySessions retry loop must be bounded by a total deadline so a
-// DB-down-at-shutdown does NOT wedge Stop()/Container.Close() until SIGKILL.
-// The pre-fix Drain retried forever (100ms sleep, no cap). This test injects a
-// short drain deadline and a permanently-failing DB, then asserts Stop()
-// returns within the deadline + a margin instead of hanging.
+// A database failure must keep Stop waiting with dirty state intact; callers
+// bound deployment preparation separately, leaving this process alive.
 // ---------------------------------------------------------------------------
 
-func TestFailurePath_DrainBoundedUnderDBDown(t *testing.T) {
+func TestFailurePath_DrainRetainsUntilRecovery(t *testing.T) {
 	store := newFailableSessionStore()
 	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
 	f.boundaryN = 1 << 30
-	f.drainDeadline = 300 * time.Millisecond // short bound for the test
 	f.Start()
-
-	f.Enqueue("drainbound:0", []byte("never-persists"))
-	store.setPutFail(true) // DB permanently down
-
-	stopDone := make(chan struct{})
-	go func() {
-		f.Stop()
-		close(stopDone)
-	}()
-
+	store.setPutFail(true)
+	f.Enqueue("drainbound:0", []byte("retained"))
+	done := make(chan struct{})
+	go func() { f.Stop(); close(done) }()
+	defer func() { store.setPutFail(false); <-done }()
 	select {
-	case <-stopDone:
-		// Correct: Drain abandoned the retry after the deadline; Stop completed.
-	case <-time.After(5 * time.Second):
-		t.Fatal("Stop() did not complete — Drain retried a down DB forever (F2)")
+	case <-done:
+		t.Fatal("Stop abandoned unwritten session")
+	case <-time.After(350 * time.Millisecond):
 	}
-
-	// The dirty entry was never persisted (DB down) — bounded crash-loss INV-7
-	// accepts this. The point is that shutdown COMPLETED rather than wedging.
-	if store.has("drainbound:0") {
-		t.Fatal("entry persisted despite a down DB — test mock inconsistency")
+	if f.DirtyCount() != 1 {
+		t.Fatal("pending session discarded")
+	}
+	store.setPutFail(false)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop did not finish after recovery")
+	}
+	if !store.has("drainbound:0") {
+		t.Fatal("session not persisted before Stop completed")
 	}
 }

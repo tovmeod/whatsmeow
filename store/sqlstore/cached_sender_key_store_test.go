@@ -58,7 +58,7 @@ func TestSenderKeyInlineFlushRetirement(t *testing.T) {
 	for _, action := range []string{"attach", "delete", "close"} {
 		t.Run(action, func(t *testing.T) {
 			old, inner := newTestCachedSenderKeyStore(t, 16)
-			f := NewSenderKeyFlusher(&mockFlushStore{}, waLog.Noop, 100)
+			f := NewSenderKeyFlusher(fakeSenderKeyBatch{inner}, waLog.Noop, 100)
 			old.SetFlusher(f)
 			structure, _ := store.UnpackFlat(testBlob(7, 2))
 			if err := old.PutSenderKeyStructure(context.Background(), "g", "sender:2", structure); err != nil {
@@ -110,8 +110,8 @@ func TestSenderKeyInlineFlushRetirement(t *testing.T) {
 			}
 			if action == "attach" {
 				pins := fresh.pinnedDevices(fresh.deviceKey("g", "sender"))
-				if len(pins) != 1 || pins[0] != "sender:2" {
-					t.Fatalf("replacement lost pending pin or retained drained pin: %v", pins)
+				if len(pins) != 0 {
+					t.Fatalf("replacement retained a pin already committed by pressure batch: %v", pins)
 				}
 				fresh.cache.Purge()
 				if got, err := fresh.GetSenderKeyStructure(context.Background(), "g", "sender:2"); err != nil || got == nil {
@@ -121,6 +121,17 @@ func TestSenderKeyInlineFlushRetirement(t *testing.T) {
 			}
 		})
 	}
+}
+
+type fakeSenderKeyBatch struct{ inner *fakeSenderKeyStore }
+
+func (s fakeSenderKeyBatch) PutManySenderKeys(ctx context.Context, rows []SenderKeyRow) error {
+	for _, row := range rows {
+		if err := s.inner.PutSenderKey(ctx, row.Group, row.User, row.Blob); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func awaitSenderKeyRetirementWait(t *testing.T) {
