@@ -889,7 +889,7 @@ func TestSingleWriter_DeleteOrdering(t *testing.T) {
 	// boundaryN high so the Enqueue below does not spontaneously flush; the test
 	// drives the flush explicitly via flushCh through the running writer.
 	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	defer f.Stop()
 
@@ -949,7 +949,7 @@ func TestSingleWriter_EvictedDirtyRead(t *testing.T) {
 	mock := newMockFlushSessionStore()
 	b := newBlockingFlushSessionStore(mock)
 	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	// released guards the single close(b.writeRelease): the test body closes it
 	// on the happy path; the defer closes it if an assertion failed early (so a
@@ -1027,7 +1027,7 @@ func TestSingleWriter_BackpressureNoInlineWrite(t *testing.T) {
 	rec := &gidRecordingStore{inner: newMockFlushSessionStore()}
 	// cap=5 -> backpressureCap=1: a second distinct dirty address triggers relief.
 	f := newSessionFlusherForTest(rec, 5, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	defer f.Stop()
 
@@ -1083,7 +1083,7 @@ func assertFullWorkChBlocksProducer(t *testing.T) {
 	mock := newMockFlushSessionStore()
 	b := newBlockingFlushSessionStore(mock)
 	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	defer f.Stop()
 
@@ -1274,7 +1274,7 @@ func TestFailurePath_ShutdownWithPendingDelete(t *testing.T) {
 	store := newFailableSessionStore()
 	store.sessions["shut:0"] = []byte("doomed")
 	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 
 	// Stop the writer FIRST: close stopCh, wait for the writer to exit, run
@@ -1320,7 +1320,7 @@ func TestFailurePath_DeleteDBFailureRetainsDirty(t *testing.T) {
 	store := newFailableSessionStore()
 	store.sessions["delfail:0"] = []byte("present-in-db")
 	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	defer f.Stop()
 
@@ -1374,7 +1374,7 @@ func TestFailurePath_CancelledCallerCtxStillDeletes(t *testing.T) {
 	store.sessions["cancel:0"] = []byte("must-be-deleted")
 	b := newBlockingFlushSessionStore(store)
 	f := newSessionFlusherForTest(b, 1000, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	defer f.Stop()
 
@@ -1431,7 +1431,7 @@ func TestFailurePath_CancelledCallerCtxStillDeletes(t *testing.T) {
 func TestFailurePath_BackpressureUnderDBFailure(t *testing.T) {
 	store := newFailableSessionStore()
 	f := newSessionFlusherForTest(store, 10, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	store.setPutFail(true)
 	done := make(chan struct{})
@@ -1482,7 +1482,7 @@ func TestFailurePath_BackpressureUnderDBFailure(t *testing.T) {
 func TestFailurePath_MigrateGateRaceDoesNotStrandPN(t *testing.T) {
 	store := newFailableSessionStore()
 	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	defer f.Stop()
 
@@ -1543,7 +1543,7 @@ func TestFailurePath_MigrateGateRaceDoesNotStrandPN(t *testing.T) {
 func TestFailurePath_DrainRetainsUntilRecovery(t *testing.T) {
 	store := newFailableSessionStore()
 	f := newSessionFlusherForTest(store, 1000, 5000*time.Second)
-	f.boundaryN = 1 << 30
+	f.testManualFlush = true
 	f.Start()
 	store.setPutFail(true)
 	f.Enqueue("drainbound:0", []byte("retained"))

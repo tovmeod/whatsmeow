@@ -8,7 +8,7 @@
 //   - SKDM dedup (skip on equal/lower iter within same keyID generation)
 //   - keyID rotation always processes (new generation bypasses dedup)
 //   - wasFailed bypass (always processes regardless of cached iter)
-//   - N=500 iteration-boundary flush trigger
+//   - Immediate flush signal on every accepted change
 //   - Eviction enqueue (dirty entry re-enqueued before LRU drop)
 //   - Synchronous Drain (blocks until dirty-set empty)
 //   - Inline sync valve (backpressure fires when dirty-set > backpressureCap)
@@ -67,7 +67,7 @@ func (m *mockFlushStore) rowCount() int {
 }
 
 // newTestFlusher builds a SenderKeyFlusher with a small cap for test isolation.
-// N is always 500 (default) unless the test overrides by setting f.boundaryN.
+// Every accepted enqueue signals a flush; these fixtures drain explicitly.
 func newTestFlusher(t *testing.T, cap int) (*SenderKeyFlusher, *mockFlushStore) {
 	t.Helper()
 	store := &mockFlushStore{}
@@ -264,33 +264,21 @@ func TestSKDMDedupBypassFailedTuple(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestFlushTriggerNBoundary
-// iter=499 → floor(499/500)=0 == floor(0/500)=0 → NO flush signal.
-// iter=500 → floor(500/500)=1 > 0 → flush signal sent to flushCh.
+// Every accepted sender-key change signals a flush, regardless of iteration.
 // ---------------------------------------------------------------------------
-
-func TestFlushTriggerNBoundary(t *testing.T) {
+func TestFlushTriggerEveryAcceptedChange(t *testing.T) {
 	f, _ := newTestFlusher(t, 1000)
-	f.boundaryN = 500
-
-	// iter=499 → no boundary crossing (floor(499/500)=0, lastFlushed=0 → 0==0).
-	f.Enqueue("group-D", "user-4", testBlob(1, 499), 1, 499, false)
-	select {
-	case <-f.flushCh:
-		t.Fatal("flushCh received signal for iter=499 but floor(499/500)=0, no boundary crossed")
-	default:
-		// correct — no signal
-	}
-
-	// iter=500 → boundary crossing (floor(500/500)=1 > floor(0/500)=0).
-	f.Enqueue("group-D", "user-4", testBlob(1, 500), 1, 500, false)
-	select {
-	case <-f.flushCh:
-		// correct — boundary signal received
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("flushCh: no signal for iter=500 boundary crossing within 100ms")
+	for _, iter := range []uint32{1, 2, 499, 500} {
+		f.Enqueue("group-D", "user-4", testBlob(1, iter), 1, iter, false)
+		select {
+		case <-f.flushCh:
+		default:
+			t.Fatalf("iteration %d did not immediately signal a flush", iter)
+		}
 	}
 }
+
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // TestEvictEnqueues

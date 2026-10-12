@@ -310,11 +310,19 @@ func (s *SQLStore) GetManySessions(ctx context.Context, addresses []string) (map
 	return result, nil
 }
 
-// PutManySessions writes up to 250 rows per SQL statement in one transaction.
+// PutManySessions writes byte- and row-bounded chunks in one transaction.
 // Sorting addresses keeps lock acquisition stable across accounts and retries.
 func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
 	if len(sessions) == 0 {
 		return nil
+	}
+	if len(sessions) == 1 {
+		// One statement is atomic without an explicit BEGIN/COMMIT. dbutil.Exec
+		// also joins an existing transaction carried by ctx, so callers retain
+		// control of the surrounding commit or rollback.
+		for address, session := range sessions {
+			return s.PutSession(ctx, address, session)
+		}
 	}
 	addresses := make([]string, 0, len(sessions))
 	for addr := range sessions {
@@ -322,25 +330,10 @@ func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]by
 	}
 	slices.Sort(addresses)
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for start := 0; start < len(addresses); start += 250 {
-			chunk := addresses[start:min(start+250, len(addresses))]
-			var query strings.Builder
-			query.WriteString("INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES ")
-			args := make([]any, 0, len(chunk)*3)
-			for i, addr := range chunk {
-				if i > 0 {
-					query.WriteByte(',')
-				}
-				n := i * 3
-				fmt.Fprintf(&query, "($%d,$%d,$%d)", n+1, n+2, n+3)
-				args = append(args, s.JID, addr, sessions[addr])
-			}
-			query.WriteString(" ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session")
-			if _, err := s.db.Exec(ctx, query.String(), args...); err != nil {
-				return err
-			}
+		if s.db.Dialect == dbutil.Postgres {
+			return s.putSessionArrays(ctx, addresses, sessions, sessionBatchBytes)
 		}
-		return nil
+		return s.putSessionChunks(ctx, addresses, sessions, sessionBatchBytes)
 	})
 }
 
