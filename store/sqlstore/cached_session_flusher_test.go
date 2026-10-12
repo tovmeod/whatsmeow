@@ -109,17 +109,10 @@ func newTestCachedSessionStoreWiring(t *testing.T, capSize int, flushBacking ses
 	var dummyExplicitRemoves uint64
 	wrapper := NewCachedSessionStore(inner, "test-jid", sessionCache, &dummyExplicitRemoves, idx)
 
-	// Phase 47.3-06 D2: the writer goroutine MUST run so DeleteSession /
-	// DeleteAllSessions / MigratePNToLID work items dispatched to workCh are
-	// processed (those methods block on a done channel — without a writer they
-	// hang). To keep DirtyCount assertions stable, boundaryN is set very high so
-	// no N-boundary flush signal ever fires, and the ticker interval is long so
-	// it never spontaneously flushes. Tests that want a flush trigger it
-	// explicitly (flusher.flushCh <- struct{}{}) or via Drain()/Stop(). The
-	// writer only auto-acts on the work channel (deletes/migrates), which is what
-	// the actor-model delete/migrate tests need.
+	// Keep the actor running for ordered deletes and migrations, while this
+	// fixture explicitly controls flushing for dirty-state assertions.
 	flusher := newSessionFlusherForTest(flushBacking, 1000, 5000*time.Second)
-	flusher.boundaryN = 1 << 30 // disable N-boundary auto-flush during wired tests
+	flusher.testManualFlush = true // explicitly controlled flushes for dirty-state assertions
 	flusher.Start()
 	t.Cleanup(flusher.Stop) // Stop drains the workCh + dirty-set, then exits the writer
 

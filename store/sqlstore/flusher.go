@@ -53,7 +53,7 @@ type dirtyEntry struct {
 // asynchronously via PutManySenderKeys. One instance per Container.
 //
 // Flush triggers (design §5):
-//  1. N-boundary crossing: floor(iter/N) > floor(lastFlushed/N)
+//  1. Every accepted dirty entry immediately signals the writer.
 //  2. LRU eviction: eviction callback re-enqueues the dirty value
 //  3. Synchronous drain on shutdown (Drain / Stop)
 //
@@ -65,9 +65,8 @@ type SenderKeyFlusher struct {
 	log   waLog.Logger
 
 	// env-tunable caps
-	cap             int    // max dirty-set entries (KAVTOV_FLUSH_SENDERKEY_CAP)
-	boundaryN       uint32 // iteration boundary N (KAVTOV_FLUSH_SENDERKEY_N)
-	backpressureCap int    // dirty-set size above which inline sync write fires
+	cap             int // max dirty-set entries (KAVTOV_FLUSH_SENDERKEY_CAP)
+	backpressureCap int // dirty-set size above which inline sync write fires
 
 	// onDrained is called AFTER each successful DB commit, ONCE per dirty-set
 	// entry that was ACTUALLY deleted from f.dirty (NOT once per snapshotted
@@ -118,15 +117,10 @@ func NewSenderKeyFlusher(store flushSenderKeyBatch, log waLog.Logger, cap int) *
 	if cap <= 0 {
 		cap = envIntOrDefault("KAVTOV_FLUSH_SENDERKEY_CAP", 256_000)
 	}
-	n := uint32(envIntOrDefault("KAVTOV_FLUSH_SENDERKEY_N", 500))
-	if n == 0 {
-		n = 500
-	}
 	return &SenderKeyFlusher{
 		store:           store,
 		log:             log,
 		cap:             cap,
-		boundaryN:       n,
 		backpressureCap: cap / 5,
 		dirty:           make(map[string]*dirtyEntry, 1024),
 		flushCh:         make(chan struct{}, 1),
@@ -200,18 +194,12 @@ func (f *SenderKeyFlusher) retireOwner() {
 	f.onDrainedSnapshot = nil
 }
 
-// crossesBoundary returns true when iter crosses an N-boundary relative to
-// lastFlushed. Design §5: floor(iter/N) > floor(lastFlushed/N).
-func (f *SenderKeyFlusher) crossesBoundary(iter, lastFlushed uint32) bool {
-	return iter/f.boundaryN > lastFlushed/f.boundaryN
-}
-
 // Enqueue records a dirty entry. It implements the SKDM dedup rule and the
 // three flush trigger points:
 //  1. If iter <= highIter AND keyID == cached keyID AND NOT wasFailed → skip.
 //  2. A new keyID (generation rotation) always processes regardless of iter.
 //  3. wasFailed=true always processes (failed-tuple recovery bypass).
-//  4. If N-boundary crossed, signal the async flusher.
+//  4. Every accepted change immediately signals the async flusher.
 //  5. If dirty-set > backpressureCap, perform an inline synchronous write.
 //
 // Phase 17.11-05: accepts []byte (PackFlat blob) instead of *senderKeyColumns.
@@ -247,9 +235,7 @@ func (f *SenderKeyFlusher) enqueueWithKeyIDs(group, user string, blob []byte, ke
 
 	f.processedCount.Add(1)
 
-	var lastFlushed uint32
 	if exists {
-		lastFlushed = entry.lastFlushed
 		entry.blob = blob // blob replaces previous; monotonic ratchet makes last-wins safe
 		entry.highIter = iter
 		entry.keyID = keyID
@@ -266,18 +252,16 @@ func (f *SenderKeyFlusher) enqueueWithKeyIDs(group, user string, blob []byte, ke
 		f.dirty[k] = entry
 	}
 
-	crossesBoundary := f.crossesBoundary(iter, lastFlushed)
 	dirtyLen := len(f.dirty)
 	needsInlineWrite := dirtyLen > f.backpressureCap
 
 	f.mu.Unlock()
 
-	// Signal flusher goroutine if N-boundary was crossed (non-blocking send).
-	if crossesBoundary {
-		select {
-		case f.flushCh <- struct{}{}:
-		default:
-		}
+	// Every accepted key change wakes the writer. Repeated signals coalesce;
+	// the dirty-set generation guard retains updates arriving during SQL work.
+	select {
+	case f.flushCh <- struct{}{}:
+	default:
 	}
 
 	// Inline synchronous write on backpressure (valve fires when dirty-set > backpressureCap).
@@ -312,8 +296,8 @@ func (f *SenderKeyFlusher) Drain() {
 }
 
 // runFlush drains the dirty-set once. Called from the async goroutine on
-// ticker tick or flushCh signal. A failed batch retains dirty state (retried
-// next cycle). Unlike Drain(), it does not retry.
+// an immediate work signal or retry timer. A failed batch retains dirty state
+// and schedules retry with shared backoff. Unlike Drain(), it tries once.
 func (f *SenderKeyFlusher) runFlush() bool {
 	f.flushMu.Lock()
 	defer f.flushMu.Unlock()
@@ -380,7 +364,7 @@ type senderKeyFlushSnap struct {
 // clear: an entry is deleted only if it is still at the snapshotted
 // (keyID, highIter) generation. If a newer iteration of the SAME generation
 // arrived during the in-flight write, the entry stays dirty (newer blob) and
-// lastFlushed records the drained iteration so N-boundary math stays correct.
+// lastFlushed records the successfully persisted iteration.
 // If the keyID changed (generation rotation mid-write), the entry stays dirty
 // and lastFlushed is left untouched — iteration numbering restarted, so the
 // drained iteration is meaningless for the new generation.
@@ -411,17 +395,18 @@ func (f *SenderKeyFlusher) Start() {
 	f.wg.Add(1)
 	go func() {
 		defer f.wg.Done()
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
+		var retry retryTimer
+		defer retry.stop()
 		for {
 			select {
 			case <-f.stopCh:
 				return
-			case <-ticker.C:
+			case <-retry.C:
 				f.runFlush()
 			case <-f.flushCh:
 				f.runFlush()
 			}
+			retry.arm(f.nextRetry())
 		}
 	}()
 }
@@ -432,4 +417,15 @@ func (f *SenderKeyFlusher) Stop() {
 	close(f.stopCh)
 	f.wg.Wait()
 	f.Drain()
+}
+
+// nextRetry reads retry state under the same lock used by background and
+// pressure flushes. Healthy or empty writers have no scheduled wakeup.
+func (f *SenderKeyFlusher) nextRetry() time.Time {
+	f.flushMu.Lock()
+	defer f.flushMu.Unlock()
+	if f.retry.err != nil && f.DirtyCount() > 0 {
+		return f.retry.next
+	}
+	return time.Time{}
 }

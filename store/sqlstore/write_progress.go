@@ -128,3 +128,31 @@ func (r *writeRetry) record(err error) {
 	r.err = err
 	r.next = time.Now().Add(r.delay)
 }
+
+// retryTimer is dormant during healthy/idle operation. Only a retained failed
+// write arms it; successful work is always signalled immediately by producers.
+type retryTimer struct {
+	timer *time.Timer
+	C     <-chan time.Time
+}
+
+func (t *retryTimer) stop() {
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	t.C = nil
+}
+
+func (t *retryTimer) arm(next time.Time) {
+	t.stop()
+	if next.IsZero() {
+		return
+	}
+	delay := max(time.Until(next), 0)
+	if t.timer == nil {
+		t.timer = time.NewTimer(delay)
+	} else {
+		t.timer.Reset(delay)
+	}
+	t.C = t.timer.C
+}

@@ -31,7 +31,7 @@
 //
 // # The single-writer invariant (TOTAL — design §9)
 //
-// EVERY DB mutation — periodic flush, N-boundary flush, single delete, prefix
+// EVERY DB mutation — signalled flush, retained-write retry, single delete, prefix
 // delete, PN->LID migrate, AND backpressure relief — executes ONLY inside the
 // writer goroutine's runFlush / processWork. There is NO code path that calls
 // db.PutManySessions / db.DeleteSession / db.DeleteAllSessions /
@@ -51,31 +51,9 @@
 // round-trip to the writer (which may be mid-DB-write) — this is the D-11
 // solution to the 17.13 -> WhatsApp-479 read-gap.
 //
-// # Why write-back is safe for sessions (at these parameters)
-//
-// Measured prod load: ~2,450 session upserts/min; 72.5% of those upsert the
-// same (jid, address) within a short window (coalescable). Sessions are
-// the #1 DB write source at 32.5% of total pg exec time.
-//
-// Chosen defaults: N=1 (KAVTOV_FLUSH_SESSION_N), T=5000ms
-// (KAVTOV_FLUSH_SESSION_T_MS), cap=100_000 (KAVTOV_FLUSH_SESSION_CAP).
-//
-// N=1 means each distinct address is flush-signalled on its FIRST Enqueue,
-// so the async goroutine drains the dirty-set approximately every 1s (the
-// ticker cadence). Same-address repeats arriving inside the in-flight drain
-// window coalesce to last-wins: the CR-02 staleness guard keeps an entry
-// dirty when a newer Enqueue landed during the batch's DB write (clearing
-// unconditionally would drop the newer blob from the durable path), so the
-// newer generation flushes on the next cycle. The 5s ticker is a hard bound
-// on staleness for addresses that never received a second signal. The crash
-// window is therefore bounded: at most ~5s of ratchet advances in the
-// dirty-set survive a crash. See 35.2-09-CRASH-LOSS.md for the full analysis.
-//
-// DM Double-Ratchet has no replayable genesis: a crash during the flush
-// window loses those ratchet advances permanently. This is acceptable for
-// the prod write-reduction benefit, but the operator must decide whether
-// to deploy. See 35.2-09-CRASH-LOSS.md and the SUMMARY deploy-decision
-// section.
+// Every accepted session change signals the writer immediately. Changes arriving
+// during a database write coalesce in the dirty set for the next write. The
+// worker blocks when idle; timers are used only to retry retained failures.
 package sqlstore
 
 import (
@@ -143,7 +121,7 @@ type writeWork struct {
 // sessionDirtyEntry tracks one pending session write in the dirty-set.
 type sessionDirtyEntry struct {
 	blob      []byte // latest flat session blob (last-wins for same address)
-	advCount  uint32 // number of Enqueues for this address (N-boundary counter)
+	advCount  uint32 // generation of the latest enqueue for this address
 	lastDrain uint32 // advCount at last successful DB write
 }
 
@@ -153,10 +131,9 @@ type sessionDirtyEntry struct {
 // single writer goroutine (design §9); concurrent reads use rwmu.RLock().
 //
 // Flush triggers:
-//  1. N-boundary crossing: advCount crosses a multiple of N (default N=1,
-//     so every new entry signals a flush immediately)
-//  2. T-timer: the flush interval ticker fires (default T=5s)
-//  3. Synchronous drain on shutdown (Drain / Stop)
+//  1. Every accepted enqueue immediately signals the writer.
+//  2. Failed writes retain their data and schedule a shared retry timer.
+//  3. Synchronous drain on shutdown (Drain / Stop).
 //
 // Backpressure: when dirty-set > backpressureCap, EnqueueAndMirror sends a
 // synchronous workFlushSync work item to the writer and blocks on its done
@@ -173,9 +150,8 @@ type SessionFlusher struct {
 	// (MigratePNToLID) itself, so they serialize FIFO with each other.
 	db sessionWriterStore
 
-	cap             int    // max dirty-set entries (KAVTOV_FLUSH_SESSION_CAP)
-	boundaryN       uint32 // advance-count boundary (KAVTOV_FLUSH_SESSION_N)
-	backpressureCap int    // synchronous relief above this size
+	cap             int // max dirty-set entries (KAVTOV_FLUSH_SESSION_CAP)
+	backpressureCap int // synchronous relief above this size
 
 	// rwmu guards the dirty map. The writer holds rwmu.Lock() only for brief
 	// in-memory passes (snapshot, clear, delete); EnqueueAndMirror holds
@@ -191,7 +167,7 @@ type SessionFlusher struct {
 	// blocking is correct backpressure (design §9), not a lock-free escape hatch.
 	workCh chan writeWork
 
-	// flushCh is the N-boundary flush signal (size 1, non-blocking send). Kept
+	// flushCh is the immediate work signal (size 1, non-blocking send). Kept
 	// separate from workCh so coalescing flush signals never starve work items.
 	flushCh chan struct{}
 
@@ -206,7 +182,7 @@ type SessionFlusher struct {
 	stopOnce sync.Once // makes Stop idempotent (double-Stop must not double-close stopCh)
 	wg       sync.WaitGroup
 
-	flushInterval time.Duration // injectable for tests; default 5s
+	testManualFlush bool // deterministic actor-ordering fixtures only; false in production
 
 	// migrateDispatches counts how many workMigratePNPrefix work items have been
 	// dispatched to the writer (Phase 47.3 F12 — replaces the permanently-zero
@@ -272,32 +248,23 @@ func NewSessionFlusher(db sessionWriterStore, log waLog.Logger, cap int) *Sessio
 	if cap <= 0 {
 		cap = envIntOrDefault("KAVTOV_FLUSH_SESSION_CAP", 100_000)
 	}
-	n := uint32(envIntOrDefault("KAVTOV_FLUSH_SESSION_N", 1))
-	if n == 0 {
-		n = 1
-	}
-	tms := envIntOrDefault("KAVTOV_FLUSH_SESSION_T_MS", 5000)
 	return &SessionFlusher{
 		log:             log,
 		db:              db,
 		cap:             cap,
-		boundaryN:       n,
 		backpressureCap: cap / 5,
 		dirty:           make(map[string]*sessionDirtyEntry, 1024),
 		workCh:          make(chan writeWork, workChBuffer),
 		flushCh:         make(chan struct{}, 1),
 		abortCh:         make(chan struct{}),
 		stopCh:          make(chan struct{}),
-		flushInterval:   time.Duration(tms) * time.Millisecond,
 	}
 }
 
-// newSessionFlusherForTest constructs a SessionFlusher with a custom flush
-// interval for unit tests. Tests pass a short interval (e.g. 50ms) to avoid
-// sleeping the full 5s default.
-func newSessionFlusherForTest(db sessionWriterStore, cap int, flushInterval time.Duration) *SessionFlusher {
+// newSessionFlusherForTest retains the old interval argument for existing
+// fixtures. Healthy writes now wake the worker immediately.
+func newSessionFlusherForTest(db sessionWriterStore, cap int, _ time.Duration) *SessionFlusher {
 	f := NewSessionFlusher(db, waLog.Noop, cap)
-	f.flushInterval = flushInterval
 	return f
 }
 
@@ -319,14 +286,8 @@ func (f *SessionFlusher) flushSyncForTest() error {
 	return f.dispatchSync(writeWork{kind: workFlushSync, ctx: ctx, done: make(chan error, 1)})
 }
 
-// crossesBoundary returns true when the advance count crosses an N-boundary
-// relative to lastDrain. Design §5: floor(adv/N) > floor(lastDrain/N).
-func (f *SessionFlusher) crossesBoundary(adv, lastDrain uint32) bool {
-	return adv/f.boundaryN > lastDrain/f.boundaryN
-}
-
 // Enqueue records a dirty session entry. Last-wins for same address.
-// Signals the async flusher goroutine when the N-boundary is crossed.
+// Signals the async flusher immediately on every accepted write.
 // Sends a synchronous backpressure-relief flush when dirty-set > backpressureCap.
 func (f *SessionFlusher) Enqueue(address string, blob []byte) {
 	f.EnqueueAndMirror(address, blob, nil)
@@ -369,21 +330,15 @@ func (f *SessionFlusher) EnqueueAndMirror(address string, blob []byte, mirror fu
 	f.progress.markPending()
 
 	entry, exists := f.dirty[address]
-	var adv uint32
-	var lastDrain uint32
 	if exists {
 		entry.blob = copyBytes(blob) // last-wins, store our own copy
 		entry.advCount++
-		adv = entry.advCount
-		lastDrain = entry.lastDrain
 	} else {
 		entry = &sessionDirtyEntry{
 			blob:     copyBytes(blob),
 			advCount: 1,
 		}
 		f.dirty[address] = entry
-		adv = 1
-		lastDrain = 0
 	}
 
 	// WR-03: mirror the blob into the LRU under the same lock that decided
@@ -392,13 +347,13 @@ func (f *SessionFlusher) EnqueueAndMirror(address string, blob []byte, mirror fu
 		mirror()
 	}
 
-	crosses := f.crossesBoundary(adv, lastDrain)
 	needsRelief := len(f.dirty) > f.backpressureCap
 
 	f.rwmu.Unlock() // RELEASE rwmu BEFORE any channel send/block (design §9 — no deadlock).
 
-	// Signal the async flusher on N-boundary crossing (non-blocking).
-	if crosses {
+	// Every accepted change wakes the writer, including updates to an entry
+	// whose previous snapshot is still in flight.
+	if !f.testManualFlush {
 		select {
 		case f.flushCh <- struct{}{}:
 		default:
@@ -588,6 +543,9 @@ func (f *SessionFlusher) clearStaleLocked(advAt map[string]uint32) {
 // No lock is held across the DB write (design §5). A failed batch retains dirty
 // state, with shared backoff limiting failed database attempts.
 func (f *SessionFlusher) runFlush() {
+	if f.retry.waiting() != nil {
+		return
+	}
 	// Step 1: snapshot under a brief write lock.
 	f.rwmu.Lock()
 	if len(f.dirty) == 0 {
@@ -866,25 +824,30 @@ flushLoop:
 
 // Start launches the single writer goroutine (the actor). Must be called once
 // after NewSessionFlusher and before any Enqueue calls in production. The
-// writer owns ALL DB mutation: it drains the ticker, the N-boundary flush
-// signal, and the work channel (deletes, migrates, backpressure relief), so
+// writer owns ALL DB mutation: immediate work signals, retry timers and the
+// work channel (deletes, migrates, backpressure relief). Thus
 // every DB write is serialized by this one goroutine (design §5 §9).
 func (f *SessionFlusher) Start() {
 	f.wg.Add(1)
 	go func() {
 		defer f.wg.Done()
-		ticker := time.NewTicker(f.flushInterval)
-		defer ticker.Stop()
+		var retry retryTimer
+		defer retry.stop()
 		for {
 			select {
 			case <-f.stopCh:
 				return
-			case <-ticker.C:
+			case <-retry.C:
 				f.runFlush()
 			case <-f.flushCh:
 				f.runFlush()
 			case work := <-f.workCh:
 				f.processWork(work)
+			}
+			if f.DirtyCount() > 0 && f.retry.err != nil {
+				retry.arm(f.retry.next)
+			} else {
+				retry.stop()
 			}
 		}
 	}()
