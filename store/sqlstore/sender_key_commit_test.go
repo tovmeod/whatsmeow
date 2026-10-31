@@ -112,8 +112,8 @@ func TestSenderKeyColdWritePreservesPersistedSiblings(t *testing.T) {
 							persisted[args[i].Value.(string)] = true
 						}
 						return nil
-					}, func(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-						if query != getSenderKeyDevicesQuery {
+					}, func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+						if query != getSenderKeyDevicesPostgresQuery || len(args) != 5 || args[3].Value != "sender:" || args[4].Value != "sender;" {
 							return nil, fmt.Errorf("unexpected query: %s", query)
 						}
 						queries.Add(1)
@@ -192,8 +192,8 @@ func TestSenderKeyColdWriteDuringStaleEnumeration(t *testing.T) {
 			entered, release := make(chan struct{}), make(chan struct{})
 			var queries atomic.Int64
 			sq := commitTestStoreWithQuery(t, func([]driver.NamedValue) error { return nil },
-				func(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-					if query != getSenderKeyDevicesQuery {
+				func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+					if query != getSenderKeyDevicesPostgresQuery || len(args) != 5 || args[3].Value != "sender:" || args[4].Value != "sender;" {
 						return nil, errors.New("unexpected query")
 					}
 					if queries.Add(1) == 1 {

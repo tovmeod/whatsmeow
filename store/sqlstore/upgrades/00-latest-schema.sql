@@ -1,4 +1,4 @@
--- v0 -> v22 (compatible with v8+): Latest schema
+-- v0 -> v23 (compatible with v8+): Latest schema
 CREATE TABLE IF NOT EXISTS whatsmeow_device (
 	jid TEXT PRIMARY KEY,
 	lid TEXT,
@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS whatsmeow_sessions (
 	PRIMARY KEY (our_jid, their_id),
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+-- v23: literal prefix bounds remain indexable in generic prepared plans.
+CREATE INDEX IF NOT EXISTS whatsmeow_sessions_prefix_idx
+    ON whatsmeow_sessions (our_jid, their_id text_pattern_ops);
+CREATE INDEX IF NOT EXISTS whatsmeow_identity_keys_prefix_idx
+    ON whatsmeow_identity_keys (our_jid, their_id text_pattern_ops);
 
 -- whatsmeow_sender_keys: end-state schema at v20.
 -- v18: primary key replaced with a UNIQUE INDEX using text_pattern_ops on sender_id
