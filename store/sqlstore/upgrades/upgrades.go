@@ -15,4 +15,6 @@ import (
 //go:embed *.sql
 var upgrades embed.FS
 
-var Table = dbutil.BuildUpgradeTable().WithFS(upgrades).Finish()
+var Table = dbutil.BuildUpgradeTable().WithFS(upgrades).
+	WithRaw(22, 23, 8, "Index signal-address prefix queries", dbutil.TxnModeOff, upgradeSignalPrefixIndexes).
+	Finish()

@@ -97,8 +97,7 @@ func (s *SQLStore) DeleteAllIdentities(ctx context.Context, phone string) error 
 	// ExistsPNSession and the other delete/migrate queries. phone is pure digits
 	// today (from from.User) — the escaper is a no-op for digits and a
 	// correctness guard for any future LID-form prefix ('_' is a LIKE wildcard).
-	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
-	return err
+	return s.deleteSignalPrefix(ctx, deleteAllIdentityKeysQuery, phone)
 }
 
 func (s *SQLStore) DeleteIdentity(ctx context.Context, address string) error {
@@ -166,6 +165,9 @@ const (
 	// not order after ':' there. LIKE matches by character, not collation ordering.
 	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2 || ':%' ESCAPE '\'`
 	deleteSessionQuery     = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
+	// Pattern operators use byte ordering, unlike locale-sensitive >= / <.
+	// Explicit bounds are usable even when a prepared plan cannot inspect LIKE's prefix.
+	signalPrefixBoundsQuery = ` AND their_id ~>=~ $3 AND their_id ~<~ $4`
 
 	// migratePNToLIDSessionsQuery copies session rows from PN-format their_id to
 	// LID-format their_id. kavtov-fork Phase 47.3 D-06: LIKE replaces broken range
@@ -230,7 +232,8 @@ const (
 	// prefixes are pure-digit phone strings with no metacharacters, but future
 	// callers may pass other forms).
 	// LIKE + ESCAPE instead of the broken >= ':' AND < ';' range (D-04/D-06).
-	existsPNSessionQuery = `SELECT true FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2 || '%' ESCAPE '\' LIMIT 1`
+	existsPNSessionPredicate = `SELECT true FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2 || '%' ESCAPE '\'`
+	existsPNSessionQuery     = existsPNSessionPredicate + ` LIMIT 1`
 )
 
 func (s *SQLStore) GetSession(ctx context.Context, address string) (session []byte, err error) {
@@ -259,8 +262,14 @@ func (s *SQLStore) HasSession(ctx context.Context, address string) (has bool, er
 // Used by CachedSessionStore.MigratePNToLID for D-02 cheap no-op detection.
 func (s *SQLStore) ExistsPNSession(ctx context.Context, pnPrefix string) (bool, error) {
 	escaped := senderKeyLikeEscaper.Replace(pnPrefix)
+	query := existsPNSessionQuery
+	args := []any{s.JID, escaped}
+	if s.db.Dialect == dbutil.Postgres && strings.HasSuffix(pnPrefix, ":") {
+		query = existsPNSessionPredicate + signalPrefixBoundsQuery + ` LIMIT 1`
+		args = append(args, pnPrefix, strings.TrimSuffix(pnPrefix, ":")+";")
+	}
 	var exists bool
-	err := s.db.QueryRow(ctx, existsPNSessionQuery, s.JID, escaped).Scan(&exists)
+	err := s.db.QueryRow(ctx, query, args...).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -358,7 +367,18 @@ func (s *SQLStore) deleteAllSessions(ctx context.Context, phone string) error {
 	// ExistsPNSession. Defensive — PN prefixes are pure digits today, but a
 	// LID-form prefix contains '_' (a LIKE wildcard); raw binding would
 	// over-match. Escaping every LIKE query removes the asymmetric footgun.
-	_, err := s.db.Exec(ctx, deleteAllSessionsQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
+	return s.deleteSignalPrefix(ctx, deleteAllSessionsQuery, phone)
+}
+
+// deleteSignalPrefix retains the escaped LIKE guard on both dialects. PostgreSQL
+// additionally seeks the literal byte range using the v23 pattern indexes.
+func (s *SQLStore) deleteSignalPrefix(ctx context.Context, query, phone string) error {
+	args := []any{s.JID, senderKeyLikeEscaper.Replace(phone)}
+	if s.db.Dialect == dbutil.Postgres {
+		query += signalPrefixBoundsQuery
+		args = append(args, phone+":", phone+";")
+	}
+	_, err := s.db.Exec(ctx, query, args...)
 	return err
 }
 
@@ -368,8 +388,7 @@ func (s *SQLStore) deleteAllSenderKeys(ctx context.Context, phone string) error 
 }
 
 func (s *SQLStore) deleteAllIdentityKeys(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, senderKeyLikeEscaper.Replace(phone))
-	return err
+	return s.deleteSignalPrefix(ctx, deleteAllIdentityKeysQuery, phone)
 }
 
 func (s *SQLStore) DeleteSession(ctx context.Context, address string) error {
@@ -569,7 +588,8 @@ const (
 	// collation ordering, and is portable (PG + SQLite). userBare contains a '_'
 	// (the LID agent suffix) and may contain '%'/'\', all LIKE metacharacters, so
 	// the bound value is escaped caller-side before binding (see GetSenderKeyDevices).
-	getSenderKeyDevicesQuery = `SELECT sender_id FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id LIKE $3 || ':%' ESCAPE '\'`
+	getSenderKeyDevicesQuery         = `SELECT sender_id FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id LIKE $3 || ':%' ESCAPE '\'`
+	getSenderKeyDevicesPostgresQuery = getSenderKeyDevicesQuery + ` AND sender_id ~>=~ $4 AND sender_id ~<~ $5`
 )
 
 // senderKeyLikeEscaper escapes the three LIKE metacharacters in a userBare value
@@ -898,7 +918,13 @@ func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []
 // LoadSenderKey fetch each record.
 func (s *SQLStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
 	// Escape LIKE metacharacters so the prefix match is literal up to the ':' (Phase 27).
-	rows, err := s.db.Query(ctx, getSenderKeyDevicesQuery, s.JID, group, senderKeyLikeEscaper.Replace(userBare))
+	query := getSenderKeyDevicesQuery
+	args := []any{s.JID, group, senderKeyLikeEscaper.Replace(userBare)}
+	if s.db.Dialect == dbutil.Postgres {
+		query = getSenderKeyDevicesPostgresQuery
+		args = append(args, userBare+":", userBare+";")
+	}
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

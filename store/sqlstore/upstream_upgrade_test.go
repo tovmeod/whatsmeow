@@ -88,8 +88,8 @@ func TestUpstreamUpgradePreservesForkSchema(t *testing.T) {
 			}
 			var version, keyID int
 			var stored []byte
-			if err := db.QueryRowContext(ctx, "SELECT version FROM whatsmeow_version").Scan(&version); err != nil || version != 22 {
-				t.Fatalf("version=%d, want 22: %v", version, err)
+			if err := db.QueryRowContext(ctx, "SELECT version FROM whatsmeow_version").Scan(&version); err != nil || version != 23 {
+				t.Fatalf("version=%d, want 23: %v", version, err)
 			}
 			if err := db.QueryRowContext(ctx, `SELECT sender_key, sk_keyid0 FROM whatsmeow_sender_keys`).Scan(&stored, &keyID); err != nil {
 				t.Fatal(err)
