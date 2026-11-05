@@ -18,22 +18,29 @@ func upgradeSignalPrefixIndexes(ctx context.Context, db *dbutil.Database) error 
 	}
 	for _, table := range []string{"whatsmeow_sessions", "whatsmeow_identity_keys"} {
 		name := table + "_prefix_idx"
-		var valid bool
-		err := db.QueryRow(ctx, `SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass($1)`, name).Scan(&valid)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("inspect %s: %w", name, err)
+		if err := ensureConcurrentIndex(ctx, db, name, table+" (our_jid, their_id text_pattern_ops)"); err != nil {
+			return err
 		}
-		if err == nil {
-			if valid {
-				continue
-			}
-			if _, err = db.Exec(ctx, "DROP INDEX CONCURRENTLY "+name); err != nil {
-				return fmt.Errorf("remove interrupted %s: %w", name, err)
-			}
+	}
+	return nil
+}
+
+func ensureConcurrentIndex(ctx context.Context, db *dbutil.Database, name, target string) error {
+	var valid bool
+	err := db.QueryRow(ctx, `SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass($1)`, name).Scan(&valid)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+	if err == nil {
+		if valid {
+			return nil
 		}
-		if _, err = db.Exec(ctx, "CREATE INDEX CONCURRENTLY "+name+" ON "+table+" (our_jid, their_id text_pattern_ops)"); err != nil {
-			return fmt.Errorf("build %s: %w", name, err)
+		if _, err = db.Exec(ctx, "DROP INDEX CONCURRENTLY "+name); err != nil {
+			return fmt.Errorf("remove interrupted %s: %w", name, err)
 		}
+	}
+	if _, err = db.Exec(ctx, "CREATE INDEX CONCURRENTLY "+name+" ON "+target); err != nil {
+		return fmt.Errorf("build %s: %w", name, err)
 	}
 	return nil
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 
@@ -27,6 +28,9 @@ type prefixQueryTrace struct {
 }
 
 func (p *prefixQueryTrace) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.EqualFold(data.SQL, "rollback") || strings.EqualFold(data.SQL, "commit") {
+		return ctx
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	args := data.Args
@@ -269,6 +273,32 @@ func TestPrefixQueriesSeekInCustomAndGenericPlans(t *testing.T) {
 	}
 }
 
+func TestSenderKeyRecoveryPrefixSeek(t *testing.T) {
+	s, db, trace := newPrefixIndexStore(t)
+	ctx := context.Background()
+	_, err := db.ExecContext(ctx, `INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
+		SELECT $1, 'prefix@g.us', 'cold-' || i || ':0', decode('010000002a','hex') FROM generate_series(1,12550) i`, testJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "VACUUM ANALYZE whatsmeow_sender_keys"); err != nil {
+		t.Fatal(err)
+	}
+	blobs, _ := lru.New[string, []byte](32)
+	devices, _ := sqlstore.NewSenderKeyDeviceCache(32)
+	cached := sqlstore.NewCachedSenderKeyStore(s, testJID, blobs, devices)
+	if _, recovered, err := cached.TryInlineRecovery(ctx, "prefix@g.us", "missing_1:3", "missing_1", 42, 1); err != nil || recovered {
+		t.Fatalf("absent donor: recovered=%t err=%v", recovered, err)
+	}
+	query, args := trace.sql, trace.args
+	for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
+		plan := explainPrefix(t, db, mode, query, args)
+		if !plan.hasBounds() || plan.Hits+plan.Reads > 10 {
+			t.Fatalf("%s recovery failed to seek directly to the sender prefix: %+v", mode, plan)
+		}
+	}
+}
+
 func TestPrefixIndexUpgradeResumesInterruptedBuild(t *testing.T) {
 	s, db, _ := newPrefixIndexStore(t)
 	ctx := context.Background()
@@ -279,7 +309,8 @@ func TestPrefixIndexUpgradeResumesInterruptedBuild(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT 'whatsmeow_sessions_prefix_idx'::regclass::oid`).Scan(&originalOID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `DROP INDEX whatsmeow_identity_keys_prefix_idx; UPDATE whatsmeow_version SET version=22`); err != nil {
+	if _, err := db.ExecContext(ctx, `DROP INDEX whatsmeow_identity_keys_prefix_idx, whatsmeow_sender_keys_recovery_idx;
+		UPDATE whatsmeow_version SET version=22`); err != nil {
 		t.Fatal(err)
 	}
 	// A failed concurrent expression build deterministically leaves an invalid
@@ -291,19 +322,29 @@ func TestPrefixIndexUpgradeResumesInterruptedBuild(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT indisvalid FROM pg_index WHERE indexrelid='whatsmeow_identity_keys_prefix_idx'::regclass`).Scan(&valid); err != nil || valid {
 		t.Fatalf("invalid-index fixture: valid=%t err=%v", valid, err)
 	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
+		VALUES ($1,'prefix@g.us','155500001:0',decode('010000002a','hex'))`, testJID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE INDEX CONCURRENTLY whatsmeow_sender_keys_recovery_idx
+		ON whatsmeow_sender_keys ((1 / (length(sender_id) - length(sender_id))))`); err == nil {
+		t.Fatal("expected failing recovery index build")
+	}
 	for range 2 {
 		if err := s.Container.Upgrade(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var count, currentOID, version int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_index WHERE indisvalid AND indexrelid IN ('whatsmeow_sessions_prefix_idx'::regclass,'whatsmeow_identity_keys_prefix_idx'::regclass)`).Scan(&count); err != nil || count != 2 {
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_index WHERE indisvalid AND indexrelid IN (
+		'whatsmeow_sessions_prefix_idx'::regclass,'whatsmeow_identity_keys_prefix_idx'::regclass,
+		'whatsmeow_sender_keys_recovery_idx'::regclass)`).Scan(&count); err != nil || count != 3 {
 		t.Fatalf("valid indexes=%d err=%v", count, err)
 	}
 	if err := db.QueryRowContext(ctx, `SELECT 'whatsmeow_sessions_prefix_idx'::regclass::oid`).Scan(&currentOID); err != nil || currentOID != originalOID {
 		t.Fatalf("completed index rebuilt: before=%d after=%d err=%v", originalOID, currentOID, err)
 	}
-	if err := db.QueryRowContext(ctx, `SELECT version FROM whatsmeow_version`).Scan(&version); err != nil || version != 23 {
+	if err := db.QueryRowContext(ctx, `SELECT version FROM whatsmeow_version`).Scan(&version); err != nil || version != 24 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var stored []byte
