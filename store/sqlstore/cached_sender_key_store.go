@@ -280,27 +280,8 @@ func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group,
 		return nil, errSenderKeyStoreRetired
 	}
 	k := c.key(group, user)
-
-	// Cache-aware read: check the write-through flat c.cache first.
-	if v, ok := c.cache.Get(k); ok {
-		if s, err := store.UnpackFlat(v); err == nil {
-			return s, nil
-		}
-		// UnpackFlat error on a cached blob: treat as miss, fall through to DB.
-		// (T-384-05: a corrupt cache entry must not return a bad structure.)
-	}
-
-	// Cache miss: also check the pinnedBlobs overlay (risk c: eviction-before-drain).
-	// A just-written-but-undrained blob whose c.cache entry was evicted is still
-	// pinned here until onDrained fires (same pinnedMu as the device-set overlay).
-	c.pinnedMu.Lock()
-	pinned := c.pinnedBlobs[k]
-	c.pinnedMu.Unlock()
-	if pinned != nil {
-		if s, err := store.UnpackFlat(pinned); err == nil {
-			return s, nil
-		}
-		// Corrupt pinned blob: fall through to DB.
+	if key := c.cachedSenderKeyStructure(k); key != nil {
+		return key, nil
 	}
 
 	r, ok := c.inner.(senderKeyFlatReader)
@@ -327,6 +308,46 @@ func (c *CachedSenderKeyStore) GetSenderKeyStructure(ctx context.Context, group,
 	// Cache the DB result (mirror GetSenderKey L254-255: Add before decode, never cache nil).
 	c.cacheBlob(k, copyBytes(blob))
 	return store.UnpackFlat(blob)
+}
+
+// GetCachedSenderKeyCandidate looks up the named device without doing I/O.
+// Require a complete device list so an old cached record cannot bypass a
+// device lookup after the list has been evicted.
+func (c *CachedSenderKeyStore) GetCachedSenderKeyCandidate(group, user string) *groupRecord.SenderKeyStructure {
+	if c.retired.Load() {
+		return nil
+	}
+	key := c.cachedSenderKeyStructure(c.key(group, user))
+	if key == nil {
+		return nil
+	}
+	owner := c.deviceCache
+	owner.mu.Lock()
+	entry, ok := owner.Get(c.deviceKey(group, user))
+	known := ok && !entry.incomplete && containsString(entry.devices, user) && !c.retired.Load()
+	owner.mu.Unlock()
+	if known {
+		return key
+	}
+	return nil
+}
+
+func (c *CachedSenderKeyStore) cachedSenderKeyStructure(k string) *groupRecord.SenderKeyStructure {
+	if blob, ok := c.cache.Get(k); ok {
+		if key, err := store.UnpackFlat(blob); err == nil {
+			return key
+		}
+	}
+	// Pending writes remain readable after LRU eviction.
+	c.pinnedMu.Lock()
+	pinned := c.pinnedBlobs[k]
+	c.pinnedMu.Unlock()
+	if pinned != nil {
+		if key, err := store.UnpackFlat(pinned); err == nil {
+			return key
+		}
+	}
+	return nil
 }
 
 func (c *CachedSenderKeyStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
@@ -707,6 +728,16 @@ func (c *CachedSenderKeyStore) cachedDevicesLocked(dk deviceQueryKey) ([]string,
 // to retry. Overflow never publishes, and tokens remain until every participant
 // has consumed the first completed result (including its fixed TTL).
 func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
+	return c.getSenderKeyDevices(ctx, group, userBare, false)
+}
+
+// GetSenderKeyCandidates also fetches the key records on a cold device-list
+// lookup, so decrypt can try each device without a separate database read.
+func (c *CachedSenderKeyStore) GetSenderKeyCandidates(ctx context.Context, group, userBare string) ([]string, error) {
+	return c.getSenderKeyDevices(ctx, group, userBare, true)
+}
+
+func (c *CachedSenderKeyStore) getSenderKeyDevices(ctx context.Context, group, userBare string, prefetch bool) ([]string, error) {
 	if c.retired.Load() {
 		return nil, errSenderKeyStoreRetired
 	}
@@ -755,11 +786,27 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 	flight = &deviceQueryFlight{done: make(chan struct{}), participants: 1}
 	owner.flights[dk] = flight
 	owner.mu.Unlock()
-	devices, err := c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
+	var devices []string
+	var keys []senderKeyDeviceRow
+	var err error
+	if reader, ok := c.inner.(interface {
+		getSenderKeyDeviceRows(context.Context, string, string) ([]senderKeyDeviceRow, error)
+	}); prefetch && ok {
+		keys, err = reader.getSenderKeyDeviceRows(ctx, group, dk.sender)
+		devices = make([]string, 0, len(keys))
+		for _, key := range keys {
+			devices = append(devices, key.device)
+		}
+	} else {
+		devices, err = c.inner.GetSenderKeyDevices(ctx, group, dk.sender)
+	}
 	completedAt := owner.now()
 	if err == nil {
 		err = ctx.Err()
 	}
+	// If a writer is active or invalidated this query, leave blob loading to
+	// the usual cache and exact-key reads.
+	prefill := len(keys) > 0 && c.writeMu.TryLock()
 	owner.mu.Lock()
 	// Completion is serialized with accepted writes. Re-read pins here rather
 	// than using a pre-query snapshot that can miss a just-accepted key.
@@ -769,6 +816,9 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 		known = mergeDeviceSets(entry.devices, pins)
 	}
 	if err == nil && !flight.invalid && !c.retired.Load() && validDeviceResult(devices, dk.sender) {
+		if prefill {
+			c.prefillSenderKeys(group, keys)
+		}
 		entry := deviceCacheEntry{devices: mergeDeviceSets(devices, known)}
 		if len(entry.devices) == 0 {
 			entry.expiresAt = completedAt.Add(senderKeyDeviceNegativeTTL)
@@ -784,8 +834,22 @@ func (c *CachedSenderKeyStore) GetSenderKeyDevices(ctx context.Context, group, u
 	flight.completed = true
 	close(flight.done)
 	owner.mu.Unlock()
+	if prefill {
+		c.writeMu.Unlock()
+	}
 	c.releaseDeviceFlight(dk, flight)
 	return mergeDeviceSets(devices, nil), err
+}
+
+func (c *CachedSenderKeyStore) prefillSenderKeys(group string, rows []senderKeyDeviceRow) {
+	c.pinnedMu.Lock()
+	defer c.pinnedMu.Unlock()
+	for _, row := range rows {
+		key := c.key(group, row.device)
+		if len(row.blob) > 0 && c.pinnedBlobs[key] == nil {
+			c.cache.ContainsOrAdd(key, row.blob)
+		}
+	}
 }
 
 func (c *CachedSenderKeyStore) releaseDeviceFlight(dk deviceQueryKey, flight *deviceQueryFlight) {

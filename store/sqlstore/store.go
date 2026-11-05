@@ -588,8 +588,10 @@ const (
 	// collation ordering, and is portable (PG + SQLite). userBare contains a '_'
 	// (the LID agent suffix) and may contain '%'/'\', all LIKE metacharacters, so
 	// the bound value is escaped caller-side before binding (see GetSenderKeyDevices).
-	getSenderKeyDevicesQuery         = `SELECT sender_id FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id LIKE $3 || ':%' ESCAPE '\'`
-	getSenderKeyDevicesPostgresQuery = getSenderKeyDevicesQuery + ` AND sender_id ~>=~ $4 AND sender_id ~<~ $5`
+	senderKeyDeviceFilter            = ` FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id LIKE $3 || ':%' ESCAPE '\'`
+	senderKeyDevicePostgresBounds    = ` AND sender_id ~>=~ $4 AND sender_id ~<~ $5`
+	getSenderKeyDevicesQuery         = `SELECT sender_id` + senderKeyDeviceFilter
+	getSenderKeyDevicesPostgresQuery = getSenderKeyDevicesQuery + senderKeyDevicePostgresBounds
 )
 
 // senderKeyLikeEscaper escapes the three LIKE metacharacters in a userBare value
@@ -917,14 +919,7 @@ func (s *SQLStore) GetSenderKey(ctx context.Context, group, user string) (key []
 // the caller to rebuild a SenderKeyName per device and let the existing cached
 // LoadSenderKey fetch each record.
 func (s *SQLStore) GetSenderKeyDevices(ctx context.Context, group, userBare string) ([]string, error) {
-	// Escape LIKE metacharacters so the prefix match is literal up to the ':' (Phase 27).
-	query := getSenderKeyDevicesQuery
-	args := []any{s.JID, group, senderKeyLikeEscaper.Replace(userBare)}
-	if s.db.Dialect == dbutil.Postgres {
-		query = getSenderKeyDevicesPostgresQuery
-		args = append(args, userBare+":", userBare+";")
-	}
-	rows, err := s.db.Query(ctx, query, args...)
+	rows, err := s.querySenderKeyDevices(ctx, getSenderKeyDevicesQuery, getSenderKeyDevicesPostgresQuery, group, userBare)
 	if err != nil {
 		return nil, err
 	}
@@ -941,6 +936,39 @@ func (s *SQLStore) GetSenderKeyDevices(ctx context.Context, group, userBare stri
 		return nil, err
 	}
 	return devices, nil
+}
+
+type senderKeyDeviceRow struct {
+	device string
+	blob   []byte
+}
+
+const getSenderKeyDeviceRowsQuery = `SELECT sender_id, sender_key` + senderKeyDeviceFilter
+
+func (s *SQLStore) getSenderKeyDeviceRows(ctx context.Context, group, userBare string) ([]senderKeyDeviceRow, error) {
+	rows, err := s.querySenderKeyDevices(ctx, getSenderKeyDeviceRowsQuery, getSenderKeyDeviceRowsQuery+senderKeyDevicePostgresBounds, group, userBare)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	keys := make([]senderKeyDeviceRow, 0)
+	for rows.Next() {
+		var key senderKeyDeviceRow
+		if err = rows.Scan(&key.device, &key.blob); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
+func (s *SQLStore) querySenderKeyDevices(ctx context.Context, query, postgresQuery, group, userBare string) (dbutil.Rows, error) {
+	args := []any{s.JID, group, senderKeyLikeEscaper.Replace(userBare)}
+	if s.db.Dialect == dbutil.Postgres {
+		query = postgresQuery
+		args = append(args, userBare+":", userBare+";")
+	}
+	return s.db.Query(ctx, query, args...)
 }
 
 const (
