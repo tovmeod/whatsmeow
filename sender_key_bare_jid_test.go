@@ -347,19 +347,26 @@ func TestGroupSenderKeyFallbackAbsentSender(t *testing.T) {
 	}
 }
 
-// TestGroupSenderKeyDeviceMatchedRecovery proves Phase-27 recovery: a message
-// whose sender key was first reachable only under a non-labeled device (:5)
-// still decrypts via the device-tolerant loop, AND once the sender's key is
-// stored under the message's labeled device (:0) the message decrypts with the
-// labeled device tried first.
-//
-// Phase-27 note (supersedes the Phase-26 "self-extinguishing" invariant): the
-// device-tolerant lookup ALWAYS enumerates the sender's device set — there is no
-// fast-path/fallback split — so GetSenderKeyDevices is consulted once per
-// decrypt. In production that enumerate is cache-served by CachedSenderKeyStore
-// (0 DB queries warm — see the sqlstore cache tests); the in-memory
-// fakeSenderKeyStore here has no LRU, so getDevicesCalls increments by exactly
-// one per decrypt. The behavioral guarantee is that the decrypt SUCCEEDS.
+type fakeCachedSenderKeyStore struct{ *fakeSenderKeyStore }
+
+func (f fakeCachedSenderKeyStore) GetCachedSenderKeyCandidate(group, user string) *groupRecord.SenderKeyStructure {
+	blob := f.keys[f.slot(group, user)]
+	if blob == nil {
+		return nil
+	}
+	key, err := groupRecord.NewSenderKeyFromBytes(blob, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
+	if err != nil {
+		return nil
+	}
+	return key.Structure()
+}
+
+func (f fakeCachedSenderKeyStore) GetSenderKeyCandidates(ctx context.Context, group, user string) ([]string, error) {
+	return f.GetSenderKeyDevices(ctx, group, user)
+}
+
+// A mislabeled message can decrypt using another device. Once the labeled
+// device has the key, it should decrypt without enumerating devices.
 func TestGroupSenderKeyDeviceMatchedRecovery(t *testing.T) {
 	ctx := context.Background()
 	chat := types.JID{User: "120363000000000004", Server: types.GroupServer}
@@ -368,7 +375,7 @@ func TestGroupSenderKeyDeviceMatchedRecovery(t *testing.T) {
 	plaintext1 := []byte("first skmsg via fallback")
 
 	fake := newFakeSenderKeyStore()
-	cli := newTestClient(fake)
+	cli := newTestClient(fakeCachedSenderKeyStore{fake})
 
 	// Step 1: seed :5 record directly and deliver first skmsg via fallback.
 	skdmBytes1, skmsgBytes1 := aliceCrypto(ctx, t, chat.String(), plaintext1)
@@ -399,9 +406,7 @@ func TestGroupSenderKeyDeviceMatchedRecovery(t *testing.T) {
 	skdmBytes2, skmsgBytes2 := aliceCrypto(ctx, t, chat.String(), plaintext2)
 	seedDeviceQualifiedRecord(ctx, t, cli, chat, senderBare, skdmBytes2)
 
-	// Step 3: deliver second skmsg (labeled :0). The device-tolerant loop tries
-	// the labeled device (:0) first and decrypts. Phase 27: the loop always
-	// enumerates once (no fast-path skip), so getDevicesCalls increments by 1.
+	// Step 3: deliver the second message with the matching :0 label.
 	before := fake.getDevicesCalls
 	skmsgNode2 := &waBinary.Node{Attrs: waBinary.Attrs{"v": "3"}, Content: skmsgBytes2}
 	pt2, _, err := cli.decryptGroupMsg(ctx, skmsgNode2, senderBare, chat, time.Now())
@@ -411,10 +416,8 @@ func TestGroupSenderKeyDeviceMatchedRecovery(t *testing.T) {
 	if string(pt2) != string(plaintext2) {
 		t.Fatalf("second decrypt plaintext mismatch: got %q want %q", pt2, plaintext2)
 	}
-	// Phase 27: the unified loop enumerates exactly once per decrypt (cache-served
-	// in prod). The recovery guarantee is decrypt success, asserted above.
-	if fake.getDevicesCalls != before+1 {
-		t.Fatalf("expected one enumerate per decrypt (Phase 27 device-tolerant loop): getDevicesCalls %d → %d, want +1", before, fake.getDevicesCalls)
+	if fake.getDevicesCalls != before {
+		t.Fatalf("matching-device decrypt enumerated devices: %d → %d", before, fake.getDevicesCalls)
 	}
 }
 

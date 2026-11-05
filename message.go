@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/libsignal/groups"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/protocol"
 	"go.mau.fi/libsignal/session"
 	"go.mau.fi/libsignal/signalerror"
@@ -855,33 +857,72 @@ func (cli *Client) decryptGroupMsg(ctx context.Context, child *waBinary.Node, fr
 	return plaintext, &ciphertextHash, nil
 }
 
-// decryptGroupSenderKey performs the Phase-27 device-tolerant group sender-key lookup. It
-// enumerates the sender's stored device-qualified records for the group (a cache-served call —
-// see CachedSenderKeyStore) and attempts decryption against each, trying the labeled device first.
-// libsignal's GroupCipher selects the key state by the message keyID and verifies the signature,
-// so a wrong candidate fails closed (never a mis-decrypt); the winning candidate's ratchet is
-// written back to its own device record by GroupCipher.Decrypt. There is no error-class branching:
-// we try every stored device for the sender and let the keyID pick. Returns ErrNoSenderKeyForUser
-// when no stored device record decrypts the message (so the retry-receipt path is unchanged).
+type groupSenderKeyLookup interface {
+	GetCachedSenderKeyCandidate(group, user string) *groupRecord.SenderKeyStructure
+	GetSenderKeyCandidates(ctx context.Context, group, user string) ([]string, error)
+}
+
+// preloadedGroupSenderKey supplies the already-decoded record to GroupCipher.
+// The embedded Device still owns the ratchet write to the winning address.
+type preloadedGroupSenderKey struct {
+	*store.Device
+	key *groupRecord.SenderKey
+}
+
+func (s preloadedGroupSenderKey) LoadSenderKey(context.Context, *protocol.SenderKeyName) (*groupRecord.SenderKey, error) {
+	return s.key, nil
+}
+
+// decryptGroupSenderKey tries a cached key for the labeled device before
+// enumerating other devices. GroupCipher checks the signature and stores the
+// updated ratchet under whichever address decrypted the message.
 func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.JID, msg *protocol.SenderKeyMessage) ([]byte, error) {
-	devices, err := cli.Store.SenderKeys.GetSenderKeyDevices(ctx, chat.String(), from.SignalAddressUser())
+	group := chat.String()
+	sender := from.SignalAddress()
+	labeled := sender.String()
+	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
+	try := func(address *protocol.SignalAddress) ([]byte, error) {
+		name := protocol.NewSenderKeyName(group, address)
+		return groups.NewGroupCipher(builder, name, cli.Store).Decrypt(ctx, msg)
+	}
+
+	var devices []string
+	var err error
+	if lookup, ok := cli.Store.SenderKeys.(groupSenderKeyLookup); ok {
+		if ctx.Err() == nil {
+			if structure := lookup.GetCachedSenderKeyCandidate(group, labeled); structure != nil {
+				key, keyErr := groupRecord.NewSenderKeyFromStruct(structure, pbSerializer.SenderKeyRecord, pbSerializer.SenderKeyState)
+				if keyErr == nil {
+					name := protocol.NewSenderKeyName(group, sender)
+					cipher := groups.NewGroupCipher(builder, name, preloadedGroupSenderKey{cli.Store, key})
+					if plaintext, decryptErr := cipher.Decrypt(ctx, msg); decryptErr == nil {
+						cli.clearFailedSenderKeyTuple(labeled, group)
+						return plaintext, nil
+					}
+				}
+			}
+		}
+		devices, err = lookup.GetSenderKeyCandidates(ctx, group, sender.Name())
+	} else {
+		devices, err = cli.Store.SenderKeys.GetSenderKeyDevices(ctx, group, sender.Name())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to enumerate sender-key devices: %w", err)
 	}
-	// Try the labeled device first (the common case), then the remaining devices.
-	labeled := from.SignalAddress().String()
-	ordered := make([]string, 0, len(devices))
+	// A newer key may have arrived during enumeration. Try the labeled
+	// device first if it is now listed.
+	if slices.Contains(devices, labeled) {
+		plaintext, decErr := try(sender)
+		if decErr == nil {
+			cli.clearFailedSenderKeyTuple(labeled, group)
+			return plaintext, nil
+		}
+		cli.Log.Debugf("Group sender-key candidate %q did not decrypt: %v", labeled, decErr)
+	}
 	for _, sid := range devices {
 		if sid == labeled {
-			ordered = append(ordered, sid)
+			continue
 		}
-	}
-	for _, sid := range devices {
-		if sid != labeled {
-			ordered = append(ordered, sid)
-		}
-	}
-	for _, sid := range ordered {
 		sep := strings.LastIndex(sid, ":")
 		if sep < 0 {
 			cli.Log.Debugf("Skipping malformed sender-key id %q (no colon separator)", sid)
@@ -892,11 +933,9 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 			cli.Log.Debugf("Skipping malformed sender-key id %q (bad device id: %v)", sid, parseErr)
 			continue
 		}
-		name := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(sid[:sep], uint32(devID)))
-		cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
-		plaintext, decErr := cipher.Decrypt(ctx, msg)
+		plaintext, decErr := try(protocol.NewSignalAddress(sid[:sep], uint32(devID)))
 		if decErr == nil {
-			cli.clearFailedSenderKeyTuple(labeled, chat.String())
+			cli.clearFailedSenderKeyTuple(labeled, group)
 			return plaintext, nil
 		}
 		cli.Log.Debugf("Group sender-key candidate %q did not decrypt: %v", sid, decErr)
@@ -905,7 +944,7 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 	// Only a terminal failure activates the existing SKDM recovery bypass.
 	if cli.Store.InlineRecoverer != nil {
 		_, recovered, recErr := cli.Store.InlineRecoverer.TryInlineRecovery(
-			ctx, chat.String(), labeled, from.SignalAddressUser(), msg.KeyID(), msg.Iteration())
+			ctx, group, labeled, sender.Name(), msg.KeyID(), msg.Iteration())
 		if recErr != nil {
 			cli.Log.Warnf("inline recovery error group=%s sender=%s keyID=%d: %v",
 				from.SignalAddressUser(), chat.String(), msg.KeyID(), recErr)
@@ -914,13 +953,9 @@ func (cli *Client) decryptGroupSenderKey(ctx context.Context, chat, from types.J
 			// Donor installed — retry decrypt directly under labeled.
 			// MUST NOT call GetSenderKeyDevices: flusher has not ticked; DB row absent;
 			// warm flat c.cache write-through from PutSenderKeyStructureRecovery is the only source. (RESEARCH Constraint 2)
-			sep := strings.LastIndex(labeled, ":")
-			devID, _ := strconv.ParseUint(labeled[sep+1:], 10, 32)
-			name := protocol.NewSenderKeyName(chat.String(), protocol.NewSignalAddress(labeled[:sep], uint32(devID)))
-			cipher := groups.NewGroupCipher(groups.NewGroupSessionBuilder(cli.Store, pbSerializer), name, cli.Store)
-			plaintext, decErr := cipher.Decrypt(ctx, msg)
+			plaintext, decErr := try(sender)
 			if decErr == nil {
-				cli.clearFailedSenderKeyTuple(labeled, chat.String())
+				cli.clearFailedSenderKeyTuple(labeled, group)
 				return plaintext, nil
 			}
 			// Donor installed but decrypt still failed — fall through to fail-open.

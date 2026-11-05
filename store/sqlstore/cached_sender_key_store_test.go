@@ -422,6 +422,55 @@ func newDevicePolicyStore(t *testing.T, cap int, read func(context.Context, stri
 	return NewCachedSenderKeyStore(inner, "account", blobs, devices), inner
 }
 
+type prefetchDeviceStore struct {
+	*fakeSenderKeyStore
+	query func() []senderKeyDeviceRow
+}
+
+func (s *prefetchDeviceStore) getSenderKeyDeviceRows(context.Context, string, string) ([]senderKeyDeviceRow, error) {
+	return s.query(), nil
+}
+
+func TestSenderKeyCandidatePrefill(t *testing.T) {
+	ctx := context.Background()
+	for _, concurrentWrite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("concurrent-write=%t", concurrentWrite), func(t *testing.T) {
+			const group, device = "group", "sender_1:5"
+			blobs, _ := lru.New[string, []byte](1)
+			devices, _ := NewSenderKeyDeviceCache(2)
+			inner := &prefetchDeviceStore{fakeSenderKeyStore: newFakeSenderKeyStore()}
+			c := NewCachedSenderKeyStore(inner, "account", blobs, devices)
+			inner.query = func() []senderKeyDeviceRow {
+				// Interleave a write with an in-progress read. Evict the
+				// new record before the old query completes to exercise
+				// the flight fence independently of cache presence.
+				if concurrentWrite {
+					if err := c.PutSenderKey(ctx, group, device, []byte("new")); err != nil {
+						t.Fatal(err)
+					}
+					blobs.Add("unrelated", []byte("eviction"))
+				}
+				return []senderKeyDeviceRow{{device: device, blob: []byte("snapshot")}}
+			}
+			got, err := c.GetSenderKeyCandidates(ctx, group, "sender_1")
+			if err != nil || len(got) != 1 || got[0] != device {
+				t.Fatalf("candidates=%q err=%v", got, err)
+			}
+			if concurrentWrite && blobs.Contains(c.key(group, device)) {
+				t.Fatal("stale query repopulated an evicted key")
+			}
+			value, err := c.GetSenderKey(ctx, group, device)
+			want := "snapshot"
+			if concurrentWrite {
+				want = "new"
+			}
+			if err != nil || string(value) != want {
+				t.Fatalf("key=%q want=%q err=%v", value, want, err)
+			}
+		})
+	}
+}
+
 func TestSenderKeyDeviceNegativeIdentity(t *testing.T) {
 	c, inner := newDevicePolicyStore(t, 32, func(context.Context, string, string) ([]string, error) { return []string{}, nil })
 	for _, pair := range [][2]string{{"a|b", "c"}, {"a", "b|c"}, {"g", "42_1"}, {"g", "42_2"}, {"g", "42@s.whatsapp.net"}, {"g", "42@lid"}} {

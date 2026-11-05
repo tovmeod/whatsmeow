@@ -1,4 +1,4 @@
--- v0 -> v23 (compatible with v8+): Latest schema
+-- v0 -> v24 (compatible with v8+): Latest schema
 CREATE TABLE IF NOT EXISTS whatsmeow_device (
 	jid TEXT PRIMARY KEY,
 	lid TEXT,
@@ -99,6 +99,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS whatsmeow_sender_keys_pkey
 -- letting PG seek directly to (group, keyID) before applying the sender_id LIKE filter.
 CREATE INDEX IF NOT EXISTS whatsmeow_sender_keys_chat_keyid0_idx
     ON whatsmeow_sender_keys(chat_id, sk_keyid0);
+
+CREATE INDEX IF NOT EXISTS whatsmeow_sender_keys_recovery_idx
+    ON whatsmeow_sender_keys(chat_id, sender_id text_pattern_ops);
 
 CREATE TABLE IF NOT EXISTS whatsmeow_app_state_sync_keys (
 	jid         TEXT,

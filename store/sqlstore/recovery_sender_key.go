@@ -34,7 +34,6 @@
 //     concurrent inbound SKDM can advance the ratchet between findSenderKeyDonor
 //     and PutSenderKeyStructure; the guard prevents clobbering it.
 //
-// No recovery index is added (DESIGN-DECISIONS line 56: measure-first).
 
 package sqlstore
 
@@ -47,6 +46,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"go.mau.fi/libsignal/groups/ratchet"
 	groupRecord "go.mau.fi/libsignal/groups/state/record"
+	"go.mau.fi/util/dbutil"
 
 	"go.mau.fi/whatsmeow/store"
 )
@@ -341,7 +341,7 @@ const recoveryScanQueryFast = `
 	WHERE chat_id=$1 AND sk_keyid0=$3 AND sender_id LIKE $2 || ':%' ESCAPE '\'
 `
 
-// recoveryScanQuery is the LIKE-only fallback donor scan, used when recoveryScanQueryFast
+// recoveryScanQuery is the all-state fallback donor lookup, used when recoveryScanQueryFast
 // finds no qualifying donor (target KeyID is in state[1+] of some multi-state row).
 // Fetches all rows for (chat_id, LIKE sender_id prefix) across ALL accounts and lets
 // the Go loop scan all states for the matching KeyID.
@@ -352,6 +352,8 @@ const recoveryScanQuery = `
 	FROM whatsmeow_sender_keys
 	WHERE chat_id=$1 AND sender_id LIKE $2 || ':%' ESCAPE '\'
 `
+
+const recoveryScanQueryPostgres = recoveryScanQuery + ` AND sender_id ~>=~ $3 AND sender_id ~<~ $4`
 
 // scanFlatRows scans a row cursor from either recoveryScanQueryFast or
 // recoveryScanQuery (both SELECT our_jid, sender_key) and updates best with the
@@ -440,7 +442,7 @@ func scanFlatRows(rows interface {
 //     seeking the composite (chat_id, sk_keyid0) index. Finds donors where
 //     state[0].KeyID == targetKeyID without scanning the full group row-set.
 //  2. Fallback path (recoveryScanQuery): runs ONLY when the fast path finds no qualifying
-//     donor. LIKE-only scan covers multi-state donors where targetKeyID is in state[1+].
+//     donor. The sender-prefix lookup covers multi-state donors where targetKeyID is in state[1+].
 //
 // All donor rows are PackFlat-encoded. Decode with store.UnpackFlat.
 // Returns (nil, nil) when no qualifying donor exists.
@@ -469,8 +471,14 @@ func (s *SQLStore) findSenderKeyDonorResult(ctx context.Context, group, senderBa
 		return best, fastComplete, nil
 	}
 
-	// Fallback path: LIKE-only scan (covers multi-state donors, state[1+] KeyID match).
-	fbRows, err := s.db.Query(ctx, recoveryScanQuery, group, escapedBare)
+	// The fallback includes all states from every device of this sender.
+	query := recoveryScanQuery
+	args := []any{group, escapedBare}
+	if s.db.Dialect == dbutil.Postgres {
+		query = recoveryScanQueryPostgres
+		args = append(args, senderBare+":", senderBare+";")
+	}
+	fbRows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, false, err
 	}
