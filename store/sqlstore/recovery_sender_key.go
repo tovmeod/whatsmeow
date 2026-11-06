@@ -374,6 +374,9 @@ func scanFlatRows(rows interface {
 			complete = false
 			continue // NULL blob — skip (should not happen post-upgrade-19)
 		}
+		if store.FlatSenderKeyDefinitelyMissing(blob, targetKeyID) {
+			continue
+		}
 
 		structure, err := store.UnpackFlat(blob)
 		if err != nil {

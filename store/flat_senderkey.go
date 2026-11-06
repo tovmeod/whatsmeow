@@ -236,6 +236,15 @@ func packSkipped(s *groupRecord.SenderKeyStructure) ([]byte, bool) {
 // u32 keyID + u32 chainIter + 32 chainKey + 33 signingPub + u8 hasPriv + 32 signingPriv = 106 bytes.
 const perStateLen = 4 + 4 + flatChainKeyLen + flatSigningPubLen + 1 + flatSigningPrivLen // 106
 
+// FlatSenderKeyDefinitelyMissing reports a key ID mismatch in the single-state
+// form with no skipped keys. Leave other records to the full decoder so
+// recovery can distinguish a missing donor from a malformed record.
+func FlatSenderKeyDefinitelyMissing(b []byte, keyID uint32) bool {
+	const tailOffset = 1 + perStateLen
+	return len(b) == tailOffset+4 && b[0] == 1 &&
+		binary.BigEndian.Uint32(b[1:5]) != keyID && binary.BigEndian.Uint32(b[tailOffset:]) == 0
+}
+
 // PackFlat serializes a *SenderKeyStructure to a self-complete []byte for storage.
 // Unlike flatFromStructure, PackFlat supports unbounded state count (up to 255 states,
 // limited only by u8 nStates). Exported for use by sqlstore and migration tool

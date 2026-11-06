@@ -628,6 +628,34 @@ func TestFlatFullRecordDecryptEquivalence(t *testing.T) {
 // TestFlatUnpackMalformed asserts that UnpackFlat returns a non-nil error and
 // never panics for all categories of malformed input: short buffer, zero nStates,
 // buffer truncated mid-states, truncated skipped count, and out-of-range stateIdx.
+func TestFlatSenderKeyDefinitelyMissing(t *testing.T) {
+	single, _ := PackFlat(makeStructure(1, 0, false))
+	multiple, _ := PackFlat(makeStructure(2, 0, false))
+	withSkipped, _ := PackFlat(makeStructure(1, 1, false))
+	badCount := append([]byte(nil), single...)
+	badCount[len(badCount)-1] = 1
+	for _, tc := range []struct {
+		name string
+		blob []byte
+		key  uint32
+		want bool
+	}{
+		{"single mismatch", single, 1001, true},
+		{"single match", single, 1000, false},
+		{"older match", multiple, 1001, false},
+		{"skipped keys", withSkipped, 1001, false},
+		{"invalid skipped count", badCount, 1001, false},
+		{"truncated", single[:len(single)-1], 1001, false},
+		{"empty", nil, 1001, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FlatSenderKeyDefinitelyMissing(tc.blob, tc.key); got != tc.want {
+				t.Fatalf("definitely missing = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFlatUnpackMalformed(t *testing.T) {
 	t.Run("empty_buffer", func(t *testing.T) {
 		_, err := UnpackFlat([]byte{})

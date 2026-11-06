@@ -128,7 +128,14 @@ func (r *flatRecoveryRows) Err() error { return nil }
 // An uncertain scan must be distinguishable from successful absence even
 // though the public recovery API still reports no donor without an error.
 func TestNoDonorCacheMalformed(t *testing.T) {
-	for _, blob := range [][]byte{nil, []byte("malformed-flat")} {
+	wrongGeneration, ok := store.PackFlat(&groupRecord.SenderKeyStructure{SenderKeyStates: []*groupRecord.SenderKeyStateStructure{{
+		KeyID: 2, SenderChainKey: &ratchet.SenderChainKeyStructure{ChainKey: make([]byte, 32)}, SigningKeyPublic: stubDonor(2, 0).SigningKeyPublic,
+	}}})
+	if !ok {
+		t.Fatal("fixture failed to pack")
+	}
+	wrongGeneration[len(wrongGeneration)-1] = 1
+	for _, blob := range [][]byte{nil, []byte("malformed-flat"), wrongGeneration} {
 		_, complete, err := scanFlatRows(&flatRecoveryRows{blobs: [][]byte{blob}}, 1, 5, nil)
 		if complete || err != nil {
 			t.Fatal("uncertain all-negative scan must carry non-cacheable evidence")
