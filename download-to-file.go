@@ -158,7 +158,7 @@ func (cli *Client) downloadAndDecryptToFile(
 }
 
 func (cli *Client) downloadPossiblyEncryptedMediaWithRetriesToFile(ctx context.Context, url string, checksum []byte, encrypted bool, file File) (mac []byte, err error) {
-	for retryNum := 0; retryNum < 5; retryNum++ {
+	for retryNum := range 5 {
 		if !encrypted && checksum == nil {
 			_, _, err = cli.downloadMediaToFile(ctx, url, file)
 		} else {
@@ -168,8 +168,7 @@ func (cli *Client) downloadPossiblyEncryptedMediaWithRetriesToFile(ctx context.C
 			return
 		}
 		retryDuration := time.Duration(retryNum+1) * time.Second
-		var httpErr DownloadHTTPError
-		if errors.As(err, &httpErr) {
+		if httpErr, ok := errors.AsType[DownloadHTTPError](err); ok {
 			retryDuration = retryafter.Parse(httpErr.Response.Header.Get("Retry-After"), retryDuration)
 		}
 		cli.Log.Warnf("Failed to download media due to network error: %v, retrying in %s...", err, retryDuration)

@@ -51,7 +51,7 @@ func TestFrameSocketProcessDataFragmented(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fs := &FrameSocket{log: waLog.Noop, Frames: make(chan []byte, len(payloads)+1)}
+			fs := &FrameSocket{log: waLog.Noop, cancelCtx: context.Background(), Frames: make(chan []byte, len(payloads)+1)}
 			for _, chunk := range tc.chunks {
 				fs.processData(chunk)
 			}

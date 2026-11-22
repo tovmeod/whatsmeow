@@ -198,7 +198,7 @@ func TestNoiseSocketWriteLifecycle(t *testing.T) {
 	t.Run("oversized_frame_retires_with_disconnect", func(t *testing.T) {
 		ns, _, _, drained := lifecycleSocket(t, false)
 		disconnected := make(chan bool, 1)
-		ns.fs.OnDisconnect = func(_ context.Context, remote bool) { disconnected <- remote }
+		ns.fs.onDisconnect.Store(new(func(_ context.Context, remote bool) { disconnected <- remote }))
 		if err := ns.SendFrame(context.Background(), make([]byte, FrameMaxSize)); !errors.Is(err, ErrFrameTooLarge) {
 			t.Fatalf("original frame error lost: %v", err)
 		}

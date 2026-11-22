@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -35,7 +36,7 @@ var keepAliveForcedReconnects atomic.Uint64
 
 const keepAliveForcedReconnectsLogEvery = 20
 
-func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
+func (cli *Client) keepAliveLoop(_ context.Context, connCtx context.Context) {
 	lastSuccess := time.Now()
 	var errorCount int
 	for {
@@ -52,7 +53,7 @@ func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
 					LastSuccess: lastSuccess,
 				})
 				if cli.EnableAutoReconnect {
-					cli.forceKeepAliveReconnect(ctx)
+					cli.forceKeepAliveReconnect(connCtx)
 				}
 			} else {
 				if errorCount > 0 {
@@ -73,21 +74,24 @@ func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
 // silently-dead connection (no FIN/RST -- the case conn.Read never errors on); the fork
 // previously waited up to KeepAliveMaxFailTime (3 minutes) of continuous ping failure before
 // forcing a reconnect -- that tolerance is deleted, this now fires on every miss.
-func (cli *Client) forceKeepAliveReconnect(ctx context.Context) {
+func (cli *Client) forceKeepAliveReconnect(connCtx context.Context) {
+	if !cli.resetConnection(connCtx) {
+		return
+	}
 	if n := keepAliveForcedReconnects.Add(1); n%keepAliveForcedReconnectsLogEvery == 0 {
 		cli.Log.Infof("KEEPALIVE_FORCED_RECONNECT count=%d", n)
 	}
 	cli.Log.Debugf("Forcing reconnect due to keepalive failure")
-	cli.Disconnect()
-	cli.resetExpectedDisconnect()
-	go cli.autoReconnect(ctx)
 }
 
 func (cli *Client) sendKeepAlive(ctx context.Context) (isSuccess, shouldContinue bool) {
+	id := cli.generateRequestID()
+	cli.lastKeepAliveID.Store(&id)
 	respCh, err := cli.sendIQAsync(ctx, infoQuery{
 		Namespace: "w:p",
 		Type:      "get",
 		To:        types.ServerJID,
+		ID:        id,
 	})
 	if ctx.Err() != nil {
 		return false, false
@@ -104,4 +108,12 @@ func (cli *Client) sendKeepAlive(ctx context.Context) (isSuccess, shouldContinue
 	case <-ctx.Done():
 		return false, false
 	}
+}
+
+func (cli *Client) isKeepAliveNode(node *waBinary.Node) bool {
+	if node.Tag != "iq" || node.Content != nil {
+		return false
+	}
+	id := cli.lastKeepAliveID.Load()
+	return id != nil && node.Attrs["id"] == *id
 }
