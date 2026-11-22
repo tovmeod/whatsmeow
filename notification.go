@@ -587,7 +587,7 @@ func (cli *Client) handleNotification(ctx context.Context, node *waBinary.Node) 
 	case "privacy_token":
 		cli.handlePrivacyTokenNotification(ctx, node)
 	case "link_code_companion_reg":
-		go cli.tryHandleCodePairNotification(ctx, node)
+		cli.runAsyncProtocol(func() { cli.tryHandleCodePairNotification(ctx, node) })
 	case "newsletter":
 		cli.handleNewsletterNotification(ctx, node)
 	case "mex":
