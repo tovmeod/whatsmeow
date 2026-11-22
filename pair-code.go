@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 
 	"go.mau.fi/util/random"
 	"golang.org/x/crypto/curve25519"
@@ -50,19 +49,11 @@ const (
 var notNumbers = regexp.MustCompile("[^0-9]")
 var linkingBase32 = base32.NewEncoding("123456789ABCDEFGHJKLMNPQRSTVWXYZ")
 
-type phoneLinkingCache struct {
-	jid         types.JID
-	keyPair     *keys.KeyPair
-	linkingCode string
-	pairingRef  string
-	finishMu    sync.Mutex
-	finish      *phonePairFinish
-}
-
 type phonePairFinish struct {
 	wrappedPrimaryHash  [sha256.Size]byte
 	primaryIdentityHash [sha256.Size]byte
 	wrappedKeyBundle    []byte
+	secret              []byte
 }
 
 func generateCompanionEphemeralKey() (ephemeralKeyPair *keys.KeyPair, ephemeralKey []byte, encodedLinkingCode string) {
@@ -102,22 +93,42 @@ func (cli *Client) PairPhone(ctx context.Context, phone string, showPushNotifica
 	if cli == nil {
 		return "", ErrClientIsNil
 	}
-	ephemeralKeyPair, ephemeralKey, encodedLinkingCode := generateCompanionEphemeralKey()
 	phone = notNumbers.ReplaceAllString(phone, "")
 	if len(phone) <= 6 {
 		return "", ErrPhoneNumberTooShort
 	} else if strings.HasPrefix(phone, "0") {
 		return "", ErrPhoneNumberIsNotInternational
 	}
-	jid := types.NewJID(phone, types.DefaultUserServer)
+	owner := cli.phonePairing.Load()
+	if owner == nil {
+		return "", ErrNotConnected
+	}
+	ephemeralKeyPair, ephemeralKey, encodedLinkingCode := generateCompanionEphemeralKey()
+	attempt := &phonePairingAttempt{
+		jid:         types.NewJID(phone, types.DefaultUserServer),
+		keyPair:     ephemeralKeyPair,
+		linkingCode: encodedLinkingCode,
+		ready:       make(chan struct{}),
+	}
+	if err := owner.begin(ctx, attempt); err != nil {
+		return "", err
+	}
+	registered := false
+	defer func() {
+		if !registered {
+			owner.abandon(context.WithoutCancel(ctx), attempt)
+		}
+	}()
 	resp, err := cli.sendIQ(ctx, infoQuery{
-		Namespace: "md",
-		Type:      iqSet,
-		To:        types.ServerJID,
+		Namespace:     "md",
+		Type:          iqSet,
+		To:            types.ServerJID,
+		NoRetry:       true,
+		pairingSocket: owner.socket,
 		Content: []waBinary.Node{{
 			Tag: "link_code_companion_reg",
 			Attrs: waBinary.Attrs{
-				"jid":   jid,
+				"jid":   attempt.jid,
 				"stage": "companion_hello",
 
 				"should_show_push_notification": strconv.FormatBool(showPushNotification),
@@ -142,12 +153,13 @@ func (cli *Client) PairPhone(ctx context.Context, phone string, showPushNotifica
 	if !ok {
 		return "", fmt.Errorf("unexpected type %T in content of link_code_pairing_ref tag", pairingRefNode.Content)
 	}
-	cli.phoneLinkingCache.Store(&phoneLinkingCache{
-		jid:         jid,
-		keyPair:     ephemeralKeyPair,
-		linkingCode: encodedLinkingCode,
-		pairingRef:  string(pairingRef),
-	})
+	if len(pairingRef) == 0 {
+		return "", fmt.Errorf("empty link_code_pairing_ref in code link registration response")
+	}
+	if err = owner.register(ctx, attempt, string(pairingRef)); err != nil {
+		return "", err
+	}
+	registered = true
 	return encodedLinkingCode[0:4] + "-" + encodedLinkingCode[4:], nil
 }
 
@@ -166,17 +178,14 @@ func (cli *Client) handleCodePairNotification(ctx context.Context, parentNode *w
 			In:  "notification",
 		}
 	}
-	linkCache := cli.phoneLinkingCache.Load()
-	if linkCache == nil {
-		return fmt.Errorf("received code pair notification without a pending pairing")
-	}
 	if cli.paired.Load() {
 		return nil
 	}
-	linkCodePairingRef, _ := node.GetChildByTag("link_code_pairing_ref").Content.([]byte)
-	if string(linkCodePairingRef) != linkCache.pairingRef {
-		return fmt.Errorf("pairing ref mismatch in code pair notification")
+	owner := cli.phonePairing.Load()
+	if owner == nil {
+		return fmt.Errorf("received code pair notification without a pending pairing")
 	}
+	linkCodePairingRef, _ := node.GetChildByTag("link_code_pairing_ref").Content.([]byte)
 	wrappedPrimaryEphemeralPub, ok := node.GetChildByTag("link_code_pairing_wrapped_primary_ephemeral_pub").Content.([]byte)
 	if !ok {
 		return &ElementMissingError{
@@ -193,19 +202,56 @@ func (cli *Client) handleCodePairNotification(ctx context.Context, parentNode *w
 			In:  "notification",
 		}
 	}
+	if len(primaryIdentityPub) != curve25519.PointSize {
+		return fmt.Errorf("unexpected length of primary_identity_pub: %d", len(primaryIdentityPub))
+	}
 
-	wrappedKeyBundle, err := cli.preparePhonePairFinish(linkCache, wrappedPrimaryEphemeralPub, primaryIdentityPub)
+	attempt, err := phonePairingDo(ctx, owner, func(s *phonePairingState) (*phonePairingAttempt, error) {
+		if s.finalizing || s.attempt == nil {
+			return nil, errPhonePairingReplaced
+		}
+		if s.ref == "" {
+			if s.waiting == maxPhonePairingReplies {
+				return nil, fmt.Errorf("too many notifications waiting for phone pairing registration")
+			}
+			s.waiting++
+		}
+		return s.attempt, nil
+	})
+	if err != nil {
+		return err
+	}
+	// The socket can deliver a notification before the PairPhone caller has
+	// published the registration response. Wait outside the state owner.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-owner.done:
+		return ErrNotConnected
+	case <-attempt.ready:
+	}
+	wrappedKeyBundle, err := phonePairingDo(ctx, owner, func(s *phonePairingState) ([]byte, error) {
+		if s.attempt != attempt || s.finalizing {
+			return nil, errPhonePairingReplaced
+		}
+		if string(linkCodePairingRef) != s.ref {
+			return nil, fmt.Errorf("pairing ref mismatch in code pair notification")
+		}
+		return cli.preparePhonePairFinish(s, wrappedPrimaryEphemeralPub, primaryIdentityPub)
+	})
 	if err != nil {
 		return err
 	}
 	_, err = cli.sendIQ(ctx, infoQuery{
-		Namespace: "md",
-		Type:      iqSet,
-		To:        types.ServerJID,
+		Namespace:     "md",
+		Type:          iqSet,
+		To:            types.ServerJID,
+		NoRetry:       true,
+		pairingSocket: owner.socket,
 		Content: []waBinary.Node{{
 			Tag: "link_code_companion_reg",
 			Attrs: waBinary.Attrs{
-				"jid":   linkCache.jid,
+				"jid":   attempt.jid,
 				"stage": "companion_finish",
 			},
 			Content: []waBinary.Node{
@@ -218,18 +264,18 @@ func (cli *Client) handleCodePairNotification(ctx context.Context, parentNode *w
 	return err
 }
 
-func (cli *Client) preparePhonePairFinish(linkCache *phoneLinkingCache, wrappedPrimaryEphemeralPub, primaryIdentityPub []byte) ([]byte, error) {
-	linkCache.finishMu.Lock()
-	defer linkCache.finishMu.Unlock()
-
-	wrappedPrimaryHash := sha256.Sum256(wrappedPrimaryEphemeralPub)
+func (cli *Client) preparePhonePairFinish(state *phonePairingState, wrappedPrimaryEphemeralPub, primaryIdentityPub []byte) ([]byte, error) {
+	wrappedPrimaryHash := sha256.Sum256(wrappedPrimaryEphemeralPub[:80])
 	primaryIdentityHash := sha256.Sum256(primaryIdentityPub)
-	if previous := linkCache.finish; previous != nil &&
-		previous.wrappedPrimaryHash == wrappedPrimaryHash && previous.primaryIdentityHash == primaryIdentityHash {
-		// A retransmission can arrive before the primary's first pair-success.
-		// Resend the same bundle so either confirmation authenticates with the same secret.
-		return previous.wrappedKeyBundle, nil
+	for _, reply := range state.replies {
+		if reply.wrappedPrimaryHash == wrappedPrimaryHash && reply.primaryIdentityHash == primaryIdentityHash {
+			return reply.wrappedKeyBundle, nil
+		}
 	}
+	if len(state.replies) == maxPhonePairingReplies {
+		return nil, fmt.Errorf("too many distinct replies for the active phone pairing")
+	}
+	attempt := state.attempt
 
 	advSecretRandom := random.Bytes(32)
 	keyBundleSalt := random.Bytes(32)
@@ -240,14 +286,14 @@ func (cli *Client) preparePhonePairFinish(linkCache *phoneLinkingCache, wrappedP
 	primarySalt := wrappedPrimaryEphemeralPub[0:32]
 	primaryIV := wrappedPrimaryEphemeralPub[32:48]
 	primaryEncryptedPubkey := wrappedPrimaryEphemeralPub[48:80]
-	linkCodeKey := pbkdf2.Key([]byte(linkCache.linkingCode), primarySalt, 2<<16, 32, sha256.New)
+	linkCodeKey := pbkdf2.Key([]byte(attempt.linkingCode), primarySalt, 2<<16, 32, sha256.New)
 	linkCipherBlock, err := aes.NewCipher(linkCodeKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create link cipher: %w", err)
 	}
 	primaryDecryptedPubkey := make([]byte, 32)
 	cipher.NewCTR(linkCipherBlock, primaryIV).XORKeyStream(primaryDecryptedPubkey, primaryEncryptedPubkey)
-	ephemeralSharedSecret, err := curve25519.X25519(linkCache.keyPair.Priv[:], primaryDecryptedPubkey)
+	ephemeralSharedSecret, err := curve25519.X25519(attempt.keyPair.Priv[:], primaryDecryptedPubkey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute ephemeral shared secret: %w", err)
 	}
@@ -273,11 +319,11 @@ func (cli *Client) preparePhonePairFinish(linkCache *phoneLinkingCache, wrappedP
 	}
 	advSecretInput := append(append(ephemeralSharedSecret, identitySharedKey...), advSecretRandom...)
 	advSecret := hkdfutil.SHA256(advSecretInput, nil, []byte("adv_secret"), 32)
-	cli.Store.AdvSecretKey = advSecret
-	linkCache.finish = &phonePairFinish{
+	state.replies = append(state.replies, phonePairFinish{
 		wrappedPrimaryHash:  wrappedPrimaryHash,
 		primaryIdentityHash: primaryIdentityHash,
 		wrappedKeyBundle:    wrappedKeyBundle,
-	}
+		secret:              advSecret,
+	})
 	return wrappedKeyBundle, nil
 }
