@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"go.mau.fi/util/random"
 	"golang.org/x/crypto/curve25519"
@@ -54,6 +55,14 @@ type phoneLinkingCache struct {
 	keyPair     *keys.KeyPair
 	linkingCode string
 	pairingRef  string
+	finishMu    sync.Mutex
+	finish      *phonePairFinish
+}
+
+type phonePairFinish struct {
+	wrappedPrimaryHash  [sha256.Size]byte
+	primaryIdentityHash [sha256.Size]byte
+	wrappedKeyBundle    []byte
 }
 
 func generateCompanionEphemeralKey() (ephemeralKeyPair *keys.KeyPair, ephemeralKey []byte, encodedLinkingCode string) {
@@ -161,7 +170,9 @@ func (cli *Client) handleCodePairNotification(ctx context.Context, parentNode *w
 	if linkCache == nil {
 		return fmt.Errorf("received code pair notification without a pending pairing")
 	}
-	cli.paired.Store(false)
+	if cli.paired.Load() {
+		return nil
+	}
 	linkCodePairingRef, _ := node.GetChildByTag("link_code_pairing_ref").Content.([]byte)
 	if string(linkCodePairingRef) != linkCache.pairingRef {
 		return fmt.Errorf("pairing ref mismatch in code pair notification")
@@ -183,50 +194,10 @@ func (cli *Client) handleCodePairNotification(ctx context.Context, parentNode *w
 		}
 	}
 
-	advSecretRandom := random.Bytes(32)
-	keyBundleSalt := random.Bytes(32)
-	keyBundleNonce := random.Bytes(12)
-
-	// Decrypt the primary device's ephemeral public key, which was encrypted with the 8-character pairing code,
-	// then compute the DH shared secret using our ephemeral private key we generated earlier.
-	primarySalt := wrappedPrimaryEphemeralPub[0:32]
-	primaryIV := wrappedPrimaryEphemeralPub[32:48]
-	primaryEncryptedPubkey := wrappedPrimaryEphemeralPub[48:80]
-	linkCodeKey := pbkdf2.Key([]byte(linkCache.linkingCode), primarySalt, 2<<16, 32, sha256.New)
-	linkCipherBlock, err := aes.NewCipher(linkCodeKey)
+	wrappedKeyBundle, err := cli.preparePhonePairFinish(linkCache, wrappedPrimaryEphemeralPub, primaryIdentityPub)
 	if err != nil {
-		return fmt.Errorf("failed to create link cipher: %w", err)
+		return err
 	}
-	primaryDecryptedPubkey := make([]byte, 32)
-	cipher.NewCTR(linkCipherBlock, primaryIV).XORKeyStream(primaryDecryptedPubkey, primaryEncryptedPubkey)
-	ephemeralSharedSecret, err := curve25519.X25519(linkCache.keyPair.Priv[:], primaryDecryptedPubkey)
-	if err != nil {
-		return fmt.Errorf("failed to compute ephemeral shared secret: %w", err)
-	}
-
-	// Encrypt and wrap key bundle containing our identity key, the primary device's identity key and the randomness used for the adv key.
-	keyBundleEncryptionKey := hkdfutil.SHA256(ephemeralSharedSecret, keyBundleSalt, []byte("link_code_pairing_key_bundle_encryption_key"), 32)
-	keyBundleCipherBlock, err := aes.NewCipher(keyBundleEncryptionKey)
-	if err != nil {
-		return fmt.Errorf("failed to create key bundle cipher: %w", err)
-	}
-	keyBundleGCM, err := cipher.NewGCM(keyBundleCipherBlock)
-	if err != nil {
-		return fmt.Errorf("failed to create key bundle GCM: %w", err)
-	}
-	plaintextKeyBundle := concatBytes(cli.Store.IdentityKey.Pub[:], primaryIdentityPub, advSecretRandom)
-	encryptedKeyBundle := keyBundleGCM.Seal(nil, keyBundleNonce, plaintextKeyBundle, nil)
-	wrappedKeyBundle := concatBytes(keyBundleSalt, keyBundleNonce, encryptedKeyBundle)
-
-	// Compute the adv secret key (which is used to authenticate the pair-success event later)
-	identitySharedKey, err := curve25519.X25519(cli.Store.IdentityKey.Priv[:], primaryIdentityPub)
-	if err != nil {
-		return fmt.Errorf("failed to compute identity shared key: %w", err)
-	}
-	advSecretInput := append(append(ephemeralSharedSecret, identitySharedKey...), advSecretRandom...)
-	advSecret := hkdfutil.SHA256(advSecretInput, nil, []byte("adv_secret"), 32)
-	cli.Store.AdvSecretKey = advSecret
-
 	_, err = cli.sendIQ(ctx, infoQuery{
 		Namespace: "md",
 		Type:      iqSet,
@@ -245,4 +216,68 @@ func (cli *Client) handleCodePairNotification(ctx context.Context, parentNode *w
 		}},
 	})
 	return err
+}
+
+func (cli *Client) preparePhonePairFinish(linkCache *phoneLinkingCache, wrappedPrimaryEphemeralPub, primaryIdentityPub []byte) ([]byte, error) {
+	linkCache.finishMu.Lock()
+	defer linkCache.finishMu.Unlock()
+
+	wrappedPrimaryHash := sha256.Sum256(wrappedPrimaryEphemeralPub)
+	primaryIdentityHash := sha256.Sum256(primaryIdentityPub)
+	if previous := linkCache.finish; previous != nil &&
+		previous.wrappedPrimaryHash == wrappedPrimaryHash && previous.primaryIdentityHash == primaryIdentityHash {
+		// A retransmission can arrive before the primary's first pair-success.
+		// Resend the same bundle so either confirmation authenticates with the same secret.
+		return previous.wrappedKeyBundle, nil
+	}
+
+	advSecretRandom := random.Bytes(32)
+	keyBundleSalt := random.Bytes(32)
+	keyBundleNonce := random.Bytes(12)
+
+	// Decrypt the primary device's ephemeral public key, which was encrypted with the 8-character pairing code,
+	// then compute the DH shared secret using our ephemeral private key we generated earlier.
+	primarySalt := wrappedPrimaryEphemeralPub[0:32]
+	primaryIV := wrappedPrimaryEphemeralPub[32:48]
+	primaryEncryptedPubkey := wrappedPrimaryEphemeralPub[48:80]
+	linkCodeKey := pbkdf2.Key([]byte(linkCache.linkingCode), primarySalt, 2<<16, 32, sha256.New)
+	linkCipherBlock, err := aes.NewCipher(linkCodeKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create link cipher: %w", err)
+	}
+	primaryDecryptedPubkey := make([]byte, 32)
+	cipher.NewCTR(linkCipherBlock, primaryIV).XORKeyStream(primaryDecryptedPubkey, primaryEncryptedPubkey)
+	ephemeralSharedSecret, err := curve25519.X25519(linkCache.keyPair.Priv[:], primaryDecryptedPubkey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute ephemeral shared secret: %w", err)
+	}
+
+	// Encrypt and wrap key bundle containing our identity key, the primary device's identity key and the randomness used for the adv key.
+	keyBundleEncryptionKey := hkdfutil.SHA256(ephemeralSharedSecret, keyBundleSalt, []byte("link_code_pairing_key_bundle_encryption_key"), 32)
+	keyBundleCipherBlock, err := aes.NewCipher(keyBundleEncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create key bundle cipher: %w", err)
+	}
+	keyBundleGCM, err := cipher.NewGCM(keyBundleCipherBlock)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create key bundle GCM: %w", err)
+	}
+	plaintextKeyBundle := concatBytes(cli.Store.IdentityKey.Pub[:], primaryIdentityPub, advSecretRandom)
+	encryptedKeyBundle := keyBundleGCM.Seal(nil, keyBundleNonce, plaintextKeyBundle, nil)
+	wrappedKeyBundle := concatBytes(keyBundleSalt, keyBundleNonce, encryptedKeyBundle)
+
+	// Compute the adv secret key (which is used to authenticate the pair-success event later)
+	identitySharedKey, err := curve25519.X25519(cli.Store.IdentityKey.Priv[:], primaryIdentityPub)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute identity shared key: %w", err)
+	}
+	advSecretInput := append(append(ephemeralSharedSecret, identitySharedKey...), advSecretRandom...)
+	advSecret := hkdfutil.SHA256(advSecretInput, nil, []byte("adv_secret"), 32)
+	cli.Store.AdvSecretKey = advSecret
+	linkCache.finish = &phonePairFinish{
+		wrappedPrimaryHash:  wrappedPrimaryHash,
+		primaryIdentityHash: primaryIdentityHash,
+		wrappedKeyBundle:    wrappedKeyBundle,
+	}
+	return wrappedKeyBundle, nil
 }
