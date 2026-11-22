@@ -302,7 +302,7 @@ type Client struct {
 
 	BackgroundEventCtx context.Context
 
-	phonePairing         atomic.Pointer[phonePairingOwner]
+	phoneLinkingCache    atomic.Pointer[phoneLinkingCache]
 	passkeyLinkingCache  atomic.Pointer[passkeyLinkingCache]
 	passkeyHandoffKey    atomic.Pointer[passkeyHandoffKey]
 	passkeySkipHandoffUX atomic.Bool
@@ -721,17 +721,8 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 	}
 	closeWait := make(chan struct{})
 	cli.handlerQueueWait = closeWait
-	consumerDone := cli.socket.ConsumerDone()
-	if cli.Store.ID == nil {
-		cli.paired.Store(false)
-		pairing := newPhonePairingOwner(cli.socket)
-		cli.phonePairing.Store(pairing)
-		go pairing.run(consumerDone)
-	} else {
-		cli.phonePairing.Store(nil)
-	}
 	go cli.keepAliveLoop(ctx, fs.Context())
-	go cli.handlerQueueLoop(ctx, fs.Context(), queue, closeWait, consumerDone)
+	go cli.handlerQueueLoop(ctx, fs.Context(), queue, closeWait, cli.socket.ConsumerDone())
 	return nil
 }
 
@@ -1163,17 +1154,13 @@ Loop:
 }
 
 func (cli *Client) sendNodeAndGetData(ctx context.Context, node waBinary.Node) ([]byte, error) {
-	return cli.sendNodeAndGetDataOnSocket(ctx, node, nil)
-}
-
-func (cli *Client) sendNodeAndGetDataOnSocket(ctx context.Context, node waBinary.Node, expected *socket.NoiseSocket) ([]byte, error) {
 	if cli == nil {
 		return nil, ErrClientIsNil
 	}
 	cli.socketLock.RLock()
 	sock := cli.socket
 	cli.socketLock.RUnlock()
-	if sock == nil || expected != nil && sock != expected {
+	if sock == nil {
 		return nil, ErrNotConnected
 	}
 
@@ -1421,7 +1408,6 @@ func (cli *Client) sendUnifiedSession() {
 
 // DisconnectAndDrain joins accepted protocol nodes after disconnecting the transport.
 // A deadline only bounds this caller's wait; it never discards accepted state.
-// Call it from outside event handlers, which may themselves be part of the work being joined.
 func (cli *Client) DisconnectAndDrain(ctx context.Context) error {
 	if cli == nil {
 		return nil
