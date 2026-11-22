@@ -13,7 +13,6 @@ import (
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
-	"go.mau.fi/whatsmeow/socket"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -107,8 +106,6 @@ type infoQuery struct {
 
 	Timeout time.Duration
 	NoRetry bool
-	// Pairing IQs belong to the connection on which the code was registered.
-	pairingSocket *socket.NoiseSocket
 }
 
 func (cli *Client) sendIQAsyncAndGetData(ctx context.Context, query *infoQuery) (<-chan *waBinary.Node, []byte, error) {
@@ -133,11 +130,11 @@ func (cli *Client) sendIQAsyncAndGetData(ctx context.Context, query *infoQuery) 
 	if !query.Target.IsEmpty() {
 		attrs["target"] = query.Target
 	}
-	data, err := cli.sendNodeAndGetDataOnSocket(ctx, waBinary.Node{
+	data, err := cli.sendNodeAndGetData(ctx, waBinary.Node{
 		Tag:     "iq",
 		Attrs:   attrs,
 		Content: query.Content,
-	}, query.pairingSocket)
+	})
 	if err != nil {
 		cli.cancelResponse(query.ID, waiter)
 		return nil, data, err

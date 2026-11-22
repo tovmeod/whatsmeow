@@ -66,15 +66,11 @@ func (cli *Client) handlePasskeyNotification(ctx context.Context, node *waBinary
 		}
 		cli.Log.Debugf("Successfully fetched passkey options after failing to parse notification")
 	}
-	if !cli.updatePairingSecret(ctx, true, func(secret []byte) {
-		cli.passkeyHandoffKey.Store(&passkeyHandoffKey{
-			hmac: hkdfutil.SHA256(secret, nil, []byte("shortcake-passkey-handoff-v1"), 32),
-			ts:   time.Now(),
-		})
-		cli.Store.AdvSecretKey = random.Bytes(32)
-	}) {
-		return
-	}
+	cli.passkeyHandoffKey.Store(&passkeyHandoffKey{
+		hmac: hkdfutil.SHA256(cli.Store.AdvSecretKey, nil, []byte("shortcake-passkey-handoff-v1"), 32),
+		ts:   time.Now(),
+	})
+	cli.Store.AdvSecretKey = random.Bytes(32)
 	cli.dispatchEvent(&events.PairPasskeyRequest{PublicKey: pubKey})
 }
 
@@ -219,14 +215,10 @@ func (cli *Client) SendPasskeyConfirmation(ctx context.Context) error {
 	} else if cache.encryptionKey == nil {
 		return fmt.Errorf("passkey linking cache does not have an encryption key yet")
 	}
-	secret, err := cli.devicePairingSecret(ctx)
-	if err != nil {
-		return err
-	}
 	req, err := proto.Marshal(&waCompanionReg.PairingRequest{
 		CompanionPublicKey:   cli.Store.NoiseKey.Pub[:],
 		CompanionIdentityKey: cli.Store.IdentityKey.Pub[:],
-		AdvSecret:            secret,
+		AdvSecret:            cli.Store.AdvSecretKey,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to marshal PairingRequest: %w", err)

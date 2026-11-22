@@ -11,7 +11,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"time"
 
@@ -51,6 +50,7 @@ func (cli *Client) handleIQ(ctx context.Context, node *waBinary.Node) {
 }
 
 func (cli *Client) handlePairDevice(ctx context.Context, node *waBinary.Node) {
+	cli.paired.Store(false)
 	pairDevice := node.GetChildByTag("pair-device")
 	err := cli.sendNode(ctx, waBinary.Node{
 		Tag: "iq",
@@ -75,26 +75,18 @@ func (cli *Client) handlePairDevice(ctx context.Context, node *waBinary.Node) {
 			cli.Log.Warnf("pair-device node contains unexpected child content type %T at index %d", child, i)
 			continue
 		}
-		if code := cli.makeQRData(content, cli.getQRClientType()); code != "" {
-			evt.Codes = append(evt.Codes, code)
-		}
+		evt.Codes = append(evt.Codes, cli.makeQRData(content, cli.getQRClientType()))
 	}
 
 	cli.dispatchEvent(evt)
 }
 
 func (cli *Client) rotateADVSecret(ctx context.Context) {
-	var oldSecret, newSecret []byte
-	if !cli.updatePairingSecret(ctx, false, func(current []byte) {
-		oldSecret = current
-		newSecret = random.Bytes(32)
-		cli.Store.AdvSecretKey = newSecret
-	}) {
-		return
-	}
+	oldSecret := cli.Store.AdvSecretKey
+	cli.Store.AdvSecretKey = random.Bytes(32)
 	cli.dispatchEvent(&events.RotateADVSecret{
 		OldSecret: base64.StdEncoding.EncodeToString(oldSecret),
-		NewSecret: base64.StdEncoding.EncodeToString(newSecret),
+		NewSecret: base64.StdEncoding.EncodeToString(cli.Store.AdvSecretKey),
 	})
 }
 
@@ -131,13 +123,9 @@ func (cli *Client) getQRClientType() PairClientType {
 }
 
 func (cli *Client) makeQRData(ref []byte, clientType PairClientType) string {
-	secret, err := cli.devicePairingSecret(cli.BackgroundEventCtx)
-	if err != nil {
-		return ""
-	}
 	noise := base64.StdEncoding.EncodeToString(cli.Store.NoiseKey.Pub[:])
 	identity := base64.StdEncoding.EncodeToString(cli.Store.IdentityKey.Pub[:])
-	adv := base64.StdEncoding.EncodeToString(secret)
+	adv := base64.StdEncoding.EncodeToString(cli.Store.AdvSecretKey)
 	return fmt.Sprintf("https://wa.me/settings/linked_devices#%s,%s,%s,%s,%s", ref, noise, identity, adv, clientType)
 }
 
@@ -157,15 +145,8 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 		cli.Log.Warnf("Failed to parse client pairing props: %v", err)
 	}
 
-	owner := cli.phonePairing.Load()
-	// Reserve the reply in receive order before starting a worker. A later
-	// passkey handoff or retry must not overtake this confirmation.
-	identity, secret, claimErr := cli.authenticatePairConfirmation(ctx, owner, deviceIdentityBytes)
-	cli.runAsyncProtocol(func() {
-		err := cli.completePair(ctx, owner, identity, secret, claimErr, id, businessName, platform, jid, lid)
-		if errors.Is(err, errPhonePairingFinalizing) || errors.Is(err, errPhonePairingStaleProof) || errors.Is(err, ErrNotConnected) {
-			return
-		}
+	go func() {
+		err := cli.handlePair(ctx, deviceIdentityBytes, id, businessName, platform, jid, lid)
 		if err != nil {
 			cli.Log.Errorf("Failed to pair device: %v", err)
 			cli.Disconnect()
@@ -175,48 +156,32 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 			go cli.sendUnifiedSession()
 			cli.dispatchEvent(&events.PairSuccess{ID: jid, LID: lid, BusinessName: businessName, Platform: platform, Props: &props})
 		}
-	})
+	}()
 }
 
 func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, reqID, businessName, platform string, jid, lid types.JID) error {
-	owner := cli.phonePairing.Load()
-	identity, secret, err := cli.authenticatePairConfirmation(ctx, owner, deviceIdentityBytes)
-	return cli.completePair(ctx, owner, identity, secret, err, reqID, businessName, platform, jid, lid)
-}
+	var deviceIdentityContainer waAdv.ADVSignedDeviceIdentityHMAC
+	err := proto.Unmarshal(deviceIdentityBytes, &deviceIdentityContainer)
+	if err != nil {
+		cli.sendPairError(ctx, reqID, 500, "internal-error")
+		return &PairProtoError{"failed to parse device identity container in pair success message", err}
+	}
 
-func validPairingHMAC(identity *waAdv.ADVSignedDeviceIdentityHMAC, secret []byte) bool {
-	h := hmac.New(sha256.New, secret)
-	if identity.GetAccountType() == waAdv.ADVEncryptionType_HOSTED {
+	h := hmac.New(sha256.New, cli.Store.AdvSecretKey)
+	if deviceIdentityContainer.GetAccountType() == waAdv.ADVEncryptionType_HOSTED {
 		h.Write(AdvHostedAccountSignaturePrefix)
+		//cli.Store.IsHosted = true
 	}
-	h.Write(identity.Details)
-	return hmac.Equal(h.Sum(nil), identity.HMAC)
-}
+	h.Write(deviceIdentityContainer.Details)
 
-func (cli *Client) authenticatePairConfirmation(ctx context.Context, owner *phonePairingOwner, data []byte) (*waAdv.ADVSignedDeviceIdentityHMAC, []byte, error) {
-	identity := &waAdv.ADVSignedDeviceIdentityHMAC{}
-	var parseErr error
-	if err := proto.Unmarshal(data, identity); err != nil {
-		parseErr = &PairProtoError{"failed to parse device identity container in pair success message", err}
-	}
-	secret, err := cli.claimPairingSecret(ctx, owner, identity, parseErr)
-	return identity, secret, err
-}
-
-func (cli *Client) completePair(ctx context.Context, owner *phonePairingOwner, deviceIdentityContainer *waAdv.ADVSignedDeviceIdentityHMAC, secret []byte, claimErr error, reqID, businessName, platform string, jid, lid types.JID) error {
-	if claimErr != nil {
-		var malformed *PairProtoError
-		if errors.Is(claimErr, ErrPairInvalidDeviceIdentityHMAC) {
-			cli.Log.Warnf("Invalid HMAC from pair success message")
-			cli.sendPairError(ctx, reqID, 401, "hmac-mismatch")
-		} else if errors.As(claimErr, &malformed) {
-			cli.sendPairError(ctx, reqID, 500, "internal-error")
-		}
-		return claimErr
+	if !hmac.Equal(h.Sum(nil), deviceIdentityContainer.HMAC) {
+		cli.Log.Warnf("Invalid HMAC from pair success message")
+		cli.sendPairError(ctx, reqID, 401, "hmac-mismatch")
+		return ErrPairInvalidDeviceIdentityHMAC
 	}
 
 	var deviceIdentity waAdv.ADVSignedDeviceIdentity
-	err := proto.Unmarshal(deviceIdentityContainer.Details, &deviceIdentity)
+	err = proto.Unmarshal(deviceIdentityContainer.Details, &deviceIdentity)
 	if err != nil {
 		cli.sendPairError(ctx, reqID, 500, "internal-error")
 		return &PairProtoError{"failed to parse signed device identity in pair success message", err}
@@ -241,6 +206,8 @@ func (cli *Client) completePair(ctx context.Context, owner *phonePairingOwner, d
 		return ErrPairRejectedLocally
 	}
 
+	cli.Store.Account = proto.Clone(&deviceIdentity).(*waAdv.ADVSignedDeviceIdentity)
+
 	mainDeviceLID := lid
 	mainDeviceLID.Device = 0
 	mainDeviceIdentity := *(*[32]byte)(deviceIdentity.AccountSignatureKey)
@@ -252,17 +219,6 @@ func (cli *Client) completePair(ctx context.Context, owner *phonePairingOwner, d
 		return &PairProtoError{"failed to marshal self-signed device identity", err}
 	}
 
-	if owner != nil {
-		_, err = phonePairingDo(ctx, owner, func(s *phonePairingState) (struct{}, error) {
-			cli.Store.AdvSecretKey = secret
-			s.reset()
-			return struct{}{}, nil
-		})
-		if err != nil {
-			return err
-		}
-	}
-	cli.Store.Account = proto.Clone(&deviceIdentity).(*waAdv.ADVSignedDeviceIdentity)
 	cli.Store.ID = &jid
 	cli.Store.LID = lid
 	cli.Store.BusinessName = businessName
