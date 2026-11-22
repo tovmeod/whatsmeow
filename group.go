@@ -11,6 +11,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+
+	"go.mau.fi/util/exslices"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/store"
@@ -628,8 +631,12 @@ func (cli *Client) cacheGroupInfo(groupInfo *types.GroupInfo, lock bool) ([]stor
 	participants := make([]types.JID, len(groupInfo.Participants))
 	lidPairs := make([]store.LIDMapping, len(groupInfo.Participants))
 	redactedPhones := make([]store.RedactedPhoneEntry, 0)
+	admins := make([]types.JID, 0)
 	for i, part := range groupInfo.Participants {
 		participants[i] = part.JID
+		if part.IsAdmin || part.IsSuperAdmin {
+			admins = append(admins, part.JID)
+		}
 		if !part.PhoneNumber.IsEmpty() && !part.LID.IsEmpty() {
 			lidPairs[i] = store.LIDMapping{
 				LID: part.LID,
@@ -649,8 +656,10 @@ func (cli *Client) cacheGroupInfo(groupInfo *types.GroupInfo, lock bool) ([]stor
 	}
 	cli.groupCache[groupInfo.JID] = &groupMetaCache{
 		AddressingMode:             groupInfo.AddressingMode,
+		ReadOnly:                   groupInfo.IsAnnounce,
 		CommunityAnnouncementGroup: groupInfo.IsAnnounce && groupInfo.IsDefaultSubGroup,
 		Members:                    participants,
+		Admins:                     admins,
 	}
 	return lidPairs, redactedPhones
 }
@@ -786,7 +795,8 @@ func (cli *Client) parseGroupNode(groupNode *waBinary.Node) (*types.GroupInfo, e
 		case "incognito":
 			group.IsIncognito = true
 		case "membership_approval_mode":
-			group.IsJoinApprovalRequired = true
+			groupJoin := child.GetChildByTag("group_join")
+			group.IsJoinApprovalRequired = groupJoin.AttrGetter().OptionalString("state") != "off"
 		case "suspended":
 			group.Suspended = true
 		default:
@@ -987,8 +997,9 @@ func (cli *Client) parseGroupChange(node *waBinary.Node) (*events.GroupInfo, []s
 				return nil, nil, fmt.Errorf("failed to parse group unlink node in group change: %w", err)
 			}
 		case "membership_approval_mode":
+			groupJoin := child.GetChildByTag("group_join")
 			evt.MembershipApprovalMode = &types.GroupMembershipApprovalMode{
-				IsJoinApprovalRequired: true,
+				IsJoinApprovalRequired: groupJoin.AttrGetter().OptionalString("state") != "off",
 			}
 		case "suspended":
 			evt.Suspended = true
@@ -1006,33 +1017,56 @@ func (cli *Client) parseGroupChange(node *waBinary.Node) (*events.GroupInfo, []s
 
 func (cli *Client) updateGroupParticipantCache(evt *events.GroupInfo) {
 	// TODO can the addressing mode change here?
-	if len(evt.Join) == 0 && len(evt.Leave) == 0 {
+	if len(evt.Join) == 0 && len(evt.Leave) == 0 && len(evt.Promote) == 0 && len(evt.Demote) == 0 && evt.Announce == nil {
 		return
 	}
 	cli.groupCacheLock.Lock()
 	defer cli.groupCacheLock.Unlock()
-	cached, ok := cli.groupCache[evt.JID]
+	origCache, ok := cli.groupCache[evt.JID]
 	if !ok {
 		return
 	}
-Outer:
-	for _, jid := range evt.Join {
-		for _, existingJID := range cached.Members {
-			if jid == existingJID {
-				continue Outer
-			}
+	cached := *origCache
+	membersCloned := false
+	modifyMembers := func() {
+		if !membersCloned {
+			membersCloned = true
+			cached.Members = slices.Clone(cached.Members)
 		}
-		cached.Members = append(cached.Members, jid)
+	}
+	adminsCloned := false
+	modifyAdmins := func() {
+		if !adminsCloned {
+			adminsCloned = true
+			cached.Admins = slices.Clone(cached.Admins)
+		}
+	}
+	if evt.Announce != nil {
+		cached.ReadOnly = evt.Announce.IsAnnounce
+	}
+	for _, jid := range evt.Join {
+		modifyMembers()
+		if !slices.Contains(cached.Members, jid) {
+			cached.Members = append(cached.Members, jid)
+		}
 	}
 	for _, jid := range evt.Leave {
-		for i, existingJID := range cached.Members {
-			if existingJID == jid {
-				cached.Members[i] = cached.Members[len(cached.Members)-1]
-				cached.Members = cached.Members[:len(cached.Members)-1]
-				break
-			}
+		modifyMembers()
+		modifyAdmins()
+		cached.Members = exslices.FastDeleteItem(cached.Members, jid)
+		cached.Admins = exslices.FastDeleteItem(cached.Admins, jid)
+	}
+	for _, jid := range evt.Promote {
+		if !slices.Contains(cached.Admins, jid) {
+			modifyAdmins()
+			cached.Admins = append(cached.Admins, jid)
 		}
 	}
+	for _, jid := range evt.Demote {
+		modifyAdmins()
+		cached.Admins = exslices.FastDeleteItem(cached.Admins, jid)
+	}
+	cli.groupCache[evt.JID] = &cached
 }
 
 func (cli *Client) parseGroupNotification(node *waBinary.Node) (any, []store.LIDMapping, []store.RedactedPhoneEntry, error) {

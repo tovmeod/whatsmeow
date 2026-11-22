@@ -5,8 +5,7 @@
 //   - the Delete error is still logged, once the backgrounded goroutine completes.
 //
 // Task 2 — WA-cadence keepalive miss forces an immediate reconnect (no 3-minute tolerance):
-//   - forceKeepAliveReconnect increments the observability counter and clears
-//     expectedDisconnect (so a subsequent autoReconnect isn't short-circuited).
+//   - forceKeepAliveReconnect respects a concurrent manual disconnect.
 //   - KeepAliveResponseDeadline matches WA Web's deadSocketTime (20s).
 //
 // Task 3 — xmlstreamend and 503 are counted, verified-recovery lifecycle (not new teardown
@@ -117,21 +116,22 @@ func TestKeepAlive_ResponseDeadlineMatchesWADeadSocketTime(t *testing.T) {
 	}
 }
 
-func TestKeepAlive_ForceReconnectIncrementsCounterAndClearsExpectedDisconnect(t *testing.T) {
+func TestKeepAlive_ForceReconnectPreservesExpectedDisconnect(t *testing.T) {
 	cli, _ := newReplayClient()
 	cli.Store = &store.Device{}
 	cli.expectedDisconnect = exsync.NewEvent()
 	cli.EnableAutoReconnect = true
+	cli.expectDisconnect()
 
 	before := keepAliveForcedReconnects.Load()
 	cli.forceKeepAliveReconnect(context.Background())
 	after := keepAliveForcedReconnects.Load()
 
-	if after != before+1 {
-		t.Fatalf("want forced-reconnect counter to increment by 1, got %d -> %d", before, after)
+	if after != before {
+		t.Fatalf("forced reconnect counter changed without a live socket: %d -> %d", before, after)
 	}
-	if cli.isExpectedDisconnect() {
-		t.Fatal("want expectedDisconnect cleared after forceKeepAliveReconnect (so autoReconnect proceeds)")
+	if !cli.isExpectedDisconnect() || cli.forceAutoReconnect.Load() {
+		t.Fatal("keepalive overrode a manual disconnect")
 	}
 }
 

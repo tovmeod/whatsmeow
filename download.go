@@ -29,7 +29,6 @@ import (
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waMediaTransport"
 	"go.mau.fi/whatsmeow/proto/waServerSync"
-	"go.mau.fi/whatsmeow/socket"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/util/cbcutil"
 	"go.mau.fi/whatsmeow/util/hkdfutil"
@@ -357,7 +356,7 @@ func shouldRetryMediaDownload(err error) bool {
 }
 
 func (cli *Client) downloadPossiblyEncryptedMediaWithRetries(ctx context.Context, url string, checksum []byte, encrypted bool) (file, mac []byte, err error) {
-	for retryNum := 0; retryNum < 5; retryNum++ {
+	for retryNum := range 5 {
 		if !encrypted && checksum == nil {
 			file, err = cli.downloadMedia(ctx, url)
 		} else {
@@ -367,8 +366,7 @@ func (cli *Client) downloadPossiblyEncryptedMediaWithRetries(ctx context.Context
 			return
 		}
 		retryDuration := time.Duration(retryNum+1) * time.Second
-		var httpErr DownloadHTTPError
-		if errors.As(err, &httpErr) {
+		if httpErr, ok := errors.AsType[DownloadHTTPError](err); ok {
 			retryDuration = retryafter.Parse(httpErr.Response.Header.Get("Retry-After"), retryDuration)
 		}
 		cli.Log.Warnf("Failed to download media due to network error: %v, retrying in %s...", err, retryDuration)
@@ -389,8 +387,8 @@ func (cli *Client) doMediaDownloadRequest(ctx context.Context, url string) (*htt
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare request: %w", err)
 	}
-	req.Header.Set("Origin", socket.Origin)
-	req.Header.Set("Referer", socket.Origin+"/")
+	req.Header.Set("Origin", cli.getMediaOrigin())
+	req.Header.Set("Referer", cli.getMediaOrigin()+"/")
 	if userAgent := cli.getUserAgent(); userAgent != "" {
 		req.Header.Set("User-Agent", cli.getUserAgent())
 	}
